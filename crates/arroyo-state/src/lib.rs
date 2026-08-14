@@ -11,6 +11,7 @@ use bincode::{Decode, Encode};
 
 use arroyo_rpc::config::config;
 use arroyo_rpc::df::ArroyoSchema;
+use arroyo_rpc::state_backend::StateBackendSelector;
 use arroyo_storage::StorageProvider;
 pub use arroyo_storage::StorageProviderFor;
 use prost::Message;
@@ -77,6 +78,9 @@ pub fn global_table_config_with_version(
             }
             .encode_to_vec(),
             state_version,
+            // Left empty on purpose: the job's selector is stamped into every table
+            // config centrally, when the operator's context is built.
+            state_backend: String::new(),
         },
     )
 }
@@ -99,6 +103,9 @@ pub fn timestamp_table_config(
         }
         .encode_to_vec(),
         state_version: 0,
+        // Left empty on purpose: the job's selector is stamped into every table config
+        // centrally, when the operator's context is built.
+        state_backend: String::new(),
     }
 }
 
@@ -168,8 +175,14 @@ pub trait BackingStore {
     ) -> Result<(), StateError>;
 
     /// cleans up a checkpoint by deleting data that is no longer needed
+    ///
+    /// `job` is the state backend the job selected. The epochs being cleaned describe
+    /// state that some run of this job wrote, and every one of them is checked against
+    /// `job` before any file is deleted, so a job can never delete another backend's
+    /// files.
     async fn cleanup_checkpoint(
         role: &StorageProviderFor,
+        job: StateBackendSelector,
         metadata: CheckpointMetadata,
         old_min_epoch: u32,
         new_min_epoch: u32,

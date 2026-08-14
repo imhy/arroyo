@@ -1,3 +1,4 @@
+use crate::state_backend::apply_job_state_backend;
 use crate::{RateLimiter, server_for_hash_array};
 use arrow::array::{Array, PrimitiveArray, RecordBatch};
 use arrow::compute::{partition, sort_to_indices, take};
@@ -10,6 +11,7 @@ use arroyo_rpc::errors::{DataflowError, DataflowResult};
 use arroyo_rpc::formats::{BadData, Format, Framing};
 use arroyo_rpc::grpc::rpc::{TableConfig, TaskCheckpointEventType};
 use arroyo_rpc::schema_resolver::SchemaResolver;
+use arroyo_rpc::state_backend::StateBackendError;
 use arroyo_rpc::{
     CompactionResult, ControlMessage, ControlResp, MetadataField, MetadataOrManifest, get_hasher,
 };
@@ -678,6 +680,27 @@ impl ArrowCollector {
 }
 
 impl OperatorContext {
+    /// Builds the context an operator runs in, and with it the operator's state.
+    ///
+    /// This is the single boundary every `fn tables()` implementation reaches, so it is
+    /// where the job's state-backend selector — carried explicitly on `task_info` — is
+    /// checked against the table configs and then written into them. Both steps run
+    /// before [`TableManager::load`], which means before any storage provider is opened,
+    /// any checkpoint metadata is read, and any table is created.
+    ///
+    /// [`TableManager::load`] then makes the matching check on the other side, against the
+    /// table configs of the checkpoint this task is restoring from. That failure is
+    /// forwarded typed while every other way of failing to build state keeps its existing
+    /// panic: a rejected selector is a job the operator can report on, not a bug in the
+    /// state machinery.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`StateBackendError`] raised by the tables' selectors — an unknown
+    /// value, two tables selecting different backends, or a table disagreeing with the
+    /// job — or by the restored checkpoint's. The task then fails to start with that
+    /// error, which the worker reports to the controller; the job never runs on a backend
+    /// it did not select.
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
         task_info: Arc<TaskInfo>,
@@ -686,14 +709,23 @@ impl OperatorContext {
         input_partitions: usize,
         in_schemas: Vec<Arc<ArroyoSchema>>,
         out_schema: Option<Arc<ArroyoSchema>>,
-        tables: HashMap<String, TableConfig>,
-    ) -> Self {
-        let (table_manager, watermark) =
-            TableManager::load(task_info.clone(), tables, control_tx.clone(), restore_from)
-                .await
-                .expect("should be able to create TableManager");
+        mut tables: HashMap<String, TableConfig>,
+    ) -> Result<Self, StateBackendError> {
+        apply_job_state_backend(task_info.state_backend, &mut tables)?;
 
-        Self {
+        let (table_manager, watermark) =
+            match TableManager::load(task_info.clone(), tables, control_tx.clone(), restore_from)
+                .await
+            {
+                Ok(loaded) => loaded,
+                Err(e) => {
+                    return Err(e.downcast::<StateBackendError>().unwrap_or_else(|e| {
+                        panic!("should be able to create TableManager: {e:?}")
+                    }));
+                }
+            };
+
+        Ok(Self {
             task_info: task_info.clone(),
             control_tx: control_tx.clone(),
             watermarks: WatermarkHolder::new(vec![
@@ -707,7 +739,7 @@ impl OperatorContext {
                 tx: control_tx,
                 task_info,
             },
-        }
+        })
     }
 
     pub fn watermark(&self) -> Option<Watermark> {
@@ -732,6 +764,10 @@ impl OperatorContext {
 mod tests {
     use arrow::array::{ArrayRef, Int64Array, TimestampNanosecondArray, UInt64Array};
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use arroyo_rpc::grpc::rpc::{
+        CheckpointManifest, OperatorCheckpointMetadata, OperatorMetadata, TableEnum,
+    };
+    use arroyo_rpc::state_backend::StateBackendSelector;
     use arroyo_types::to_nanos;
     use std::time::Duration;
 
@@ -899,5 +935,123 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         assert!(tx.send(ArrowMessage::Data(msg)).await.is_err());
+    }
+
+    /// The selector is checked before `TableManager::load` runs at all.
+    ///
+    /// `restore_from` is a manifest with no operators in it, so the very first statement
+    /// of `TableManager::load` — the checkpoint-metadata lookup, which runs before the
+    /// storage provider is opened and before any table is created — fails, and
+    /// `OperatorContext::new` turns that failure into a panic. This context asks for a
+    /// parquet job with a table that selects stateengine, and gets the typed selector
+    /// error back: proof that validation happened first. Move the check after the load
+    /// and this test panics instead of returning `Err`.
+    #[tokio::test]
+    async fn selector_is_validated_before_the_table_manager_loads_anything() {
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel(1);
+        let restore_from = MetadataOrManifest::Manifest(CheckpointManifest::default());
+        let task_info = Arc::new(TaskInfo {
+            state_backend: StateBackendSelector::Parquet,
+            ..TaskInfo::for_test("job_1", "w:window")
+        });
+        let tables = HashMap::from([(
+            "w:window".to_string(),
+            TableConfig {
+                table_type: TableEnum::GlobalKeyValue as i32,
+                config: vec![],
+                state_version: 0,
+                state_backend: StateBackendSelector::StateEngine.as_str().to_string(),
+            },
+        )]);
+
+        let err = match OperatorContext::new(
+            task_info,
+            Some(&restore_from),
+            control_tx,
+            1,
+            vec![],
+            None,
+            tables,
+        )
+        .await
+        {
+            Ok(_) => panic!("a table disagreeing with the job must not build a context"),
+            Err(err) => err,
+        };
+
+        assert_eq!(
+            err,
+            StateBackendError::TableMismatch {
+                label: "table \"w:window\"".to_string(),
+                found: StateBackendSelector::StateEngine,
+                job: StateBackendSelector::Parquet,
+            }
+        );
+    }
+
+    /// A restored checkpoint written by another backend is a manifest whose table configs
+    /// say so. It reaches this boundary through `TableManager::load`, which checks it
+    /// before it opens a storage provider, constructs a single table, or starts the writer
+    /// that would produce the next checkpoint — so this test, which supplies no storage
+    /// configuration at all, can only pass because nothing was opened.
+    ///
+    /// The task's own tables are empty, which is what every `fn tables()` implementation
+    /// produces, so the acquisition-side check passes and the failure can only come from
+    /// the restored side. This is the case a job upgrading its selector in place hits:
+    /// its state is still the old backend's, and it must be told so rather than read it.
+    #[tokio::test]
+    async fn a_checkpoint_from_another_backend_is_refused_before_any_state_is_opened() {
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel(1);
+        let restore_from = MetadataOrManifest::Manifest(CheckpointManifest {
+            epoch: 12,
+            operators: vec![OperatorCheckpointMetadata {
+                operator_metadata: Some(OperatorMetadata {
+                    job_id: "job_1".to_string(),
+                    operator_id: "w:window".to_string(),
+                    epoch: 12,
+                    ..Default::default()
+                }),
+                table_configs: HashMap::from([(
+                    "w:window".to_string(),
+                    TableConfig {
+                        table_type: TableEnum::GlobalKeyValue as i32,
+                        config: vec![],
+                        state_version: 0,
+                        state_backend: StateBackendSelector::Parquet.as_str().to_string(),
+                    },
+                )]),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let task_info = Arc::new(TaskInfo {
+            state_backend: StateBackendSelector::StateEngine,
+            ..TaskInfo::for_test("job_1", "w:window")
+        });
+
+        let err = match OperatorContext::new(
+            task_info,
+            Some(&restore_from),
+            control_tx,
+            1,
+            vec![],
+            None,
+            HashMap::new(),
+        )
+        .await
+        {
+            Ok(_) => panic!("a checkpoint from another backend must not build a context"),
+            Err(err) => err,
+        };
+
+        assert_eq!(
+            err,
+            StateBackendError::CheckpointMismatch {
+                label: "restored checkpoint \"epoch 12, operator w:window, table w:window\""
+                    .to_string(),
+                found: StateBackendSelector::Parquet,
+                job: StateBackendSelector::StateEngine,
+            }
+        );
     }
 }

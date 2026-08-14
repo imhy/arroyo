@@ -25,6 +25,7 @@ use arroyo_rpc::df::ArroyoSchema;
 use arroyo_rpc::errors::{DataflowError, StateError};
 use arroyo_rpc::grpc::rpc::CheckpointManifest;
 use arroyo_rpc::grpc::{api, rpc::TaskAssignment};
+use arroyo_rpc::state_backend::{StateBackendError, StateBackendSelector};
 use arroyo_rpc::{ControlMessage, ControlResp, MetadataOrManifest};
 use arroyo_state::{BackingStore, StateBackend, StorageProviderFor};
 use arroyo_types::{
@@ -168,11 +169,14 @@ impl Program {
         self.graph.read().unwrap().node_count()
     }
 
+    /// Builds an in-process program for local execution and tests. There is no
+    /// `StartExecutionReq` to read a selector from, so the caller states one explicitly.
     pub async fn local_from_logical(
         job_id: String,
         logical: &DiGraph<LogicalNode, LogicalEdge>,
         udfs: &[LocalUdf],
         restore_epoch: Option<u64>,
+        state_backend: StateBackendSelector,
         control_tx: Sender<ControlResp>,
     ) -> Self {
         let assignments = logical
@@ -200,6 +204,7 @@ impl Program {
             restore_epoch,
             None,
             CheckpointFilePathLayout::Legacy,
+            state_backend,
             control_tx,
         )
         .await
@@ -215,6 +220,7 @@ impl Program {
         restore_epoch: Option<u64>,
         checkpoint_manifest_ref: Option<CheckpointManifest>,
         file_path_layout: CheckpointFilePathLayout,
+        state_backend: StateBackendSelector,
         control_tx: Sender<ControlResp>,
     ) -> Result<Program, StateError> {
         let mut physical = DiGraph::new();
@@ -290,10 +296,11 @@ impl Program {
                         out_schema.clone(),
                         checkpoint_metadata.as_ref(),
                         file_path_layout.clone(),
+                        state_backend,
                         control_tx.clone(),
                         registry.clone(),
                     )
-                    .await,
+                    .await?,
                 })));
             }
         }
@@ -801,6 +808,14 @@ impl Engine {
     }
 }
 
+/// Builds one subtask's operator (or operator chain) together with its state.
+///
+/// # Errors
+///
+/// Returns the [`StateBackendError`] raised when a table config's state-backend selector
+/// disagrees with `state_backend`, is unknown, or mixes backends. The check happens
+/// before any state is created, so a rejected job never touches a backend it did not
+/// select.
 #[allow(clippy::too_many_arguments)]
 pub async fn construct_node(
     chain: OperatorChain,
@@ -813,9 +828,10 @@ pub async fn construct_node(
     out_schema: Option<Arc<ArroyoSchema>>,
     restore_from: Option<&MetadataOrManifest>,
     file_path_layout: CheckpointFilePathLayout,
+    state_backend: StateBackendSelector,
     control_tx: Sender<ControlResp>,
     registry: Arc<Registry>,
-) -> OperatorNode {
+) -> Result<OperatorNode, StateBackendError> {
     if chain.is_source() {
         let (head, _) = chain.iter().next().unwrap();
         let ConstructedOperator::Source(operator) =
@@ -833,9 +849,10 @@ pub async fn construct_node(
             parallelism,
             key_range: range_for_server(subtask_idx as usize, parallelism as usize),
             checkpoint_file_path_layout: file_path_layout.clone(),
+            state_backend,
         });
 
-        OperatorNode::Source(SourceNode {
+        Ok(OperatorNode::Source(SourceNode {
             context: OperatorContext::new(
                 task_info,
                 restore_from,
@@ -845,9 +862,9 @@ pub async fn construct_node(
                 out_schema,
                 operator.tables(),
             )
-            .await,
+            .await?,
             operator,
-        })
+        }))
     } else {
         let mut head = None;
         let mut cur: Option<&mut ChainedOperator> = None;
@@ -869,6 +886,7 @@ pub async fn construct_node(
                     parallelism,
                     key_range: range_for_server(subtask_idx as usize, parallelism as usize),
                     checkpoint_file_path_layout: file_path_layout.clone(),
+                    state_backend,
                 }),
                 restore_from,
                 control_tx.clone(),
@@ -881,7 +899,7 @@ pub async fn construct_node(
                 edge.cloned().or(out_schema.clone()),
                 op.tables(),
             )
-            .await;
+            .await?;
 
             if cur.is_none() {
                 head = Some(ChainedOperator::new(op, ctx));
@@ -893,7 +911,7 @@ pub async fn construct_node(
             }
         }
 
-        OperatorNode::Chained(head.unwrap())
+        Ok(OperatorNode::Chained(head.unwrap()))
     }
 }
 

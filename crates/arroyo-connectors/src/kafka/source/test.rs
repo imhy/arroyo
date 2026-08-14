@@ -136,7 +136,8 @@ impl KafkaTopicTester {
             out_schema,
             kafka.tables(),
         )
-        .await;
+        .await
+        .unwrap();
 
         let chain_info = Arc::new(ChainInfo {
             job_id: ctx.task_info.job_id.clone(),
@@ -445,7 +446,8 @@ async fn test_kafka_with_metadata_fields() {
         ))),
         kafka.tables(),
     )
-    .await;
+    .await
+    .unwrap();
 
     let chain_info = Arc::new(ChainInfo {
         job_id: ctx.task_info.job_id.clone(),

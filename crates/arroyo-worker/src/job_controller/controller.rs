@@ -16,6 +16,7 @@ use arroyo_rpc::grpc::rpc::{
     TaskAssignment, TaskCheckpointEventType, WorkerPhase,
 };
 use arroyo_rpc::log_event;
+use arroyo_rpc::state_backend::StateBackendSelector;
 use arroyo_server_common::shutdown::ShutdownGuard;
 use arroyo_state::tables::ErasedTable;
 use arroyo_state::tables::expiring_time_key_map::ExpiringTimeKeyTable;
@@ -93,6 +94,7 @@ impl WorkerJobController {
         checkpoint_interval: Duration,
         parent_ref: Option<(CheckpointRef, CheckpointManifest)>,
         metrics: Option<JobMetrics>,
+        state_backend: StateBackendSelector,
     ) -> anyhow::Result<Self> {
         info!(job_id =? worker_context.job_id,
             restore_from =? parent_ref.as_ref().map(|p| &p.0),
@@ -145,6 +147,7 @@ impl WorkerJobController {
         let status = JobControllerStatus {
             job_status,
             checkpoint_history,
+            state_backend,
         };
         status.transition(rpc::JobState::JobRunning)?;
 
@@ -271,6 +274,7 @@ impl WorkerJobController {
                 worker_leader_mode: true,
                 storage_role: StorageProviderFor::Worker,
                 finished_operators: vec![],
+                state_backend,
                 generation_manifest: Some(generation_manifest),
             },
             status,

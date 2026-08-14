@@ -262,6 +262,8 @@ impl ArrowOperator for KafkaSinkFunc {
                     }
                     .encode_to_vec(),
                     state_version: 0,
+                    // Stamped in centrally when the operator context is built.
+                    state_backend: String::new(),
                 },
             )
         } else {

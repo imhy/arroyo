@@ -1030,6 +1030,7 @@ dependencies = [
  "bincode",
  "chrono",
  "serde",
+ "thiserror 2.0.12",
 ]
 
 [[package]]

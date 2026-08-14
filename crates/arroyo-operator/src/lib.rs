@@ -21,6 +21,7 @@ pub mod connector;
 pub mod context;
 pub mod inq_reader;
 pub mod operator;
+mod state_backend;
 pub mod udfs;
 
 pub trait TimerT: Data + PartialEq + Eq + 'static {}

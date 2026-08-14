@@ -1,5 +1,6 @@
 use crate::grpc::rpc;
 use arrow_schema::ArrowError;
+use arroyo_types::state_backend::StateBackendError;
 use datafusion::error::DataFusionError;
 use datafusion::parquet::errors::ParquetError;
 use serde::{Deserialize, Serialize};
@@ -317,6 +318,11 @@ pub enum StateError {
     BincodeEncodeError(#[from] bincode::error::EncodeError),
     #[error("protobuf decode error: {0}")]
     ProtoDecodeError(#[from] prost::DecodeError),
+    /// A state-backend selector was rejected before any state was created or read. The
+    /// inner error is carried through unchanged so the failure that reaches the
+    /// controller still names the offending table and the values that disagreed.
+    #[error(transparent)]
+    StateBackendError(#[from] StateBackendError),
 }
 
 #[derive(Debug, Clone)]

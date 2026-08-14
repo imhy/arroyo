@@ -17,6 +17,7 @@ use arroyo_rpc::grpc::rpc::{
 };
 use arroyo_rpc::identity::WorkerClient;
 use arroyo_rpc::public_ids::{IdTypes, generate_id};
+use arroyo_rpc::state_backend::StateBackendSelector;
 use arroyo_state::parquet::ParquetBackend;
 use arroyo_state::{BackingStore, StateBackend, StorageProviderFor, get_storage_provider};
 use arroyo_state_protocol::ProtocolPaths;
@@ -55,6 +56,12 @@ pub struct RunningJobModel {
     pub generation_manifest: Option<GenerationManifest>,
 
     pub finished_operators: Vec<OperatorCheckpointMetadata>,
+
+    /// The state backend this job selected, taken from the job's config on the controller
+    /// and from the leader's `StartExecutionReq` in worker-leader mode. Every checkpoint
+    /// this model creates, merges, or compacts is validated against it; nothing here
+    /// consults a process-global backend.
+    pub state_backend: StateBackendSelector,
 
     pub worker_leader_mode: bool,
 
@@ -372,6 +379,7 @@ impl RunningJobModel {
             self.epoch,
             self.min_epoch,
             self.program.clone(),
+            self.state_backend,
         );
 
         self.checkpoint_state = Some(CheckpointingOrCommittingState::Checkpointing(state));
@@ -405,6 +413,7 @@ impl RunningJobModel {
                 let compacted_tables = ParquetBackend::compact_operator(
                     // compact the operator's state and notify the workers to load the new files
                     &storage_role,
+                    self.state_backend,
                     self.job_id.0.clone(),
                     &op.operator_id,
                     *self.epoch as u32,

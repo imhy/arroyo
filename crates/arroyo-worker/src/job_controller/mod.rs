@@ -12,7 +12,7 @@ use arroyo_rpc::grpc::rpc::{
 };
 use arroyo_rpc::grpc_channel_builder;
 use arroyo_rpc::identity::{WorkerClient, worker_client};
-use arroyo_state::{BackingStore, StateBackend};
+use arroyo_rpc::state_backend::StateBackendSelector;
 use arroyo_types::WorkerId;
 use arroyo_types::to_micros;
 use async_trait::async_trait;
@@ -34,7 +34,7 @@ pub const COMPACT_EVERY: u64 = 10;
 pub struct StoredCheckpointMetadata {
     checkpoint_id: String,
     epoch: u64,
-    state_backend: String,
+    state_backend: StateBackendSelector,
     start_time: SystemTime,
     finish_time: Option<SystemTime>,
     event_spans: Vec<JobCheckpointSpan>,
@@ -78,11 +78,18 @@ impl CheckpointHistory {
         }
     }
 
-    fn create_checkpoint(&mut self, req: &CreateCheckpointReq) {
+    /// Records a newly started checkpoint. `state_backend` is the selector of the job
+    /// this history belongs to, handed in by the caller — there is no process-global
+    /// backend to ask.
+    fn create_checkpoint(
+        &mut self,
+        req: &CreateCheckpointReq,
+        state_backend: StateBackendSelector,
+    ) {
         let checkpoint = StoredCheckpointMetadata {
             checkpoint_id: req.checkpoint_id.clone(),
             epoch: req.epoch,
-            state_backend: StateBackend::name().to_string(),
+            state_backend,
             start_time: req.start_time,
             finish_time: None,
             event_spans: vec![],
@@ -157,7 +164,7 @@ impl CheckpointHistory {
             })
             .map(|c| rpc::JobCheckpointMetadata {
                 epoch: c.epoch,
-                state_backend: c.state_backend.clone(),
+                state_backend: c.state_backend.as_str().to_string(),
                 start_time: to_micros(c.start_time),
                 finish_time: c.finish_time.map(to_micros),
                 event_spans: c
@@ -208,7 +215,7 @@ mod tests {
     #[test]
     fn checkpoint_history_marks_scheduled_checkpoints() {
         let mut history = CheckpointHistory::default();
-        history.create_checkpoint(&create_req(1, false));
+        history.create_checkpoint(&create_req(1, false), StateBackendSelector::DEFAULT);
 
         let checkpoints = history.checkpoints();
         assert_eq!(checkpoints.len(), 1);
@@ -218,11 +225,56 @@ mod tests {
     #[test]
     fn checkpoint_history_marks_stopping_checkpoints() {
         let mut history = CheckpointHistory::default();
-        history.create_checkpoint(&create_req(1, true));
+        history.create_checkpoint(&create_req(1, true), StateBackendSelector::DEFAULT);
 
         let checkpoints = history.checkpoints();
         assert_eq!(checkpoints.len(), 1);
         assert!(checkpoints[0].is_stopping);
+    }
+
+    /// The worker leader's checkpoint store records the backend it was handed, not a
+    /// process-global one: the same history records "stateengine" or "parquet" purely
+    /// according to the job it is serving.
+    #[test]
+    fn checkpoint_history_records_the_job_selector_it_was_given() {
+        for selector in [
+            StateBackendSelector::Parquet,
+            StateBackendSelector::StateEngine,
+        ] {
+            let mut history = CheckpointHistory::default();
+            history.create_checkpoint(&create_req(1, false), selector);
+
+            let checkpoints = history.checkpoints();
+            assert_eq!(checkpoints.len(), 1);
+            assert_eq!(checkpoints[0].state_backend, selector.as_str());
+        }
+    }
+
+    /// The worker-leader `CheckpointMetadataStore` (the leader-mode counterpart of the
+    /// controller's `DbCheckpointMetadataStore`) writes the selector it was constructed
+    /// with, which is the one the leader read from its `StartExecutionReq`.
+    #[tokio::test]
+    async fn leader_checkpoint_store_writes_the_job_selector() {
+        let status = JobControllerStatus {
+            job_status: Arc::new(Mutex::new(JobStatus {
+                job_state: rpc::JobState::JobRunning.into(),
+                updated_at: 0,
+                transitioned_at: 0,
+                last_checkpointed_at: None,
+                job_failure: None,
+            })),
+            checkpoint_history: Arc::new(Mutex::new(CheckpointHistory::default())),
+            state_backend: StateBackendSelector::StateEngine,
+        };
+
+        status
+            .create_checkpoint(create_req(7, false))
+            .await
+            .unwrap();
+
+        let checkpoints = status.checkpoint_history.lock().unwrap().checkpoints();
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints[0].state_backend, "stateengine");
     }
 }
 
@@ -344,6 +396,10 @@ pub(crate) async fn connect_to_worker(id: WorkerId, addr: String) -> anyhow::Res
 pub struct JobControllerStatus {
     pub job_status: Arc<Mutex<JobStatus>>,
     pub checkpoint_history: Arc<Mutex<CheckpointHistory>>,
+    /// The selector of the job this worker leader is running, taken from the
+    /// `StartExecutionReq` that started it. It mirrors the controller-mode
+    /// `DbCheckpointMetadataStore` field of the same name.
+    pub state_backend: StateBackendSelector,
 }
 
 impl JobControllerStatus {
@@ -404,7 +460,7 @@ impl CheckpointMetadataStore for JobControllerStatus {
         self.checkpoint_history
             .lock()
             .unwrap()
-            .create_checkpoint(&req);
+            .create_checkpoint(&req, self.state_backend);
 
         Ok(())
     }

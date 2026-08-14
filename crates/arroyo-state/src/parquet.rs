@@ -12,6 +12,7 @@ use futures::stream::FuturesUnordered;
 
 use arroyo_rpc::config::config;
 use arroyo_rpc::grpc::rpc;
+use arroyo_rpc::state_backend::{StateBackendSelector, validate_restored_operator_metadata};
 use prost::Message;
 use std::collections::{HashMap, HashSet};
 use std::ops::RangeInclusive;
@@ -109,6 +110,7 @@ impl BackingStore for ParquetBackend {
 
     async fn cleanup_checkpoint(
         role: &StorageProviderFor,
+        job: StateBackendSelector,
         mut metadata: CheckpointMetadata,
         old_min_epoch: u32,
         min_epoch: u32,
@@ -125,6 +127,7 @@ impl BackingStore for ParquetBackend {
             .map(|operator_id| {
                 Self::cleanup_operator(
                     role,
+                    job,
                     metadata.job_id.clone(),
                     operator_id.clone(),
                     old_min_epoch,
@@ -168,8 +171,19 @@ impl BackingStore for ParquetBackend {
 
 impl ParquetBackend {
     /// Called after a checkpoint is committed
+    ///
+    /// `job` is the state backend the job selected. The checkpoint about to be rewritten
+    /// is checked against it before any file is read or written: compacting a checkpoint
+    /// another backend wrote would rewrite that backend's state under this one's rules.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateError::StateBackendError`] if the checkpoint's table configs
+    /// disagree with `job`, alongside the storage and table failures compaction can
+    /// otherwise produce.
     pub async fn compact_operator(
         role: &StorageProviderFor,
+        job: StateBackendSelector,
         job_id: Arc<String>,
         operator_id: &str,
         epoch: u32,
@@ -180,6 +194,8 @@ impl ParquetBackend {
             Self::load_operator_metadata(role, &job_id, operator_id, epoch)
                 .await?
                 .expect("expect operator metadata to still be present");
+        validate_restored_operator_metadata(job, &operator_checkpoint_metadata)?;
+
         let storage_provider = get_storage_provider(role).await?;
         let compaction_config = CompactionConfig {
             compact_generations: vec![0].into_iter().collect(),
@@ -230,8 +246,19 @@ impl ParquetBackend {
     }
 
     /// Delete files no longer referenced by the new min epoch
+    ///
+    /// `job` is the state backend the job selected. Both the epoch being kept and every
+    /// epoch being dropped are checked against it before anything is deleted, because the
+    /// dropped epochs may predate a restart: a job that was previously run on another
+    /// backend must not have that backend's files deleted by this one's file layout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateError::StateBackendError`] if any of those epochs' table configs
+    /// disagree with `job`, alongside the storage failures deletion can produce.
     pub async fn cleanup_operator(
         role: &StorageProviderFor,
+        job: StateBackendSelector,
         job_id: String,
         operator_id: String,
         old_min_epoch: u32,
@@ -241,6 +268,8 @@ impl ParquetBackend {
             Self::load_operator_metadata(role, &job_id, &operator_id, new_min_epoch)
                 .await?
                 .expect("expect new_min_epoch metadata to still be present");
+        validate_restored_operator_metadata(job, &operator_metadata)?;
+
         let paths_to_keep: HashSet<String> = operator_metadata
             .table_checkpoint_metadata
             .iter()
@@ -272,6 +301,7 @@ impl ParquetBackend {
             else {
                 continue;
             };
+            validate_restored_operator_metadata(job, &operator_metadata)?;
 
             // delete any files that are not in the new min epoch
             let mut files = HashSet::new();

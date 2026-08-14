@@ -411,6 +411,7 @@ mod tests {
     use arrow::array::{RecordBatch, StringArray, TimestampNanosecondArray};
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use arroyo_rpc::formats::JsonFormat;
+    use arroyo_rpc::state_backend::StateBackendSelector;
     use arroyo_types::{CheckpointFilePathLayout, TaskInfo};
     use flate2::read::MultiGzDecoder;
     use std::io::Read;
@@ -433,6 +434,7 @@ mod tests {
                 parallelism: 1,
                 key_range: 0..=u64::MAX,
                 checkpoint_file_path_layout: CheckpointFilePathLayout::Legacy,
+                state_backend: StateBackendSelector::DEFAULT,
             })),
             connection_id: Arc::new(String::from("test")),
             output_format: format.name(),

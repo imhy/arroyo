@@ -446,6 +446,11 @@ message TableConfig {
   TableEnum table_type = 1;
   bytes config = 2;
   uint32 state_version = 3;
+  // the state backend this table's state lives in ("parquet" or "stateengine"); empty
+  // means "parquet", which is what a config written before this field existed decodes
+  // as. Operators never set this: the job's selector is stamped in centrally when the
+  // operator's context is built.
+  string state_backend = 4;
 }
 
 message TableCheckpointMetadata {
@@ -492,6 +497,10 @@ message StartExecutionReq {
   uint64 checkpoint_interval_micros = 9;
   // for leader mode, this gives the path to load the restore checkpoint manifest from
   optional string checkpoint_manifest_ref = 10;
+  // the state backend the job selected ("parquet" or "stateengine"); empty means
+  // "parquet", which is also what a request from a controller predating this field
+  // decodes as
+  string state_backend = 11;
 }
 
 message StartExecutionResp {

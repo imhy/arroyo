@@ -21,6 +21,7 @@ use arroyo_rpc::grpc::rpc::{
     WorkerInitializationCompleteResp,
 };
 use arroyo_rpc::public_ids::{IdTypes, generate_id};
+use arroyo_rpc::state_backend::{StateBackendError, StateBackendSelector};
 use arroyo_rpc::worker_types::{RunningMessage, TaskFailedEvent};
 use arroyo_rpc::{StateContext, config, errors};
 use arroyo_server_common::shutdown::ShutdownGuard;
@@ -45,7 +46,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::codec::CompressionEncoding;
 use tonic::{Request, Response, Status};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 //pub mod compiler;
 pub mod job_controller;
@@ -119,6 +120,67 @@ pub struct JobConfig {
     /// interprets this; the controller treats it as opaque. An empty
     /// object is the no-override case.
     scheduler_config: serde_json::Value,
+    /// The state backend this job stores its operator state in. Parsed once, when the
+    /// row is read, so every later use — the workers' `StartExecutionReq`, the
+    /// checkpoint metadata store — carries an already-validated value rather than a
+    /// string that has to be re-interpreted.
+    state_backend: StateBackendSelector,
+}
+
+impl JobConfig {
+    /// Builds a job config from a `job_configs`/`job_statuses` row.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateBackendError`] if the row's `state_backend` column holds a value
+    /// that is not empty, `"parquet"`, or `"stateengine"`. The empty string is what rows
+    /// written before the column existed carry, and it means `"parquet"`.
+    fn from_row(row: queries::controller_queries::Job) -> Result<Self, StateBackendError> {
+        let state_backend =
+            StateBackendSelector::normalize(&row.state_backend, &format!("job {}", row.id))?;
+
+        Ok(Self {
+            id: Arc::new(row.id),
+            organization_id: row.org_id,
+            pipeline_id: row.pipeline_id,
+            pipeline_name: row.pipeline_name,
+            stop_mode: row.stop,
+            checkpoint_interval: Duration::from_micros(row.checkpoint_interval_micros as u64),
+            ttl: row.ttl_micros.map(|t| Duration::from_micros(t as u64)),
+            parallelism_overrides: row
+                .parallelism_overrides
+                .as_object()
+                .unwrap()
+                .into_iter()
+                .filter_map(|(k, v)| Some((u32::from_str(k).ok()?, v.as_u64()? as usize)))
+                .collect(),
+            restart_nonce: row.config_restart_nonce,
+            restart_mode: row.restart_mode,
+            ignore_state_before_epoch: row.ignore_state_before_epoch,
+            env_vars: row.env_vars,
+            scheduler_config: row.scheduler_config,
+            state_backend,
+        })
+    }
+}
+
+/// Converts a polled job row into a [`JobConfig`], or reports it and returns `None`.
+///
+/// A row the controller cannot interpret is a hard failure *for that job*: it is never
+/// downgraded to a default, so the job simply never gets a state machine and never
+/// starts. It must not be a failure for the update thread, though — returning the error
+/// from the polling loop would stop every other job on the cluster from being updated
+/// because one row is bad. The error is therefore logged on each poll, which is also what
+/// makes the condition visible until an operator fixes the row.
+fn job_config_or_skip(row: queries::controller_queries::Job) -> Option<JobConfig> {
+    let job_id = row.id.clone();
+    match JobConfig::from_row(row) {
+        Ok(config) => Some(config),
+        Err(e) => {
+            error!(job_id = %job_id, error = %e, "skipping job with an unusable config");
+            None
+        }
+    }
 }
 
 /// Per-pipeline data that doesn't change for the lifetime of a job.
@@ -695,35 +757,10 @@ impl ControllerServer {
                 update_job_state_metrics(&state_counts);
 
                 for p in res {
-                    let id = Arc::new(p.id);
-                    let config = JobConfig {
-                        id: id.clone(),
-                        organization_id: p.org_id,
-                        pipeline_id: p.pipeline_id,
-                        pipeline_name: p.pipeline_name,
-                        stop_mode: p.stop,
-                        checkpoint_interval: Duration::from_micros(
-                            p.checkpoint_interval_micros as u64,
-                        ),
-                        ttl: p.ttl_micros.map(|t| Duration::from_micros(t as u64)),
-                        parallelism_overrides: p
-                            .parallelism_overrides
-                            .as_object()
-                            .unwrap()
-                            .into_iter()
-                            .filter_map(|(k, v)| {
-                                Some((u32::from_str(k).ok()?, v.as_u64()? as usize))
-                            })
-                            .collect(),
-                        restart_nonce: p.config_restart_nonce,
-                        restart_mode: p.restart_mode,
-                        ignore_state_before_epoch: p.ignore_state_before_epoch,
-                        env_vars: p.env_vars,
-                        scheduler_config: p.scheduler_config,
-                    };
+                    let id = Arc::new(p.id.clone());
 
-                    let mut jobs = jobs.lock().await;
-
+                    // Everything the status needs is read before the config consumes the
+                    // row, so a rejected config can skip just this job.
                     let state_context: StateContext =
                         serde_json::from_value(p.state_context.clone()).unwrap_or_else(|e| {
                             warn!(job_id = %id, original =? p.state_context, error =? e,
@@ -737,18 +774,27 @@ impl ControllerServer {
                     let status = JobStatus {
                         id: id.clone(),
                         generation: p.run_id.unwrap_or(0).max(0) as u64,
-                        state: p.state.unwrap_or_else(|| Created {}.name().to_string()),
+                        state: p
+                            .state
+                            .clone()
+                            .unwrap_or_else(|| Created {}.name().to_string()),
                         start_time: p.start_time,
                         finish_time: p.finish_time,
                         tasks: p.tasks,
-                        failure_message: p.failure_message,
-                        failure_domain: p.failure_domain,
+                        failure_message: p.failure_message.clone(),
+                        failure_domain: p.failure_domain.clone(),
                         restarts: p.restarts,
-                        pipeline_path: p.pipeline_path,
-                        wasm_path: p.wasm_path,
+                        pipeline_path: p.pipeline_path.clone(),
+                        wasm_path: p.wasm_path.clone(),
                         restart_nonce: p.status_restart_nonce,
                         state_context,
                     };
+
+                    let Some(config) = job_config_or_skip(p) else {
+                        continue;
+                    };
+
+                    let mut jobs = jobs.lock().await;
 
                     if let Some(sm) = jobs.get_mut(&*id) {
                         sm.update(config, status, &guard).await;
@@ -852,8 +898,190 @@ impl ControllerServer {
 #[cfg(test)]
 mod tests {
     use prometheus::core::Collector;
+    use prost::Message;
 
     use super::*;
+    use crate::queries::controller_queries::{Job, LastSuccessfulCheckpoint};
+    use arroyo_rpc::grpc::rpc::StartExecutionReq;
+    use arroyo_rpc::state_backend::validate_restored_checkpoint;
+
+    /// A `job_configs`/`job_statuses` row as the update thread polls it. `state_backend`
+    /// is the only field these tests vary; everything else is the shape a freshly created
+    /// job has.
+    fn job_row(state_backend: &str) -> Job {
+        Job {
+            id: "job_abc".to_string(),
+            org_id: "org".to_string(),
+            pipeline_name: "pipeline".to_string(),
+            pipeline_id: 1,
+            checkpoint_interval_micros: 10_000_000,
+            ttl_micros: None,
+            parallelism_overrides: serde_json::json!({}),
+            stop: StopMode::none,
+            state: None,
+            start_time: None,
+            finish_time: None,
+            tasks: None,
+            failure_message: None,
+            failure_domain: None,
+            restarts: 0,
+            run_id: None,
+            pipeline_path: None,
+            wasm_path: None,
+            config_restart_nonce: 0,
+            status_restart_nonce: 0,
+            restart_mode: RestartMode::safe,
+            ignore_state_before_epoch: None,
+            state_context: serde_json::json!({}),
+            env_vars: serde_json::json!({}),
+            scheduler_config: serde_json::json!({}),
+            state_backend: state_backend.to_string(),
+        }
+    }
+
+    /// The deployability guarantee: a row written before the V33 migration takes the
+    /// column's `DEFAULT ''`, and the job it describes keeps running on parquet.
+    #[test]
+    fn job_row_written_before_the_migration_is_parquet() {
+        let config = JobConfig::from_row(job_row("")).unwrap();
+        assert_eq!(config.state_backend, StateBackendSelector::Parquet);
+        // and the rest of the row still converts as it always did
+        assert_eq!(*config.id, "job_abc");
+        assert_eq!(config.checkpoint_interval, Duration::from_secs(10));
+    }
+
+    /// A row written with an explicit selector round-trips through the conversion.
+    #[test]
+    fn job_row_round_trips_an_explicit_state_backend() {
+        for selector in [
+            StateBackendSelector::Parquet,
+            StateBackendSelector::StateEngine,
+        ] {
+            let config = JobConfig::from_row(job_row(selector.as_str())).unwrap();
+            assert_eq!(config.state_backend, selector);
+        }
+    }
+
+    /// An unrecognized column value fails typed at the point the row is read, naming the
+    /// job — it is never defaulted to parquet.
+    #[test]
+    fn job_row_with_an_unknown_state_backend_fails_typed() {
+        let err = JobConfig::from_row(job_row("rocksdb")).unwrap_err();
+        assert_eq!(
+            err,
+            StateBackendError::UnknownValue {
+                label: "job job_abc".to_string(),
+                value: "rocksdb".to_string(),
+            }
+        );
+    }
+
+    /// The failure surfaces as a skipped job, not as an error out of the update thread:
+    /// one unusable row must not stop every other job on the cluster from being polled.
+    #[test]
+    fn an_unusable_row_is_skipped_and_the_others_are_kept() {
+        assert!(job_config_or_skip(job_row("rocksdb")).is_none());
+        assert!(job_config_or_skip(job_row("")).is_some());
+        assert!(job_config_or_skip(job_row("stateengine")).is_some());
+    }
+
+    /// What the controller reads from the row is exactly what every worker of that job
+    /// receives, across a real prost encode/decode of the start request.
+    #[test]
+    fn the_job_selector_reaches_workers_unchanged() {
+        for (raw, expected) in [
+            ("", StateBackendSelector::Parquet),
+            ("parquet", StateBackendSelector::Parquet),
+            ("stateengine", StateBackendSelector::StateEngine),
+        ] {
+            let config = JobConfig::from_row(job_row(raw)).unwrap();
+
+            // exactly how states::scheduling builds the request for each worker
+            let req = StartExecutionReq {
+                state_backend: config.state_backend.as_str().to_string(),
+                ..Default::default()
+            };
+            let decoded = StartExecutionReq::decode(&req.encode_to_vec()[..]).unwrap();
+
+            assert_eq!(
+                StateBackendSelector::normalize(&decoded.state_backend, "job job_abc").unwrap(),
+                expected
+            );
+        }
+    }
+
+    /// The `checkpoints` row the scheduler restores from, as `last_successful_checkpoint`
+    /// returns it. Naming the field here is itself part of the contract: the restore
+    /// check is only possible because that query reads the column.
+    fn checkpoint_row(state_backend: &str) -> LastSuccessfulCheckpoint {
+        LastSuccessfulCheckpoint {
+            pub_id: "chk_abc".to_string(),
+            epoch: 12,
+            min_epoch: 3,
+            state_backend: state_backend.to_string(),
+            needs_commits: false,
+        }
+    }
+
+    /// Runs the pairing `states::scheduling` performs when it resolves a checkpoint to
+    /// restore: the job row says which backend the job selects, the checkpoint row records
+    /// which backend wrote the checkpoint.
+    fn restore(job: &str, checkpoint: &str) -> Result<(), StateBackendError> {
+        let config = JobConfig::from_row(job_row(job)).unwrap();
+        let row = checkpoint_row(checkpoint);
+        validate_restored_checkpoint(config.state_backend, row.epoch as u64, &row.state_backend)
+    }
+
+    /// The deployability guarantee across both rows: a cluster upgraded in place has jobs
+    /// and checkpoints alike carrying the columns' `DEFAULT ''`, and every one of those
+    /// jobs restores its own checkpoints exactly as before.
+    #[test]
+    fn a_checkpoint_written_before_the_migration_restores_into_its_job() {
+        restore("", "").unwrap();
+        restore("parquet", "").unwrap();
+        restore("", "parquet").unwrap();
+        restore("stateengine", "stateengine").unwrap();
+    }
+
+    /// Changing a running job's backend does not silently reinterpret its state: the
+    /// checkpoint it would restore was written by the other backend, and it is refused
+    /// with the checkpoint named.
+    #[test]
+    fn a_checkpoint_written_by_another_backend_is_refused_for_the_job() {
+        let err = restore("stateengine", "parquet").unwrap_err();
+        assert_eq!(
+            err,
+            StateBackendError::CheckpointMismatch {
+                label: "restored checkpoint \"epoch 12\"".to_string(),
+                found: StateBackendSelector::Parquet,
+                job: StateBackendSelector::StateEngine,
+            }
+        );
+
+        let err = restore("parquet", "stateengine").unwrap_err();
+        assert_eq!(
+            err,
+            StateBackendError::CheckpointMismatch {
+                label: "restored checkpoint \"epoch 12\"".to_string(),
+                found: StateBackendSelector::StateEngine,
+                job: StateBackendSelector::Parquet,
+            }
+        );
+    }
+
+    /// An unrecognized checkpoint row is a hard failure, not a fallback to the job's own
+    /// backend — which would read another backend's files under this one's layout.
+    #[test]
+    fn a_checkpoint_row_with_an_unknown_state_backend_is_refused() {
+        let err = restore("parquet", "rocksdb").unwrap_err();
+        assert_eq!(
+            err,
+            StateBackendError::UnknownValue {
+                label: "restored checkpoint \"epoch 12\"".to_string(),
+                value: "rocksdb".to_string(),
+            }
+        );
+    }
 
     #[test]
     fn metric_job_states_preserve_raw_states() {

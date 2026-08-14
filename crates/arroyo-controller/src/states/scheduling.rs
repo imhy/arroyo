@@ -26,6 +26,10 @@ use anyhow::{anyhow, bail};
 use arroyo_datastream::logical::LogicalProgram;
 use arroyo_rpc::config::{JobControllerMode, config};
 use arroyo_rpc::grpc::api;
+use arroyo_rpc::state_backend::{
+    StateBackendError, validate_restored_checkpoint, validate_restored_manifest,
+    validate_restored_operator_metadata,
+};
 use arroyo_rpc::worker_types::RunningMessage;
 use arroyo_rpc::{LeaderContext, grpc_channel_builder};
 use arroyo_state::{
@@ -243,7 +247,7 @@ async fn get_checkpoint_info_legacy<'a>(
                 }
             };
 
-        checkpoint_result.into_iter().next().and_then(|r| {
+        let row = checkpoint_result.into_iter().next().filter(|r| {
             // Filter checkpoint based on ignore_state_before_epoch threshold
             let should_restore = ctx
                 .config
@@ -259,13 +263,6 @@ async fn get_checkpoint_info_legacy<'a>(
                     epoch = r.epoch,
                     min_epoch = r.min_epoch
                 );
-
-                Some(CheckpointInfo {
-                    id: r.pub_id,
-                    epoch: r.epoch as u64,
-                    min_epoch: r.min_epoch as u64,
-                    needs_commits: r.needs_commits,
-                })
             } else {
                 info!(
                     message = "skipping checkpoint due to ignore_state_before_epoch threshold",
@@ -274,8 +271,35 @@ async fn get_checkpoint_info_legacy<'a>(
                     checkpoint_epoch = r.epoch,
                     threshold = ctx.config.ignore_state_before_epoch.unwrap()
                 );
-                None
             }
+
+            should_restore
+        });
+
+        // The checkpoint row records the backend that wrote it. Checking it here — before
+        // in-progress checkpoints are marked failed, before any metadata is loaded,
+        // before commit data is rebuilt, and before the rewritten metadata is put back —
+        // means a job never touches state written by a backend it did not select. A
+        // disagreement is fatal rather than retryable: the same row is read again on
+        // every attempt.
+        if let Some(r) = &row
+            && let Err(e) = validate_restored_checkpoint(
+                ctx.config.state_backend,
+                r.epoch as u64,
+                &r.state_backend,
+            )
+        {
+            return Err(fatal(
+                "cannot restore a checkpoint written with a different state backend",
+                e.into(),
+            ));
+        }
+
+        row.map(|r| CheckpointInfo {
+            id: r.pub_id,
+            epoch: r.epoch as u64,
+            min_epoch: r.min_epoch as u64,
+            needs_commits: r.needs_commits,
         })
     };
 
@@ -381,6 +405,20 @@ async fn get_checkpoint_info_legacy<'a>(
                         ),
                     ));
                 };
+
+                // The checkpoint row said which backend wrote this checkpoint; the
+                // operator's own table configs say it per table. Both are checked, and
+                // this one runs before a single table's committing data is rebuilt.
+                if let Err(e) = validate_restored_operator_metadata(
+                    ctx.config.state_backend,
+                    &operator_metadata,
+                ) {
+                    return Err(fatal(
+                        "cannot commit a checkpoint written with a different state backend",
+                        e.into(),
+                    ));
+                }
+
                 for (table_name, table_metadata) in &operator_metadata.table_checkpoint_metadata {
                     let config =
                         operator_metadata
@@ -513,6 +551,13 @@ async fn get_and_register_checkpoint_info_leader<'a>(
         let manifest = read_protobuf::<_, CheckpointManifest>(storage_provider.as_ref(), &r)
             .await?
             .ok_or_else(|| anyhow!("recovery checkpoint manifest {r} is missing!"))?;
+
+        // Leader mode keeps no `checkpoints` row, so the manifest's own table configs are
+        // the whole persisted record of which backend wrote this checkpoint. Checking them
+        // here is what stops a disagreeing manifest from ever being handed to a worker:
+        // `checkpoint_manifest_ref` is only put in a `StartExecutionReq` after this
+        // returns, and the leader replays commits from exactly this manifest.
+        validate_restored_manifest(ctx.config.state_backend, &manifest)?;
 
         Some(CheckpointInfo {
             epoch: manifest.epoch,
@@ -671,6 +716,14 @@ impl State for Scheduling {
         let (self, checkpoint_info, committing_state) = if leader_mode {
             match get_and_register_checkpoint_info_leader(ctx).await {
                 Ok(ci) => (self, ci, None),
+                // A rejected selector is not a transient failure: every attempt resolves
+                // the same recovery manifest, so retrying only delays the report.
+                Err(e) if e.downcast_ref::<StateBackendError>().is_some() => {
+                    return Err(fatal(
+                        "cannot restore a checkpoint written with a different state backend",
+                        e,
+                    ));
+                }
                 Err(e) => {
                     return Err(ctx.retryable(self, "failed to load checkpoint metadata", e, 20));
                 }
@@ -780,6 +833,9 @@ impl State for Scheduling {
         });
 
         let checkpoint_interval_micros = ctx.config.checkpoint_interval.as_micros() as u64;
+        // The job's own selector, already validated when the row was read; every worker
+        // in this job — leader and non-leader alike — is started with the same value.
+        let state_backend = ctx.config.state_backend;
 
         let tasks: Vec<_> = worker_connects
             .into_iter()
@@ -815,6 +871,7 @@ impl State for Scheduling {
                             wait_for_leader: leader_id.is_some(),
                             checkpoint_interval_micros,
                             checkpoint_manifest_ref: checkpoint_manifest_ref.clone(),
+                            state_backend: state_backend.as_str().to_string(),
                         }))
                         .await
                     {
@@ -992,7 +1049,7 @@ impl State for Scheduling {
                 let checkpoint_store = Arc::new(DbCheckpointMetadataStore {
                     organization_id: ctx.config.organization_id.clone(),
                     job_id: ctx.config.id.clone(),
-                    state_backend: StateBackend::name(),
+                    state_backend: ctx.config.state_backend,
                     db: ctx.db.clone(),
                 });
                 let mut controller = JobController::new(

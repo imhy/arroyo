@@ -4,6 +4,7 @@ use arroyo_rpc::checkpoints::{
     UpdateCheckpointReq,
 };
 use arroyo_rpc::notify_db;
+use arroyo_rpc::state_backend::StateBackendSelector;
 use cornucopia_async::DatabaseSource;
 use std::sync::Arc;
 use time::OffsetDateTime;
@@ -15,7 +16,10 @@ pub struct DbCheckpointMetadataStore {
     pub organization_id: String,
     pub job_id: Arc<String>,
     pub db: DatabaseSource,
-    pub state_backend: &'static str,
+    /// The backend the job this store serves selected. It is the job's own persisted
+    /// value, not a process-global one, so every checkpoint row records the backend that
+    /// actually wrote it.
+    pub state_backend: StateBackendSelector,
 }
 
 fn to_db_state(status: CheckpointStatus) -> DbCheckpointState {
@@ -38,7 +42,7 @@ impl CheckpointMetadataStore for DbCheckpointMetadataStore {
             &req.checkpoint_id,
             &self.organization_id,
             &*self.job_id,
-            &self.state_backend,
+            &self.state_backend.as_str(),
             &(req.epoch as i32),
             &(req.min_epoch as i32),
             &OffsetDateTime::from(req.start_time),

@@ -130,6 +130,7 @@ impl JobController {
                     storage_url: state_url,
                 },
                 finished_operators: vec![],
+                state_backend: config.state_backend,
                 generation_manifest: None,
                 job_metrics,
             },
@@ -332,6 +333,7 @@ impl JobController {
 
     fn start_cleanup(&mut self, new_min: Epoch) -> JoinHandle<anyhow::Result<Epoch>> {
         let min_epoch = Epoch((*self.model.min_epoch).max(1));
+        let state_backend = self.config.state_backend;
         let job_id = self.config.id.clone();
         let pipeline_id = self.model.pipeline_id.clone();
         let store = self.checkpoint_store.clone();
@@ -358,6 +360,7 @@ impl JobController {
 
             StateBackend::cleanup_checkpoint(
                 &storage_role,
+                state_backend,
                 checkpoint,
                 *min_epoch as u32,
                 *new_min as u32,

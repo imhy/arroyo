@@ -23,6 +23,7 @@ use arroyo_rpc::grpc::rpc::{
     WorkerInitializationCompleteReq, WorkerPhase, WorkerResources,
 };
 use arroyo_rpc::identity::VerifyWorkerId;
+use arroyo_rpc::state_backend::{StateBackendError, StateBackendSelector};
 use arroyo_types::{
     CLUSTER_ID_ENV, CheckpointBarrier, CheckpointFilePathLayout, GENERATION_ENV, JOB_ID_ENV, JobId,
     MachineId, PIPELINE_ID_ENV, PipelineId, WorkerId, from_micros, from_millis, to_micros,
@@ -202,6 +203,25 @@ impl LocalRunner {
     }
 }
 
+/// The state backend a [`StartExecutionReq`] selects for the job it starts.
+///
+/// An empty field means parquet: that is both what a controller predating this field
+/// sends and what a `job_configs` row written before the selector migration carries.
+/// Every worker in a job — the leader and the plain workers alike — reads this one field,
+/// so the leader's job controller and each worker's task initialization cannot end up on
+/// different backends.
+///
+/// # Errors
+///
+/// Returns [`StateBackendError`] if the field is neither empty nor a known backend name.
+/// The worker start then fails rather than silently running on the wrong backend.
+fn request_state_backend(
+    req: &StartExecutionReq,
+    job_id: &str,
+) -> Result<StateBackendSelector, StateBackendError> {
+    StateBackendSelector::normalize(&req.state_backend, &format!("job {job_id}"))
+}
+
 #[derive(Clone)]
 pub struct WorkerState {
     worker_context: WorkerContext,
@@ -259,6 +279,7 @@ impl WorkerState {
         shutdown: &ShutdownGuard,
         checkpoint_interval: Duration,
         parent: Option<(CheckpointRef, CheckpointManifest)>,
+        state_backend: StateBackendSelector,
     ) -> anyhow::Result<bool> {
         // runs only on the leader
 
@@ -295,6 +316,7 @@ impl WorkerState {
             checkpoint_interval,
             parent,
             metrics,
+            state_backend,
         )
         .await
         {
@@ -322,6 +344,11 @@ impl WorkerState {
         shutdown_guard: ShutdownGuard,
         req: StartExecutionReq,
     ) -> Result<()> {
+        // Normalized exactly once per worker start, before anything else in the start
+        // sequence runs. Both the leader's job controller and this worker's own tasks are
+        // handed this one value explicitly.
+        let state_backend = request_state_backend(&req, &self.worker_context.job_id)?;
+
         let mut registry = new_registry();
         let logical = Arc::new(
             LogicalProgram::try_from(req.program.expect("Program is None"))
@@ -388,6 +415,7 @@ impl WorkerState {
                     &shutdown_guard,
                     Duration::from_micros(req.checkpoint_interval_micros),
                     parent.clone(),
+                    state_backend,
                 )
                 .await?
             {
@@ -421,6 +449,7 @@ impl WorkerState {
                 req.restore_epoch,
                 parent.map(|(_, m)| m),
                 file_path_layout,
+                state_backend,
                 control_tx.clone(),
             )
             .await?;
@@ -1492,5 +1521,133 @@ impl JobStatusGrpc for LeaderServer {
             .await?;
 
         Ok(Response::new(StopJobResp {}))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::job_controller::JobControllerStatus;
+    use arroyo_rpc::checkpoints::{CheckpointMetadataStore, CreateCheckpointReq};
+    use arroyo_types::TaskInfo;
+
+    fn req(state_backend: &str) -> StartExecutionReq {
+        StartExecutionReq {
+            state_backend: state_backend.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// A `StartExecutionReq` from a controller that predates the selector leaves the
+    /// field at protobuf's default for a string, so it never reaches the wire at all and
+    /// decodes as empty. That must mean parquet, unchanged behaviour for existing jobs.
+    #[test]
+    fn absent_state_backend_starts_the_worker_on_parquet() {
+        let old_request = StartExecutionReq::default();
+        assert!(old_request.state_backend.is_empty());
+        assert_eq!(
+            request_state_backend(&old_request, "job_old").unwrap(),
+            StateBackendSelector::Parquet
+        );
+
+        // The same request after a trip through the wire.
+        let encoded = old_request.encode_to_vec();
+        let decoded = StartExecutionReq::decode(&encoded[..]).unwrap();
+        assert_eq!(
+            request_state_backend(&decoded, "job_old").unwrap(),
+            StateBackendSelector::Parquet
+        );
+    }
+
+    /// An explicit selector survives prost encode/decode and normalizes back to the value
+    /// the controller sent.
+    #[test]
+    fn explicit_state_backend_round_trips_through_the_wire() {
+        for selector in [
+            StateBackendSelector::Parquet,
+            StateBackendSelector::StateEngine,
+        ] {
+            let encoded = req(selector.as_str()).encode_to_vec();
+            let decoded = StartExecutionReq::decode(&encoded[..]).unwrap();
+            assert_eq!(decoded.state_backend, selector.as_str());
+            assert_eq!(request_state_backend(&decoded, "job_1").unwrap(), selector);
+        }
+    }
+
+    /// An unrecognized value fails the worker start with a typed error naming the job,
+    /// rather than quietly falling back to parquet.
+    #[test]
+    fn unknown_state_backend_fails_the_worker_start() {
+        let err = request_state_backend(&req("rocksdb"), "job_1").unwrap_err();
+        assert_eq!(
+            err,
+            StateBackendError::UnknownValue {
+                label: "job job_1".to_string(),
+                value: "rocksdb".to_string(),
+            }
+        );
+    }
+
+    /// One request field feeds both halves of a worker start: the worker-leader's job
+    /// controller (`is_leader`/`wait_for_leader`) and this worker's own task
+    /// initialization. Neither reads an ambient selector, so they cannot disagree.
+    #[tokio::test]
+    async fn leader_and_task_initialization_carry_the_same_selector() {
+        // ("", parquet) is the old-request case; both halves must still agree on it.
+        for (raw, expected) in [
+            ("", StateBackendSelector::Parquet),
+            ("parquet", StateBackendSelector::Parquet),
+            ("stateengine", StateBackendSelector::StateEngine),
+        ] {
+            // A leader worker is also a task-running worker: one request sets both flags.
+            let request = StartExecutionReq {
+                is_leader: true,
+                wait_for_leader: true,
+                ..req(raw)
+            };
+            let selector = request_state_backend(&request, "job_1").unwrap();
+            assert_eq!(selector, expected);
+
+            // Leader half: the value handed to `WorkerJobController::init` is what the
+            // leader's checkpoint metadata store records.
+            let leader_store = JobControllerStatus {
+                job_status: Arc::new(Mutex::new(rpc::JobStatus {
+                    job_state: rpc::JobState::JobRunning.into(),
+                    updated_at: 0,
+                    transitioned_at: 0,
+                    last_checkpointed_at: None,
+                    job_failure: None,
+                })),
+                checkpoint_history: Arc::new(Mutex::new(CheckpointHistory::default())),
+                state_backend: selector,
+            };
+            leader_store
+                .create_checkpoint(CreateCheckpointReq {
+                    checkpoint_id: "chk".to_string(),
+                    epoch: 1,
+                    min_epoch: 0,
+                    start_time: SystemTime::now(),
+                    is_stopping: false,
+                })
+                .await
+                .unwrap();
+            let leader_value = leader_store
+                .checkpoint_history
+                .lock()
+                .unwrap()
+                .checkpoints()[0]
+                .state_backend
+                .clone();
+
+            // Task half: the value handed to `construct_node` is what every `TaskInfo`
+            // carries.
+            let task_info = TaskInfo {
+                state_backend: selector,
+                ..TaskInfo::for_test("job_1", "op_1")
+            };
+
+            assert_eq!(leader_value, expected.as_str());
+            assert_eq!(task_info.state_backend, expected);
+        }
     }
 }

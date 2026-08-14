@@ -3,6 +3,7 @@ pub mod checkpoints;
 pub mod formats;
 pub mod public_ids;
 pub mod schema_resolver;
+pub mod state_backend;
 pub mod var_str;
 pub mod worker_types;
 

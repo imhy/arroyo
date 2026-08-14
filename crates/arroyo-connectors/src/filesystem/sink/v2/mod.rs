@@ -414,6 +414,8 @@ impl<BBW: BatchBufferingWriter + Send + 'static> ArrowOperator for FileSystemSin
                 }
                 .encode_to_vec(),
                 state_version: 1,
+                // Stamped in centrally when the operator context is built.
+                state_backend: String::new(),
             },
         );
         tables
