@@ -1,6 +1,6 @@
 use super::{
-    JobContext, State, StateError, Transition, fatal, leader_stop_if_desired_running,
-    scheduling::Scheduling,
+    JobContext, State, StateError, Transition, check_config_update, fatal,
+    leader_stop_if_desired_running, scheduling::Scheduling,
 };
 use crate::JobMessage;
 use crate::states::recovering::Recovering;
@@ -9,7 +9,7 @@ use arroyo_rpc::config::config;
 use arroyo_rpc::grpc::rpc;
 use arroyo_rpc::grpc::rpc::{JobFailure, JobState, JobStopMode};
 use std::time::{Duration, Instant};
-use tracing::{info, warn};
+use tracing::info;
 
 #[derive(Debug)]
 pub struct LeaderRestarting {
@@ -55,14 +55,16 @@ impl State for LeaderRestarting {
                                 Some(JobMessage::ConfigUpdate(c)) => {
                                     leader_stop_if_desired_running!(self, c, ctx);
 
+                                    // This restart ends in `Scheduling`, which starts
+                                    // workers from the job's selector; a stop is honoured
+                                    // above, but the job must not be rescheduled from a
+                                    // configuration that changes the backend.
+                                    check_config_update(ctx.execution_selector, &c)?;
                                 }
                                 Some(msg) => {
-                                    warn!(
-                                        job_id = %ctx.config.id,
-                                        pipeline_id = *ctx.pipeline_info.pipeline_id,
-                                        ?msg,
-                                        "unexpected job message in leader mode"
-                                    );
+                                    // Routed rather than logged here so a refused
+                                    // configuration reaches the one place that acts on it.
+                                    ctx.handle(msg)?;
                                 }
                                 None => {
                                     panic!("job queue shut down");

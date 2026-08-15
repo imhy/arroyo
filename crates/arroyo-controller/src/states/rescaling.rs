@@ -1,6 +1,9 @@
 use crate::{JobMessage, states::stop_if_desired_non_running};
 
-use super::{JobContext, State, StateError, Transition, scheduling::Scheduling};
+use super::{
+    JobContext, State, StateError, Transition, check_config_update, handle_unhandled_message,
+    scheduling::Scheduling,
+};
 
 #[derive(Debug)]
 pub struct Rescaling {}
@@ -12,6 +15,9 @@ impl State for Rescaling {
     }
 
     async fn next(mut self: Box<Self>, ctx: &mut JobContext) -> Result<Transition, StateError> {
+        let job_id = ctx.config.id.clone();
+        let pipeline_id = ctx.pipeline_info.pipeline_id.clone();
+        let execution_selector = ctx.execution_selector;
         let job_controller = ctx.job_controller.as_mut().unwrap();
 
         let mut final_checkpoint_started = false;
@@ -60,9 +66,13 @@ impl State for Rescaling {
                 }
                 JobMessage::ConfigUpdate(c) => {
                     stop_if_desired_non_running!(self, &c);
+                    // A rescale ends in `Scheduling`, which starts workers from the job's
+                    // selector; nothing but a stop may be taken from an update that
+                    // changes it.
+                    check_config_update(execution_selector, &c)?;
                 }
-                _ => {
-                    // ignore other messages
+                msg => {
+                    handle_unhandled_message(&job_id, &pipeline_id, msg)?;
                 }
             }
         }

@@ -55,8 +55,11 @@ impl State for Running {
                             stop_if_desired_running!(self, &c);
 
                             // Shared with leader mode: refuses a state-backend change and
-                            // decides whether the rest of the update needs a restart.
-                            match classify_running_config_update(&ctx.config, &c, ctx.status.restart_nonce)? {
+                            // decides whether the rest of the update needs a restart. The
+                            // comparison is against the execution's own selector, not
+                            // against `ctx.config`, which is refreshed from shared state
+                            // after every transition.
+                            match classify_running_config_update(ctx.execution_selector, &ctx.config, &c, ctx.status.restart_nonce)? {
                                 RunningConfigUpdate::Restart(mode) => {
                                     return Ok(Transition::next(*self, Restarting { mode }));
                                 }

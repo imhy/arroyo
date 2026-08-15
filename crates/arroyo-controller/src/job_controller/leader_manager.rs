@@ -2,7 +2,8 @@ use crate::JobMessage;
 use crate::states::leader_stopping::{LeaderStopBehavior, LeaderStopping};
 use crate::states::recovering::Recovering;
 use crate::states::{
-    JobContext, State, StateError, Transition, TransitionTo, controller_job_failure,
+    JobContext, State, StateError, Transition, TransitionTo, check_config_update,
+    controller_job_failure,
 };
 use crate::types::public::StopMode as SqlStopMode;
 use anyhow::{anyhow, bail};
@@ -207,14 +208,16 @@ where
                                 stop_behavior
                             }));
                         }
+
+                        // After the stop decision above, deliberately: stopping is how an
+                        // operator undoes a refused selector. Nothing else in an update
+                        // that changes the backend may be taken.
+                        check_config_update(ctx.execution_selector, &c)?;
                     }
                     Some(msg) => {
-                        warn!(
-                            job_id = %ctx.config.id,
-                            pipeline_id = *ctx.pipeline_info.pipeline_id,
-                            ?msg,
-                            "unexpected job message in leader leader mode"
-                        );
+                        // Routed rather than logged here so a refused configuration
+                        // reaches the one place that acts on it.
+                        ctx.handle(msg)?;
                     }
                     None => {
                         panic!("job queue shut down");

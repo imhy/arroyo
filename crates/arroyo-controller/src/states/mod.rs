@@ -39,7 +39,9 @@ use arroyo_rpc::errors::ErrorDomain;
 use arroyo_rpc::grpc::rpc;
 use arroyo_rpc::grpc::rpc::JobFailure;
 use arroyo_rpc::public_ids::{IdTypes, generate_id};
-use arroyo_rpc::state_backend::validate_unchanged_job_selector;
+use arroyo_rpc::state_backend::{
+    StateBackendError, StateBackendSelector, validate_unchanged_job_selector,
+};
 use arroyo_rpc::worker_types::{RunningMessage, TaskFailedEvent};
 use arroyo_rpc::{errors, log_event};
 use arroyo_server_common::shutdown::ShutdownGuard;
@@ -532,6 +534,11 @@ pub(crate) enum RunningConfigUpdate {
 /// restart for a restart-nonce, env-var, or scheduler-config change, and both refuse a
 /// state-backend change outright.
 ///
+/// `execution_selector` — not `current.state_backend` — is what the update is checked
+/// against. `current` is the state machine's shared configuration as of the last
+/// transition, so using it would compare the update against whatever the previous refresh
+/// installed; the execution's selector is fixed for the life of the job's workers.
+///
 /// The state backend is deliberately *not* a restartable change. A restart restores from
 /// the job's last checkpoint, and that checkpoint was written by the backend the job is
 /// running with, so restarting under a different selector would only move the failure to
@@ -550,6 +557,7 @@ pub(crate) enum RunningConfigUpdate {
 /// [`StateBackendError::JobSelectorChanged`](arroyo_rpc::state_backend::StateBackendError::JobSelectorChanged)
 /// if `updated` names a different state backend than the job is running with.
 pub(crate) fn classify_running_config_update(
+    execution_selector: StateBackendSelector,
     current: &JobConfig,
     updated: &JobConfig,
     restart_nonce: i32,
@@ -557,7 +565,7 @@ pub(crate) fn classify_running_config_update(
     // Checked before anything else is acted on: a job whose selector has changed must not
     // be restarted into the new one, and must not go on running while the database claims
     // a backend its workers are not using.
-    validate_unchanged_job_selector(&current.id, current.state_backend, updated.state_backend)
+    validate_unchanged_job_selector(&current.id, execution_selector, updated.state_backend)
         .map_err(|e| {
             fatal(
                 "the state backend of a running job cannot be changed",
@@ -602,6 +610,19 @@ pub(crate) use stop_if_desired_running;
 
 pub struct JobContext<'a> {
     pub config: JobConfig,
+    /// The state backend this execution of the job is running with.
+    ///
+    /// Captured once, from the configuration the state machine was started with, and
+    /// never reassigned: the workers' `TaskInfo`, every `TableConfig` they stamp, every
+    /// checkpoint they write and every cleanup that deletes one all carry this value, so
+    /// it is the job's authority for as long as the job runs. [`config`](Self::config) is
+    /// refreshed from the state machine's shared configuration after every transition and
+    /// is therefore *not* that authority — which is the whole reason this field exists
+    /// separately from `config.state_backend`.
+    ///
+    /// It is per-job state, threaded explicitly from the job's own [`StateMachine`]; there
+    /// is deliberately no process-global, thread-local, or environment fallback (M11.T08d).
+    pub execution_selector: StateBackendSelector,
     pub pipeline_info: Arc<PipelineInfo>,
     pub status: &'a mut JobStatus,
     pub program: &'a mut LogicalProgram,
@@ -615,20 +636,82 @@ pub struct JobContext<'a> {
     pub metrics: Arc<tokio::sync::RwLock<HashMap<Arc<String>, JobMetrics>>>,
 }
 
-impl JobContext<'_> {
-    pub fn handle(&mut self, msg: JobMessage) -> Result<(), StateError> {
-        if !matches!(
-            msg,
-            JobMessage::RunningMessage(RunningMessage::WorkerHeartbeat { .. })
-        ) {
-            warn!(
-                job_id = %self.config.id,
-                pipeline_id = *self.pipeline_info.pipeline_id,
-                "unhandled job message {:?}",
-                msg
+/// Handles a job message no state has a use of its own for.
+///
+/// This is the one place a [`JobMessage::ConfigRefused`] is acted on: every state that
+/// reads the job's message channel routes what it does not recognize here, so the policy
+/// for a refused configuration — fail the job, in whatever state it is in — is written
+/// once instead of once per state.
+///
+/// It is a free function rather than only a [`JobContext`] method because the states that
+/// hold a live borrow of [`JobContext::job_controller`] across their message loop cannot
+/// also borrow the whole context; they pass the two fields it reports on.
+///
+/// # Errors
+///
+/// Returns a fatal [`StateError`] for [`JobMessage::ConfigRefused`]. Every other message
+/// is logged and ignored.
+pub(crate) fn handle_unhandled_message(
+    job_id: &str,
+    pipeline_id: &str,
+    msg: JobMessage,
+) -> Result<(), StateError> {
+    match msg {
+        JobMessage::ConfigRefused(e) => {
+            error!(
+                %job_id,
+                pipeline_id,
+                error = %e,
+                "failing job whose persisted configuration was refused"
             );
+            Err(fatal(
+                "the job's persisted configuration was refused",
+                e.into(),
+            ))
         }
-        Ok(())
+        JobMessage::RunningMessage(RunningMessage::WorkerHeartbeat { .. }) => Ok(()),
+        msg => {
+            warn!(%job_id, pipeline_id, "unhandled job message {:?}", msg);
+            Ok(())
+        }
+    }
+}
+
+/// Refuses a configuration update that names a different state backend than the one this
+/// execution is running with.
+///
+/// [`StateMachine::update`] already refuses such a row before it replaces the state
+/// machine's authoritative configuration, so in a running controller no state should ever
+/// see a change. Every state that acts on a [`JobMessage::ConfigUpdate`] calls this
+/// anyway, because "the selector is immutable" is a property of the whole lifecycle and
+/// not of the one writer that happens to enforce it today: a state that reschedules,
+/// restarts, or rescales the job must validate against the selector the job is actually
+/// running with, and never against whatever the last refresh of [`JobContext::config`]
+/// put there.
+///
+/// # Errors
+///
+/// Returns a fatal [`StateError`] carrying
+/// [`StateBackendError::JobSelectorChanged`](arroyo_rpc::state_backend::StateBackendError::JobSelectorChanged)
+/// if `updated` names a different state backend than `execution_selector`.
+pub(crate) fn check_config_update(
+    execution_selector: StateBackendSelector,
+    updated: &JobConfig,
+) -> Result<(), StateError> {
+    validate_unchanged_job_selector(&updated.id, execution_selector, updated.state_backend).map_err(
+        |e| {
+            fatal(
+                "the state backend of an existing job cannot be changed",
+                e.into(),
+            )
+        },
+    )
+}
+
+impl JobContext<'_> {
+    /// [`handle_unhandled_message`] for a context that can be borrowed whole.
+    pub fn handle(&self, msg: JobMessage) -> Result<(), StateError> {
+        handle_unhandled_message(&self.config.id, &self.pipeline_info.pipeline_id, msg)
     }
 
     pub fn retryable(
@@ -997,6 +1080,7 @@ pub(crate) async fn state_backoff(retries_attempted: usize, job_id: &str, pipeli
 #[allow(clippy::too_many_arguments)]
 async fn run_to_completion(
     job_config_and_status: Arc<RwLock<(JobConfig, AppliedStatus)>>,
+    execution_selector: StateBackendSelector,
     pipeline_info: Arc<PipelineInfo>,
     mut program: LogicalProgram,
     mut status: JobStatus,
@@ -1033,6 +1117,7 @@ async fn run_to_completion(
 
     let mut ctx = JobContext {
         config: job_config,
+        execution_selector,
         pipeline_info,
         status: &mut status,
         program: &mut program,
@@ -1056,8 +1141,44 @@ async fn run_to_completion(
             (None, _) => break,
         }
 
-        ctx.config = job_config_and_status.read().unwrap().0.clone();
+        let refreshed = job_config_and_status.read().unwrap().0.clone();
+        if let Some(adopted) = adopt_refreshed_config(
+            refreshed,
+            execution_selector,
+            &ctx.pipeline_info.pipeline_id,
+        ) {
+            ctx.config = adopted;
+        }
     }
+}
+
+/// Decides whether the *next* state adopts the configuration the state machine's shared
+/// cell now holds, returning `Some(config)` to adopt it and `None` to keep the one the
+/// last state ran with.
+///
+/// This is the one place a transition's view of the job's configuration is replaced.
+/// [`StateMachine::update`] refuses a row that names a different backend before it ever
+/// reaches that cell, so `refreshed` should never disagree; keeping the configuration this
+/// execution was validated with — rather than adopting the new one and letting the next
+/// state treat it as its baseline — is what makes the refusal a property of the loop and
+/// not of the one writer that enforces it today.
+fn adopt_refreshed_config(
+    refreshed: JobConfig,
+    execution_selector: StateBackendSelector,
+    pipeline_id: &str,
+) -> Option<JobConfig> {
+    if refreshed.state_backend == execution_selector {
+        return Some(refreshed);
+    }
+
+    error!(
+        job_id = %refreshed.id,
+        pipeline_id,
+        running = %execution_selector,
+        requested = %refreshed.state_backend,
+        "refusing to adopt a job configuration that changes the state backend"
+    );
+    None
 }
 
 #[derive(Copy, Clone)]
@@ -1069,6 +1190,22 @@ enum AppliedStatus {
 pub struct StateMachine {
     tx: Option<Sender<JobMessage>>,
     config: Arc<RwLock<(JobConfig, AppliedStatus)>>,
+    /// The state backend this job is running with, read once from the row that created
+    /// the state machine and never reassigned.
+    ///
+    /// This is the job's authoritative selector. [`Self::config`] is replaced whenever the
+    /// update thread polls a changed row, and the running state machine adopts it after
+    /// every transition, so it can never be the authority for a value that is fixed for
+    /// the life of the job's state. Holding the selector separately is what lets
+    /// [`Self::update`] classify a polled row *before* the shared configuration is
+    /// overwritten.
+    ///
+    /// Per job, and owned by that job's state machine: no static, thread-local,
+    /// environment, or configuration fallback exists (M11.T08d).
+    execution_selector: StateBackendSelector,
+    /// Whether the last polled row was refused, so the refusal is logged once rather than
+    /// on every 500ms poll for as long as the row stays bad.
+    refused: bool,
     pub(crate) state: Arc<RwLock<String>>,
     metrics: Arc<tokio::sync::RwLock<HashMap<Arc<String>, JobMetrics>>>,
     db: DatabaseSource,
@@ -1084,9 +1221,12 @@ impl StateMachine {
         shutdown_guard: ShutdownGuard,
         metrics: Arc<tokio::sync::RwLock<HashMap<Arc<String>, JobMetrics>>>,
     ) -> Self {
+        let execution_selector = config.state_backend;
         let mut this = Self {
             tx: None,
             config: Arc::new(RwLock::new((config, AppliedStatus::NotApplied))),
+            execution_selector,
+            refused: false,
             state: Arc::new(RwLock::new(status.state.clone())),
             metrics,
             db,
@@ -1197,6 +1337,10 @@ impl StateMachine {
             let (tx, rx) = channel(1024);
             {
                 let config = self.config.clone();
+                // The job's selector, fixed for the life of the state machine and handed
+                // to the execution rather than re-read from the shared config it is the
+                // authority for.
+                let execution_selector = self.execution_selector;
                 let db = self.db.clone();
                 let scheduler = self.scheduler.clone();
                 let metrics = self.metrics.clone();
@@ -1214,6 +1358,7 @@ impl StateMachine {
                             );
                             run_to_completion(
                                 config,
+                                execution_selector,
                                 pipeline_info,
                                 program,
                                 status,
@@ -1246,6 +1391,16 @@ impl StateMachine {
         }
     }
 
+    /// Applies a freshly polled `job_configs` row to this job.
+    ///
+    /// The selector is classified **first**, before the shared configuration is replaced.
+    /// Everything downstream reads that cell — the states' `ConfigUpdate` message, the
+    /// `ctx.config` refresh after every transition, and therefore the worker and task
+    /// startup requests scheduling builds from it — so a row that changes the backend has
+    /// to be stopped here, at the one writer, rather than at each of those readers. It
+    /// also makes the refusal durable: because the new `restart_nonce` is refused along
+    /// with the rest of the row, `Failed` does not see a restart request and the update
+    /// the refusal promised not to restart cannot restart.
     pub async fn update(
         &mut self,
         config: JobConfig,
@@ -1253,6 +1408,17 @@ impl StateMachine {
         shutdown_guard: &ShutdownGuard,
     ) {
         *self.state.write().unwrap() = status.state.clone();
+
+        if let Err(e) = validate_unchanged_job_selector(
+            &config.id,
+            self.execution_selector,
+            config.state_backend,
+        ) {
+            self.refuse_config(e).await;
+            return;
+        }
+        self.refused = false;
+
         if self.config.read().unwrap().0 != config {
             let update = JobMessage::ConfigUpdate(config.clone());
             {
@@ -1266,6 +1432,37 @@ impl StateMachine {
             let applied = self.config.read().unwrap().1;
             self.restart_if_needed(applied, status, shutdown_guard)
                 .await;
+        }
+    }
+
+    /// Refuses the job's persisted configuration and fails the job.
+    ///
+    /// Two things reach this: a row whose `state_backend` names a different backend than
+    /// the job is running with, and a row whose `state_backend` cannot be interpreted at
+    /// all (see [`crate::job_config_or_refusal`]).
+    ///
+    /// Nothing about the refused row is adopted — the shared configuration is deliberately
+    /// left holding the value the job's workers, table configs, and checkpoints were built
+    /// from, so the refused selector never becomes any state's baseline, and the refused
+    /// `restart_nonce` never reaches [`Failed`], which is what stops the job restarting
+    /// under a selector that was just refused. The job is failed instead, by the state it
+    /// is in, through [`JobContext::handle`].
+    ///
+    /// If the state machine has already stopped there is nothing to fail and nothing to
+    /// restart: the send fails and — unlike an accepted update — no restart is attempted,
+    /// because restarting is exactly what a refused row must not cause.
+    pub(crate) async fn refuse_config(&mut self, error: StateBackendError) {
+        let job_id = self.config.read().unwrap().0.id.clone();
+        if !self.refused {
+            self.refused = true;
+            error!(job_id = %job_id, error = %error, "refusing the job's persisted configuration");
+        }
+
+        if self.send(JobMessage::ConfigRefused(error)).await.is_err() {
+            debug!(
+                job_id = %job_id,
+                "state machine is already stopped; not restarting it for a refused config"
+            );
         }
     }
 
@@ -1311,13 +1508,24 @@ impl StateMachine {
 
 #[cfg(test)]
 mod tests {
-    use super::{RunningConfigUpdate, StateError, classify_running_config_update};
-    use crate::JobConfig;
+    use super::{
+        AppliedStatus, Failed, Failing, JobContext, RunningConfigUpdate, State, StateMachine,
+        Transition, adopt_refreshed_config, check_config_update, classify_running_config_update,
+        handle_unhandled_message,
+    };
+    use crate::schedulers::{Scheduler, SchedulerError, StartPipelineReq};
     use crate::types::public::{RestartMode, StopMode};
+    use crate::{JobConfig, JobMessage, JobStatus, PipelineInfo, StateContext, states::StateError};
+    use arroyo_datastream::logical::LogicalProgram;
+    use arroyo_rpc::grpc::rpc::{HeartbeatNodeReq, RegisterNodeReq, WorkerFinishedReq};
     use arroyo_rpc::state_backend::{StateBackendError, StateBackendSelector};
+    use arroyo_server_common::shutdown::{Shutdown, SignalBehavior};
+    use arroyo_types::{PipelineId, WorkerId};
+    use cornucopia_async::DatabaseSource;
     use std::collections::HashMap;
-    use std::sync::Arc;
-    use std::time::Duration;
+    use std::sync::{Arc, Mutex, RwLock};
+    use std::time::{Duration, Instant};
+    use tokio::sync::mpsc::{Receiver, channel};
 
     /// A running job's config. Only the fields the classifier reads vary between the
     /// cases below; everything else is fixed so a difference in the result can only come
@@ -1350,6 +1558,135 @@ mod tests {
             .unwrap_or_else(|| panic!("expected a typed selector error, got {source:?}"))
     }
 
+    /// A scheduler that does nothing and records the teardowns the terminal states ask
+    /// for. Enough to run the states that only tear a cluster down.
+    #[derive(Default)]
+    struct RecordingScheduler {
+        stopped: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Scheduler for RecordingScheduler {
+        async fn start_workers(&self, _: StartPipelineReq) -> Result<(), SchedulerError> {
+            Ok(())
+        }
+        async fn register_node(&self, _: RegisterNodeReq) {}
+        async fn heartbeat_node(&self, _: HeartbeatNodeReq) -> Result<(), tonic::Status> {
+            Ok(())
+        }
+        async fn worker_finished(&self, _: WorkerFinishedReq) {}
+        async fn stop_workers(&self, job_id: &str, _: Option<u64>, _: bool) -> anyhow::Result<()> {
+            self.stopped.lock().unwrap().push(job_id.to_string());
+            Ok(())
+        }
+        async fn workers_for_job(&self, _: &str, _: Option<u64>) -> anyhow::Result<Vec<WorkerId>> {
+            Ok(vec![])
+        }
+    }
+
+    /// A database handle the tests below never query. `Failed`/`Failing` write status
+    /// through `execute_state`, which these tests do not call; they drive `next` directly.
+    fn unused_db() -> DatabaseSource {
+        DatabaseSource::Sqlite(Arc::new(Mutex::new(
+            cornucopia_async::rusqlite::Connection::open_in_memory().unwrap(),
+        )))
+    }
+
+    fn job_status(restart_nonce: i32) -> JobStatus {
+        JobStatus {
+            id: Arc::new("job_abc".to_string()),
+            generation: 1,
+            state: "Running".to_string(),
+            start_time: None,
+            finish_time: None,
+            tasks: None,
+            failure_message: None,
+            failure_domain: None,
+            restarts: 0,
+            pipeline_path: None,
+            wasm_path: None,
+            restart_nonce,
+            state_context: StateContext {
+                version: 1,
+                leader: None,
+            },
+        }
+    }
+
+    /// Owns everything a [`JobContext`] borrows, so a test can hand real states a real
+    /// context and run their `next`.
+    struct Harness {
+        status: JobStatus,
+        program: LogicalProgram,
+        rx: Receiver<JobMessage>,
+        scheduler: Arc<RecordingScheduler>,
+    }
+
+    impl Harness {
+        fn new(restart_nonce: i32) -> Self {
+            let (_tx, rx) = channel(16);
+            Self {
+                status: job_status(restart_nonce),
+                program: LogicalProgram::default(),
+                rx,
+                scheduler: Arc::new(RecordingScheduler::default()),
+            }
+        }
+
+        fn ctx(
+            &mut self,
+            config: JobConfig,
+            execution_selector: StateBackendSelector,
+        ) -> JobContext<'_> {
+            JobContext {
+                config,
+                execution_selector,
+                pipeline_info: Arc::new(PipelineInfo {
+                    pipeline_id: PipelineId("pipeline_1".to_string().into()),
+                    state_url: None,
+                    tags: HashMap::new(),
+                }),
+                status: &mut self.status,
+                program: &mut self.program,
+                db: unused_db(),
+                scheduler: self.scheduler.clone(),
+                rx: &mut self.rx,
+                retries_attempted: 0,
+                job_controller: None,
+                leader_manager: None,
+                last_transitioned_at: Instant::now(),
+                metrics: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            }
+        }
+    }
+
+    /// A state machine whose channel a test can read, without a database or a spawned
+    /// task. `update` and `refuse_config` are the two entry points exercised here and
+    /// neither touches the database.
+    fn state_machine(
+        config: JobConfig,
+        execution_selector: StateBackendSelector,
+    ) -> (StateMachine, Receiver<JobMessage>) {
+        let (tx, rx) = channel(16);
+        (
+            StateMachine {
+                tx: Some(tx),
+                config: Arc::new(RwLock::new((config, AppliedStatus::Applied))),
+                execution_selector,
+                refused: false,
+                state: Arc::new(RwLock::new("Running".to_string())),
+                metrics: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+                db: unused_db(),
+                scheduler: Arc::new(RecordingScheduler::default()),
+            },
+            rx,
+        )
+    }
+
+    fn shutdown_guard() -> arroyo_server_common::shutdown::ShutdownGuard {
+        Shutdown::new("test", SignalBehavior::None).guard("test")
+    }
+
     /// A configuration that changes the state backend of a job whose workers are already
     /// running is refused outright, in both running modes — they share this classifier,
     /// so there is one rule rather than two.
@@ -1361,8 +1698,13 @@ mod tests {
         let current = running_config(StateBackendSelector::Parquet);
         let updated = running_config(StateBackendSelector::StateEngine);
 
-        let err = classify_running_config_update(&current, &updated, current.restart_nonce)
-            .expect_err("a selector change must not be accepted");
+        let err = classify_running_config_update(
+            current.state_backend,
+            &current,
+            &updated,
+            current.restart_nonce,
+        )
+        .expect_err("a selector change must not be accepted");
         assert_eq!(
             selector_error(&err),
             &StateBackendError::JobSelectorChanged {
@@ -1373,8 +1715,13 @@ mod tests {
         );
 
         // and in the other direction, so a stateengine job cannot be demoted either
-        let err = classify_running_config_update(&updated, &current, updated.restart_nonce)
-            .expect_err("a selector change must not be accepted");
+        let err = classify_running_config_update(
+            updated.state_backend,
+            &updated,
+            &current,
+            updated.restart_nonce,
+        )
+        .expect_err("a selector change must not be accepted");
         assert!(
             matches!(
                 selector_error(&err),
@@ -1400,8 +1747,13 @@ mod tests {
         updated.env_vars = serde_json::json!({ "A": "1" });
         updated.scheduler_config = serde_json::json!({ "slots": 2 });
 
-        let err = classify_running_config_update(&current, &updated, current.restart_nonce)
-            .expect_err("a selector change must not be accepted");
+        let err = classify_running_config_update(
+            current.state_backend,
+            &current,
+            &updated,
+            current.restart_nonce,
+        )
+        .expect_err("a selector change must not be accepted");
         assert!(
             matches!(
                 selector_error(&err),
@@ -1424,7 +1776,8 @@ mod tests {
             let current = running_config(selector);
 
             assert_eq!(
-                classify_running_config_update(&current, &current, current.restart_nonce).unwrap(),
+                classify_running_config_update(selector, &current, &current, current.restart_nonce)
+                    .unwrap(),
                 RunningConfigUpdate::Apply
             );
 
@@ -1432,23 +1785,34 @@ mod tests {
             restarted.restart_nonce = current.restart_nonce + 1;
             restarted.restart_mode = RestartMode::force;
             assert_eq!(
-                classify_running_config_update(&current, &restarted, current.restart_nonce)
-                    .unwrap(),
+                classify_running_config_update(
+                    selector,
+                    &current,
+                    &restarted,
+                    current.restart_nonce
+                )
+                .unwrap(),
                 RunningConfigUpdate::Restart(RestartMode::force)
             );
 
             let mut env = running_config(selector);
             env.env_vars = serde_json::json!({ "A": "1" });
             assert_eq!(
-                classify_running_config_update(&current, &env, current.restart_nonce).unwrap(),
+                classify_running_config_update(selector, &current, &env, current.restart_nonce)
+                    .unwrap(),
                 RunningConfigUpdate::Restart(RestartMode::safe)
             );
 
             let mut scheduler = running_config(selector);
             scheduler.scheduler_config = serde_json::json!({ "slots": 2 });
             assert_eq!(
-                classify_running_config_update(&current, &scheduler, current.restart_nonce)
-                    .unwrap(),
+                classify_running_config_update(
+                    selector,
+                    &current,
+                    &scheduler,
+                    current.restart_nonce
+                )
+                .unwrap(),
                 RunningConfigUpdate::Restart(RestartMode::safe)
             );
         }
@@ -1458,12 +1822,19 @@ mod tests {
         let empty = running_config(StateBackendSelector::normalize("", "job").unwrap());
         let explicit = running_config(StateBackendSelector::normalize("parquet", "job").unwrap());
         assert_eq!(
-            classify_running_config_update(&empty, &explicit, empty.restart_nonce).unwrap(),
+            classify_running_config_update(
+                empty.state_backend,
+                &empty,
+                &explicit,
+                empty.restart_nonce
+            )
+            .unwrap(),
             RunningConfigUpdate::Apply
         );
     }
 
-    /// Both running modes must route their config updates through the one classifier;
+    /// Both running modes must route their config updates through the one classifier, and
+    /// must hand it the execution's own selector rather than the refreshable `ctx.config`;
     /// neither may keep a private copy of the restart rules that would then not carry the
     /// selector guard. This is a structural pin rather than a behavioural one — driving
     /// either state's `next` needs a live scheduler, database, and worker set.
@@ -1475,14 +1846,350 @@ mod tests {
         ] {
             assert!(
                 source.contains(
-                    "classify_running_config_update(&ctx.config, &c, ctx.status.restart_nonce)?"
+                    "classify_running_config_update(ctx.execution_selector, &ctx.config, &c, \
+                     ctx.status.restart_nonce)?"
                 ),
-                "{name} must classify config updates through classify_running_config_update"
+                "{name} must classify config updates through classify_running_config_update, \
+                 against the execution's selector"
             );
             assert!(
                 !source.contains("c.restart_nonce != ctx.status.restart_nonce"),
                 "{name} must not keep its own copy of the restart-nonce rule"
             );
         }
+    }
+
+    /// Every state that acts on a `ConfigUpdate` must validate it against the execution's
+    /// selector, and every state that reads the job's message channel must route what it
+    /// does not recognize to `handle_unhandled_message`, which is where a refusal is
+    /// turned into a job failure.
+    ///
+    /// A structural pin, because none of these states' `next` can be driven without a live
+    /// scheduler, a Postgres schema, and a worker set: `Scheduling` blocks on real worker
+    /// connections and `Restarting`/`Rescaling`/`CheckpointStopping` dereference a
+    /// `JobController`. What each of them does once the check fires *is* covered
+    /// behaviourally, by the tests of `check_config_update` and `handle_unhandled_message`
+    /// below.
+    #[test]
+    fn every_config_update_consumer_validates_against_the_execution_selector() {
+        for (name, source) in [
+            ("scheduling.rs", include_str!("scheduling.rs")),
+            ("restarting.rs", include_str!("restarting.rs")),
+            ("rescaling.rs", include_str!("rescaling.rs")),
+            (
+                "checkpoint_stopping.rs",
+                include_str!("checkpoint_stopping.rs"),
+            ),
+            ("leader_restarting.rs", include_str!("leader_restarting.rs")),
+            (
+                "leader_manager.rs",
+                include_str!("../job_controller/leader_manager.rs"),
+            ),
+        ] {
+            let updates = source.matches("JobMessage::ConfigUpdate(c)").count();
+            assert!(updates > 0, "{name} should still consume config updates");
+            assert_eq!(
+                source.matches("check_config_update(").count(),
+                updates,
+                "{name} must validate every config update against the execution's selector"
+            );
+        }
+
+        // scheduling.rs routes unknown messages through `handle_worker_connect`, which
+        // ends in `ctx.handle`; running.rs does so directly.
+        for (name, source) in [
+            ("scheduling.rs", include_str!("scheduling.rs")),
+            ("running.rs", include_str!("running.rs")),
+            ("leader_running.rs", include_str!("leader_running.rs")),
+            ("leader_restarting.rs", include_str!("leader_restarting.rs")),
+            (
+                "leader_manager.rs",
+                include_str!("../job_controller/leader_manager.rs"),
+            ),
+        ] {
+            assert!(
+                source.contains("ctx.handle("),
+                "{name} must route unrecognized job messages to JobContext::handle"
+            );
+        }
+        for (name, source) in [
+            ("restarting.rs", include_str!("restarting.rs")),
+            ("rescaling.rs", include_str!("rescaling.rs")),
+            (
+                "checkpoint_stopping.rs",
+                include_str!("checkpoint_stopping.rs"),
+            ),
+        ] {
+            assert!(
+                source.contains("handle_unhandled_message(&job_id, &pipeline_id, msg)?"),
+                "{name} must route unrecognized job messages to handle_unhandled_message"
+            );
+        }
+    }
+
+    /// The central refusal, on the real writer. A polled row that changes the selector
+    /// must not replace the state machine's authoritative config — not the selector, and
+    /// not the restart nonce that arrived with it — and must not be delivered as a
+    /// `ConfigUpdate` any state could act on.
+    ///
+    /// Without this, `update` stored the row first: scheduling's worker- and task-startup
+    /// consumers, and the `ctx.config` refresh after every transition, would then read the
+    /// new selector as their baseline.
+    #[tokio::test]
+    async fn a_polled_row_that_changes_the_selector_never_reaches_the_shared_config() {
+        let current = running_config(StateBackendSelector::Parquet);
+        let (mut sm, mut rx) = state_machine(current.clone(), StateBackendSelector::Parquet);
+
+        let mut updated = running_config(StateBackendSelector::StateEngine);
+        updated.restart_nonce = current.restart_nonce + 1;
+
+        sm.update(
+            updated,
+            job_status(current.restart_nonce),
+            &shutdown_guard(),
+        )
+        .await;
+
+        let stored = sm.config.read().unwrap().0.clone();
+        assert_eq!(
+            stored.state_backend,
+            StateBackendSelector::Parquet,
+            "the refused selector must not have become the job's authoritative config"
+        );
+        assert_eq!(
+            stored.restart_nonce, current.restart_nonce,
+            "the restart nonce that arrived with the refused selector must not have been \
+             stored either, or Failed would restart the job under it"
+        );
+
+        match rx
+            .try_recv()
+            .expect("the refusal should have been delivered")
+        {
+            JobMessage::ConfigRefused(e) => assert!(
+                matches!(e, StateBackendError::JobSelectorChanged { .. }),
+                "{e:?}"
+            ),
+            other => panic!("a refused row must not be delivered as a config update: {other:?}"),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing else may be delivered for a refused row"
+        );
+    }
+
+    /// The compatibility direction of the same writer: an update that does not change the
+    /// selector is stored and delivered exactly as before, including the restart nonce.
+    #[tokio::test]
+    async fn a_polled_row_that_keeps_the_selector_is_applied_as_before() {
+        let current = running_config(StateBackendSelector::Parquet);
+        let (mut sm, mut rx) = state_machine(current.clone(), StateBackendSelector::Parquet);
+
+        let mut updated = running_config(StateBackendSelector::Parquet);
+        updated.restart_nonce = current.restart_nonce + 1;
+
+        sm.update(
+            updated.clone(),
+            job_status(current.restart_nonce),
+            &shutdown_guard(),
+        )
+        .await;
+
+        assert_eq!(sm.config.read().unwrap().0, updated);
+        match rx
+            .try_recv()
+            .expect("the update should have been delivered")
+        {
+            JobMessage::ConfigUpdate(c) => assert_eq!(c, updated),
+            other => panic!("expected a config update, got {other:?}"),
+        }
+    }
+
+    /// Finding 3's route: a row the controller cannot interpret at all is refused to an
+    /// existing job through the same path, rather than skipped while the job keeps running
+    /// under a selector the database no longer agrees with.
+    #[tokio::test]
+    async fn an_uninterpretable_row_is_refused_to_the_running_job() {
+        let current = running_config(StateBackendSelector::Parquet);
+        let (mut sm, mut rx) = state_machine(current.clone(), StateBackendSelector::Parquet);
+
+        sm.refuse_config(StateBackendError::UnknownValue {
+            label: "job job_abc".to_string(),
+            value: "rocksdb".to_string(),
+        })
+        .await;
+
+        assert_eq!(
+            sm.config.read().unwrap().0,
+            current,
+            "an unusable row must not disturb the config the job is running with"
+        );
+        match rx
+            .try_recv()
+            .expect("the refusal should have been delivered")
+        {
+            JobMessage::ConfigRefused(StateBackendError::UnknownValue { value, .. }) => {
+                assert_eq!(value, "rocksdb")
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// The refusal reaches the job as a failure, wherever it is. This is the one place the
+    /// policy lives, so every state that routes an unrecognized message here fails the
+    /// same way.
+    #[test]
+    fn a_delivered_refusal_fails_the_job() {
+        let err = handle_unhandled_message(
+            "job_abc",
+            "pipeline_1",
+            JobMessage::ConfigRefused(StateBackendError::JobSelectorChanged {
+                label: "job \"job_abc\"".to_string(),
+                running: StateBackendSelector::Parquet,
+                requested: StateBackendSelector::StateEngine,
+            }),
+        )
+        .expect_err("a refused configuration must fail the job");
+        assert!(
+            matches!(
+                selector_error(&err),
+                StateBackendError::JobSelectorChanged { .. }
+            ),
+            "{err:?}"
+        );
+
+        // and every other message is still ignored, so routing them here changes nothing
+        handle_unhandled_message(
+            "job_abc",
+            "pipeline_1",
+            JobMessage::TaskStarted {
+                worker_id: WorkerId(1),
+                task_id: 1,
+                subtask_idx: 0,
+            },
+        )
+        .expect("an ordinary unhandled message must still be ignored");
+    }
+
+    /// The check every non-running consumer applies, in both directions: a changed
+    /// selector is fatal, and an unchanged one — including a row edited from `""` to
+    /// `"parquet"` — passes.
+    #[test]
+    fn a_config_update_is_checked_against_the_execution_selector() {
+        let updated = running_config(StateBackendSelector::StateEngine);
+        let err = check_config_update(StateBackendSelector::Parquet, &updated)
+            .expect_err("a selector change must not be accepted mid-transition");
+        assert!(
+            matches!(
+                selector_error(&err),
+                StateBackendError::JobSelectorChanged { .. }
+            ),
+            "{err:?}"
+        );
+
+        check_config_update(
+            StateBackendSelector::Parquet,
+            &running_config(StateBackendSelector::normalize("", "job").unwrap()),
+        )
+        .expect("an unchanged selector must still be accepted");
+        check_config_update(
+            StateBackendSelector::StateEngine,
+            &running_config(StateBackendSelector::StateEngine),
+        )
+        .expect("an unchanged selector must still be accepted");
+    }
+
+    /// The refusal is durable, driven through the real cleanup and restart states.
+    ///
+    /// A selector change arriving with a new restart nonce is classified fatal by both
+    /// running modes, and a fatal error goes to `Failing` and then `Failed`. `Failed`
+    /// restarts the job whenever the config's nonce is ahead of the status's — so if the
+    /// refused row had been stored, the update the classifier promised not to restart
+    /// would restart, under the refused selector. Because the row is refused before the
+    /// shared config is replaced, `Failed` sees the nonce it started with and stops.
+    ///
+    /// The second half of the test is the control: the same states, with the new nonce
+    /// actually adopted, do restart. That is what makes the first half a statement about
+    /// the refusal rather than about `Failed`.
+    #[tokio::test]
+    async fn a_refused_selector_and_nonce_do_not_restart_the_job_through_the_fatal_path() {
+        let current = running_config(StateBackendSelector::Parquet);
+        let mut updated = running_config(StateBackendSelector::StateEngine);
+        updated.restart_nonce = current.restart_nonce + 1;
+
+        // both modes classify it the same way, through the one shared rule
+        let err = classify_running_config_update(
+            StateBackendSelector::Parquet,
+            &current,
+            &updated,
+            current.restart_nonce,
+        )
+        .expect_err("a selector change must be fatal");
+        assert!(matches!(err, StateError::FatalError { .. }), "{err:?}");
+
+        // the fatal path, with the refused row never stored
+        let (mut sm, _rx) = state_machine(current.clone(), StateBackendSelector::Parquet);
+        sm.update(
+            updated.clone(),
+            job_status(current.restart_nonce),
+            &shutdown_guard(),
+        )
+        .await;
+        let after_refusal = sm.config.read().unwrap().0.clone();
+
+        let mut harness = Harness::new(current.restart_nonce);
+        let mut ctx = harness.ctx(after_refusal, StateBackendSelector::Parquet);
+
+        let Ok(Transition::Advance(next)) = Box::new(Failing {}).next(&mut ctx).await else {
+            panic!("Failing must advance");
+        };
+        assert_eq!(next.state.name(), "Failed");
+
+        let stopped = matches!(
+            Box::new(Failed {}).next(&mut ctx).await,
+            Ok(Transition::Stop)
+        );
+        assert!(
+            stopped,
+            "a job failed by a refused selector must not restart into it"
+        );
+        assert_eq!(
+            harness.scheduler.stopped.lock().unwrap().as_slice(),
+            ["job_abc"],
+            "`Failed` still tears the cluster down; refusing the row does not skip cleanup"
+        );
+
+        // the control: had the new nonce been adopted, Failed would have restarted
+        let mut harness = Harness::new(current.restart_nonce);
+        let mut ctx = harness.ctx(updated, StateBackendSelector::StateEngine);
+        let restarted = matches!(
+            Box::new(Failed {}).next(&mut ctx).await,
+            Ok(Transition::Advance(_))
+        );
+        assert!(
+            restarted,
+            "the test would not detect the refusal if Failed never restarted"
+        );
+    }
+
+    /// The transition funnel refuses to adopt a configuration with a different selector,
+    /// so even a writer that got past `StateMachine::update` could not make the next state
+    /// treat the new value as its baseline.
+    #[test]
+    fn a_refreshed_config_with_a_different_selector_is_not_adopted() {
+        let mut refreshed = running_config(StateBackendSelector::StateEngine);
+        refreshed.restart_nonce = 99;
+        assert!(
+            adopt_refreshed_config(refreshed, StateBackendSelector::Parquet, "pipeline_1")
+                .is_none()
+        );
+
+        // and the ordinary refresh still happens
+        let mut refreshed = running_config(StateBackendSelector::Parquet);
+        refreshed.restart_nonce = 99;
+        let adopted =
+            adopt_refreshed_config(refreshed, StateBackendSelector::Parquet, "pipeline_1")
+                .expect("an unchanged selector must still be adopted");
+        assert_eq!(adopted.restart_nonce, 99);
     }
 }

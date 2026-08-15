@@ -164,23 +164,26 @@ impl JobConfig {
     }
 }
 
-/// Converts a polled job row into a [`JobConfig`], or reports it and returns `None`.
+/// Converts a polled job row into a [`JobConfig`], or reports it and returns the error
+/// that makes it unusable.
 ///
 /// A row the controller cannot interpret is a hard failure *for that job*: it is never
-/// downgraded to a default, so the job simply never gets a state machine and never
-/// starts. It must not be a failure for the update thread, though — returning the error
-/// from the polling loop would stop every other job on the cluster from being updated
-/// because one row is bad. The error is therefore logged on each poll, which is also what
-/// makes the condition visible until an operator fixes the row.
-fn job_config_or_skip(row: queries::controller_queries::Job) -> Option<JobConfig> {
+/// downgraded to a default. A job that has no state machine yet therefore never gets one
+/// and never starts, and a job that already has one is failed through its own failure
+/// path — see [`StateMachine::refuse_config`] — because a job must not go on running
+/// while the database claims a backend its workers are not using.
+///
+/// It must not be a failure for the *update thread*, though: returning the error from the
+/// polling loop would stop every other job on the cluster from being updated because one
+/// row is bad. The error is therefore returned per row and logged on each poll, which is
+/// also what makes the condition visible until an operator fixes the row.
+fn job_config_or_refusal(
+    row: queries::controller_queries::Job,
+) -> Result<JobConfig, StateBackendError> {
     let job_id = row.id.clone();
-    match JobConfig::from_row(row) {
-        Ok(config) => Some(config),
-        Err(e) => {
-            error!(job_id = %job_id, error = %e, "skipping job with an unusable config");
-            None
-        }
-    }
+    JobConfig::from_row(row).inspect_err(|e| {
+        error!(job_id = %job_id, error = %e, "refusing job with an unusable config");
+    })
 }
 
 /// Per-pipeline data that doesn't change for the lifetime of a job.
@@ -249,6 +252,16 @@ fn job_in_final_state(config: &JobConfig, status: &JobStatus) -> bool {
 #[derive(Debug)]
 pub enum JobMessage {
     ConfigUpdate(JobConfig),
+    /// The job's persisted configuration was refused: the row either names a state
+    /// backend other than the one this execution is running with, or holds a value that
+    /// cannot be interpreted at all.
+    ///
+    /// A refusal is delivered as its own message, and never as a [`JobMessage::ConfigUpdate`]
+    /// carrying the refused row, precisely so that no state can apply any part of it. The
+    /// state machine's authoritative config is left holding the value the job's workers,
+    /// table configs and checkpoints were built from, and every state routes this message
+    /// to [`states::JobContext::handle`], which fails the job.
+    ConfigRefused(StateBackendError),
     WorkerConnect {
         worker_id: WorkerId,
         machine_id: MachineId,
@@ -790,8 +803,20 @@ impl ControllerServer {
                         state_context,
                     };
 
-                    let Some(config) = job_config_or_skip(p) else {
-                        continue;
+                    let config = match job_config_or_refusal(p) {
+                        Ok(config) => config,
+                        Err(e) => {
+                            // Fail-open for the poll loop — one unusable row must never
+                            // stop the other jobs on the cluster from being polled — but
+                            // not for the job itself. A job that already has a state
+                            // machine is routed to its own failure path rather than left
+                            // running under a selector the database no longer agrees
+                            // with; a job that has none still simply never starts.
+                            if let Some(sm) = jobs.lock().await.get_mut(&*id) {
+                                sm.refuse_config(e).await;
+                            }
+                            continue;
+                        }
                     };
 
                     let mut jobs = jobs.lock().await;
@@ -976,13 +1001,48 @@ mod tests {
         );
     }
 
-    /// The failure surfaces as a skipped job, not as an error out of the update thread:
-    /// one unusable row must not stop every other job on the cluster from being polled.
+    /// The failure surfaces per row, not as an error out of the update thread: one
+    /// unusable row must not stop every other job on the cluster from being polled. The
+    /// error itself is returned rather than swallowed, because the update thread routes it
+    /// to the job's own failure path when that job already has a state machine — see
+    /// `StateMachine::refuse_config` and its tests.
     #[test]
-    fn an_unusable_row_is_skipped_and_the_others_are_kept() {
-        assert!(job_config_or_skip(job_row("rocksdb")).is_none());
-        assert!(job_config_or_skip(job_row("")).is_some());
-        assert!(job_config_or_skip(job_row("stateengine")).is_some());
+    fn an_unusable_row_is_refused_and_the_others_are_kept() {
+        let err = job_config_or_refusal(job_row("rocksdb"))
+            .expect_err("an unknown selector must not be downgraded to a default");
+        assert!(
+            matches!(err, StateBackendError::UnknownValue { .. }),
+            "{err:?}"
+        );
+        assert!(job_config_or_refusal(job_row("")).is_ok());
+        assert!(job_config_or_refusal(job_row("stateengine")).is_ok());
+    }
+
+    /// The update thread must not treat an unusable row as a skip once the job has a state
+    /// machine: the job would keep running with its old selector while the database says
+    /// something else. A structural pin — the routing lives inside the spawned polling
+    /// closure, which needs a live Postgres and a running updater to drive.
+    #[test]
+    fn an_unusable_row_is_routed_to_an_existing_jobs_failure_path() {
+        // Assembled rather than written out: this file is its own fixture, so a literal
+        // would match the assertion itself and pass however the poll loop is written.
+        let source = include_str!("lib.rs");
+        assert!(
+            source.contains(&format!("sm.{}(e).await;", "refuse_config")),
+            "an unusable row must be routed to an existing state machine's failure path"
+        );
+        assert!(
+            source.contains(&format!(
+                ") -> Result<JobConfig, {}> {{",
+                "StateBackendError"
+            )),
+            "the row conversion must hand the caller the error rather than swallowing it"
+        );
+        assert!(
+            source.contains("                            continue;\n"),
+            "and the poll loop must still move on to the next job: fail-open for the \
+             cluster, hard failure for the job"
+        );
     }
 
     /// What the controller reads from the row is exactly what every worker of that job

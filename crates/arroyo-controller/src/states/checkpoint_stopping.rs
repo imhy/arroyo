@@ -4,7 +4,7 @@ use tracing::debug;
 use crate::{JobMessage, states::StateError};
 
 use super::{
-    JobContext, State, Stopped, Transition,
+    JobContext, State, Stopped, Transition, check_config_update, handle_unhandled_message,
     stopping::{StopBehavior, Stopping},
 };
 
@@ -20,6 +20,7 @@ impl State for CheckpointStopping {
     async fn next(mut self: Box<Self>, ctx: &mut JobContext) -> Result<Transition, StateError> {
         let job_id = ctx.config.id.clone();
         let pipeline_id = ctx.pipeline_info.pipeline_id.clone();
+        let execution_selector = ctx.execution_selector;
         let job_controller = ctx.job_controller.as_mut().unwrap();
 
         let mut final_checkpoint_started = false;
@@ -94,9 +95,14 @@ impl State for CheckpointStopping {
                             // do nothing
                         }
                     }
+
+                    // After the stop escalation above, deliberately: stopping is how an
+                    // operator undoes a refused selector, so a stop is still honoured.
+                    // Anything else in an update that changes the backend is not.
+                    check_config_update(execution_selector, &c)?;
                 }
-                _ => {
-                    // ignore other messages
+                msg => {
+                    handle_unhandled_message(&job_id, &pipeline_id, msg)?;
                 }
             }
         }

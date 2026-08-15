@@ -11,7 +11,10 @@ use tokio::{select, sync::Mutex, task::JoinHandle};
 use tonic::Request;
 use tracing::{debug, error, info, warn};
 
-use super::{JobContext, State, Transition, leader_running::LeaderRunning, running::Running};
+use super::{
+    JobContext, State, Transition, check_config_update, leader_running::LeaderRunning,
+    running::Running,
+};
 use crate::job_controller::checkpoint_store::DbCheckpointMetadataStore;
 use crate::job_controller::leader_manager::LeaderManager;
 use crate::{JobMessage, schedulers::SchedulerError};
@@ -342,20 +345,19 @@ async fn get_checkpoint_info_legacy<'a>(
             let storage_role = StorageProviderFor::Controller {
                 storage_url: ctx.pipeline_info.state_url.clone(),
             };
-            let parallelism_for = |operator_id: &str| {
-                ctx.program
-                    .graph
-                    .node_weights()
-                    .find(|node| node.operator_chain.first().operator_id == operator_id)
-                    .map(|node| node.parallelism)
-            };
+            // The operators the workers of this job will actually construct, keyed to the
+            // parallelism each is built at. This is the same derivation the checkpoint
+            // writer uses to fill in `operator_ids`, so it covers every operator of every
+            // chain and not just the chain heads — a chained operator is restored, and
+            // commits for it are replayed, exactly like any other.
+            let restoring = ctx.program.tasks_per_operator();
 
             match prepare_restored_checkpoint(
                 &storage_role,
                 ctx.config.state_backend,
                 &ctx.config.id,
                 info,
-                &parallelism_for,
+                &restoring,
             )
             .await
             {
@@ -401,8 +403,9 @@ enum RestorePreparationError {
 /// so the whole checkpoint has to be classified before either happens:
 ///
 /// 1. load the checkpoint's own metadata,
-/// 2. load **every** operator's metadata and check each one's table configs against the
-///    job's selector — this is the preflight, and it writes nothing,
+/// 2. check that the checkpoint covers exactly the operators the workers will build, then
+///    load **every** one of their metadata objects and check each one's table configs
+///    against the job's selector — this is the preflight, and it writes nothing,
 /// 3. derive any committing state from the metadata already loaded in step 2,
 /// 4. only then rewrite the top-level metadata with the new min epoch.
 ///
@@ -417,21 +420,26 @@ enum RestorePreparationError {
 /// a `ready` checkpoint pays one metadata read per operator, which is the read each worker
 /// was about to do anyway as it built that operator.
 ///
-/// `parallelism_for` resolves an operator's parallelism from the job's program.
+/// `restoring` maps every operator the job's workers will construct to the parallelism it
+/// is built at — `LogicalProgram::tasks_per_operator`. One value serves both halves of the
+/// preflight: its key set is what the checkpoint must cover, and the same set is what
+/// commit replay is derived over, so the operators that were checked are exactly the
+/// operators that are acted on.
 ///
 /// # Errors
 ///
 /// Returns [`RestorePreparationError::Fatal`] if the checkpoint was written by a different
-/// backend than the job selects, if an operator listed in a commit-replaying checkpoint
-/// has no metadata, or if its tables cannot be interpreted — in each case nothing has been
-/// rewritten. Returns [`RestorePreparationError::Retryable`] for the storage failures
-/// reading or writing metadata can produce.
+/// backend than the job selects, if the checkpoint does not cover exactly the operators
+/// the workers will build, if any of them has no metadata object, or if its tables cannot
+/// be interpreted — in each case nothing has been rewritten. Returns
+/// [`RestorePreparationError::Retryable`] for the storage failures reading or writing
+/// metadata can produce.
 async fn prepare_restored_checkpoint(
     storage_role: &StorageProviderFor,
     job: StateBackendSelector,
     job_id: &str,
     checkpoint: &CheckpointInfo,
-    parallelism_for: &(dyn Fn(&str) -> Option<usize> + Sync),
+    restoring: &HashMap<String, usize>,
 ) -> Result<Option<CommittingState>, RestorePreparationError> {
     let CheckpointInfo {
         id,
@@ -458,20 +466,34 @@ async fn prepare_restored_checkpoint(
 
     // The preflight. The checkpoint row said which backend wrote this checkpoint; each
     // operator's own table configs say it per table, and every one of them is checked
-    // here — before the rewrite below, and before any worker is started.
-    let operators = StateBackend::load_checkpoint_operators(storage_role, job, &metadata)
-        .await
-        .map_err(|err| match err {
-            StateStoreError::StateBackendError(e) => RestorePreparationError::Fatal {
-                message: "cannot restore a checkpoint written with a different state backend"
-                    .to_string(),
-                source: e.into(),
-            },
-            err => RestorePreparationError::Retryable {
-                message: format!("Failed to load operator metadata for epoch {epoch}"),
-                source: err.into(),
-            },
-        })?;
+    // here — before the rewrite below, and before any worker is started. The set that is
+    // checked is the workers' own, not the checkpoint's list, so an operator the
+    // checkpoint omits cannot slip past unread and then fail in a worker.
+    let expected: HashSet<&str> = restoring.keys().map(String::as_str).collect();
+    let operators =
+        StateBackend::load_checkpoint_operators(storage_role, job, &expected, &metadata)
+            .await
+            .map_err(|err| match err {
+                StateStoreError::StateBackendError(e) => RestorePreparationError::Fatal {
+                    message: "cannot restore a checkpoint written with a different state backend"
+                        .to_string(),
+                    source: e.into(),
+                },
+                // Not retryable: the same checkpoint, and the same program, are read again on
+                // every attempt.
+                err @ StateStoreError::IncompleteCheckpoint { .. } => {
+                    RestorePreparationError::Fatal {
+                        message:
+                            "cannot restore a checkpoint that does not cover the job's operators"
+                                .to_string(),
+                        source: err.into(),
+                    }
+                }
+                err => RestorePreparationError::Retryable {
+                    message: format!("Failed to load operator metadata for epoch {epoch}"),
+                    source: err.into(),
+                },
+            })?;
 
     let mut committing_state = None;
     if *needs_commits {
@@ -479,18 +501,10 @@ async fn prepare_restored_checkpoint(
         // (operator_id => (table_name => (subtask => data)))
         let mut committing_data: HashMap<String, HashMap<String, HashMap<u32, Vec<u8>>>> =
             HashMap::new();
+        // Exactly the operators the preflight covered, which is exactly the set the
+        // workers will build: the coverage check above is what makes those three the same
+        // set, so nothing is committed for an operator that was not validated.
         for (operator_id, operator_metadata) in &operators {
-            let Some(operator_metadata) = operator_metadata else {
-                return Err(RestorePreparationError::Fatal {
-                    message: "missing operator metadata".to_string(),
-                    source: anyhow!(
-                        "operator metadata for {} not found for job {}",
-                        operator_id,
-                        job_id
-                    ),
-                });
-            };
-
             for (table_name, table_metadata) in &operator_metadata.table_checkpoint_metadata {
                 let config = operator_metadata
                     .table_configs
@@ -517,7 +531,9 @@ async fn prepare_restored_checkpoint(
                         .entry(operator_id.clone())
                         .or_default()
                         .insert(table_name.to_string(), commit_data);
-                    let parallelism = parallelism_for(operator_id).ok_or_else(|| {
+                    // Present by construction: `operators` is the coverage-checked set,
+                    // which is `restoring`'s key set.
+                    let parallelism = *restoring.get(operator_id).ok_or_else(|| {
                         RestorePreparationError::Fatal {
                             message: format!(
                                 "Failed to restore job; operator {operator_id} is not in the \
@@ -827,6 +843,11 @@ impl State for Scheduling {
                     match val {
                         Some(JobMessage::ConfigUpdate(c)) => {
                             stop_if_desired_non_running!(self, &c);
+                            // The workers this loop is waiting for were started from the
+                            // job's selector, and the `StartExecutionReq` below stamps it
+                            // into every one of them. An update that changes it may not be
+                            // carried into either.
+                            check_config_update(ctx.execution_selector, &c)?;
                         }
                         Some(msg) => {
                             handle_worker_connect(msg, &mut workers, worker_connects.clone(), &mut handles, ctx).await?;
@@ -1043,6 +1064,10 @@ impl State for Scheduling {
                         }
                         Some(JobMessage::ConfigUpdate(c)) => {
                             stop_if_desired_non_running!(self, &c);
+                            // The tasks this loop is waiting for are already building
+                            // their state under the job's selector; the job cannot adopt
+                            // a different one now.
+                            check_config_update(ctx.execution_selector, &c)?;
                         }
                         Some(msg) => {
                             ctx.handle(msg)?;
@@ -1364,8 +1389,10 @@ mod tests {
         }
     }
 
-    fn one_subtask(_operator_id: &str) -> Option<usize> {
-        Some(1)
+    /// The operators the job's workers would build, each at parallelism 1 — what
+    /// `LogicalProgram::tasks_per_operator` supplies in production.
+    fn restoring(operator_ids: &[&str]) -> HashMap<String, usize> {
+        operator_ids.iter().map(|id| (id.to_string(), 1)).collect()
     }
 
     fn selector_error(err: &RestorePreparationError) -> &StateBackendError {
@@ -1398,7 +1425,7 @@ mod tests {
             StateBackendSelector::Parquet,
             JOB_ID,
             &checkpoint_info(false),
-            &one_subtask,
+            &restoring(&["node_1", "node_2"]),
         )
         .await
         else {
@@ -1447,7 +1474,7 @@ mod tests {
             StateBackendSelector::Parquet,
             JOB_ID,
             &checkpoint_info(true),
-            &one_subtask,
+            &restoring(&["node_1", "node_2"]),
         )
         .await
         else {
@@ -1487,7 +1514,7 @@ mod tests {
             StateBackendSelector::Parquet,
             JOB_ID,
             &checkpoint_info(false),
-            &one_subtask,
+            &restoring(&["node_1", "node_2"]),
         )
         .await
         else {
@@ -1502,7 +1529,7 @@ mod tests {
             StateBackendSelector::Parquet,
             JOB_ID,
             &checkpoint_info(true),
-            &one_subtask,
+            &restoring(&["node_1", "node_2"]),
         )
         .await
         else {
@@ -1516,5 +1543,108 @@ mod tests {
              metadata"
         );
         assert_eq!(store.stored_min_epoch().await, NEW_MIN_EPOCH);
+    }
+
+    /// Returns the message of a fatal preparation error, or panics saying what came back
+    /// instead.
+    fn fatal_message(err: &RestorePreparationError) -> String {
+        let RestorePreparationError::Fatal { source, .. } = err else {
+            panic!("expected a fatal error, got {err:?}");
+        };
+        source.to_string()
+    }
+
+    /// The set the preflight checks is the workers', not the checkpoint's. `node_2` is in
+    /// the job's program and its metadata disagrees with the job, but the checkpoint does
+    /// not list it — so walking the checkpoint's list finds nothing wrong, rewrites the
+    /// metadata, and leaves the disagreement for a worker to hit. Deriving the set from
+    /// the program refuses the restore with the rewrite untouched.
+    ///
+    /// `node_1` is listed and complete, so `node_2` is not reached first for any other
+    /// reason.
+    #[tokio::test]
+    async fn an_operator_the_checkpoint_omits_is_refused_before_the_rewrite() {
+        let store = checkpoint_with(
+            "omitted-operator",
+            &[("node_1", "parquet", TableEnum::GlobalKeyValue)],
+        )
+        .await;
+        // node_2's object exists and disagrees, but is not in the checkpoint's list
+        StateBackend::write_operator_checkpoint_metadata(
+            &store.role,
+            operator_metadata("node_2", "stateengine", TableEnum::GlobalKeyValue),
+        )
+        .await
+        .unwrap();
+
+        let Err(err) = prepare_restored_checkpoint(
+            &store.role,
+            StateBackendSelector::Parquet,
+            JOB_ID,
+            &checkpoint_info(false),
+            &restoring(&["node_1", "node_2"]),
+        )
+        .await
+        else {
+            panic!("a checkpoint that omits one of the job's operators must not be prepared");
+        };
+
+        let message = fatal_message(&err);
+        assert!(message.contains("node_2"), "{message}");
+
+        assert_eq!(
+            store.stored_min_epoch().await,
+            STORED_MIN_EPOCH,
+            "the checkpoint's metadata must not have been rewritten"
+        );
+    }
+
+    /// A `ready` checkpoint listing an operator whose metadata object is absent. Nothing
+    /// disagrees about the backend, and commit replay — the only consumer that used to
+    /// reject an absent object — never runs, so this reached the rewrite and then the
+    /// worker, which requires the object. It must now be refused with the rewrite
+    /// untouched.
+    #[tokio::test]
+    async fn a_listed_operator_with_no_object_is_refused_before_the_rewrite() {
+        let store = checkpoint_with(
+            "absent-object",
+            &[("node_1", "parquet", TableEnum::GlobalKeyValue)],
+        )
+        .await;
+        // relist the checkpoint with an operator that has no object of its own
+        StateBackend::write_checkpoint_metadata(
+            &store.role,
+            CheckpointMetadata {
+                job_id: JOB_ID.to_string(),
+                epoch: EPOCH,
+                min_epoch: STORED_MIN_EPOCH,
+                start_time: 0,
+                finish_time: 0,
+                operator_ids: vec!["node_1".to_string(), "node_2".to_string()],
+            },
+        )
+        .await
+        .unwrap();
+
+        let Err(err) = prepare_restored_checkpoint(
+            &store.role,
+            StateBackendSelector::Parquet,
+            JOB_ID,
+            &checkpoint_info(false),
+            &restoring(&["node_1", "node_2"]),
+        )
+        .await
+        else {
+            panic!("a checkpoint missing an operator's metadata object must not be prepared");
+        };
+
+        let message = fatal_message(&err);
+        assert!(message.contains("node_2"), "{message}");
+
+        assert_eq!(
+            store.stored_min_epoch().await,
+            STORED_MIN_EPOCH,
+            "the checkpoint's metadata must not have been rewritten"
+        );
     }
 }

@@ -4,7 +4,9 @@ use crate::states::scheduling::Scheduling;
 use crate::states::stop_if_desired_non_running;
 use crate::types::public::RestartMode;
 
-use super::{JobContext, State, StateError, Transition};
+use super::{
+    JobContext, State, StateError, Transition, check_config_update, handle_unhandled_message,
+};
 
 #[derive(Debug)]
 pub struct Restarting {
@@ -18,6 +20,9 @@ impl State for Restarting {
     }
 
     async fn next(mut self: Box<Self>, ctx: &mut JobContext) -> Result<Transition, StateError> {
+        let job_id = ctx.config.id.clone();
+        let pipeline_id = ctx.pipeline_info.pipeline_id.clone();
+        let execution_selector = ctx.execution_selector;
         let job_controller = ctx.job_controller.as_mut().unwrap();
 
         match self.mode {
@@ -55,6 +60,10 @@ impl State for Restarting {
                             }
                         }
                         JobMessage::ConfigUpdate(c) => {
+                            // Before the force-restart branch below: a restart reschedules
+                            // the job, and it must not be rescheduled from a configuration
+                            // that changes the backend its state was written with.
+                            check_config_update(execution_selector, &c)?;
                             if c.restart_mode == RestartMode::force {
                                 return Ok(Transition::next(
                                     *self,
@@ -65,8 +74,8 @@ impl State for Restarting {
                             }
                             stop_if_desired_non_running!(self, &c);
                         }
-                        _ => {
-                            // ignore other messages
+                        msg => {
+                            handle_unhandled_message(&job_id, &pipeline_id, msg)?;
                         }
                     }
                 }

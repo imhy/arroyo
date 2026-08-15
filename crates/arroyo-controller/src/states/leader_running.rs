@@ -104,8 +104,11 @@ impl State for LeaderRunning {
                             leader_stop_if_desired_running!(self, c, ctx);
 
                             // Shared with legacy mode: refuses a state-backend change and
-                            // decides whether the rest of the update needs a restart.
-                            match classify_running_config_update(&ctx.config, &c, ctx.status.restart_nonce)? {
+                            // decides whether the rest of the update needs a restart. The
+                            // comparison is against the execution's own selector, not
+                            // against `ctx.config`, which is refreshed from shared state
+                            // after every transition.
+                            match classify_running_config_update(ctx.execution_selector, &ctx.config, &c, ctx.status.restart_nonce)? {
                                 RunningConfigUpdate::Restart(mode) => {
                                     return Ok(Transition::next(
                                         *self,
@@ -127,12 +130,9 @@ impl State for LeaderRunning {
 
                         }
                         Some(msg) => {
-                            warn!(
-                                job_id = %ctx.config.id,
-                                pipeline_id = *ctx.pipeline_info.pipeline_id,
-                                msg =? msg,
-                                "unexpected job message in leader mode"
-                            );
+                            // Routed rather than logged here so a refused configuration
+                            // reaches the one place that acts on it.
+                            ctx.handle(msg)?;
                         }
                         None => {
                             panic!("job queue shut down");
