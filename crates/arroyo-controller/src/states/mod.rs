@@ -1224,11 +1224,17 @@ enum AppliedStatus {
 /// each time.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum RefusalDelivery {
-    /// A [`JobMessage::ConfigRefused`] carrying this refusal is with the job's queue, or
-    /// there was no live queue to give it to. Nothing more to send.
+    /// A [`JobMessage::ConfigRefused`] carrying this refusal is with the job's queue.
+    /// Nothing more to send.
+    ///
+    /// Only [`Delivery::Delivered`] reaches this. Having no live queue to give the refusal
+    /// to used to count as well, which is how a job could be recorded as told about a
+    /// refusal that nothing had ever received.
     Sent,
-    /// The job's queue was full. Nothing is lost — the same refusal, at the same version,
-    /// is offered again on the next poll.
+    /// Nothing holds this refusal yet: the job's queue was full, or the job has no state
+    /// task to give it to at all. Nothing is lost — the same refusal, at the same version,
+    /// is offered again on the next poll, and a repair, a different refusal, or a stop
+    /// supersedes it exactly as it supersedes a [`Self::Sent`] one.
     Pending,
     /// No refusal message exists for this one and none will be sent: the job is being
     /// stopped instead, which is what the refused row itself asked for
@@ -1612,6 +1618,18 @@ impl StateMachine {
                     );
                 }
                 Delivery::Inactive => {
+                    // Stored without a roll-back, unlike [`Self::request_stop`], and the
+                    // difference is a guard rather than a judgement call. `request_stop`
+                    // returns at its head when the stored stop mode already equals the
+                    // requested one, so a stop stored against a state task that never came
+                    // up would short-circuit every later poll and strand the job. There is
+                    // no such guard here: an update stored and not started leaves
+                    // `self.config` equal to the polled row, which sends the next poll down
+                    // the unchanged-row branch below and into `restart_if_needed`, and the
+                    // `AppliedStatus::NotApplied` stored with it is exactly what makes that
+                    // call start the job. Rolling back instead would only re-run this same
+                    // branch. Covered by
+                    // `an_accepted_update_that_could_not_start_is_retried_until_it_can`.
                     *self.config.write().unwrap() = (config, AppliedStatus::NotApplied);
                     self.start(status, shutdown_guard.clone_temporary()).await;
                 }
@@ -1640,6 +1658,13 @@ impl StateMachine {
     /// Everything else about the row is still discarded: the stop is issued on top of the
     /// configuration the job's workers, table configs, and checkpoints were built from,
     /// with the refused selector and the refused restart nonce nowhere in it.
+    ///
+    /// Either way the job must first *exist* as a state task, because neither a stop nor a
+    /// refusal can be given to a job that has none: the stop branch restarts through
+    /// [`Self::request_stop`], the refusal branch through [`Self::restart_if_needed`]. Both
+    /// restart the job under its own immutable selector and its own unrefused
+    /// configuration, which is why refusing a row still cannot restart the job into the
+    /// value being refused.
     async fn apply_refused_row(
         &mut self,
         error: StateBackendError,
@@ -1653,6 +1678,30 @@ impl StateMachine {
                 .await;
             return;
         }
+
+        // A refusal has to reach the job, and a job with no state task cannot be told
+        // anything. [`Self::start`] leaves exactly that behind when it cannot load the
+        // program — a transient `get_program` or database failure while a cold controller
+        // adopts a still-running job — and explicitly promises to retry on the next poll.
+        // This branch used to return before the ordinary inactive retry, so for a refused
+        // row that promise was never kept: the job was neither adopted nor failed, its
+        // workers kept running unmanaged, and program loading was never retried even after
+        // the dependency recovered.
+        //
+        // The retry is the ordinary one, on the same terms as any unchanged row.
+        // `restart_if_needed` starts the job only if it should be running or has never
+        // applied its configuration, so a job that legitimately reached a terminal state
+        // is not woken up; and `start` runs it under [`Self::execution_selector`], which is
+        // immutable, and the shared configuration the refused row was deliberately kept out
+        // of. The refused selector and the refused restart nonce are in neither, so this
+        // restarts the job as itself and never under the value being refused.
+        //
+        // Ordered before the refusal so that the poll which finally gets a state task up
+        // also delivers the refusal to it; if nothing came up, the refusal stays pending
+        // and both are tried again 500ms later.
+        let applied = self.config.read().unwrap().1;
+        self.restart_if_needed(applied, status, shutdown_guard)
+            .await;
 
         self.refuse_config(error);
     }
@@ -1796,9 +1845,16 @@ impl StateMachine {
     /// from being polled. It is offered without waiting; a refusal the job's queue could
     /// not take is offered again on the next poll rather than dropped.
     ///
-    /// If the state machine has already stopped there is nothing to fail and nothing to
-    /// restart: unlike an accepted update, no restart is attempted, because restarting is
-    /// exactly what a refused row must not cause.
+    /// A job with no state task has not been told anything, so this does not pretend it
+    /// has: an offer that finds no live queue leaves the refusal [`RefusalDelivery::Pending`]
+    /// and the next poll offers it again. Recording it as sent was the third way
+    /// [`Delivery::Inactive`] got mistaken for delivery — every later poll then
+    /// short-circuited on "already sent" while nothing had ever received it.
+    ///
+    /// Restoring a state task that *can* receive it is deliberately not done here.
+    /// [`Self::apply_refused_row`] does it, because only the caller holds the job's status
+    /// and shutdown guard, and because this function must stay non-`async`: the update
+    /// thread calls it while it holds the global job map.
     ///
     /// Coalescing alone does not make the refusal safe to deliver late. Between the poll
     /// that queues it and the state that reads it, the operator can repair the row — the
@@ -1840,9 +1896,10 @@ impl StateMachine {
             Delivery::Inactive => {
                 debug!(
                     job_id = %job_id,
-                    "state machine is already stopped; not restarting it for a refused config"
+                    "the job has no state task to receive its refusal; keeping it pending so \
+                     the next poll offers it again"
                 );
-                RefusalDelivery::Sent
+                RefusalDelivery::Pending
             }
             Delivery::Full => RefusalDelivery::Pending,
         };
@@ -2047,6 +2104,31 @@ mod tests {
             )
             .unwrap();
         DatabaseSource::Sqlite(Arc::new(Mutex::new(connection)))
+    }
+
+    /// Makes the job's program loadable or not, the way a database that is briefly
+    /// unavailable and then recovers does.
+    ///
+    /// With the pipeline row gone, `fetch_get_program` returns nothing and
+    /// [`StateMachine::get_program`] is an `Err` — the "something went wrong, we'll retry
+    /// on the next go around" arm of [`StateMachine::start`], which is the arm a transient
+    /// database failure during a cold controller restart takes. Putting the row back is the
+    /// dependency recovering.
+    fn program_loadable(db: &DatabaseSource, loadable: bool) {
+        let DatabaseSource::Sqlite(connection) = db else {
+            unreachable!("the fixture is always sqlite")
+        };
+        let connection = connection.lock().unwrap();
+        connection.execute("DELETE FROM pipelines", []).unwrap();
+        if loadable {
+            connection
+                .execute(
+                    "INSERT INTO pipelines (id, pub_id, program, proto_version, state_url, tags)
+                     VALUES (1, 'pl_1', ?1, 2, NULL, '{}')",
+                    cornucopia_async::rusqlite::params![ArrowProgram::default().encode_to_vec()],
+                )
+                .unwrap();
+        }
     }
 
     /// What the job's durable execution record says now, read straight out of the fixture.
@@ -3123,6 +3205,291 @@ mod tests {
                  instead of stopping it"
             );
         }
+    }
+
+    /// Round 6's finding: the third route on which `Delivery::Inactive` was mistaken for
+    /// delivery, and the only one that could strand a job for good.
+    ///
+    /// A cold controller adopts a still-running job whose row now names a different
+    /// backend. `start` cannot load the program — a transient `get_program` or database
+    /// failure — so it leaves the job with no state task and explicitly promises to retry
+    /// on the next poll. The refused row asks for no stop, so `request_stop`'s own restart
+    /// (round 5) never runs; instead the refusal branch returned before the ordinary
+    /// inactive `restart_if_needed` path and recorded the refusal as sent to a queue that
+    /// did not exist. Every later poll then short-circuited on "already sent": program
+    /// loading was never retried, the job was never adopted, and its workers kept running
+    /// with nothing administering them — even after the database recovered.
+    #[tokio::test]
+    async fn cold_adoption_is_retried_for_a_refused_row_that_asks_for_no_stop() {
+        let db = sqlite_startable_job("Running", 2);
+        program_loadable(&db, false);
+
+        let current = running_config(StateBackendSelector::Parquet);
+        // The shape round 5's fix never sees: refused, and asking for no stop.
+        let refused = running_config(StateBackendSelector::Parquet);
+        assert_eq!(refused.stop_mode, StopMode::none);
+
+        let refused_poll = || {
+            polled(
+                StateBackendSelector::Parquet,
+                refused.clone(),
+                Some(selector_changed()),
+            )
+        };
+
+        // Cold adoption itself, through the real constructor.
+        let mut sm = StateMachine::new(
+            refused_poll(),
+            job_status(current.restart_nonce),
+            db.clone(),
+            Arc::new(RecordingScheduler::default()),
+            shutdown_guard(),
+            Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+        )
+        .await;
+
+        for poll in 0..3 {
+            assert!(
+                sm.done(),
+                "poll {poll}: the program still cannot be loaded, so there is no state task"
+            );
+            assert_eq!(
+                recorded_status(&db).1,
+                None,
+                "poll {poll}: and no execution has begun, so none is recorded"
+            );
+
+            sm.update(
+                refused_poll(),
+                job_status(current.restart_nonce),
+                &shutdown_guard(),
+            )
+            .await;
+        }
+
+        // The dependency recovers. The row is unchanged and still refused, and nothing
+        // else about the job has changed, so the only thing that can adopt it now is the
+        // retry `start` promised.
+        program_loadable(&db, true);
+        sm.update(
+            refused_poll(),
+            job_status(current.restart_nonce),
+            &shutdown_guard(),
+        )
+        .await;
+
+        assert!(
+            !sm.done(),
+            "once the program loads, the still-live job must finally be adopted: a refusal \
+             it cannot be told about is not a reason to stop trying to reach it"
+        );
+        assert_eq!(
+            recorded_status(&db),
+            ("Compiling".to_string(), Some("parquet".to_string())),
+            "and the execution that has now begun is recorded under the job's own \
+             immutable selector, never the refused row's"
+        );
+    }
+
+    /// The delivery half of the same route. A refusal offered to a job with no state task
+    /// is not delivered, so it must not be recorded as delivered: it stays pending and is
+    /// offered again until something can receive it.
+    ///
+    /// The version matters as much as the message. The refusal that finally arrives has to
+    /// be one the state machine still holds, or `handle_unhandled_message` discards it and
+    /// the job keeps running under a row the controller has already rejected.
+    #[tokio::test]
+    async fn a_refusal_with_no_state_task_is_delivered_once_the_job_has_one() {
+        let current = running_config(StateBackendSelector::Parquet);
+        let mut sm = state_machine_with(
+            current.clone(),
+            StateBackendSelector::Parquet,
+            None,
+            sqlite_startable_job("Running", 1),
+        );
+
+        for poll in 0..3 {
+            sm.update(
+                polled(
+                    StateBackendSelector::Parquet,
+                    current.clone(),
+                    Some(selector_changed()),
+                ),
+                job_status(current.restart_nonce),
+                &shutdown_guard(),
+            )
+            .await;
+            assert!(
+                sm.done(),
+                "poll {poll}: the program still cannot be loaded, so nothing can receive \
+                 the refusal"
+            );
+        }
+
+        // The job's state machine comes back up, as `start` promised it would, and the
+        // same unchanged row is polled again.
+        let (tx, mut rx) = channel(16);
+        sm.tx = Some(tx);
+        sm.update(
+            polled(
+                StateBackendSelector::Parquet,
+                current.clone(),
+                Some(selector_changed()),
+            ),
+            job_status(current.restart_nonce),
+            &shutdown_guard(),
+        )
+        .await;
+
+        assert_eq!(
+            refusal_if_current(
+                rx.try_recv()
+                    .expect("the refusal must reach the state task that can finally act on it")
+            ),
+            Some(selector_changed()),
+            "and at a version the state machine still holds, so the job is failed rather \
+             than left running under a row the controller rejected"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "one unusable row still produces one refusal, not one per poll it was pending"
+        );
+        assert_eq!(
+            sm.config.read().unwrap().0,
+            current,
+            "and the refused row is still adopted nowhere"
+        );
+    }
+
+    /// Pending must not mean immortal. Keeping an undelivered refusal alive across polls is
+    /// only safe because a repair supersedes it exactly as it supersedes a delivered one —
+    /// otherwise round 6's fix would reintroduce round 5's: a job that comes back up after
+    /// the operator fixed the row would be failed for a configuration that no longer
+    /// exists.
+    #[tokio::test]
+    async fn a_pending_refusal_is_superseded_by_the_repair_that_answers_it() {
+        let current = running_config(StateBackendSelector::Parquet);
+        let mut sm = state_machine_with(
+            current.clone(),
+            StateBackendSelector::Parquet,
+            None,
+            sqlite_startable_job("Running", 1),
+        );
+
+        // Refused while the job has no state task: nothing receives this one.
+        sm.update(
+            polled(
+                StateBackendSelector::Parquet,
+                current.clone(),
+                Some(selector_changed()),
+            ),
+            job_status(current.restart_nonce),
+            &shutdown_guard(),
+        )
+        .await;
+        assert!(sm.done(), "the program cannot be loaded");
+
+        // The operator repairs the row, and only then does a state task exist.
+        let (tx, mut rx) = channel(16);
+        sm.tx = Some(tx);
+        sm.update(
+            polled(StateBackendSelector::Parquet, current.clone(), None),
+            job_status(current.restart_nonce),
+            &shutdown_guard(),
+        )
+        .await;
+
+        assert!(
+            rx.try_recv().is_err(),
+            "a refusal that was still pending when the row was repaired must not be \
+             delivered to the job the repair saved"
+        );
+
+        // The control: the mechanism is still live, so a row that goes bad again is
+        // refused afresh and does reach the job.
+        sm.update(
+            polled(
+                StateBackendSelector::Parquet,
+                current.clone(),
+                Some(selector_changed()),
+            ),
+            job_status(current.restart_nonce),
+            &shutdown_guard(),
+        )
+        .await;
+        assert_eq!(
+            refusal_if_current(rx.try_recv().expect("the new refusal must be delivered")),
+            Some(selector_changed()),
+            "the test would not detect the supersession if no refusal ever arrived"
+        );
+    }
+
+    /// Round 5 left the accepted-update `Inactive` branch without a roll-back and argued it
+    /// was unnecessary because the next poll reaches `restart_if_needed` anyway. Round 6's
+    /// finding is a case where exactly that argument failed, because a different branch
+    /// returned first — so the argument is checked here instead of repeated.
+    ///
+    /// An accepted update handed to a job with no state task is stored, and storing it is
+    /// precisely what sends every later poll down the unchanged-row branch and into
+    /// `restart_if_needed`, which retries `start` for as long as the configuration is
+    /// `NotApplied`. When the program finally loads, the job starts under it.
+    #[tokio::test]
+    async fn an_accepted_update_that_could_not_start_is_retried_until_it_can() {
+        let db = sqlite_startable_job("Running", 2);
+        program_loadable(&db, false);
+
+        let current = running_config(StateBackendSelector::Parquet);
+        let mut sm = state_machine_with(
+            current.clone(),
+            StateBackendSelector::Parquet,
+            None,
+            db.clone(),
+        );
+
+        let mut updated = running_config(StateBackendSelector::Parquet);
+        updated.restart_nonce = current.restart_nonce + 1;
+
+        for poll in 0..3 {
+            sm.update(
+                polled(StateBackendSelector::Parquet, updated.clone(), None),
+                job_status(current.restart_nonce),
+                &shutdown_guard(),
+            )
+            .await;
+
+            assert!(
+                sm.done(),
+                "poll {poll}: the program cannot be loaded, so nothing took the update"
+            );
+            assert_eq!(
+                sm.config.read().unwrap().0,
+                updated,
+                "poll {poll}: the update stays stored — there is no head guard here to \
+                 short-circuit on it, so storing it is what makes the next poll retry"
+            );
+            assert_eq!(
+                recorded_status(&db).1,
+                None,
+                "poll {poll}: and no execution has begun, so none is recorded"
+            );
+        }
+
+        program_loadable(&db, true);
+        sm.update(
+            polled(StateBackendSelector::Parquet, updated.clone(), None),
+            job_status(current.restart_nonce),
+            &shutdown_guard(),
+        )
+        .await;
+
+        assert!(
+            !sm.done(),
+            "the retry the roll-back-free branch relies on has to actually happen"
+        );
+        assert_eq!(
+            recorded_status(&db),
+            ("Compiling".to_string(), Some("parquet".to_string()))
+        );
     }
 
     /// The check every non-running consumer applies, in both directions: a changed
