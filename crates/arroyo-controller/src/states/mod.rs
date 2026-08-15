@@ -633,6 +633,17 @@ pub struct JobContext<'a> {
     /// It is per-job state, threaded explicitly from the job's own [`StateMachine`]; there
     /// is deliberately no process-global, thread-local, or environment fallback (M11.T08d).
     pub execution_selector: StateBackendSelector,
+    /// The identity of the cluster this controller belongs to, stamped into every worker
+    /// this job starts.
+    ///
+    /// Threaded from the controller that owns the job, for the same reason
+    /// [`execution_selector`](Self::execution_selector) is: a state should be given what it
+    /// acts on rather than reach for a process-wide cell. It matters beyond tidiness here,
+    /// because the only way to populate that cell is a setter that resolves the identity
+    /// against `~/.config/arroyo/cluster-info` and writes it there — so a `Scheduling` that
+    /// read the global made every test of it a reason to create or overwrite a developer's
+    /// real cluster identity.
+    pub cluster_id: Arc<String>,
     pub pipeline_info: Arc<PipelineInfo>,
     pub status: &'a mut JobStatus,
     pub program: &'a mut LogicalProgram,
@@ -1178,6 +1189,7 @@ pub(crate) async fn state_backoff(retries_attempted: usize, job_id: &str, pipeli
 async fn run_to_completion(
     job_config_and_status: Arc<RwLock<(JobConfig, AppliedStatus)>>,
     execution_selector: StateBackendSelector,
+    cluster_id: Arc<String>,
     refusal_gate: RefusalGate,
     pipeline_info: Arc<PipelineInfo>,
     mut program: LogicalProgram,
@@ -1221,6 +1233,7 @@ async fn run_to_completion(
     let mut ctx = JobContext {
         config: job_config,
         execution_selector,
+        cluster_id,
         pipeline_info,
         status: &mut status,
         program: &mut program,
@@ -1574,6 +1587,9 @@ pub struct StateMachine {
     /// Per job, and owned by that job's state machine: no static, thread-local,
     /// environment, or configuration fallback exists (M11.T08d).
     execution_selector: StateBackendSelector,
+    /// The identity of the controller's cluster, handed to every state task this machine
+    /// starts. See [`JobContext::cluster_id`].
+    cluster_id: Arc<String>,
     /// The refusal the job's configuration is currently under, if any.
     ///
     /// One refusal, not one per poll. The row stays bad until an operator fixes it, so a
@@ -1620,11 +1636,13 @@ impl StateMachine {
     /// to the new state machine exactly as it would be to one that had been there all
     /// along. Before this, a refused row with no state machine was skipped, which meant a
     /// still-running job was neither adopted nor failed.
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         polled: PolledJob,
         status: JobStatus,
         db: DatabaseSource,
         scheduler: Arc<dyn Scheduler>,
+        cluster_id: Arc<String>,
         shutdown_guard: ShutdownGuard,
         metrics: Arc<tokio::sync::RwLock<HashMap<Arc<String>, JobMetrics>>>,
     ) -> Self {
@@ -1638,6 +1656,7 @@ impl StateMachine {
             tx: None,
             config: Arc::new(RwLock::new((config, AppliedStatus::NotApplied))),
             execution_selector,
+            cluster_id,
             refusal: None,
             refusal_version: Arc::new(AtomicU64::new(0)),
             refusal_gate: RefusalGate::default(),
@@ -1777,6 +1796,9 @@ impl StateMachine {
                 // to the execution rather than re-read from the shared config it is the
                 // authority for.
                 let execution_selector = self.execution_selector;
+                // The controller's own cluster identity, handed to the task for the same
+                // reason: a state is given what it stamps into its workers.
+                let cluster_id = self.cluster_id.clone();
                 // The task's half of the refusal gate. Cloned rather than re-derived, so a
                 // refusal already published when this task is created gates its very first
                 // state, and one raised later reaches it at the next state boundary.
@@ -1827,6 +1849,7 @@ impl StateMachine {
                             run_to_completion(
                                 config,
                                 execution_selector,
+                                cluster_id,
                                 refusal_gate,
                                 pipeline_info,
                                 program,
@@ -2454,12 +2477,12 @@ mod tests {
         /// Panics instead of starting the cluster, after recording the request.
         ///
         /// This is how the tests that need a panic *inside* the admitted region get one they
-        /// own. They used to rely on `Scheduling::start_workers` panicking at
-        /// `arroyo_server_common::get_cluster_id`, which no test set — but that is a
-        /// process-global `OnceCell`, so as soon as one test in this binary sets it, tests that
-        /// depended on it being unset would change behaviour depending on the order they ran
-        /// in. A panic the scheduler raises is under the same admission and depends on nothing
-        /// outside the test.
+        /// own, and it stays that way now that the cluster identity is threaded through
+        /// [`JobContext::cluster_id`]. They used to rely on `Scheduling::start_workers`
+        /// panicking on a process-wide cell no test had populated: a panic that any test which
+        /// *did* populate it would take away from every test that ran after it in the same
+        /// binary. A panic the scheduler raises is under the same admission, is what the test
+        /// asked for, and depends on nothing outside the test.
         panic_on_start: bool,
         /// Announces that the cluster has been asked for. See [`SchedulingBarriers`].
         barriers: Option<Arc<SchedulingBarriers>>,
@@ -2733,6 +2756,19 @@ mod tests {
         }
     }
 
+    /// The cluster identity the tests hand to the code under test.
+    ///
+    /// A plain value, injected, and that is the point. The only way to populate the
+    /// process-wide cell this used to come from is `arroyo_server_common`'s setter, and that
+    /// setter resolves the identity against `~/.config/arroyo/cluster-info` and *writes* it
+    /// there whenever the directory exists and holds nothing valid. Running `cargo test` is
+    /// not a reason to give a developer's machine a cluster identity, still less to give it
+    /// this one — so no test in this crate calls it, which
+    /// `no_state_and_no_state_test_reaches_for_a_process_wide_cluster_identity` keeps true.
+    fn test_cluster_id() -> Arc<String> {
+        Arc::new("2f2a2f3c-0000-4000-8000-000000000001".to_string())
+    }
+
     /// Owns everything a [`JobContext`] borrows, so a test can hand real states a real
     /// context and run their `next`.
     struct Harness {
@@ -2806,6 +2842,7 @@ mod tests {
             JobContext {
                 config,
                 execution_selector,
+                cluster_id: test_cluster_id(),
                 pipeline_info: Arc::new(PipelineInfo {
                     pipeline_id: PipelineId("pipeline_1".to_string().into()),
                     state_url: self.state_url.clone(),
@@ -2850,6 +2887,7 @@ mod tests {
             tx,
             config: Arc::new(RwLock::new((config, AppliedStatus::Applied))),
             execution_selector,
+            cluster_id: test_cluster_id(),
             refusal: None,
             refusal_version: Arc::new(AtomicU64::new(0)),
             refusal_gate: RefusalGate::default(),
@@ -3891,6 +3929,7 @@ mod tests {
             job_status(current.restart_nonce),
             db.clone(),
             scheduler.clone(),
+            test_cluster_id(),
             shutdown.guard().clone_temporary(),
             Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         )
@@ -4232,6 +4271,7 @@ mod tests {
             job_status(current.restart_nonce),
             db.clone(),
             scheduler.clone(),
+            test_cluster_id(),
             shutdown.guard().clone_temporary(),
             Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         )
@@ -4286,6 +4326,7 @@ mod tests {
             job_status(current.restart_nonce),
             db.clone(),
             scheduler.clone(),
+            test_cluster_id(),
             shutdown.guard().clone_temporary(),
             Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         )
@@ -4356,10 +4397,10 @@ mod tests {
     /// for, no replacement workers were started, and no recovery was prepared — the last
     /// because preparing it is strictly after starting workers, which never happened.
     ///
-    /// Without the interlock this test does not merely mis-assert: the preamble runs on into
-    /// `start_workers`, whose `get_cluster_id` no test sets, and panics. That is caught here
-    /// so the failure reports what was done to the job rather than where it happened to
-    /// stop.
+    /// Without the interlock this test does not merely mis-assert: the preamble runs on
+    /// through `start_workers` into the checkpoint recovery this fixture has laid nothing
+    /// down for, and can die there. The unwind is caught so that the failure reports what was
+    /// done to the job rather than wherever the preamble happened to stop.
     #[tokio::test]
     async fn a_refusal_published_after_the_gate_snapshot_still_stops_the_scheduling_preamble() {
         let db = sqlite_startable_job("Scheduling", 2);
@@ -4432,10 +4473,14 @@ mod tests {
     /// the job refusable rather than wedged for the life of the controller — which a `std`
     /// mutex would not have.
     ///
-    /// The panic used to come from `arroyo_server_common::get_cluster_id`, which no test set.
-    /// It is asked for explicitly now because that is a process-global `OnceCell` and the
-    /// end-to-end tests below have to set it, which would otherwise make this test's premise
-    /// depend on the order the binary happened to run them in.
+    /// The panic is asked for explicitly, from the scheduler, rather than being inherited from
+    /// whatever the preamble happened to trip over. It used to come from `start_workers`
+    /// reading a process-wide cluster identity no test had populated — a premise that any
+    /// test which populated it would silently remove, depending on the order the binary ran
+    /// them in. That identity is now handed to the state ([`JobContext::cluster_id`]) and no
+    /// test populates anything process-wide, but the explicit panic stays: what this test
+    /// asserts is that a panic *under the admission* releases it, so it has to own the panic
+    /// rather than depend on one.
     #[tokio::test]
     async fn an_unrefused_job_still_schedules_and_a_panic_under_the_admission_releases_it() {
         let db = sqlite_startable_job("Scheduling", 2);
@@ -4570,20 +4615,6 @@ mod tests {
     // asserted is what arrived at the worker.
     // ---------------------------------------------------------------------------------------
 
-    /// The process-global cluster id `Scheduling::start_workers` reads.
-    ///
-    /// `arroyo_server_common::set_cluster_id` writes a `OnceCell` and can only happen once per
-    /// process, so it goes through a `Once`. The value is a well-formed uuid because that
-    /// function persists it to `~/.config/arroyo/cluster-info` — but only when that directory
-    /// already exists, and only when it does not already hold a valid id, so on an ordinary
-    /// checkout nothing is written at all.
-    fn cluster_id_is_set() {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| {
-            arroyo_server_common::set_cluster_id("2f2a2f3c-0000-4000-8000-000000000001")
-        });
-    }
-
     /// The points inside one run of `Scheduling::next` that a test can wait for.
     ///
     /// These are what make the tests below deterministic rather than timed. Each is announced
@@ -4619,6 +4650,119 @@ mod tests {
         }
     }
 
+    /// How a [`FakeWorker`] answers `StartExecution`.
+    #[derive(Clone, Default)]
+    enum StartsExecution {
+        /// Records the call and accepts, which is what every round-9 test wants.
+        #[default]
+        Accepting,
+        /// Fails the RPC — but not before the paused worker is inside its own handler, so the
+        /// fan-out's failure always lands on a job that has another request outstanding.
+        FailingOnce(Arc<tokio::sync::Notify>),
+        /// Announces that it has been asked and then waits, so the controller has a
+        /// `StartExecution` in flight for as long as the test wants one.
+        Pausing(Arc<PausedWorker>),
+    }
+
+    /// A worker that has been asked to start executing and has not answered yet.
+    ///
+    /// This is the instrument for round 11: the question is whether a request the controller
+    /// has stopped waiting for can still reach its worker, and the only way to ask it is to
+    /// hold one open across the moment the controller gives up.
+    struct PausedWorker {
+        /// Fired from inside the handler, so no test has to guess when the request arrived.
+        asked: tokio::sync::Notify,
+        /// The same announcement, for the worker whose failure must land only once *this*
+        /// request is outstanding. Separate from [`Self::asked`] because a `Notify` permit
+        /// has one taker and these are two.
+        asked_relay: Arc<tokio::sync::Notify>,
+        /// Fired by a test to let the handler finish, if it still exists.
+        released: tokio::sync::Notify,
+        outcome: tokio::sync::watch::Sender<Option<PausedOutcome>>,
+    }
+
+    /// What became of a paused `StartExecution` handler.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum PausedOutcome {
+        /// Its stream was cut off before it could apply the request: the controller took the
+        /// call back.
+        CutOff,
+        /// It ran to completion, and the worker was told to start executing.
+        Applied,
+    }
+
+    impl PausedWorker {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                asked: tokio::sync::Notify::new(),
+                asked_relay: Arc::new(tokio::sync::Notify::new()),
+                released: tokio::sync::Notify::new(),
+                outcome: tokio::sync::watch::Sender::new(None),
+            })
+        }
+
+        /// The signal a [`StartsExecution::FailingOnce`] worker waits on before it fails.
+        fn asked_relay(&self) -> Arc<tokio::sync::Notify> {
+            self.asked_relay.clone()
+        }
+
+        fn announce(&self) {
+            self.asked.notify_one();
+            self.asked_relay.notify_one();
+        }
+
+        fn settle(&self, outcome: PausedOutcome) {
+            self.outcome.send_replace(Some(outcome));
+        }
+
+        /// Waits for the handler to have finished one way or the other.
+        ///
+        /// Both endings announce themselves — completion from the handler, cancellation from
+        /// [`CutOffOnDrop`] — and a `watch` rather than a one-shot signal so that asking twice,
+        /// or asking after the answer arrived, is the same question.
+        async fn outcome(&self) -> PausedOutcome {
+            let mut settled = self.outcome.subscribe();
+            loop {
+                if let Some(outcome) = *settled.borrow_and_update() {
+                    return outcome;
+                }
+                settled.changed().await.unwrap();
+            }
+        }
+    }
+
+    /// How long a test waits for a cut-off that the fix makes immediate.
+    ///
+    /// **Not a synchronisation point.** With the fix, the controller dropping an in-flight
+    /// request resets its stream and the worker end announces the cut-off by itself, in
+    /// microseconds over loopback; nothing in the passing path waits on this deadline. It is
+    /// here because the *unfixed* shape detaches the request instead, so nothing would ever
+    /// announce anything — and a regression must fail the assertions rather than hang the
+    /// suite. On expiry the test releases the worker, and the assertions then report what a
+    /// request nobody was waiting for still managed to do.
+    const CUT_OFF_DEADLINE: Duration = Duration::from_secs(30);
+
+    /// Records that a paused handler was dropped rather than resumed.
+    ///
+    /// `tonic` drops a request handler when its stream is reset or its connection closes,
+    /// which is what the controller dropping an in-flight request does to the worker end. So
+    /// this guard firing *is* the observation "the worker was never asked to start after all".
+    struct CutOffOnDrop(Option<Arc<PausedWorker>>);
+
+    impl CutOffOnDrop {
+        fn disarm(mut self) {
+            self.0 = None;
+        }
+    }
+
+    impl Drop for CutOffOnDrop {
+        fn drop(&mut self) {
+            if let Some(worker) = self.0.take() {
+                worker.settle(PausedOutcome::CutOff);
+            }
+        }
+    }
+
     /// A worker, as far as the controller can tell.
     ///
     /// A real server on a real socket, because the claim under test is about real RPCs: the
@@ -4628,6 +4772,7 @@ mod tests {
     struct FakeWorker {
         calls: Arc<WorkerCalls>,
         barriers: Arc<SchedulingBarriers>,
+        starts_execution: StartsExecution,
     }
 
     #[tonic::async_trait]
@@ -4636,11 +4781,28 @@ mod tests {
             &self,
             request: tonic::Request<StartExecutionReq>,
         ) -> Result<tonic::Response<StartExecutionResp>, tonic::Status> {
-            self.calls
-                .start_execution
-                .lock()
-                .unwrap()
-                .push(request.into_inner().state_backend);
+            let selector = request.into_inner().state_backend;
+            match &self.starts_execution {
+                StartsExecution::Accepting => {}
+                StartsExecution::FailingOnce(after) => {
+                    after.notified().await;
+                    return Err(tonic::Status::internal(
+                        "this worker cannot start executing",
+                    ));
+                }
+                StartsExecution::Pausing(paused) => {
+                    paused.announce();
+                    let cut_off = CutOffOnDrop(Some(paused.clone()));
+                    paused.released.notified().await;
+                    // Only reached if the handler was not dropped while it waited.
+                    cut_off.disarm();
+                    self.calls.start_execution.lock().unwrap().push(selector);
+                    paused.settle(PausedOutcome::Applied);
+                    self.barriers.execution_started.notify_one();
+                    return Ok(tonic::Response::new(StartExecutionResp {}));
+                }
+            }
+            self.calls.start_execution.lock().unwrap().push(selector);
             self.barriers.execution_started.notify_one();
             Ok(tonic::Response::new(StartExecutionResp {}))
         }
@@ -4709,23 +4871,34 @@ mod tests {
 
     /// Serves a [`FakeWorker`] on a loopback port and returns the address a `WorkerConnect`
     /// would carry.
-    async fn fake_worker(calls: Arc<WorkerCalls>, barriers: Arc<SchedulingBarriers>) -> String {
+    async fn fake_worker(
+        calls: Arc<WorkerCalls>,
+        barriers: Arc<SchedulingBarriers>,
+        starts_execution: StartsExecution,
+    ) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(
             tonic::transport::Server::builder()
-                .add_service(WorkerGrpcServer::new(FakeWorker { calls, barriers }))
+                .add_service(WorkerGrpcServer::new(FakeWorker {
+                    calls,
+                    barriers,
+                    starts_execution,
+                }))
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
         );
         format!("http://{addr}")
     }
 
-    /// The `WorkerConnect` the fake worker would send, at the generation the preamble has just
-    /// advanced to and with exactly the slots [`one_operator_program`] needs.
-    fn worker_connect(rpc_address: &str) -> JobMessage {
+    /// The `WorkerConnect` a fake worker would send, at the generation the preamble has just
+    /// advanced to, carrying one slot.
+    ///
+    /// One slot per worker throughout, so "how many workers" and "how many slots the program
+    /// needs" are the same number and a test states it once.
+    fn worker_connect_from(worker_id: WorkerId, rpc_address: &str) -> JobMessage {
         JobMessage::WorkerConnect {
-            worker_id: WorkerId(7),
-            machine_id: MachineId(Arc::new("machine_1".to_string())),
+            worker_id,
+            machine_id: MachineId(Arc::new(format!("machine_{}", worker_id.0))),
             generation: 2,
             rpc_address: rpc_address.to_string(),
             data_address: "127.0.0.1:1".to_string(),
@@ -4733,7 +4906,12 @@ mod tests {
         }
     }
 
-    /// The `TaskStarted` that satisfies the second loop for [`one_operator_program`].
+    /// The single-worker case, which is what the round-9 tests use.
+    fn worker_connect(rpc_address: &str) -> JobMessage {
+        worker_connect_from(WorkerId(7), rpc_address)
+    }
+
+    /// The `TaskStarted` that satisfies the second loop for a single-worker run.
     fn task_started() -> JobMessage {
         JobMessage::TaskStarted {
             worker_id: WorkerId(7),
@@ -4742,9 +4920,9 @@ mod tests {
         }
     }
 
-    /// One operator at parallelism 1: one slot to fill, one task to start, one operator for the
-    /// restored checkpoint to cover.
-    fn one_operator_program() -> LogicalProgram {
+    /// One operator at the given parallelism: that many slots to fill and that many tasks to
+    /// start, over one operator for the restored checkpoint to cover.
+    fn one_operator_program_at(parallelism: usize) -> LogicalProgram {
         let mut program = LogicalProgram::default();
         program.graph.add_node(LogicalNode::single(
             1,
@@ -4752,7 +4930,7 @@ mod tests {
             OperatorName::ArrowValue,
             vec![],
             "the only operator".to_string(),
-            1,
+            parallelism,
         ));
         program
     }
@@ -4874,31 +5052,42 @@ mod tests {
             .unwrap();
     }
 
-    /// Everything a run of the real `Scheduling::next` against a real worker needs.
+    /// Everything a run of the real `Scheduling::next` against real workers needs.
     struct SchedulingRun {
         db: DatabaseSource,
         calls: Arc<WorkerCalls>,
         barriers: Arc<SchedulingBarriers>,
-        worker_address: String,
+        worker_addresses: Vec<String>,
         harness: Harness,
         /// Held for the test: dropping it takes the checkpoint away.
         _checkpoints: CheckpointDir,
     }
 
     impl SchedulingRun {
+        /// One worker that accepts, which is what the round-9 tests want.
         async fn new(name: &str) -> Self {
-            cluster_id_is_set();
+            Self::with_workers(name, vec![StartsExecution::Accepting]).await
+        }
+
+        /// One worker per behaviour, each with one slot, and a program that needs exactly as
+        /// many slots as there are workers.
+        async fn with_workers(name: &str, workers: Vec<StartsExecution>) -> Self {
             let db = sqlite_startable_job("Scheduling", 2);
             let checkpoints = CheckpointDir::new(name);
             committing_checkpoint(&checkpoints, &db).await;
 
             let calls = Arc::new(WorkerCalls::default());
             let barriers = Arc::new(SchedulingBarriers::default());
-            let worker_address = fake_worker(calls.clone(), barriers.clone()).await;
+            let mut worker_addresses = Vec::new();
+            for starts_execution in &workers {
+                worker_addresses.push(
+                    fake_worker(calls.clone(), barriers.clone(), starts_execution.clone()).await,
+                );
+            }
 
             let mut harness = Harness::new(3)
                 .with_db(db.clone())
-                .with_program(one_operator_program())
+                .with_program(one_operator_program_at(workers.len()))
                 .with_state_url(checkpoints.url())
                 .with_scheduler(RecordingScheduler::watching(barriers.clone()));
             harness.status.state = "Scheduling".to_string();
@@ -4907,10 +5096,15 @@ mod tests {
                 db,
                 calls,
                 barriers,
-                worker_address,
+                worker_addresses,
                 harness,
                 _checkpoints: checkpoints,
             }
+        }
+
+        /// The address of the nth worker, in the order its behaviour was given.
+        fn address(&self, n: usize) -> String {
+            self.worker_addresses[n].clone()
         }
 
         /// Runs the real `Scheduling::next` against the real worker.
@@ -4958,7 +5152,7 @@ mod tests {
         let gate = run.harness.refusal_gate.clone();
         let queue = run.harness.queue();
         let barriers = run.barriers.clone();
-        let address = run.worker_address.clone();
+        let address = run.address(0);
 
         let version = Arc::new(AtomicU64::new(1));
         let refusal = RefusedConfig::new(selector_changed(), 1, version);
@@ -5033,10 +5227,7 @@ mod tests {
 
         // The connect is already in the queue, so the first loop is satisfied without the
         // poll thread doing anything: this test is about the second one.
-        queue
-            .send(worker_connect(&run.worker_address))
-            .await
-            .unwrap();
+        queue.send(worker_connect(&run.address(0))).await.unwrap();
 
         let version = Arc::new(AtomicU64::new(1));
         let refusal = RefusedConfig::new(selector_changed(), 1, version);
@@ -5093,10 +5284,7 @@ mod tests {
     async fn an_unrefused_job_starts_executing_publishes_its_commits_and_runs() {
         let mut run = SchedulingRun::new("unrefused-control").await;
         let queue = run.harness.queue();
-        queue
-            .send(worker_connect(&run.worker_address))
-            .await
-            .unwrap();
+        queue.send(worker_connect(&run.address(0))).await.unwrap();
         queue.send(task_started()).await.unwrap();
 
         let outcome = run.schedule().await;
@@ -5129,6 +5317,195 @@ mod tests {
             state_writes(&run.db),
             [("Scheduling".to_string(), 2)],
             "and the generation persisted exactly once"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Round 11: the fan-out's own lifetime.
+    //
+    // Holding the admission across the fan-out only says something if the fan-out is over when
+    // the admission is released. It was not: every request was a `tokio::spawn`, and dropping a
+    // `JoinHandle` detaches its task rather than cancelling it. So the first worker to fail
+    // ended the helper and left its siblings running, and cancelling the job's state task left
+    // all of them running — in both cases past the point where a refusal could be published,
+    // and a detached request can still make a worker execute the configuration just refused.
+    //
+    // The two tests below are the two ways out that leaked: a sibling failing, and the parent
+    // being dropped. Both hold one worker inside its own `StartExecution` handler across that
+    // moment and ask what happened to it. A real server on a real socket is what makes the
+    // question answerable at all: cutting a request off is something the worker end observes.
+    // ---------------------------------------------------------------------------------------
+
+    /// A worker still inside its `StartExecution` must be cut off when a sibling request fails,
+    /// so that nothing is left able to start it once a refusal can be published again.
+    ///
+    /// The reviewer's scenario, deterministically: two workers, one that fails and one that is
+    /// held inside its handler when the failure lands. The failing worker waits for the paused
+    /// one to be inside before it fails, so "a request was outstanding" is enforced rather than
+    /// hoped for. The refusal is then published at the first instant a publication is possible
+    /// — which is by construction the first instant after the fan-out released the admission.
+    ///
+    /// Before the fix the paused worker's request was a detached task: the helper returned the
+    /// failing worker's `JoinError`, the admission went, the refusal was published, and the
+    /// detached request went on to tell a worker to start executing the refused configuration.
+    #[tokio::test]
+    async fn a_worker_still_inside_start_execution_is_cut_off_when_a_sibling_request_fails() {
+        let paused = PausedWorker::new();
+        let mut run = SchedulingRun::with_workers(
+            "sibling-failure",
+            vec![
+                StartsExecution::FailingOnce(paused.asked_relay()),
+                StartsExecution::Pausing(paused.clone()),
+            ],
+        )
+        .await;
+
+        let gate = run.harness.refusal_gate.clone();
+        let queue = run.harness.queue();
+        for (n, worker_id) in [WorkerId(7), WorkerId(8)].into_iter().enumerate() {
+            queue
+                .send(worker_connect_from(worker_id, &run.address(n)))
+                .await
+                .unwrap();
+        }
+
+        let version = Arc::new(AtomicU64::new(1));
+        let refusal = RefusedConfig::new(selector_changed(), 1, version);
+
+        let watching = paused.clone();
+        let poll = tokio::spawn(async move {
+            // Not before the fan-out has begun. A publication that succeeded during the
+            // receive phase ahead of it would stop the fan-out at its own gate read — round
+            // 9's scenario, covered by round 9's tests — and this test is about what is left
+            // running once the fan-out has already been entered and has failed.
+            watching.asked.notified().await;
+
+            // Publishing is impossible for as long as a region is in flight, so the first
+            // success is the first instant after the fan-out gave the admission up. The
+            // deadline is for the *unfixed* helper, which awaited its spawned handles in queue
+            // order and so could be sitting on this very worker forever.
+            let published = tokio::time::timeout(
+                CUT_OFF_DEADLINE,
+                publish_when_admitted(&gate, refusal.clone()),
+            )
+            .await
+            .is_ok();
+
+            // See `CUT_OFF_DEADLINE`: with the fix the request has already been taken back
+            // and this returns at once; without it, nothing will ever take it back, and
+            // releasing the worker is what turns a hang into the assertion below.
+            if tokio::time::timeout(CUT_OFF_DEADLINE, watching.outcome())
+                .await
+                .is_err()
+            {
+                watching.released.notify_one();
+            }
+            if !published {
+                publish_when_admitted(&gate, refusal).await;
+            }
+        });
+
+        let outcome = run.schedule().await;
+        poll.await.unwrap();
+
+        assert_eq!(
+            paused.outcome().await,
+            PausedOutcome::CutOff,
+            "the request the fan-out stopped waiting for must have been taken back, not \
+             detached: the controller released the job's admission on the strength of having \
+             finished with its workers"
+        );
+        assert_eq!(
+            run.calls.started(),
+            Vec::<String>::new(),
+            "so no worker may be told to start executing — one refused the request and the \
+             other was cut off before it could apply one, and by the time it was released a \
+             refusal had been published for the very configuration it was holding"
+        );
+        assert_eq!(
+            run.calls.committed(),
+            Vec::<u64>::new(),
+            "and nothing is committed: the commits come after an execution that never started"
+        );
+
+        let Err(err) = outcome else {
+            panic!("a fan-out in which a worker refused the request cannot have succeeded");
+        };
+        assert!(
+            format!("{err:?}").contains("failed to initialize workers"),
+            "and the state fails for the worker that refused it: {err:?}"
+        );
+    }
+
+    /// Cancelling the job's state task must take its outstanding `StartExecution` requests with
+    /// it, because the admission goes at the same moment and cannot cover them afterwards.
+    ///
+    /// The other way a spawned request outlived its admission, and the one no error path
+    /// reaches: the state task is simply dropped — the controller shutting down, the job being
+    /// torn down — while the fan-out is in flight. Dropping the task dropped the `JoinHandle`s
+    /// and Tokio detached every one of them, so the requests carried on after the admission
+    /// they were authorised by no longer existed and a refusal could be published behind them.
+    ///
+    /// Here the fan-out is dropped with a worker held inside its handler. A publication then
+    /// succeeds — the admission really is gone — and the worker is let go, and must never have
+    /// been asked to start.
+    #[tokio::test]
+    async fn dropping_the_scheduling_task_cuts_off_the_start_execution_it_had_in_flight() {
+        let paused = PausedWorker::new();
+        let mut run = SchedulingRun::with_workers(
+            "cancelled-fan-out",
+            vec![StartsExecution::Pausing(paused.clone())],
+        )
+        .await;
+
+        let gate = run.harness.refusal_gate.clone();
+        let queue = run.harness.queue();
+        queue
+            .send(worker_connect_from(WorkerId(7), &run.address(0)))
+            .await
+            .unwrap();
+
+        {
+            let mut scheduling = std::pin::pin!(run.schedule());
+            tokio::select! {
+                _ = &mut scheduling => {
+                    panic!("the state cannot have finished: a worker is still holding its \
+                            `StartExecution` open")
+                }
+                _ = paused.asked.notified() => {}
+            }
+            // The job's state task, cancelled with a request in flight.
+        }
+
+        let admission = gate.admit_publication().expect(
+            "the admission must have gone with the task that held it — this is the moment the \
+             detached requests of the unfixed fan-out were still running in",
+        );
+        gate.publish(
+            &admission,
+            RefusedConfig::new(selector_changed(), 1, Arc::new(AtomicU64::new(1))),
+        );
+        drop(admission);
+
+        // See `CUT_OFF_DEADLINE`.
+        if tokio::time::timeout(CUT_OFF_DEADLINE, paused.outcome())
+            .await
+            .is_err()
+        {
+            paused.released.notify_one();
+        }
+
+        assert_eq!(
+            paused.outcome().await,
+            PausedOutcome::CutOff,
+            "the request must have gone with the task: a task that is no longer running cannot \
+             be holding an admission for it"
+        );
+        assert_eq!(
+            run.calls.started(),
+            Vec::<String>::new(),
+            "so the worker was never told to start executing, and in particular not after the \
+             refusal above"
         );
     }
 
@@ -5353,6 +5730,24 @@ mod tests {
                 .all(|(i, _)| i > effect_at),
             "the `StartExecution` RPCs must be issued inside the effect, not before it"
         );
+
+        // And the lifetime half of the same guarantee, which no region boundary can express.
+        //
+        // A region covers the work *this task* does between its boundaries. `tokio::spawn`
+        // hands its child an independent lifetime — dropping a `JoinHandle` detaches the task
+        // rather than cancelling it — so a spawned effect is precisely an effect the region
+        // cannot end. The one spawn left in this file is `handle_worker_connect`'s channel
+        // setup, which is outside every region, does nothing irreversible, and is awaited to
+        // completion by the phase that started it. A second one means someone has given a
+        // piece of `Scheduling` a life of its own, and has to say which region ends it.
+        assert_eq!(
+            source.matches("tokio::spawn").count(),
+            1,
+            "`Scheduling` may spawn exactly one thing — the worker channel setup in \
+             `handle_worker_connect`. Anything else spawned here can outlive the admission \
+             that authorised it, because dropping its handle detaches it rather than \
+             cancelling it, and can then reach a worker after a refusal has been published"
+        );
     }
 
     /// The assumption [`scheduling_source_without_comments`] rests on.
@@ -5372,6 +5767,42 @@ mod tests {
                  the region audit strip real code: {line}",
                 n + 1
             );
+        }
+    }
+
+    /// Neither the states nor their tests may reach for the process's cluster identity.
+    ///
+    /// **A source pin: it asserts about the text of `states/mod.rs` and `states/scheduling.rs`,
+    /// not about what the controller does.** The behaviour it protects is not the controller's
+    /// either — it is the developer's machine.
+    ///
+    /// `arroyo_server_common`'s cluster-id setter is not a setter. It resolves the identity
+    /// against `~/.config/arroyo/cluster-info` and, whenever that directory exists and holds
+    /// nothing valid, *writes* the value there; every later real Arroyo process on that machine
+    /// then inherits it. A test fixture that called it to satisfy `Scheduling::start_workers`
+    /// therefore gave `cargo test -p arroyo-controller` the power to create or overwrite a
+    /// developer's cluster identity with a fixed test uuid — on any machine where a real
+    /// Arroyo had ever run, which is exactly the machines that would notice.
+    ///
+    /// The states now take the identity ([`JobContext::cluster_id`]); the controller reads the
+    /// process-wide cell once, in `start_updater`, where a test never goes. What is pinned here
+    /// is that neither half of either file goes back — including the tests, which is why the
+    /// needles are assembled rather than written out, so this test does not match itself.
+    #[test]
+    fn no_state_and_no_state_test_reaches_for_a_process_wide_cluster_identity() {
+        for (file, source) in [
+            ("states/mod.rs", include_str!("mod.rs")),
+            ("states/scheduling.rs", include_str!("scheduling.rs")),
+        ] {
+            for needle in [concat!("set_", "cluster_id"), concat!("get_", "cluster_id")] {
+                assert!(
+                    !source.contains(needle),
+                    "{file} calls `{needle}`. The identity a job stamps into its workers is \
+                     handed to the state, not fetched from a process-wide cell — and the cell's \
+                     setter persists what it is given to the machine's own configuration, so a \
+                     test that populates it changes the machine rather than the test"
+                );
+            }
         }
     }
 

@@ -1,17 +1,14 @@
 use arroyo_rpc::grpc::rpc::{JobState, StartExecutionReq, TaskAssignment};
 use arroyo_rpc::identity::{WorkerClient, worker_client};
 use arroyo_types::{CLUSTER_ID_ENV, JobId, MachineId, PipelineId, WorkerId};
+use futures::stream::{FuturesUnordered, StreamExt};
 use std::time::SystemTime;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::{
-    select,
-    sync::Mutex,
-    task::{JoinError, JoinHandle},
-};
+use tokio::{select, sync::Mutex, task::JoinHandle};
 use tonic::Request;
 use tracing::{debug, error, info, warn};
 
@@ -240,6 +237,40 @@ struct ExecutionPlan {
 /// configuration the controller has refused — which is why the caller must hand over an
 /// [`Admission`] to call this at all, and why the caller takes that admission by re-reading
 /// the gate rather than by trusting the message loop that just ended.
+///
+/// # Why the requests are not spawned
+///
+/// The RPCs are concurrent but they are *not* separate tasks, and that is the whole of the
+/// lifetime guarantee. `tokio::spawn` hands the child an independent lifetime: dropping a
+/// [`JoinHandle`] detaches the task rather than cancelling it, so the first worker to fail
+/// used to end this function — through `?` on a `JoinError` — while every sibling request
+/// carried on. The caller then released the admission, a poll could publish a refusal, and a
+/// detached request could still make a worker execute the configuration that had just been
+/// refused. Cancelling the job's state task did the same thing to all of them at once.
+///
+/// A [`FuturesUnordered`] of plain futures is polled *by this task*, so the requests are
+/// children of the region rather than peers of it. Every way out takes them with it:
+///
+/// * the last request completing, which is the ordinary path;
+/// * `?` on the first failure, which drops the set and with it every request still in flight;
+/// * a panic, which drops the set while unwinding;
+/// * the caller's future being dropped — the job's task cancelled, the controller shutting
+///   down — which drops this future and the set inside it.
+///
+/// In all four the requests are gone *before* the admission is, because the admission is a
+/// local of the caller declared before the temporary holding this future, and locals are
+/// dropped in reverse. Dropping an in-flight request resets its gRPC stream, so a worker
+/// that has been asked but has not yet applied the request never applies it.
+///
+/// Nothing here needs a task of its own: the closures capture owned clones, the work is a
+/// `tonic` call and not a blocking one, and no request has any reason to outlive the region
+/// that authorised it.
+///
+/// # Errors
+///
+/// Returns the first worker's error, without waiting for the rest. An RPC failure is a plain
+/// error rather than a panic in a child task — the shape that produced the `JoinError` above
+/// — and the caller turns it into the same retryable [`StateError`] as before.
 async fn start_execution_on_workers(
     admission: &Admission,
     job_id: Arc<String>,
@@ -247,15 +278,14 @@ async fn start_execution_on_workers(
     plan: ExecutionPlan,
     workers: &mut HashMap<WorkerId, WorkerStatus>,
     worker_connects: HashMap<WorkerId, WorkerClient>,
-) -> Result<HashMap<WorkerId, WorkerClient>, JoinError> {
-    // The whole of this — the spawns as much as the wait for them — is one effect inside one
-    // region: `tokio::spawn` is already the request going out, so nothing here may sit outside
-    // the guard.
+) -> anyhow::Result<HashMap<WorkerId, WorkerClient>> {
+    // The whole of this — issuing the requests as much as waiting for them — is one effect
+    // inside one region, and none of it may outlive the guard.
     admission
         .effect("send every worker its StartExecution", async move {
             let (leader_id, leader_addr) = plan.leader.unzip();
 
-            let tasks: Vec<_> = worker_connects
+            let mut requests: FuturesUnordered<_> = worker_connects
                 .into_iter()
                 .map(|(id, mut c)| {
                     let assignments = plan.assignments.clone();
@@ -273,7 +303,7 @@ async fn start_execution_on_workers(
                         plan.checkpoint_interval_micros,
                     );
 
-                    tokio::spawn(async move {
+                    async move {
                         info!(
                             message = "starting execution on worker",
                             job_id = %job_id,
@@ -306,7 +336,7 @@ async fn start_execution_on_workers(
                                     worker_id = id.0,
                                     machine_id = *machine_id.0,
                                 );
-                                (id, c)
+                                Ok((id, c))
                             }
                             Err(e) => {
                                 error!(
@@ -317,16 +347,16 @@ async fn start_execution_on_workers(
                                     machine_id = *machine_id.0,
                                     error = format!("{:?}", e),
                                 );
-                                panic!("Failed to start execution on worker {id:?}: {e}");
+                                Err(anyhow!("failed to start execution on worker {id:?}: {e}"))
                             }
                         }
-                    })
+                    }
                 })
                 .collect();
 
             let mut started = HashMap::new();
-            for t in tasks {
-                let (id, c) = t.await?;
+            // `?` here drops `requests`, and every request still in flight with it.
+            while let Some((id, c)) = requests.next().await.transpose()? {
                 if let Some(worker) = workers.get_mut(&id) {
                     worker.state = WorkerState::Initializing;
                 }
@@ -825,9 +855,12 @@ impl Scheduling {
                 );
             });
 
-        let cluster_id = arroyo_server_common::get_cluster_id();
+        // Threaded from the controller that owns this job rather than read out of a
+        // process-global. The value is the same one in production; what changes is that
+        // running this code no longer requires a process to have an identity installed in it,
+        // so nothing that exercises `Scheduling` has any reason to install one.
         env_vars
-            .insert(CLUSTER_ID_ENV.to_string(), cluster_id)
+            .insert(CLUSTER_ID_ENV.to_string(), (*ctx.cluster_id).clone())
             .inspect(|_| {
                 warn!(
                     job_id = %ctx.config.id,
@@ -1152,6 +1185,13 @@ impl State for Scheduling {
         // here, and the admission is held across the fan-out below — which is where this job's
         // program actually begins to run, restoring state under the job's selector and
         // producing to its sinks.
+        //
+        // The fan-out's requests are children of this future rather than spawned tasks, so
+        // every exit from it — success, the first worker's failure, a panic, or this task
+        // being cancelled — takes the requests still in flight with it, and does so before
+        // `admission` is dropped: `admission` is declared first, and locals drop in reverse.
+        // Nothing can therefore still be asking a worker to start once a refusal can again be
+        // published. See `start_execution_on_workers`.
         let admission = ctx.admit_irreversible_scheduling().await?;
         let started = start_execution_on_workers(
             &admission,
@@ -1167,7 +1207,7 @@ impl State for Scheduling {
         let worker_connects = match started {
             Ok(connects) => connects,
             Err(e) => {
-                return Err(ctx.retryable(self, "failed to initialize workers", e.into(), 10));
+                return Err(ctx.retryable(self, "failed to initialize workers", e, 10));
             }
         };
 

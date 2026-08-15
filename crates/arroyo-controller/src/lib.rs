@@ -1013,6 +1013,11 @@ impl ControllerServer {
         let jobs = Arc::clone(&self.job_state);
         let scheduler = Arc::clone(&self.scheduler);
         let metrics = Arc::clone(&self.metrics);
+        // Read once, here, and handed to every job's state machine. This is the controller
+        // process's own identity and the only place the controller reads it from the
+        // process-wide cell, so the code that stamps it into a worker takes it as an
+        // argument and can be exercised without a process identity existing at all.
+        let cluster_id = Arc::new(arroyo_server_common::get_cluster_id());
 
         let token = guard.token();
 
@@ -1054,6 +1059,7 @@ impl ControllerServer {
                                 status,
                                 db.clone(),
                                 scheduler.clone(),
+                                cluster_id.clone(),
                                 guard.clone_temporary(),
                                 metrics.clone(),
                             )
