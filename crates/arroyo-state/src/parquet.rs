@@ -259,19 +259,21 @@ impl ParquetBackend {
     /// but the program does not contain means the checkpoint belongs to a different
     /// program.
     ///
-    /// Every listed operator must also *have* a metadata object. Absence used to be
-    /// reported as `None` and left to the caller, on the grounds that absence states no
-    /// selector; but the workers this preflight runs on behalf of reject it
-    /// (`TableManager::load` requires the object whenever it restores at all), so
-    /// tolerating it here only moved the failure past the point where the checkpoint's
-    /// metadata has already been rewritten.
+    /// Every listed operator must also *have* a metadata object, and that object must
+    /// carry an operator header naming it. Absence used to be reported as `None` and left
+    /// to the caller, on the grounds that absence states no selector; but the workers this
+    /// preflight runs on behalf of reject it (`TableManager::load` requires the object
+    /// whenever it restores at all, and reads the restored watermark out of its header
+    /// without checking that there is one), so tolerating either only moved the failure
+    /// past the point where the checkpoint's metadata has already been rewritten.
     ///
     /// # Errors
     ///
     /// Returns [`StateError::StateBackendError`] if any operator's table configs disagree
     /// with `job`, name an unknown backend, or disagree with each other;
     /// [`StateError::IncompleteCheckpoint`] if the checkpoint's operator set is not
-    /// exactly `restoring` or a listed operator has no metadata object; alongside the
+    /// exactly `restoring`, or a listed operator has no metadata object, or its object
+    /// carries no operator header or one naming a different operator; alongside the
     /// storage failures reading the metadata can produce. Nothing is written or deleted in
     /// any case.
     pub async fn load_checkpoint_operators(
@@ -326,6 +328,26 @@ impl ParquetBackend {
                          worker that builds it requires one"
                     ))
                 })?;
+                // ...and that object must carry an operator header naming this operator.
+                // `TableManager::load` reads the restored watermark straight out of it
+                // and panics if it is absent, so tolerating a headerless object here only
+                // moves the failure into a worker, past the metadata rewrite.
+                match loaded.operator_metadata.as_ref() {
+                    Some(header) if header.operator_id == *operator_id => {}
+                    Some(header) => {
+                        return Err(incomplete(format!(
+                            "the checkpoint metadata object for operator {operator_id} is \
+                             headed \"{}\" instead",
+                            header.operator_id
+                        )));
+                    }
+                    None => {
+                        return Err(incomplete(format!(
+                            "the checkpoint metadata object for operator {operator_id} has \
+                             no operator header, which the worker that builds it requires"
+                        )));
+                    }
+                }
                 validate_restored_operator_metadata(job, &loaded)?;
                 Ok::<_, StateError>((operator_id.clone(), loaded))
             })
@@ -1056,6 +1078,48 @@ mod tests {
         );
         let message = err.to_string();
         assert!(message.contains("node_2"), "{message}");
+    }
+
+    /// A listed operator whose metadata object carries no operator header — or one naming
+    /// a different operator — is refused as well.
+    ///
+    /// The object existing is not enough: `TableManager::load` reads the restored
+    /// watermark straight out of that header and unwraps it, so a headerless object
+    /// panics a worker. Round 3 required the object; this requires it to describe the
+    /// operator it was loaded for, which is the same rule the leader path's manifest
+    /// coverage check applies.
+    #[tokio::test]
+    async fn loading_a_checkpoints_operators_refuses_one_whose_object_has_no_header() {
+        let store = LocalCheckpointStore::new("restore-preflight-headerless");
+        write_epoch(&store, "node_1", 1, "").await;
+
+        // Written straight to the path the loader reads: the writer refuses to produce a
+        // headerless object, which is exactly why one can only arrive from outside.
+        let mut headerless = operator_metadata("node_2", 1, "", &[]);
+        headerless.operator_metadata = None;
+        store
+            .put(
+                &metadata_path(&operator_path(JOB_ID, 1, "node_2")),
+                headerless.encode_to_vec(),
+            )
+            .await;
+
+        let err = ParquetBackend::load_checkpoint_operators(
+            &store.role,
+            StateBackendSelector::Parquet,
+            &restoring(&["node_1", "node_2"]),
+            &checkpoint_metadata(&["node_1", "node_2"], 1),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(err, StateError::IncompleteCheckpoint { epoch: 1, .. }),
+            "{err:?}"
+        );
+        let message = err.to_string();
+        assert!(message.contains("node_2"), "{message}");
+        assert!(message.contains("no operator header"), "{message}");
     }
 
     /// The other half of "exact coverage": a checkpoint listing an operator the current

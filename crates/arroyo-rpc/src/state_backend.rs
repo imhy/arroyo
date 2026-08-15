@@ -24,7 +24,8 @@
 pub use arroyo_types::state_backend::*;
 
 use crate::grpc::rpc::{CheckpointManifest, OperatorCheckpointMetadata, TableConfig};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use thiserror::Error;
 
 /// Checks a whole-checkpoint selector — the `state_backend` column of a `checkpoints` row
 /// — against the job that is about to restore from it.
@@ -91,8 +92,10 @@ pub fn validate_restored_operator_metadata(
 /// Checks every operator in a restored checkpoint manifest against the job's selector.
 ///
 /// A manifest is the leader-mode equivalent of the controller's checkpoint row plus every
-/// operator's metadata, so this is the whole restore check for that mode, run on the
-/// controller before any worker is told to execute.
+/// operator's metadata, so this is the selector half of the restore check for that mode,
+/// run on the controller before any worker is told to execute. The coverage half —
+/// whether the manifest describes exactly the operators the workers will build — is
+/// [`validate_manifest_covers_program`], and callers that publish protocol state run both.
 ///
 /// # Errors
 ///
@@ -106,6 +109,102 @@ pub fn validate_restored_manifest(
         .operators
         .iter()
         .try_for_each(|operator| validate_restored_operator_metadata(job, operator))
+}
+
+/// A restored checkpoint manifest that cannot restore the program its workers will build.
+///
+/// This is deliberately not a [`StateBackendError`]: nothing about it is a selector
+/// disagreement. It is the leader-mode counterpart of
+/// `StateError::IncompleteCheckpoint`, which reports the same condition for a legacy
+/// checkpoint's operator metadata objects.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("the checkpoint at epoch {epoch} cannot restore this job's program: {detail}")]
+pub struct IncompleteManifest {
+    /// The epoch of the manifest that was rejected.
+    pub epoch: u64,
+    /// What exactly was wrong, naming the operators involved.
+    pub detail: String,
+}
+
+/// Checks that a restored checkpoint manifest describes **exactly** the operators the
+/// job's workers are going to build, one valid entry each.
+///
+/// This is the leader-mode preflight for restoring, and it exists for the same reason the
+/// legacy path's is a whole-set check rather than a per-item one: a worker constructs
+/// every operator of its *current* program and each one looks itself up in this manifest
+/// by operator id, requiring an entry that carries an operator header naming it. An entry
+/// the manifest happens to contain therefore proves nothing — what matters is whether
+/// every operator that will ask for one finds exactly one.
+///
+/// Validating the manifest's own entries instead, which is all a per-item check can do,
+/// passes a manifest with an operator omitted, an operator the program does not contain,
+/// the same operator twice, or an entry with no header at all — and each of those fails
+/// only later, in a worker, after the generation has already been published and the
+/// protocol state has already advanced.
+///
+/// `restoring` is the set of operator ids the workers will construct, derived from the
+/// *current* program (`LogicalProgram::tasks_per_operator`), which is the same source of
+/// truth the legacy path's preflight uses. Both a checkpoint's entries and the program's
+/// operator set are compared as sets, so the manifest's order does not matter.
+///
+/// Nothing here reads or writes storage: it is pure set arithmetic over an object the
+/// caller has already read, so it can run before the caller publishes anything.
+///
+/// # Errors
+///
+/// Returns [`IncompleteManifest`] if any entry has no operator header, if two entries name
+/// the same operator, if an operator of the program is not described, or if the manifest
+/// describes an operator the program does not contain. Operators are listed sorted so the
+/// message is stable.
+pub fn validate_manifest_covers_program(
+    manifest: &CheckpointManifest,
+    restoring: &HashSet<&str>,
+) -> Result<(), IncompleteManifest> {
+    let incomplete = |detail: String| IncompleteManifest {
+        epoch: manifest.epoch,
+        detail,
+    };
+
+    let mut listed: HashSet<&str> = HashSet::with_capacity(manifest.operators.len());
+    for (index, operator) in manifest.operators.iter().enumerate() {
+        // A headerless entry cannot be found by the worker that needs it — the lookup
+        // matches on the header's operator id — so it is not a description of anything.
+        let Some(header) = operator.operator_metadata.as_ref() else {
+            return Err(incomplete(format!(
+                "entry {index} has no operator metadata header, so no operator can match it"
+            )));
+        };
+
+        if !listed.insert(header.operator_id.as_str()) {
+            return Err(incomplete(format!(
+                "operator {} is described more than once, so which of its entries would \
+                 be restored is not defined",
+                header.operator_id
+            )));
+        }
+    }
+
+    let mut missing: Vec<&str> = restoring.difference(&listed).copied().collect();
+    if !missing.is_empty() {
+        missing.sort_unstable();
+        return Err(incomplete(format!(
+            "the job's program contains operator(s) {} that the checkpoint does not \
+             describe, and every operator a worker builds looks itself up in it",
+            missing.join(", ")
+        )));
+    }
+
+    let mut extra: Vec<&str> = listed.difference(restoring).copied().collect();
+    if !extra.is_empty() {
+        extra.sort_unstable();
+        return Err(incomplete(format!(
+            "the checkpoint describes operator(s) {} that the job's program does not \
+             contain",
+            extra.join(", ")
+        )));
+    }
+
+    Ok(())
 }
 
 /// Checks the table configs a subtask reported with its finished checkpoint against the
@@ -159,14 +258,14 @@ fn validate_table_configs(
 #[cfg(test)]
 mod tests {
     use super::{
-        StateBackendError, StateBackendSelector, validate_restored_checkpoint,
-        validate_restored_manifest, validate_restored_operator_metadata,
-        validate_subtask_table_configs,
+        StateBackendError, StateBackendSelector, validate_manifest_covers_program,
+        validate_restored_checkpoint, validate_restored_manifest,
+        validate_restored_operator_metadata, validate_subtask_table_configs,
     };
     use crate::grpc::rpc::{
         CheckpointManifest, OperatorCheckpointMetadata, OperatorMetadata, TableConfig, TableEnum,
     };
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     fn table_configs<'a>(
         entries: impl IntoIterator<Item = (&'a str, &'a str)>,
@@ -415,5 +514,121 @@ mod tests {
                 job: StateBackendSelector::StateEngine,
             }
         );
+    }
+
+    /// An entry for `operator_id`, headed as the writer heads it.
+    fn described(operator_id: &str) -> OperatorCheckpointMetadata {
+        OperatorCheckpointMetadata {
+            operator_metadata: Some(OperatorMetadata {
+                job_id: "job_1".to_string(),
+                operator_id: operator_id.to_string(),
+                epoch: 7,
+                min_watermark: None,
+                max_watermark: None,
+                parallelism: 1,
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn manifest(operators: Vec<OperatorCheckpointMetadata>) -> CheckpointManifest {
+        CheckpointManifest {
+            epoch: 7,
+            operators,
+            ..Default::default()
+        }
+    }
+
+    /// The operator ids a program's workers will build, as
+    /// `LogicalProgram::tasks_per_operator` yields them.
+    fn program<'a>(ids: &[&'a str]) -> HashSet<&'a str> {
+        ids.iter().copied().collect()
+    }
+
+    /// The direction that must keep working: a manifest that describes exactly the
+    /// program's operators, in any order, restores.
+    #[test]
+    fn a_manifest_describing_exactly_the_program_is_accepted() {
+        validate_manifest_covers_program(
+            &manifest(vec![described("b"), described("a")]),
+            &program(&["a", "b"]),
+        )
+        .unwrap();
+
+        // ...including the degenerate case of a program with no operators at all
+        validate_manifest_covers_program(&manifest(vec![]), &program(&[])).unwrap();
+    }
+
+    /// The defect: an operator the program contains but the manifest omits used to pass,
+    /// because the validator only ever looked at entries that happened to be present.
+    /// The worker that builds that operator looks itself up in the manifest and fails.
+    #[test]
+    fn a_manifest_that_omits_an_operator_is_refused() {
+        let err = validate_manifest_covers_program(
+            &manifest(vec![described("a")]),
+            &program(&["a", "b"]),
+        )
+        .unwrap_err();
+        assert_eq!(err.epoch, 7);
+        assert!(err.detail.contains('b'), "{}", err.detail);
+        assert!(err.to_string().contains("epoch 7"), "{err}");
+    }
+
+    /// An operator the manifest describes but the program does not contain means the
+    /// checkpoint belongs to a different program.
+    #[test]
+    fn a_manifest_with_an_extra_operator_is_refused() {
+        let err = validate_manifest_covers_program(
+            &manifest(vec![described("a"), described("c")]),
+            &program(&["a"]),
+        )
+        .unwrap_err();
+        assert!(err.detail.contains('c'), "{}", err.detail);
+    }
+
+    /// Two entries for one operator: which one would be restored is not defined, so
+    /// neither is.
+    #[test]
+    fn a_manifest_describing_an_operator_twice_is_refused() {
+        let err = validate_manifest_covers_program(
+            &manifest(vec![described("a"), described("a")]),
+            &program(&["a"]),
+        )
+        .unwrap_err();
+        assert!(err.detail.contains("more than once"), "{}", err.detail);
+    }
+
+    /// A headerless entry describes nothing: the worker's lookup matches on the header's
+    /// operator id, so an entry without one can never be found — and the legacy loader
+    /// reads the restored watermark straight out of that header.
+    #[test]
+    fn a_manifest_with_a_headerless_entry_is_refused() {
+        let err = validate_manifest_covers_program(
+            &manifest(vec![
+                described("a"),
+                OperatorCheckpointMetadata {
+                    operator_metadata: None,
+                    ..Default::default()
+                },
+            ]),
+            &program(&["a"]),
+        )
+        .unwrap_err();
+        assert!(
+            err.detail.contains("no operator metadata header"),
+            "{}",
+            err.detail
+        );
+
+        // and the coverage check is what catches it: the selector check tolerates it,
+        // because a headerless entry states no selector to disagree with
+        validate_restored_manifest(
+            StateBackendSelector::Parquet,
+            &manifest(vec![OperatorCheckpointMetadata {
+                operator_metadata: None,
+                ..Default::default()
+            }]),
+        )
+        .expect("the selector half has nothing to say about a headerless entry");
     }
 }

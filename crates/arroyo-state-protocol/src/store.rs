@@ -1,6 +1,6 @@
 use crate::types::{CheckpointRef, ProtocolError};
 use arroyo_rpc::errors::StorageError;
-use arroyo_rpc::state_backend::StateBackendError;
+use arroyo_rpc::state_backend::{IncompleteManifest, StateBackendError};
 use arroyo_storage::StorageProvider;
 use async_trait::async_trait;
 use prost::Message;
@@ -49,6 +49,11 @@ pub enum StoreError {
     /// through unchanged so the failure names the checkpoint and the table that disagreed.
     #[error(transparent)]
     StateBackend(#[from] StateBackendError),
+    /// A recovery checkpoint's manifest does not describe exactly the operators the job's
+    /// workers will build. Raised while classifying, before anything is published: the
+    /// inner error names the operators that made the manifest unusable.
+    #[error(transparent)]
+    IncompleteManifest(#[from] IncompleteManifest),
 }
 
 /// Minimal storage interface required by the protocol workflows.

@@ -286,7 +286,7 @@ async fn get_checkpoint_info_legacy<'a>(
         // every attempt.
         if let Some(r) = &row
             && let Err(e) = validate_restored_checkpoint(
-                ctx.config.state_backend,
+                ctx.execution_selector,
                 r.epoch as u64,
                 &r.state_backend,
             )
@@ -354,7 +354,7 @@ async fn get_checkpoint_info_legacy<'a>(
 
             match prepare_restored_checkpoint(
                 &storage_role,
-                ctx.config.state_backend,
+                ctx.execution_selector,
                 &ctx.config.id,
                 info,
                 &restoring,
@@ -587,12 +587,14 @@ async fn get_and_register_checkpoint_info_leader<'a>(
         );
     }
 
-    // Leader mode keeps no `checkpoints` row, so the recovery manifest's own table configs
-    // are the whole persisted record of which backend wrote the checkpoint this generation
-    // would restore from. `initialize_generation` reads and checks them against the job's
-    // selector before it writes either the current-generation file or the new generation
-    // manifest, so a mismatch leaves no published state pointing at a checkpoint this job
-    // may not read, and returns the manifest it validated for use here.
+    // Leader mode keeps no `checkpoints` row, so the recovery manifest is the whole
+    // persisted record of both the backend that wrote the checkpoint this generation would
+    // restore from and the operators it describes. `initialize_generation` reads it and
+    // checks both — that it covers exactly the operators the workers will build, and that
+    // its table configs agree with the job's selector — before it writes either the
+    // current-generation file or the new generation manifest, so a mismatch leaves no
+    // published state pointing at a checkpoint this job cannot restore, and returns the
+    // manifest it validated for use here.
     let new_gen = initialize_generation(
         storage_provider.as_ref(),
         InitializeGenerationRequest {
@@ -600,7 +602,11 @@ async fn get_and_register_checkpoint_info_leader<'a>(
             job_id: JobId(ctx.config.id.clone()),
             generation: Generation(ctx.status.generation),
             updated_at: SystemTime::now(),
-            state_backend: ctx.config.state_backend,
+            state_backend: ctx.execution_selector,
+            // The same derivation the legacy preflight uses, so both modes require the
+            // recovery checkpoint to cover the same set: every operator of every chain,
+            // not just the chain heads.
+            program_operators: ctx.program.tasks_per_operator().into_keys().collect(),
         },
         true,
     )
@@ -925,9 +931,11 @@ impl State for Scheduling {
         });
 
         let checkpoint_interval_micros = ctx.config.checkpoint_interval.as_micros() as u64;
-        // The job's own selector, already validated when the row was read; every worker
-        // in this job — leader and non-leader alike — is started with the same value.
-        let state_backend = ctx.config.state_backend;
+        // The job's own selector, fixed for the life of this execution; every worker in
+        // this job — leader and non-leader alike — is started with the same value. Read
+        // from the execution rather than from the configuration cell, which is refreshed
+        // from the database after every transition.
+        let state_backend = ctx.execution_selector;
 
         let tasks: Vec<_> = worker_connects
             .into_iter()
@@ -1089,6 +1097,7 @@ impl State for Scheduling {
                             id,
                             addr,
                             config().controller.connect_timeout.as_deref().copied(),
+                            ctx.execution_selector,
                         ).await
                             && let Ok(status) = leader_manager.poll_leader_status().await {
                                 match JobState::try_from(status.job_state) {
@@ -1145,7 +1154,7 @@ impl State for Scheduling {
                 let checkpoint_store = Arc::new(DbCheckpointMetadataStore {
                     organization_id: ctx.config.organization_id.clone(),
                     job_id: ctx.config.id.clone(),
-                    state_backend: ctx.config.state_backend,
+                    state_backend: ctx.execution_selector,
                     db: ctx.db.clone(),
                 });
                 let mut controller = JobController::new(
@@ -1186,6 +1195,7 @@ impl State for Scheduling {
                     id,
                     addr.clone(),
                     config().controller.connect_timeout.as_deref().copied(),
+                    ctx.execution_selector,
                 )
                 .await
                 {

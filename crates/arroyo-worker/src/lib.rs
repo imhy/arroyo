@@ -232,6 +232,14 @@ pub struct WorkerState {
     job_status: Arc<Mutex<JobStatus>>,
     checkpoint_history: Arc<Mutex<CheckpointHistory>>,
     metrics: Arc<OnceLock<JobMetrics>>,
+    /// The selector this worker was started with, recorded once so the leader can report
+    /// it to a controller that asks.
+    ///
+    /// A controller that restarts rebuilds its view of a running job from persisted state;
+    /// this is the value the live execution actually has, and answering with it is what
+    /// lets that controller detect a disagreement before it administers the job. Set from
+    /// [`StartExecutionReq::state_backend`] as the execution starts and never reassigned.
+    state_backend: Arc<OnceLock<StateBackendSelector>>,
 }
 
 impl WorkerState {
@@ -348,6 +356,9 @@ impl WorkerState {
         // sequence runs. Both the leader's job controller and this worker's own tasks are
         // handed this one value explicitly.
         let state_backend = request_state_backend(&req, &self.worker_context.job_id)?;
+        // Recorded before any of the start sequence runs, so a leader can answer for the
+        // job's selector from the moment it can answer for the job at all.
+        let _ = self.state_backend.set(state_backend);
 
         let mut registry = new_registry();
         let logical = Arc::new(
@@ -762,6 +773,7 @@ impl WorkerServer {
                 })),
                 checkpoint_history: Arc::new(Mutex::new(CheckpointHistory::default())),
                 metrics: Arc::new(OnceLock::new()),
+                state_backend: Arc::new(OnceLock::new()),
             },
             shutdown_guard,
         }
@@ -1462,6 +1474,18 @@ impl JobStatusGrpc for LeaderServer {
             job_id: req.job_id,
             generation: self.state.worker_context.generation,
             job_status: Some((*self.state.job_status.lock().unwrap()).clone()),
+            // The selector this leader is actually running with, so a controller that
+            // rebuilt its own view of the job from persisted state can check it against
+            // the live execution rather than trust its reconstruction. Reported in the
+            // persisted spelling; unset — which a leader that has not started executing
+            // sends — is the empty string, i.e. parquet.
+            state_backend: self
+                .state
+                .state_backend
+                .get()
+                .map(|s| s.as_str())
+                .unwrap_or_default()
+                .to_string(),
         }))
     }
 
@@ -1529,6 +1553,7 @@ mod tests {
     use super::*;
     use crate::job_controller::JobControllerStatus;
     use arroyo_rpc::checkpoints::{CheckpointMetadataStore, CreateCheckpointReq};
+    use arroyo_rpc::state_backend::validate_leader_selector;
     use arroyo_types::TaskInfo;
 
     fn req(state_backend: &str) -> StartExecutionReq {
@@ -1649,5 +1674,82 @@ mod tests {
             assert_eq!(leader_value, expected.as_str());
             assert_eq!(task_info.state_backend, expected);
         }
+    }
+
+    /// The leader answers for the selector it is actually running with, so a controller
+    /// that rebuilt its own view of the job after a restart can check that view against
+    /// the live execution rather than trust it.
+    ///
+    /// This is the wire half: the response `get_job_status` builds survives prost, and the
+    /// controller's check accepts a leader that agrees and refuses one that does not.
+    #[test]
+    fn the_leader_reports_the_selector_it_is_running_with() {
+        for selector in [
+            StateBackendSelector::Parquet,
+            StateBackendSelector::StateEngine,
+        ] {
+            // Exactly how `LeaderServer::get_job_status` fills the field.
+            let recorded: OnceLock<StateBackendSelector> = OnceLock::new();
+            let _ = recorded.set(selector);
+            let resp = JobStatusResp {
+                job_id: "job_1".to_string(),
+                generation: 1,
+                job_status: None,
+                state_backend: recorded
+                    .get()
+                    .map(|s| s.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+            };
+
+            let decoded = JobStatusResp::decode(&resp.encode_to_vec()[..]).unwrap();
+            validate_leader_selector("job_1", selector, &decoded.state_backend)
+                .expect("a leader running the job's own backend must be accepted");
+
+            let other = match selector {
+                StateBackendSelector::Parquet => StateBackendSelector::StateEngine,
+                StateBackendSelector::StateEngine => StateBackendSelector::Parquet,
+            };
+            assert!(
+                validate_leader_selector("job_1", other, &decoded.state_backend).is_err(),
+                "a leader running another backend must not be attached to"
+            );
+        }
+    }
+
+    /// The compatibility direction: a leader that predates the field — or one whose
+    /// execution has not started yet — sends nothing, which decodes as empty and means
+    /// parquet, so a parquet job attaches to it exactly as before.
+    #[test]
+    fn a_leader_that_records_no_selector_reports_parquet() {
+        let unset: OnceLock<StateBackendSelector> = OnceLock::new();
+        let resp = JobStatusResp {
+            job_id: "job_1".to_string(),
+            generation: 1,
+            job_status: None,
+            state_backend: unset
+                .get()
+                .map(|s| s.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        };
+        assert!(resp.state_backend.is_empty());
+
+        let decoded = JobStatusResp::decode(&resp.encode_to_vec()[..]).unwrap();
+        validate_leader_selector(
+            "job_1",
+            StateBackendSelector::Parquet,
+            &decoded.state_backend,
+        )
+        .expect("a parquet job must still attach to a leader that reports nothing");
+        assert!(
+            validate_leader_selector(
+                "job_1",
+                StateBackendSelector::StateEngine,
+                &decoded.state_backend,
+            )
+            .is_err(),
+            "and a stateengine job must not: such a leader cannot be running stateengine"
+        );
     }
 }

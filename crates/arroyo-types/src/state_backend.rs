@@ -22,7 +22,10 @@
 //!    their own inputs into `(label, raw value)` pairs. The value is also fixed for the
 //!    life of the job: a configuration that changes it on an existing job is refused by
 //!    [`validate_unchanged_job_selector`], because the running workers, their table
-//!    configs, and every checkpoint they have written already carry the old value.
+//!    configs, and every checkpoint they have written already carry the old value. What a
+//!    running job is actually using is asked of the job's own execution — its persisted
+//!    execution record, and [`validate_leader_selector`] for a live worker leader — never
+//!    of the configuration row, which an operator can edit at any time.
 
 use std::fmt;
 use thiserror::Error;
@@ -122,6 +125,9 @@ pub enum SelectorScope {
     Table,
     /// The selector recorded in checkpoint metadata a job is restoring from.
     Checkpoint,
+    /// The selector a live worker leader reports for the job it is running, i.e. the
+    /// value it was handed in its own `StartExecutionReq`.
+    Leader,
 }
 
 impl SelectorScope {
@@ -130,6 +136,7 @@ impl SelectorScope {
         match self {
             Self::Table => "table",
             Self::Checkpoint => "restored checkpoint",
+            Self::Leader => "worker leader for",
         }
     }
 
@@ -150,6 +157,7 @@ impl SelectorScope {
         match self {
             Self::Table => StateBackendError::TableMismatch { label, found, job },
             Self::Checkpoint => StateBackendError::CheckpointMismatch { label, found, job },
+            Self::Leader => StateBackendError::LeaderMismatch { label, found, job },
         }
     }
 }
@@ -272,12 +280,30 @@ pub enum StateBackendError {
         job: StateBackendSelector,
     },
 
+    /// The live worker leader of a job reports a different backend than the controller
+    /// intends to administer it with. See [`validate_leader_selector`].
+    #[error(
+        "{label} is running with state backend \"{found}\", but this controller would \
+         administer it as \"{job}\"; the leader's value is the one its workers, table \
+         configs, and checkpoints were built with"
+    )]
+    LeaderMismatch {
+        /// Which job's leader disagreed, e.g. `worker leader for "job_abc"`.
+        label: String,
+        /// The backend the live leader reports.
+        found: StateBackendSelector,
+        /// The backend this controller recovered for the job.
+        job: StateBackendSelector,
+    },
+
     /// A job that is already running was handed a different selector than the one it
     /// started with. See [`validate_unchanged_job_selector`].
     #[error(
         "{label} is running with state backend \"{running}\", but its configuration now \
          says \"{requested}\"; a job's state backend cannot be changed while it exists — \
-         stop the job and create a new one, or restore the previous value"
+         stop the job and create a new one, or restore the previous value. Either remedy \
+         works with this value still in place: a stop requested alongside it is still \
+         carried out, under the backend the job is running with"
     )]
     JobSelectorChanged {
         /// Which job's selector changed, e.g. `job "job_abc"`.
@@ -305,6 +331,12 @@ pub enum StateBackendError {
 /// job would keep writing state under one authority while being administered under
 /// another.
 ///
+/// Both of those remedies stay available while the bad value is still in the row. Refusing
+/// the selector refuses only the selector: a row that carries a stop request alongside it
+/// is still executed as a stop, under the backend the job is running with and with the
+/// final-checkpoint semantics the stop mode asked for. A refusal that also discarded the
+/// remedy it documents would not be a refusal, it would be a dead end.
+///
 /// `running` is the selector the job is actually running with and `requested` is the one
 /// the new configuration carries; both are already-normalized values, so a row that
 /// changes from `""` to `"parquet"` is not a change at all.
@@ -328,11 +360,41 @@ pub fn validate_unchanged_job_selector(
     })
 }
 
+/// Checks the selector a live worker leader reports against the one a controller is about
+/// to administer that job with.
+///
+/// This is the only check in the system that consults neither a database row nor a
+/// persisted object. A worker leader received its selector in its own `StartExecutionReq`
+/// and has been stamping it into task infos, table configs, and every checkpoint it has
+/// written ever since; it is therefore the live authority for as long as it is running. A
+/// controller that has just been restarted rebuilds its view of the job from persisted
+/// state, and asking the leader is how it finds out that its reconstruction disagrees
+/// *before* it starts administering a job that is still running under something else.
+///
+/// `reported` is the raw value exactly as the leader sent it. The empty string is what a
+/// leader predating the field sends, and — as everywhere else — it means `parquet`, which
+/// is the only backend such a leader can be running. That is what makes the check
+/// backwards compatible in the direction that matters: a parquet job agrees with an old
+/// leader, and a stateengine job does not, which is the conservative answer.
+///
+/// # Errors
+///
+/// Returns [`StateBackendError::UnknownValue`] if the leader reports a value that is
+/// neither empty nor a known backend name, or [`StateBackendError::LeaderMismatch`] if it
+/// reports a different backend than `execution`.
+pub fn validate_leader_selector(
+    job_id: &str,
+    execution: StateBackendSelector,
+    reported: &str,
+) -> Result<(), StateBackendError> {
+    validate_agreement(execution, SelectorScope::Leader, [(job_id, reported)])
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         SelectorScope, StateBackendError, StateBackendSelector, validate_agreement,
-        validate_unchanged_job_selector,
+        validate_leader_selector, validate_unchanged_job_selector,
     };
 
     #[test]
@@ -601,6 +663,65 @@ mod tests {
                 requested: StateBackendSelector::Parquet,
                 ..
             })
+        ));
+    }
+
+    /// The live leader is the authority a restarted controller checks itself against, so
+    /// agreement must be required and a disagreement must be typed and name the job.
+    #[test]
+    fn a_leader_running_another_backend_is_refused() {
+        // Agreement, explicit on both sides.
+        for selector in [
+            StateBackendSelector::Parquet,
+            StateBackendSelector::StateEngine,
+        ] {
+            validate_leader_selector("job_abc", selector, selector.as_str()).unwrap();
+        }
+
+        let err = validate_leader_selector("job_abc", StateBackendSelector::StateEngine, "parquet")
+            .unwrap_err();
+        assert_eq!(
+            err,
+            StateBackendError::LeaderMismatch {
+                label: "worker leader for \"job_abc\"".to_string(),
+                found: StateBackendSelector::Parquet,
+                job: StateBackendSelector::StateEngine,
+            }
+        );
+        let message = err.to_string();
+        assert!(message.contains("job_abc"), "{message}");
+
+        // and symmetrically
+        assert!(matches!(
+            validate_leader_selector("job_abc", StateBackendSelector::Parquet, "stateengine"),
+            Err(StateBackendError::LeaderMismatch {
+                found: StateBackendSelector::StateEngine,
+                job: StateBackendSelector::Parquet,
+                ..
+            })
+        ));
+    }
+
+    /// The compatibility direction, and the conservative one, in a single rule. A leader
+    /// that predates the field reports nothing, which means parquet — the only backend it
+    /// could be running — so a parquet job attaches to it as it always did, and a
+    /// stateengine job refuses to, because such a leader cannot be running stateengine.
+    #[test]
+    fn a_leader_that_reports_no_backend_means_parquet() {
+        validate_leader_selector("job_abc", StateBackendSelector::Parquet, "").unwrap();
+
+        assert!(matches!(
+            validate_leader_selector("job_abc", StateBackendSelector::StateEngine, ""),
+            Err(StateBackendError::LeaderMismatch {
+                found: StateBackendSelector::Parquet,
+                ..
+            })
+        ));
+
+        // and a value nobody recognizes is never downgraded to either of them
+        assert!(matches!(
+            validate_leader_selector("job_abc", StateBackendSelector::Parquet, "rocksdb"),
+            Err(StateBackendError::UnknownValue { ref value, .. }) if value == "rocksdb"
         ));
     }
 }

@@ -122,6 +122,7 @@ mod tests {
     use arroyo_rpc::state_backend::{StateBackendError, StateBackendSelector};
     use arroyo_types::{JobId, PipelineId, from_micros};
     use prost::Message;
+    use std::collections::HashSet;
     use std::time::SystemTime;
 
     fn checkpoint_ref(path: &str) -> CheckpointRef {
@@ -286,6 +287,13 @@ mod tests {
             .into(),
             table_configs: Default::default(),
         }
+    }
+
+    /// A manifest entry headed for `operator_id`, as the checkpoint writer heads them.
+    fn named_operator(operator_id: &str) -> OperatorCheckpointMetadata {
+        let mut operator = global_operator(vec![]);
+        operator.operator_metadata.as_mut().unwrap().operator_id = operator_id.to_string();
+        operator
     }
 
     fn expiring_operator(
@@ -1031,6 +1039,7 @@ mod tests {
                 generation: Generation(1),
                 updated_at: from_micros(123),
                 state_backend: StateBackendSelector::Parquet,
+                program_operators: HashSet::new(),
             },
             false,
         )
@@ -1097,6 +1106,7 @@ mod tests {
                 generation: Generation(2),
                 updated_at: from_micros(456),
                 state_backend: StateBackendSelector::Parquet,
+                program_operators: HashSet::from(["op".to_string()]),
             },
             true,
         )
@@ -1160,6 +1170,7 @@ mod tests {
                 generation: Generation(2),
                 updated_at: from_micros(456),
                 state_backend: StateBackendSelector::Parquet,
+                program_operators: HashSet::from(["op".to_string()]),
             },
             true,
         )
@@ -1199,6 +1210,130 @@ mod tests {
         );
     }
 
+    /// Finding 2, in the four shapes a manifest can fail to describe a program.
+    ///
+    /// Publishing a generation is what commits a job to a recovery checkpoint, so a
+    /// manifest that cannot restore the program the workers will build has to be refused
+    /// *before* either the current-generation file or the new generation manifest is
+    /// written. The recording store is the assertion: after the fixture is in place, a
+    /// rejected initialization must not write a single object.
+    ///
+    /// Each shape fails only in a worker if it gets past here — the omitted operator and
+    /// the headerless entry cannot be found by the operator that looks itself up, the
+    /// extra one means the checkpoint belongs to a different program, and the duplicate
+    /// leaves it undefined which entry would be restored — by which point the protocol
+    /// state has already advanced.
+    #[tokio::test]
+    async fn initialize_generation_refuses_every_unrestorable_manifest_shape() {
+        let headerless = OperatorCheckpointMetadata {
+            operator_metadata: None,
+            ..Default::default()
+        };
+
+        let mut problems: Vec<String> = vec![];
+
+        for (name, operators, program, expect) in [
+            (
+                "missing",
+                vec![named_operator("op")],
+                vec!["op", "other"],
+                "other",
+            ),
+            (
+                "extra",
+                vec![named_operator("op"), named_operator("gone")],
+                vec!["op"],
+                "gone",
+            ),
+            (
+                "duplicate",
+                vec![named_operator("op"), named_operator("op")],
+                vec!["op"],
+                "more than once",
+            ),
+            (
+                "headerless",
+                vec![named_operator("op"), headerless.clone()],
+                vec!["op"],
+                "no operator metadata header",
+            ),
+        ] {
+            let store = MemoryProtocolStore::default();
+            let paths = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J"));
+            write_current_generation(&store, &paths, Generation(1)).await;
+
+            let checkpoint_ref = paths.checkpoint_manifest(Generation(1), Epoch(1));
+            let mut checkpoint = checkpoint_for_generation(Generation(1), 1, None, false);
+            checkpoint.operators = operators;
+            write_canonical_checkpoint(&store, &paths, &checkpoint_ref, &checkpoint).await;
+            put_json(
+                &store,
+                &paths.generation_manifest(Generation(1)),
+                &generation_manifest_for_generation(
+                    Generation(1),
+                    None,
+                    Some(checkpoint_ref.clone()),
+                ),
+            )
+            .await
+            .unwrap();
+
+            store.forget_writes();
+
+            let outcome = initialize_generation(
+                &store,
+                InitializeGenerationRequest {
+                    pipeline_id: PipelineId::new("P"),
+                    job_id: JobId::new("J"),
+                    generation: Generation(2),
+                    updated_at: from_micros(456),
+                    state_backend: StateBackendSelector::Parquet,
+                    program_operators: program.iter().map(|s| s.to_string()).collect(),
+                },
+                true,
+            )
+            .await;
+
+            // Collected rather than asserted one shape at a time, so a run reports every
+            // shape that got through instead of stopping at the first.
+            match outcome {
+                Ok(_) => problems.push(format!("{name}: this manifest must not be published")),
+                Err(StoreError::IncompleteManifest(incomplete))
+                    if incomplete.detail.contains(expect) => {}
+                Err(other) => problems.push(format!(
+                    "{name}: expected an incomplete-manifest error naming {expect:?}, got \
+                     {other:?}"
+                )),
+            }
+
+            if !store.written_objects().is_empty() {
+                problems.push(format!(
+                    "{name}: no protocol state may be published for a manifest that cannot \
+                     restore the program, but {:?} was written",
+                    store.written_objects()
+                ));
+            }
+            let current: CurrentGeneration = read_json(&store, &paths.current_generation())
+                .await
+                .unwrap()
+                .expect("the previous current generation should still be there");
+            if current.generation != Generation(1) {
+                problems.push(format!("{name}: the current generation was advanced"));
+            }
+            if read_json::<_, GenerationManifest>(&store, &paths.generation_manifest(Generation(2)))
+                .await
+                .unwrap()
+                .is_some()
+            {
+                problems.push(format!(
+                    "{name}: the new generation manifest must not have been written"
+                ));
+            }
+        }
+
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
     #[tokio::test]
     async fn initialize_generation_restores_previous_ready_checkpoint() {
         let store = MemoryProtocolStore::default();
@@ -1226,6 +1361,7 @@ mod tests {
                 generation: Generation(2),
                 updated_at: from_micros(456),
                 state_backend: StateBackendSelector::Parquet,
+                program_operators: HashSet::new(),
             },
             false,
         )
@@ -1285,6 +1421,7 @@ mod tests {
                 generation: Generation(2),
                 updated_at: from_micros(456),
                 state_backend: StateBackendSelector::Parquet,
+                program_operators: HashSet::new(),
             },
             false,
         )
@@ -1335,6 +1472,7 @@ mod tests {
                 generation: Generation(3),
                 updated_at: from_micros(789),
                 state_backend: StateBackendSelector::Parquet,
+                program_operators: HashSet::new(),
             },
             false,
         )
@@ -1383,6 +1521,7 @@ mod tests {
                 generation: Generation(2),
                 updated_at: from_micros(456),
                 state_backend: StateBackendSelector::Parquet,
+                program_operators: HashSet::new(),
             },
             false,
         )
@@ -1440,6 +1579,7 @@ mod tests {
                 generation: Generation(3),
                 updated_at: from_micros(456),
                 state_backend: StateBackendSelector::Parquet,
+                program_operators: HashSet::new(),
             },
             false,
         )
@@ -1507,6 +1647,7 @@ mod tests {
                 generation: Generation(3),
                 updated_at: from_micros(456),
                 state_backend: StateBackendSelector::Parquet,
+                program_operators: HashSet::new(),
             },
             false,
         )
@@ -1546,6 +1687,7 @@ mod tests {
                 generation: Generation(2),
                 updated_at: from_micros(456),
                 state_backend: StateBackendSelector::Parquet,
+                program_operators: HashSet::new(),
             },
             false,
         )

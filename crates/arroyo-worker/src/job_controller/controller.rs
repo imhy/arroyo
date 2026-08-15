@@ -166,6 +166,12 @@ impl WorkerJobController {
                 // The leader validates the checkpoint it is about to recover from against
                 // the job's selector, and does so before this generation is published.
                 state_backend,
+                // ...and against the operators this program's workers will actually
+                // build. Every one of them looks itself up in the recovery manifest as it
+                // constructs its state, so a manifest that does not describe exactly this
+                // set fails in a worker rather than here, once the generation has already
+                // been published.
+                program_operators: program.tasks_per_operator().into_keys().collect(),
             },
             false,
         )

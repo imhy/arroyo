@@ -12,6 +12,7 @@ use arroyo_rpc::grpc::rpc;
 use arroyo_rpc::grpc::rpc::job_status_grpc_client::JobStatusGrpcClient;
 use arroyo_rpc::grpc::rpc::{JobState, JobStatusReq, JobStopMode, StopJobReq};
 use arroyo_rpc::identity::InjectWorkerId;
+use arroyo_rpc::state_backend::{StateBackendSelector, validate_leader_selector};
 use arroyo_rpc::{job_status_client, retry};
 use arroyo_types::{JobId, PipelineId, WorkerId};
 use std::time::{Duration, Instant};
@@ -24,10 +25,27 @@ pub struct LeaderManager {
     pub job_id: JobId,
     pub pipeline_id: PipelineId,
     pub generation: u64,
+    /// The selector the controller is administering this job with, checked against the
+    /// one the live leader reports on every status poll.
+    execution_selector: StateBackendSelector,
     pub last_heartbeat: Instant,
 }
 
 impl LeaderManager {
+    /// Connects to a job's live worker leader, and refuses to attach to one that is
+    /// running the job on a different state backend.
+    ///
+    /// `execution_selector` is what this controller believes the job's backend is. A
+    /// controller that has just restarted rebuilt that belief from persisted state, while
+    /// the leader has been running with the value it was handed in its own
+    /// `StartExecutionReq` — so the agreement is checked here, before the manager is
+    /// handed to any state, rather than left to be discovered by a checkpoint, a cleanup,
+    /// or a restore that acts under the wrong one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the leader cannot be reached, if it is running a different job
+    /// or generation, or if it reports a different state backend.
     pub async fn connect(
         job_id: JobId,
         pipeline_id: PipelineId,
@@ -35,6 +53,7 @@ impl LeaderManager {
         worker_id: WorkerId,
         address: String,
         connect_timeout: Option<Duration>,
+        execution_selector: StateBackendSelector,
     ) -> anyhow::Result<Self> {
         let leader_client = retry!(
             job_status_client(
@@ -56,13 +75,21 @@ impl LeaderManager {
             )
         )?;
 
-        Ok(Self {
+        let mut this = Self {
             job_id,
             pipeline_id,
             generation,
+            execution_selector,
             leader_client,
             last_heartbeat: Instant::now(),
-        })
+        };
+
+        // The handshake. `poll_leader_status` is what validates the reported selector, so
+        // one poll here means no caller can ever hold a manager for a leader that has not
+        // agreed at least once.
+        this.poll_leader_status().await?;
+
+        Ok(this)
     }
 
     pub async fn poll_leader_status(&mut self) -> anyhow::Result<rpc::JobStatus> {
@@ -100,6 +127,17 @@ impl LeaderManager {
                 response.generation
             );
         }
+
+        // The live leader owns the selector it was started with; this controller's value
+        // was recovered from persisted state and may have been rebuilt after a restart.
+        // Checked on every poll rather than only at connect, because a leader that has
+        // been replaced under a running manager is exactly the case a one-off check
+        // would miss.
+        validate_leader_selector(
+            &self.job_id,
+            self.execution_selector,
+            &response.state_backend,
+        )?;
 
         let status = response
             .job_status

@@ -1269,10 +1269,32 @@ pub struct LeaderContext {
     pub generation: u64,
 }
 
+/// The controller's own durable record of a job's *execution*, kept in the
+/// `job_statuses.state_context` column.
+///
+/// Everything here is written by the controller about a job that is running, and is read
+/// back when a controller starts up and has to rebuild its view of jobs it did not start.
+/// That is what separates it from the `job_configs` row, which is the operator's editable
+/// request: a value that must survive an edit to that row has to live here.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StateContext {
     pub version: u32,
     pub leader: Option<LeaderContext>,
+    /// The state backend this execution of the job is running with, in its persisted
+    /// spelling (`"parquet"` or `"stateengine"`), as recorded when the job's state
+    /// machine was created.
+    ///
+    /// The job's workers, their table configs, and every checkpoint they have written
+    /// carry this value, so a controller that restarts must recover *this* rather than
+    /// re-read `job_configs.state_backend` — that column can have been edited in the
+    /// meantime, and adopting the edited value would let a rebuilt controller administer
+    /// a still-running job under a backend it is not using (M11.T08d).
+    ///
+    /// `None` means the record predates this field: the job's execution was started by a
+    /// build that had no selector at all, so it is parquet. It is deliberately not
+    /// defaulted to the config row's value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_selector: Option<String>,
 }
 
 #[cfg(test)]

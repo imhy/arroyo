@@ -13,8 +13,11 @@ use crate::types::{
     validate_epoch_record_matches_checkpoint,
 };
 use arroyo_rpc::grpc::rpc::CheckpointManifest;
-use arroyo_rpc::state_backend::{StateBackendSelector, validate_restored_manifest};
+use arroyo_rpc::state_backend::{
+    StateBackendSelector, validate_manifest_covers_program, validate_restored_manifest,
+};
 use arroyo_types::{JobId, PipelineId, to_micros};
+use std::collections::HashSet;
 use std::time::SystemTime;
 
 /// Request to claim canonical ownership of a checkpoint's epoch.
@@ -77,6 +80,16 @@ pub struct InitializeGenerationRequest {
     /// job cannot advance persistent protocol state towards a checkpoint it is not
     /// allowed to read.
     pub state_backend: StateBackendSelector,
+    /// Every operator id the job's workers will construct, i.e. the key set of
+    /// `LogicalProgram::tasks_per_operator` for the *current* program.
+    ///
+    /// The recovery checkpoint's manifest has to describe exactly these, one valid entry
+    /// each, before the generation is published: each of these operators looks itself up
+    /// in that manifest as it builds its state, so a manifest that omits one, describes
+    /// one the program does not contain, or describes one twice fails in a worker — after
+    /// the protocol state has already advanced. This is the same source of truth the
+    /// legacy restore preflight uses.
+    pub program_operators: HashSet<String>,
 }
 
 /// Checkpoint, if any, that a newly initialized generation should restore from.
@@ -238,14 +251,22 @@ pub enum CommitAuthorization {
 /// If `update_current_generation` is set, this method will write the current generation
 /// file. If not set, it will read the current generation and enforce conformance.
 ///
-/// # Selector validation and write ordering
+/// # Recovery-checkpoint validation and write ordering
 ///
 /// Publishing a generation is what commits this job to a recovery checkpoint: the current
 /// generation file names the generation, and the generation manifest records its link to
 /// the checkpoint it will restore from. Both are persistent protocol state, so the
-/// recovery checkpoint has to be resolved, read, and checked against
-/// `request.state_backend` *before* either of them is written — validating afterwards
-/// would report the mismatch only once the job had already advanced.
+/// recovery checkpoint has to be resolved, read, and checked *before* either of them is
+/// written — validating afterwards would report the problem only once the job had already
+/// advanced.
+///
+/// Two things are checked, and both are whole-set claims about the manifest rather than
+/// per-entry ones:
+///
+/// 1. It must describe exactly `request.program_operators`, one entry each, carrying an
+///    operator header. Every one of those operators looks itself up in this manifest as it
+///    builds its state; an entry the manifest merely happens to contain proves nothing.
+/// 2. Every table config in it must agree with `request.state_backend`.
 ///
 /// The resolved manifest is returned in
 /// [`GenerationInitialization::Initialized::recovery_checkpoint`] so callers use the same
@@ -253,10 +274,11 @@ pub enum CommitAuthorization {
 ///
 /// # Errors
 ///
-/// Returns [`StoreError::StateBackend`] if the recovery checkpoint was written by a
-/// different backend than the job selects, or names an unknown one. In that case nothing
-/// has been written: the previous generation and its manifest are untouched, and the
-/// checkpoint remains restorable by a job that does select its backend.
+/// Returns [`StoreError::IncompleteManifest`] if the recovery checkpoint does not describe
+/// exactly the operators the job's workers will build, or [`StoreError::StateBackend`] if
+/// it was written by a different backend than the job selects or names an unknown one. In
+/// either case nothing has been written: the previous generation and its manifest are
+/// untouched, and the checkpoint remains restorable by a job it does fit.
 pub async fn initialize_generation<S>(
     store: &S,
     request: InitializeGenerationRequest,
@@ -311,6 +333,15 @@ where
                         checkpoint_ref: checkpoint_ref.clone(),
                     })
                 })?;
+            // Set arithmetic first: it needs nothing but the object already in hand, and
+            // a manifest that cannot restore this program must be refused before the
+            // generation that would commit the job to it is published.
+            let restoring: HashSet<&str> = request
+                .program_operators
+                .iter()
+                .map(String::as_str)
+                .collect();
+            validate_manifest_covers_program(&checkpoint, &restoring)?;
             validate_restored_manifest(request.state_backend, &checkpoint)?;
             Some(checkpoint)
         }
