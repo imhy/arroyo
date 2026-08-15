@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use std::{fmt::Debug, sync::Arc};
 
@@ -34,7 +35,8 @@ use crate::job_controller::JobController;
 use crate::queries::controller_queries;
 use crate::types::public::{LogLevel, RestartMode, StopMode};
 use crate::{
-    JobConfig, JobMessage, JobStatus, PipelineInfo, PolledJob, queries, schedulers::Scheduler,
+    JobConfig, JobMessage, JobStatus, PipelineInfo, PolledJob, RefusedConfig, queries,
+    schedulers::Scheduler,
 };
 use arroyo_datastream::logical::LogicalProgram;
 use arroyo_rpc::config::{JobControllerMode, config};
@@ -657,15 +659,30 @@ pub struct JobContext<'a> {
 ///
 /// # Errors
 ///
-/// Returns a fatal [`StateError`] for [`JobMessage::ConfigRefused`]. Every other message
-/// is logged and ignored.
+/// Returns a fatal [`StateError`] for a [`JobMessage::ConfigRefused`] that still describes
+/// the job's configuration. A refusal that has been superseded since it was queued — the
+/// operator repaired the row, a different refusal replaced it, or a stop is answering it —
+/// is discarded, because failing the job would fail it for a configuration that no longer
+/// exists. Every other message is logged and ignored.
 pub(crate) fn handle_unhandled_message(
     job_id: &str,
     pipeline_id: &str,
     msg: JobMessage,
 ) -> Result<(), StateError> {
     match msg {
-        JobMessage::ConfigRefused(e) => {
+        JobMessage::ConfigRefused(refusal) => {
+            let Some(e) = refusal.into_current_error() else {
+                // The queue is FIFO and a message in it cannot be retracted, so this is
+                // the only place the race can be resolved: the row this refusal describes
+                // has already been repaired or replaced.
+                info!(
+                    %job_id,
+                    pipeline_id,
+                    "discarding a configuration refusal that no longer describes the job's \
+                     configuration"
+                );
+                return Ok(());
+            };
             error!(
                 %job_id,
                 pipeline_id,
@@ -1200,15 +1217,38 @@ enum AppliedStatus {
     NotApplied,
 }
 
-/// A refused configuration, and whether the job's state machine has been told about it.
+/// What has been done about a refusal, on the sending side.
 ///
-/// `delivered` is what makes repeated refusal delivery idempotent: a refusal that has
-/// reached the state machine is never sent again, and one that has not — because the
-/// job's own queue was full at the time — is offered again on the next poll rather than
-/// dropped or waited for.
+/// This is what makes repeated refusal delivery idempotent: the row stays bad until an
+/// operator fixes it, so it is polled again every 500ms and must not produce a message
+/// each time.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum RefusalDelivery {
+    /// A [`JobMessage::ConfigRefused`] carrying this refusal is with the job's queue, or
+    /// there was no live queue to give it to. Nothing more to send.
+    Sent,
+    /// The job's queue was full. Nothing is lost — the same refusal, at the same version,
+    /// is offered again on the next poll.
+    Pending,
+    /// No refusal message exists for this one and none will be sent: the job is being
+    /// stopped instead, which is what the refused row itself asked for
+    /// (see [`StateMachine::apply_refused_row`]).
+    AnsweredByStop,
+}
+
+/// A refused configuration, its version, and what has been done about it.
+///
+/// `version` is the sending half of [`crate::RefusedConfig`]: a queued refusal cannot be
+/// retracted, so the only way a repaired row can stop an already-queued refusal from
+/// failing the job is for the receiver to be able to tell that the refusal it is holding
+/// is not the one the state machine is now under. Every change of refusal state — raising
+/// a different one, clearing one because the row was repaired, or handing one over to a
+/// stop — advances [`StateMachine::refusal_version`], and a message stamped with an older
+/// version is discarded on receipt.
 struct Refusal {
     error: StateBackendError,
-    delivered: bool,
+    version: u64,
+    delivery: RefusalDelivery,
 }
 
 /// What became of a message offered to a job's own queue, without ever waiting for it.
@@ -1253,6 +1293,15 @@ pub struct StateMachine {
     /// delivery idempotent: it is offered until it is taken, then never again unless it
     /// changes.
     refusal: Option<Refusal>,
+    /// The version of the refusal the job is currently under.
+    ///
+    /// Shared with every [`crate::RefusedConfig`] this state machine has ever queued, so a
+    /// refusal that has not been read yet can still be told apart from the one that
+    /// describes the job now. Advanced whenever the refusal state changes; never reset.
+    ///
+    /// It is per job and threaded through the job's own messages — no static, thread-local
+    /// or global registry — for the same reason [`Self::execution_selector`] is.
+    refusal_version: Arc<AtomicU64>,
     pub(crate) state: Arc<RwLock<String>>,
     metrics: Arc<tokio::sync::RwLock<HashMap<Arc<String>, JobMetrics>>>,
     db: DatabaseSource,
@@ -1291,17 +1340,20 @@ impl StateMachine {
             config: Arc::new(RwLock::new((config, AppliedStatus::NotApplied))),
             execution_selector,
             refusal: None,
+            refusal_version: Arc::new(AtomicU64::new(0)),
             state: Arc::new(RwLock::new(status.state.clone())),
             metrics,
             db,
             scheduler,
         };
 
-        this.start(status, shutdown_guard).await;
+        this.start(status.clone(), shutdown_guard.clone_temporary())
+            .await;
 
         if let Some(error) = refusal {
             let refused = this.config.read().unwrap().0.clone();
-            this.apply_refused_row(error, &refused);
+            this.apply_refused_row(error, &refused, status, &shutdown_guard)
+                .await;
         }
 
         this
@@ -1402,14 +1454,8 @@ impl StateMachine {
 
         if let Some(initial_state) = initial_state {
             status.state = initial_state.name().to_string();
-            // Recorded before this execution does anything else, and carried by every
-            // later status write, so a controller that restarts recovers the backend this
-            // job is running with from the job's own execution record instead of from the
-            // configuration row — which an operator can edit while the controller is down.
-            status.state_context.execution_selector =
-                Some(self.execution_selector.as_str().to_string());
-            status.update_db(&self.db).await.unwrap();
             let (tx, rx) = channel(1024);
+            let started;
             {
                 let config = self.config.clone();
                 // The job's selector, fixed for the life of the state machine and handed
@@ -1420,7 +1466,35 @@ impl StateMachine {
                 let scheduler = self.scheduler.clone();
                 let metrics = self.metrics.clone();
                 let pipeline_id = config.read().unwrap().0.pipeline_id;
-                match Self::get_program(&db, &status.id, pipeline_id).await {
+                // Loaded before anything durable is written, because whether this call
+                // succeeds is the difference between a job that has an execution and a job
+                // that does not — and the execution selector must only be recorded for one
+                // that does.
+                let program = Self::get_program(&db, &status.id, pipeline_id).await;
+
+                if matches!(program, Ok(Some(_))) {
+                    // Recorded at the one moment the execution actually begins: the
+                    // program is loaded and the state task is about to run under this
+                    // selector. Recording it any earlier wrote a selector for a job that
+                    // never started — and because a recorded selector is authority that
+                    // outranks the configuration row, that guess could not be corrected by
+                    // any later poll, so a job the controller could not start was pinned
+                    // to a backend it had never used.
+                    //
+                    // Carried by every later status write, so a controller that restarts
+                    // recovers the backend this job is running with from the job's own
+                    // execution record instead of from the configuration row — which an
+                    // operator can edit while the controller is down.
+                    status.state_context.execution_selector =
+                        Some(self.execution_selector.as_str().to_string());
+                }
+
+                // The state itself is written either way, exactly as before: a recovered
+                // job's status must reflect the state it was recovered into whether or not
+                // its program could be loaded.
+                status.update_db(&self.db).await.unwrap();
+
+                started = match program {
                     Ok(Some((program, pipeline_info))) => {
                         let pipeline_info = Arc::new(pipeline_info);
                         let pipeline_id = pipeline_info.pipeline_id.clone();
@@ -1451,18 +1525,27 @@ impl StateMachine {
                             );
                             Ok(())
                         });
+                        true
                     }
                     Ok(None) => {
                         // this is a bad/old pipeline, skip it
+                        false
                     }
                     Err(e) => {
                         // something went wrong, we'll retry on the next go around
                         warn!(job_id = %status.id, "Failed to start job: {:?}", e);
+                        false
                     }
-                }
+                };
             }
 
-            self.tx = Some(tx);
+            // Only a state task that actually took the receiving end gets to be the job's
+            // queue. Installing the sender unconditionally advertised a channel whose
+            // receiver had already been dropped, so every later `offer` reported
+            // `Inactive` for a state machine that had explicitly promised to retry — and a
+            // caller that treats `Inactive` as delivery loses the message. `done()` is
+            // true either way, so the retry itself is unaffected.
+            self.tx = started.then_some(tx);
         }
     }
 
@@ -1503,11 +1586,16 @@ impl StateMachine {
         }
 
         if let Some(error) = refusal {
-            self.apply_refused_row(error, &config);
+            self.apply_refused_row(error, &config, status, shutdown_guard)
+                .await;
             return;
         }
 
-        self.refusal = None;
+        // The row is good again. Clearing the refusal also supersedes any `ConfigRefused`
+        // still unread in the job's queue: without that, a row repaired between the poll
+        // that raised the refusal and the state that reads it would still fail the job,
+        // for a configuration that no longer exists.
+        self.clear_refusal();
 
         if self.config.read().unwrap().0 != config {
             match self.offer(JobMessage::ConfigUpdate(config.clone())) {
@@ -1552,10 +1640,17 @@ impl StateMachine {
     /// Everything else about the row is still discarded: the stop is issued on top of the
     /// configuration the job's workers, table configs, and checkpoints were built from,
     /// with the refused selector and the refused restart nonce nowhere in it.
-    fn apply_refused_row(&mut self, error: StateBackendError, refused: &JobConfig) {
+    async fn apply_refused_row(
+        &mut self,
+        error: StateBackendError,
+        refused: &JobConfig,
+        status: JobStatus,
+        shutdown_guard: &ShutdownGuard,
+    ) {
         if refused.stop_mode != StopMode::none {
             self.note_refusal(error);
-            self.request_stop(refused.stop_mode, &refused.id);
+            self.request_stop(refused.stop_mode, &refused.id, status, shutdown_guard)
+                .await;
             return;
         }
 
@@ -1568,10 +1663,26 @@ impl StateMachine {
     /// state backend and the restart nonce — is copied from the shared configuration, so
     /// the job stops as itself rather than restarting or rescheduling as something else.
     ///
-    /// Idempotent by construction: the request is stored once it has been delivered, so a
-    /// row that keeps asking for the same stop on every poll produces one message, and a
-    /// full queue simply means the same request is offered again 500ms later.
-    fn request_stop(&mut self, stop_mode: StopMode, job_id: &str) {
+    /// Idempotent by construction: the request is recorded in the shared configuration once
+    /// something is actually going to execute it, so a row that keeps asking for the same
+    /// stop on every poll produces one message, and a full queue simply means the same
+    /// request is offered again 500ms later.
+    ///
+    /// "Actually going to execute it" is the whole of the `Inactive` case. A stopped state
+    /// machine is not delivery: recording the mode against one would make every later poll
+    /// short-circuit on "the job is already stopping" while nothing ever stopped it, and
+    /// the job would sit in that state until an operator noticed. `Inactive` is reachable
+    /// with a refused row — [`Self::start`] leaves the job with no queue when its program
+    /// cannot be loaded, and explicitly promises to retry — so the stop restarts the state
+    /// machine exactly as an accepted update does, and if that restart does not take, the
+    /// request is put back so the next poll offers it again.
+    async fn request_stop(
+        &mut self,
+        stop_mode: StopMode,
+        job_id: &str,
+        status: JobStatus,
+        shutdown_guard: &ShutdownGuard,
+    ) {
         let stop = {
             let current = self.config.read().unwrap();
             if current.0.stop_mode == stop_mode {
@@ -1584,7 +1695,7 @@ impl StateMachine {
         };
 
         match self.offer(JobMessage::ConfigUpdate(stop.clone())) {
-            Delivery::Delivered | Delivery::Inactive => {
+            Delivery::Delivered => {
                 *self.config.write().unwrap() = (stop, AppliedStatus::NotApplied);
             }
             Delivery::Full => {
@@ -1593,13 +1704,46 @@ impl StateMachine {
                     "job queue is full; deferring a refused row's stop request to the next poll"
                 );
             }
+            Delivery::Inactive => {
+                // Stored before the restart, so the state task reads the stop from the
+                // shared configuration the moment it comes up.
+                let previous = std::mem::replace(
+                    &mut *self.config.write().unwrap(),
+                    (stop, AppliedStatus::NotApplied),
+                );
+
+                self.start(status, shutdown_guard.clone_temporary()).await;
+
+                if self.done() {
+                    // Nothing came up to execute it — a program that still cannot be
+                    // loaded, most likely. Put the configuration back rather than leave a
+                    // stop recorded that no one is acting on, so the next poll offers it
+                    // again instead of short-circuiting on it.
+                    *self.config.write().unwrap() = previous;
+                    warn!(
+                        %job_id,
+                        "could not restart the job's state machine to execute a refused \
+                         row's stop request; it will be offered again on the next poll"
+                    );
+                }
+            }
         }
     }
 
     /// Records a refusal that is being answered by stopping the job rather than by failing
     /// it, so it is reported once and no [`JobMessage::ConfigRefused`] is ever sent for it.
+    ///
+    /// Taking a refusal over also *supersedes* any refusal message still unread in the
+    /// job's queue. Without that, a row edited from "bad selector" to "bad selector plus a
+    /// stop" would have the stop queued behind a refusal already on its way, and the job
+    /// would be failed by the older message before the stop it asked for was executed —
+    /// losing exactly the final-checkpoint semantics that stop existed for.
     fn note_refusal(&mut self, error: StateBackendError) {
-        if self.refusal.as_ref().is_some_and(|r| r.error == error) {
+        if self
+            .refusal
+            .as_ref()
+            .is_some_and(|r| r.error == error && r.delivery == RefusalDelivery::AnsweredByStop)
+        {
             return;
         }
 
@@ -1609,10 +1753,33 @@ impl StateMachine {
             "refusing the job's persisted state backend; executing the stop the same row \
              requests, under the state backend the job is running with"
         );
+        let version = self.next_refusal_version();
         self.refusal = Some(Refusal {
             error,
-            delivered: true,
+            version,
+            delivery: RefusalDelivery::AnsweredByStop,
         });
+    }
+
+    /// Supersedes whatever refusal the job was under, and returns the version that
+    /// describes it now.
+    ///
+    /// Any [`JobMessage::ConfigRefused`] still sitting unread in the job's queue was
+    /// stamped with an older version and will be discarded when a state reads it.
+    fn next_refusal_version(&mut self) -> u64 {
+        self.refusal_version.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Forgets the refusal the job's configuration was under, because the row is good
+    /// again.
+    ///
+    /// The bookkeeping alone is not enough: the queue is FIFO and a message already in it
+    /// cannot be retracted, so the version is advanced too, which is what lets the state
+    /// task tell that the refusal it eventually reads no longer describes the job.
+    fn clear_refusal(&mut self) {
+        if self.refusal.take().is_some() {
+            self.next_refusal_version();
+        }
     }
 
     /// Refuses the job's persisted configuration and fails the job.
@@ -1632,33 +1799,59 @@ impl StateMachine {
     /// If the state machine has already stopped there is nothing to fail and nothing to
     /// restart: unlike an accepted update, no restart is attempted, because restarting is
     /// exactly what a refused row must not cause.
+    ///
+    /// Coalescing alone does not make the refusal safe to deliver late. Between the poll
+    /// that queues it and the state that reads it, the operator can repair the row — the
+    /// remedy the refusal itself asks for — and the queued message cannot be retracted. So
+    /// every refusal is stamped with [`Self::refusal_version`], and a version the state
+    /// machine has since moved past is discarded on receipt instead of failing the job.
     pub(crate) fn refuse_config(&mut self, error: StateBackendError) {
         let job_id = self.config.read().unwrap().0.id.clone();
 
-        match &self.refusal {
+        let version = match &self.refusal {
             // Already with the state machine, and unchanged. Nothing to say and nothing
             // to send.
-            Some(refusal) if refusal.error == error && refusal.delivered => return,
-            // Known, but the job's queue was full last time. Retry quietly.
-            Some(refusal) if refusal.error == error => {}
+            Some(refusal)
+                if refusal.error == error && refusal.delivery == RefusalDelivery::Sent =>
+            {
+                return;
+            }
+            // Known, but the job's queue was full last time. Retry quietly, at the same
+            // version: this is the same refusal, not a new one.
+            Some(refusal)
+                if refusal.error == error && refusal.delivery == RefusalDelivery::Pending =>
+            {
+                refusal.version
+            }
+            // A different refusal, none at all, or one a stop was answering: whatever the
+            // job's queue may still hold is superseded and this one is raised afresh.
             _ => {
                 error!(job_id = %job_id, error = %error, "refusing the job's persisted configuration");
+                self.next_refusal_version()
             }
-        }
+        };
 
-        let delivered = match self.offer(JobMessage::ConfigRefused(error.clone())) {
-            Delivery::Delivered => true,
+        let delivery = match self.offer(JobMessage::ConfigRefused(RefusedConfig::new(
+            error.clone(),
+            version,
+            Arc::clone(&self.refusal_version),
+        ))) {
+            Delivery::Delivered => RefusalDelivery::Sent,
             Delivery::Inactive => {
                 debug!(
                     job_id = %job_id,
                     "state machine is already stopped; not restarting it for a refused config"
                 );
-                true
+                RefusalDelivery::Sent
             }
-            Delivery::Full => false,
+            Delivery::Full => RefusalDelivery::Pending,
         };
 
-        self.refusal = Some(Refusal { error, delivered });
+        self.refusal = Some(Refusal {
+            error,
+            version,
+            delivery,
+        });
     }
 
     /// Offers a message to the job's own queue without ever waiting for capacity.
@@ -1719,18 +1912,22 @@ mod tests {
     use crate::schedulers::{Scheduler, SchedulerError, StartPipelineReq};
     use crate::types::public::{RestartMode, StopMode};
     use crate::{
-        JobConfig, JobMessage, JobStatus, PipelineInfo, PolledJob, StateContext, states::StateError,
+        JobConfig, JobMessage, JobStatus, PipelineInfo, PolledJob, RefusedConfig, StateContext,
+        states::StateError,
     };
     use arroyo_datastream::logical::LogicalProgram;
+    use arroyo_rpc::grpc::api::ArrowProgram;
     use arroyo_rpc::grpc::rpc::{HeartbeatNodeReq, RegisterNodeReq, WorkerFinishedReq};
     use arroyo_rpc::state_backend::{StateBackendError, StateBackendSelector};
     use arroyo_server_common::shutdown::{Shutdown, SignalBehavior};
     use arroyo_types::{PipelineId, WorkerId};
     use cornucopia_async::DatabaseSource;
+    use prost::Message as _;
     use std::collections::HashMap;
+    use std::sync::atomic::AtomicU64;
     use std::sync::{Arc, Mutex, RwLock};
     use std::time::{Duration, Instant};
-    use tokio::sync::mpsc::{Receiver, channel};
+    use tokio::sync::mpsc::{Receiver, Sender, channel};
 
     /// A running job's config. Only the fields the classifier reads vary between the
     /// cases below; everything else is fixed so a difference in the result can only come
@@ -1795,6 +1992,79 @@ mod tests {
         DatabaseSource::Sqlite(Arc::new(Mutex::new(
             cornucopia_async::rusqlite::Connection::open_in_memory().unwrap(),
         )))
+    }
+
+    /// The two rows [`StateMachine::start`] actually reads and writes, in a schema that
+    /// mirrors the migrated one for the columns it touches.
+    ///
+    /// `proto_version` decides whether the job's program can be loaded: the controller only
+    /// runs `proto_version = 2` pipelines, so `1` is the "this is a bad/old pipeline" path
+    /// — the one that leaves `start` with a job it cannot run while it explicitly promises
+    /// to retry on the next poll.
+    fn sqlite_startable_job(state: &str, proto_version: i32) -> DatabaseSource {
+        let connection = cornucopia_async::rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE job_statuses (
+                    id TEXT PRIMARY KEY,
+                    state TEXT,
+                    start_time TIMESTAMP,
+                    finish_time TIMESTAMP,
+                    tasks INTEGER,
+                    failure_message TEXT,
+                    failure_domain TEXT,
+                    restarts INTEGER DEFAULT 0 NOT NULL,
+                    pipeline_path TEXT,
+                    wasm_path TEXT,
+                    run_id INTEGER DEFAULT 0 NOT NULL,
+                    restart_nonce INTEGER DEFAULT 0 NOT NULL,
+                    state_context TEXT DEFAULT '{\"version\": 1}' NOT NULL
+                );
+                CREATE TABLE pipelines (
+                    id INTEGER PRIMARY KEY,
+                    pub_id TEXT NOT NULL,
+                    program BLOB NOT NULL,
+                    proto_version INTEGER NOT NULL,
+                    state_url TEXT,
+                    tags TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO job_statuses (id, state) VALUES ('job_abc', ?1)",
+                [state],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO pipelines (id, pub_id, program, proto_version, state_url, tags)
+                 VALUES (1, 'pl_1', ?1, ?2, NULL, '{}')",
+                cornucopia_async::rusqlite::params![
+                    ArrowProgram::default().encode_to_vec(),
+                    proto_version
+                ],
+            )
+            .unwrap();
+        DatabaseSource::Sqlite(Arc::new(Mutex::new(connection)))
+    }
+
+    /// What the job's durable execution record says now, read straight out of the fixture.
+    fn recorded_status(db: &DatabaseSource) -> (String, Option<String>) {
+        let DatabaseSource::Sqlite(connection) = db else {
+            unreachable!("the fixture is always sqlite")
+        };
+        let (state, raw): (String, String) = connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT state, state_context FROM job_statuses WHERE id = 'job_abc'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let context: StateContext = serde_json::from_str(&raw).unwrap();
+        (state, context.execution_selector)
     }
 
     fn job_status(restart_nonce: i32) -> JobStatus {
@@ -1868,25 +2138,44 @@ mod tests {
 
     /// A state machine whose channel a test can read, without a database or a spawned
     /// task. `update` and `refuse_config` are the two entry points exercised here and
-    /// neither touches the database.
+    /// neither touches the database while the job's queue stays live.
     fn state_machine(
         config: JobConfig,
         execution_selector: StateBackendSelector,
     ) -> (StateMachine, Receiver<JobMessage>) {
         let (tx, rx) = channel(16);
         (
-            StateMachine {
-                tx: Some(tx),
-                config: Arc::new(RwLock::new((config, AppliedStatus::Applied))),
-                execution_selector,
-                refusal: None,
-                state: Arc::new(RwLock::new("Running".to_string())),
-                metrics: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-                db: unused_db(),
-                scheduler: Arc::new(RecordingScheduler::default()),
-            },
+            state_machine_with(config, execution_selector, Some(tx), unused_db()),
             rx,
         )
+    }
+
+    fn state_machine_with(
+        config: JobConfig,
+        execution_selector: StateBackendSelector,
+        tx: Option<Sender<JobMessage>>,
+        db: DatabaseSource,
+    ) -> StateMachine {
+        StateMachine {
+            tx,
+            config: Arc::new(RwLock::new((config, AppliedStatus::Applied))),
+            execution_selector,
+            refusal: None,
+            refusal_version: Arc::new(AtomicU64::new(0)),
+            state: Arc::new(RwLock::new("Running".to_string())),
+            metrics: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            db,
+            scheduler: Arc::new(RecordingScheduler::default()),
+        }
+    }
+
+    /// The error a queued [`JobMessage::ConfigRefused`] would fail the job with, or `None`
+    /// if it has been superseded and a state would discard it.
+    fn refusal_if_current(msg: JobMessage) -> Option<StateBackendError> {
+        match msg {
+            JobMessage::ConfigRefused(refusal) => refusal.into_current_error(),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
     }
 
     fn shutdown_guard() -> arroyo_server_common::shutdown::ShutdownGuard {
@@ -2233,16 +2522,13 @@ mod tests {
             "a refused row must replace nothing in the job's authoritative config"
         );
 
-        match rx
-            .try_recv()
-            .expect("the refusal should have been delivered")
-        {
-            JobMessage::ConfigRefused(e) => assert!(
-                matches!(e, StateBackendError::JobSelectorChanged { .. }),
-                "{e:?}"
+        assert_eq!(
+            refusal_if_current(
+                rx.try_recv()
+                    .expect("the refusal should have been delivered")
             ),
-            other => panic!("a refused row must not be delivered as a config update: {other:?}"),
-        }
+            Some(selector_changed()),
+        );
         assert!(
             rx.try_recv().is_err(),
             "nothing else may be delivered for a refused row"
@@ -2391,12 +2677,10 @@ mod tests {
             sm.refuse_config(selector_changed());
         }
 
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(JobMessage::ConfigRefused(
-                StateBackendError::JobSelectorChanged { .. }
-            ))
-        ));
+        assert_eq!(
+            refusal_if_current(rx.try_recv().expect("the refusal must be delivered")),
+            Some(selector_changed())
+        );
         assert!(
             rx.try_recv().is_err(),
             "one unusable row must produce one refusal, not one per poll"
@@ -2411,16 +2695,12 @@ mod tests {
     async fn refusing_a_row_never_waits_for_the_jobs_own_queue() {
         let current = running_config(StateBackendSelector::Parquet);
         let (tx, mut rx) = channel(1);
-        let mut sm = StateMachine {
-            tx: Some(tx),
-            config: Arc::new(RwLock::new((current, AppliedStatus::Applied))),
-            execution_selector: StateBackendSelector::Parquet,
-            refusal: None,
-            state: Arc::new(RwLock::new("Running".to_string())),
-            metrics: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-            db: unused_db(),
-            scheduler: Arc::new(RecordingScheduler::default()),
-        };
+        let mut sm = state_machine_with(
+            current,
+            StateBackendSelector::Parquet,
+            Some(tx),
+            unused_db(),
+        );
 
         // Fill the job's queue, as a delayed teardown or retry consumer would.
         sm.offer(JobMessage::TaskStarted {
@@ -2444,12 +2724,12 @@ mod tests {
         // offered again rather than dropped.
         assert!(matches!(rx.try_recv(), Ok(JobMessage::TaskStarted { .. })));
         sm.refuse_config(selector_changed());
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(JobMessage::ConfigRefused(
-                StateBackendError::JobSelectorChanged { .. }
-            )),
-        ));
+        assert_eq!(
+            refusal_if_current(rx.try_recv().expect("the retry must be delivered")),
+            Some(selector_changed()),
+            "a refusal the queue could not take is offered again at the same version, so \
+             the retry is still the refusal that describes the job"
+        );
     }
 
     /// Coalescing must not swallow a *different* refusal: a row edited from one bad value
@@ -2459,24 +2739,24 @@ mod tests {
         let current = running_config(StateBackendSelector::Parquet);
         let (mut sm, mut rx) = state_machine(current, StateBackendSelector::Parquet);
 
-        sm.refuse_config(selector_changed());
-        sm.refuse_config(StateBackendError::UnknownValue {
+        let unknown = StateBackendError::UnknownValue {
             label: "job job_abc".to_string(),
             value: "rocksdb".to_string(),
-        });
+        };
+        sm.refuse_config(selector_changed());
+        sm.refuse_config(unknown.clone());
 
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(JobMessage::ConfigRefused(
-                StateBackendError::JobSelectorChanged { .. }
-            ))
-        ));
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(JobMessage::ConfigRefused(
-                StateBackendError::UnknownValue { .. }
-            ))
-        ));
+        assert_eq!(
+            refusal_if_current(rx.try_recv().expect("the first refusal was queued")),
+            None,
+            "the first refusal no longer describes the job, so a state that reads it now \
+             must discard it rather than fail the job for a value that has been replaced"
+        );
+        assert_eq!(
+            refusal_if_current(rx.try_recv().expect("the second refusal must be delivered")),
+            Some(unknown),
+            "and the refusal that does describe the job still fails it"
+        );
     }
 
     /// The compatibility direction of the same writer: an update that does not change the
@@ -2524,14 +2804,12 @@ mod tests {
             current,
             "an unusable row must not disturb the config the job is running with"
         );
-        match rx
-            .try_recv()
-            .expect("the refusal should have been delivered")
-        {
-            JobMessage::ConfigRefused(StateBackendError::UnknownValue { value, .. }) => {
-                assert_eq!(value, "rocksdb")
-            }
-            other => panic!("expected a refusal, got {other:?}"),
+        match refusal_if_current(
+            rx.try_recv()
+                .expect("the refusal should have been delivered"),
+        ) {
+            Some(StateBackendError::UnknownValue { value, .. }) => assert_eq!(value, "rocksdb"),
+            other => panic!("expected a current refusal naming the bad value, got {other:?}"),
         }
     }
 
@@ -2539,15 +2817,16 @@ mod tests {
     /// policy lives, so every state that routes an unrecognized message here fails the
     /// same way.
     #[test]
-    fn a_delivered_refusal_fails_the_job() {
+    fn a_current_refusal_fails_the_job_and_a_superseded_one_is_discarded() {
+        let version = Arc::new(AtomicU64::new(4));
         let err = handle_unhandled_message(
             "job_abc",
             "pipeline_1",
-            JobMessage::ConfigRefused(StateBackendError::JobSelectorChanged {
-                label: "job \"job_abc\"".to_string(),
-                running: StateBackendSelector::Parquet,
-                requested: StateBackendSelector::StateEngine,
-            }),
+            JobMessage::ConfigRefused(RefusedConfig::new(
+                selector_changed(),
+                4,
+                Arc::clone(&version),
+            )),
         )
         .expect_err("a refused configuration must fail the job");
         assert!(
@@ -2557,6 +2836,15 @@ mod tests {
             ),
             "{err:?}"
         );
+
+        // The same refusal, read after the state machine has moved past it: the row it
+        // describes no longer exists, so the job must not be failed for it.
+        handle_unhandled_message(
+            "job_abc",
+            "pipeline_1",
+            JobMessage::ConfigRefused(RefusedConfig::new(selector_changed(), 3, version)),
+        )
+        .expect("a superseded refusal must be discarded, not turned into a job failure");
 
         // and every other message is still ignored, so routing them here changes nothing
         handle_unhandled_message(
@@ -2569,6 +2857,272 @@ mod tests {
             },
         )
         .expect("an ordinary unhandled message must still be ignored");
+    }
+
+    /// Finding 2, the exact race the previous review asked for.
+    ///
+    /// A refusal is queued, not applied in place, so between the poll that raises it and
+    /// the state that reads it the operator can repair the row — which is the remedy the
+    /// refusal itself asks for. The queue is FIFO and a message already in it cannot be
+    /// retracted, so the only thing that can save the repaired job is the receiver being
+    /// able to tell that the refusal it is holding no longer describes the job.
+    ///
+    /// Round 4 coalesced repeated refusals, which fixed repeated-send backpressure but not
+    /// this: the valid poll cleared the sender's bookkeeping and left the older message in
+    /// the queue, and every state turned a `ConfigRefused` into an unconditional fatal
+    /// error. The repaired job still failed.
+    #[tokio::test]
+    async fn a_row_repaired_before_the_refusal_is_read_does_not_fail_the_job() {
+        let current = running_config(StateBackendSelector::Parquet);
+        let (mut sm, mut rx) = state_machine(current.clone(), StateBackendSelector::Parquet);
+
+        // The bad poll. Nothing has read the job's queue yet.
+        sm.update(
+            polled(
+                StateBackendSelector::Parquet,
+                current.clone(),
+                Some(selector_changed()),
+            ),
+            job_status(current.restart_nonce),
+            &shutdown_guard(),
+        )
+        .await;
+
+        // The operator repairs the row and the next poll accepts it — still before the
+        // state task has drained anything.
+        let mut repaired = running_config(StateBackendSelector::Parquet);
+        repaired.env_vars = serde_json::json!({ "A": "1" });
+        sm.update(
+            polled(StateBackendSelector::Parquet, repaired.clone(), None),
+            job_status(current.restart_nonce),
+            &shutdown_guard(),
+        )
+        .await;
+
+        // Only now does the state task read its queue, oldest first.
+        let queued = rx
+            .try_recv()
+            .expect("the refusal was queued before the repair");
+        handle_unhandled_message("job_abc", "pipeline_1", queued)
+            .expect("a repaired row must not be failed by the refusal that preceded it");
+
+        match rx
+            .try_recv()
+            .expect("and the repaired configuration must still be delivered")
+        {
+            JobMessage::ConfigUpdate(c) => assert_eq!(c, repaired),
+            other => panic!("expected the repaired config update, got {other:?}"),
+        }
+        assert_eq!(sm.config.read().unwrap().0, repaired);
+    }
+
+    /// The same race in the shape the refusal's own remedy produces.
+    ///
+    /// The operator reads "stop the job and create a new one under the new backend" and
+    /// adds a stop to the row that is still bad. The stop is queued behind a refusal raised
+    /// on an earlier poll; if that older message still fails the job, the stop it was
+    /// answering never runs — the job ends in `Failed` rather than `Stopped` and loses the
+    /// final checkpoint a `checkpoint` stop asked for.
+    #[tokio::test]
+    async fn a_stop_answering_a_refusal_supersedes_the_refusal_already_queued() {
+        let current = running_config(StateBackendSelector::Parquet);
+        let (mut sm, mut rx) = state_machine(current.clone(), StateBackendSelector::Parquet);
+
+        sm.update(
+            polled(
+                StateBackendSelector::Parquet,
+                current.clone(),
+                Some(selector_changed()),
+            ),
+            job_status(current.restart_nonce),
+            &shutdown_guard(),
+        )
+        .await;
+
+        let mut with_stop = running_config(StateBackendSelector::Parquet);
+        with_stop.stop_mode = StopMode::checkpoint;
+        sm.update(
+            polled(
+                StateBackendSelector::Parquet,
+                with_stop,
+                Some(selector_changed()),
+            ),
+            job_status(current.restart_nonce),
+            &shutdown_guard(),
+        )
+        .await;
+
+        let queued = rx.try_recv().expect("the refusal was queued first");
+        handle_unhandled_message("job_abc", "pipeline_1", queued).expect(
+            "a refusal that is being answered by a stop must not fail the job before the \
+             stop is executed",
+        );
+
+        match rx.try_recv().expect("the stop must still be delivered") {
+            JobMessage::ConfigUpdate(c) => {
+                assert_eq!(c.stop_mode, StopMode::checkpoint);
+                assert_eq!(c.state_backend, StateBackendSelector::Parquet);
+            }
+            other => panic!("expected the stop, got {other:?}"),
+        }
+    }
+
+    /// Finding 1's second half, on the real writer.
+    ///
+    /// `start` recorded the execution selector into `job_statuses.state_context` before it
+    /// had even tried to load the job's program, so a job the controller could not start
+    /// was left with a recorded execution it never had. A recorded selector outranks the
+    /// configuration row by design, so that guess could not be corrected by any later poll:
+    /// the row was pinned to a backend the job had never used, and nothing downstream —
+    /// checkpoint validation, worker startup — ever got the chance to reject it.
+    #[tokio::test]
+    async fn no_execution_selector_is_recorded_for_a_job_that_could_not_be_started() {
+        let db = sqlite_startable_job("Running", 1);
+        let mut sm = state_machine_with(
+            running_config(StateBackendSelector::StateEngine),
+            StateBackendSelector::StateEngine,
+            None,
+            db.clone(),
+        );
+
+        sm.start(job_status(3), shutdown_guard()).await;
+
+        assert!(
+            sm.done(),
+            "the program cannot be loaded, so there is no state task and start must retry"
+        );
+        assert!(
+            sm.sender().is_none(),
+            "and no queue is advertised for a state task that never took the receiving end"
+        );
+        assert_eq!(
+            recorded_status(&db),
+            ("Compiling".to_string(), None),
+            "the recovered state is still written exactly as before, but a job with no \
+             execution must have no recorded execution selector"
+        );
+    }
+
+    /// The other direction: a job that really does start records its selector, which is
+    /// what a restarted controller recovers instead of re-reading the editable row.
+    #[tokio::test]
+    async fn a_job_that_starts_records_the_selector_its_execution_runs_with() {
+        for selector in [
+            StateBackendSelector::Parquet,
+            StateBackendSelector::StateEngine,
+        ] {
+            // `Stopped` is terminal, so the state task this spawns has nothing to do but
+            // tear a cluster down through `RecordingScheduler`.
+            let db = sqlite_startable_job("Stopped", 2);
+            let mut sm = state_machine_with(running_config(selector), selector, None, db.clone());
+
+            let mut status = job_status(3);
+            status.state = "Stopped".to_string();
+            sm.start(status, shutdown_guard()).await;
+
+            assert!(
+                !sm.done(),
+                "the program loads, so a state task must be running"
+            );
+            assert_eq!(
+                recorded_status(&db),
+                ("Stopped".to_string(), Some(selector.as_str().to_string()))
+            );
+        }
+    }
+
+    /// Finding 3. `Delivery::Inactive` is not delivery.
+    ///
+    /// `start` creates the job's channel and then finds it cannot load the program, so
+    /// nothing takes the receiving end: the job has no state task, while `start` explicitly
+    /// promises to retry on the next poll. A refused row that also asks the job to stop
+    /// reaches `request_stop` in exactly that state.
+    ///
+    /// Recording the stop mode against a state machine that cannot execute it made every
+    /// later poll return early on "that mode is already stored" while nothing ever stopped
+    /// the job — a `checkpoint`, `graceful`, `immediate` or `force` stop that disappeared
+    /// permanently. The accepted-update branch already restarted the state task on
+    /// `Inactive`; this is the refused row's equivalent.
+    #[tokio::test]
+    async fn a_refused_rows_stop_is_not_swallowed_by_a_state_machine_that_cannot_run_it() {
+        for stop_mode in [
+            StopMode::checkpoint,
+            StopMode::graceful,
+            StopMode::immediate,
+            StopMode::force,
+        ] {
+            let db = sqlite_startable_job("Running", 1);
+            let current = running_config(StateBackendSelector::Parquet);
+            let mut sm = state_machine_with(
+                current.clone(),
+                StateBackendSelector::Parquet,
+                None,
+                db.clone(),
+            );
+
+            let mut refused = running_config(StateBackendSelector::Parquet);
+            refused.stop_mode = stop_mode;
+
+            for poll in 0..3 {
+                sm.update(
+                    polled(
+                        StateBackendSelector::Parquet,
+                        refused.clone(),
+                        Some(selector_changed()),
+                    ),
+                    job_status(current.restart_nonce),
+                    &shutdown_guard(),
+                )
+                .await;
+
+                assert!(
+                    sm.done(),
+                    "{stop_mode:?} poll {poll}: the program still cannot be loaded, so no \
+                     state task can exist to execute the stop"
+                );
+                assert_eq!(
+                    sm.config.read().unwrap().0.stop_mode,
+                    StopMode::none,
+                    "{stop_mode:?} poll {poll}: a stop nothing can execute must not be \
+                     recorded as issued — recording it is what makes the next poll return \
+                     early on it and strand the job"
+                );
+            }
+
+            // The job's state machine comes back up, as `start` promised it would. The
+            // same row is still asking for the same stop, and now it is executed — under
+            // the configuration the job is running with, not the refused row's.
+            let (tx, mut rx) = channel(16);
+            sm.tx = Some(tx);
+            sm.update(
+                polled(
+                    StateBackendSelector::Parquet,
+                    refused.clone(),
+                    Some(selector_changed()),
+                ),
+                job_status(current.restart_nonce),
+                &shutdown_guard(),
+            )
+            .await;
+
+            let stored = sm.config.read().unwrap().0.clone();
+            assert_eq!(stored.stop_mode, stop_mode);
+            assert_eq!(stored.state_backend, StateBackendSelector::Parquet);
+            assert_eq!(stored.restart_nonce, current.restart_nonce);
+
+            match rx.try_recv().expect("the stop must reach the job") {
+                JobMessage::ConfigUpdate(c) => {
+                    assert_eq!(c.stop_mode, stop_mode);
+                    assert_eq!(c.state_backend, StateBackendSelector::Parquet);
+                }
+                other => panic!("expected the stop, got {other:?}"),
+            }
+            assert!(
+                rx.try_recv().is_err(),
+                "and it must not also arrive as a refusal, which would fail the job \
+                 instead of stopping it"
+            );
+        }
     }
 
     /// The check every non-running consumer applies, in both directions: a changed

@@ -39,6 +39,7 @@ use std::env;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{self, AtomicU64};
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use tokio::net::TcpListener;
@@ -258,6 +259,69 @@ fn classify_polled_row(
     })
 }
 
+/// Decodes the controller's own durable record of a job's execution.
+///
+/// `job_statuses.state_context` is persisted state, and therefore untrusted input. A blob
+/// that cannot be decoded is *not* turned into "this job has no execution": for a job that
+/// does have one, that would erase its only selector authority, and the editable
+/// configuration row would be adopted in its place — the very substitution
+/// [`classify_polled_row`] exists to prevent.
+///
+/// `None` therefore means *skip this job*. It is reported on every poll, so the condition
+/// stays visible until an operator repairs the row, and it is scoped to the one job: the
+/// rest of the cluster goes on being polled.
+fn decode_state_context(job_id: &str, raw: &serde_json::Value) -> Option<StateContext> {
+    match serde_json::from_value::<StateContext>(raw.clone()) {
+        Ok(state_context) => Some(state_context),
+        Err(e) => {
+            error!(job_id = %job_id, original =? raw, error =? e,
+                "skipping job whose execution record cannot be decoded");
+            None
+        }
+    }
+}
+
+/// Turns one polled row into the job's status and the configuration the state machine
+/// should act on, or `None` if the update thread must move on without touching this job.
+///
+/// This is the whole of the per-row decision, in one place the tests can drive: decode the
+/// execution record, build the status from it, then resolve the row against it. Every
+/// `None` here is fail-closed for the job and fail-open for the cluster — the poll loop
+/// skips to the next row rather than erroring out.
+fn classify_polled_job(row: queries::controller_queries::Job) -> Option<(PolledJob, JobStatus)> {
+    let id = Arc::new(row.id.clone());
+
+    // Everything the status needs is read before the config consumes the row, so a
+    // rejected row can skip just this job.
+    let state_context = decode_state_context(&id, &row.state_context)?;
+
+    let status = JobStatus {
+        id: id.clone(),
+        generation: row.run_id.unwrap_or(0).max(0) as u64,
+        state: row
+            .state
+            .clone()
+            .unwrap_or_else(|| Created {}.name().to_string()),
+        start_time: row.start_time,
+        finish_time: row.finish_time,
+        tasks: row.tasks,
+        failure_message: row.failure_message.clone(),
+        failure_domain: row.failure_domain.clone(),
+        restarts: row.restarts,
+        pipeline_path: row.pipeline_path.clone(),
+        wasm_path: row.wasm_path.clone(),
+        restart_nonce: row.status_restart_nonce,
+        state_context,
+    };
+
+    // Resolved against the job's own execution record, not just parsed: a controller that
+    // has been restarted must recover the selector a running job is using rather than
+    // re-baseline it from a row that may have been edited while the controller was down.
+    let polled = classify_polled_row(row, &status)?;
+
+    Some((polled, status))
+}
+
 /// Per-pipeline data that doesn't change for the lifetime of a job.
 #[derive(Clone, Debug)]
 pub struct PipelineInfo {
@@ -284,6 +348,33 @@ pub struct JobStatus {
 }
 
 impl JobStatus {
+    /// Whether this job has an execution on record at all.
+    ///
+    /// "An execution exists" is a fact about the job's own durable status, and deliberately
+    /// not about which controller mode it runs in. Before the execution selector existed, a
+    /// *controller*-mode job recorded nothing in `state_context` — no leader and no
+    /// selector — so leader presence cannot be the test: a pre-upgrade controller-mode job
+    /// in `Running`, `Compiling` or `Scheduling` would read as a job that had never
+    /// started, and its editable `job_configs.state_backend` would be adopted as the
+    /// backend of a job whose workers, table configs and checkpoints are parquet.
+    ///
+    /// Two independent facts are consulted, and either is sufficient:
+    ///
+    /// * The status leaves `Created` exactly once — when the controller starts running the
+    ///   job — and never goes back, so any other state name means workers have been, or
+    ///   are being, brought up for this job. That includes the terminal states: a `Stopped`
+    ///   or `Failed` job still owns the checkpoints its execution wrote, and restarting it
+    ///   restores them.
+    /// * `start_time` is stamped the first time the job reaches `Running` and is never
+    ///   cleared except to be re-stamped, so it survives a status row whose state name this
+    ///   build does not recognize.
+    ///
+    /// A status row that has neither is a job that has not started, and *that* is the one
+    /// moment `job_configs.state_backend` is allowed to choose.
+    fn has_execution(&self) -> bool {
+        self.state != Created {}.name() || self.start_time.is_some()
+    }
+
     /// The state backend this job's *execution* recorded for itself, if it has one.
     ///
     /// This is the row-independent half of the job's selector. `job_statuses.state_context`
@@ -297,6 +388,11 @@ impl JobStatus {
     /// build could have used — which is the same "absent means parquet" rule every other
     /// persisted value in this system follows, and is why a job running across the upgrade
     /// to this build is not re-baselined from its row either.
+    ///
+    /// Whether an execution exists is [`Self::has_execution`]'s question, answered from the
+    /// job's durable status rather than from the presence of a leader: leader context is
+    /// only ever written in worker-leader mode, so testing for it made the upgrade rule
+    /// hold for leader-mode jobs and silently not hold for controller-mode ones.
     ///
     /// # Errors
     ///
@@ -312,7 +408,13 @@ impl JobStatus {
                 StateBackendSelector::normalize(raw, &format!("job {} execution", self.id))
                     .map(Some)
             }
-            None if self.state_context.leader.is_some() => Ok(Some(StateBackendSelector::DEFAULT)),
+            // An execution with no recorded selector predates the field, in either
+            // controller mode: a leader on record is one proof it exists, the job's own
+            // durable status is the other, and a build with no selector could only have
+            // run parquet.
+            None if self.has_execution() || self.state_context.leader.is_some() => {
+                Ok(Some(StateBackendSelector::DEFAULT))
+            }
             None => Ok(None),
         }
     }
@@ -354,6 +456,50 @@ fn job_in_final_state(config: &JobConfig, status: &JobStatus) -> bool {
     }
 }
 
+/// A refusal of the job's persisted configuration, as it travels to the job's own state
+/// task.
+///
+/// A refusal is queued rather than applied in place, and the queue is FIFO and cannot be
+/// retracted, so between the poll that raised the refusal and the state that finally reads
+/// it the operator can have repaired the row — which is exactly the remedy the refusal
+/// asks for. Failing the job then would fail it for a configuration that no longer exists.
+///
+/// So a refusal carries the version it was raised at, together with a handle on the
+/// version its state machine currently holds. They differ once the refusal has been
+/// superseded — by a repair, by a different refusal, or by a stop that answers it — and a
+/// superseded refusal is discarded instead of failing the job. Nothing about this makes
+/// the *send* blocking: the version is stamped and read without waiting on anything.
+#[derive(Clone, Debug)]
+pub struct RefusedConfig {
+    error: StateBackendError,
+    /// The value [`Self::current`] held when this refusal was offered to the queue.
+    version: u64,
+    /// The state machine's live refusal version. Shared, so it keeps moving after this
+    /// message has been queued.
+    current: Arc<AtomicU64>,
+}
+
+impl RefusedConfig {
+    pub(crate) fn new(error: StateBackendError, version: u64, current: Arc<AtomicU64>) -> Self {
+        Self {
+            error,
+            version,
+            current,
+        }
+    }
+
+    /// Whether this refusal still describes the job's configuration.
+    pub(crate) fn is_current(&self) -> bool {
+        self.current.load(atomic::Ordering::SeqCst) == self.version
+    }
+
+    /// The error this refusal reports, or `None` if it has been superseded since it was
+    /// queued and must not be acted on.
+    pub(crate) fn into_current_error(self) -> Option<StateBackendError> {
+        self.is_current().then_some(self.error)
+    }
+}
+
 #[derive(Debug)]
 pub enum JobMessage {
     ConfigUpdate(JobConfig),
@@ -365,8 +511,9 @@ pub enum JobMessage {
     /// carrying the refused row, precisely so that no state can apply any part of it. The
     /// state machine's authoritative config is left holding the value the job's workers,
     /// table configs and checkpoints were built from, and every state routes this message
-    /// to [`states::JobContext::handle`], which fails the job.
-    ConfigRefused(StateBackendError),
+    /// to [`states::JobContext::handle`], which fails the job — unless the refusal has
+    /// been superseded in the meantime, which is what [`RefusedConfig`] is for.
+    ConfigRefused(RefusedConfig),
     WorkerConnect {
         worker_id: WorkerId,
         machine_id: MachineId,
@@ -875,54 +1022,17 @@ impl ControllerServer {
                 update_job_state_metrics(&state_counts);
 
                 for p in res {
-                    let id = Arc::new(p.id.clone());
-
-                    // Everything the status needs is read before the config consumes the
-                    // row, so a rejected config can skip just this job.
-                    let state_context: StateContext =
-                        serde_json::from_value(p.state_context.clone()).unwrap_or_else(|e| {
-                            warn!(job_id = %id, original =? p.state_context, error =? e,
-                                "failed to deserialize state context");
-                            StateContext {
-                                version: 1,
-                                leader: None,
-                                execution_selector: None,
-                            }
-                        });
-
-                    let status = JobStatus {
-                        id: id.clone(),
-                        generation: p.run_id.unwrap_or(0).max(0) as u64,
-                        state: p
-                            .state
-                            .clone()
-                            .unwrap_or_else(|| Created {}.name().to_string()),
-                        start_time: p.start_time,
-                        finish_time: p.finish_time,
-                        tasks: p.tasks,
-                        failure_message: p.failure_message.clone(),
-                        failure_domain: p.failure_domain.clone(),
-                        restarts: p.restarts,
-                        pipeline_path: p.pipeline_path.clone(),
-                        wasm_path: p.wasm_path.clone(),
-                        restart_nonce: p.status_restart_nonce,
-                        state_context,
-                    };
-
-                    // Resolved against the job's own execution record, not just parsed:
-                    // a controller that has been restarted must recover the selector a
-                    // running job is using rather than re-baseline it from a row that
-                    // may have been edited while the controller was down.
-                    //
                     // Fail-open for the poll loop — one unusable row must never stop the
                     // other jobs on the cluster from being polled — but not for the job
                     // itself. A job with an execution on record is adopted under that
                     // execution's backend and then routed to its own refusal path,
                     // whether or not this controller was the one that started it; a job
-                    // with none still simply never starts.
-                    let Some(polled) = classify_polled_row(p, &status) else {
+                    // with none still simply never starts; and a job whose execution
+                    // record cannot be decoded is skipped rather than guessed at.
+                    let Some((polled, status)) = classify_polled_job(p) else {
                         continue;
                     };
+                    let id = Arc::clone(&status.id);
 
                     let mut jobs = jobs.lock().await;
 
@@ -1063,7 +1173,10 @@ mod tests {
             status_restart_nonce: 0,
             restart_mode: RestartMode::safe,
             ignore_state_before_epoch: None,
-            state_context: serde_json::json!({}),
+            // Exactly what the V29/V7 migration's `DEFAULT '{"version": 1}'` puts in the
+            // column for a job whose status has never been written, which is the shape
+            // `decode_state_context` has to accept.
+            state_context: serde_json::json!({ "version": 1 }),
             env_vars: serde_json::json!({}),
             scheduler_config: serde_json::json!({}),
             state_backend: state_backend.to_string(),
@@ -1099,10 +1212,30 @@ mod tests {
         }
     }
 
-    /// A job the controller has never seen: no execution on record.
+    /// A job the controller has never seen: `Created`, never run, nothing recorded. This
+    /// is the one shape whose `job_configs.state_backend` is allowed to choose.
     fn never_started() -> JobStatus {
         job_status("Created", None, false)
     }
+
+    /// Every state a job's status can be in that is *not* `Created`, and therefore proof
+    /// that an execution exists — including the terminal ones, which still own the
+    /// checkpoints that execution wrote.
+    const STATES_WITH_AN_EXECUTION: [&str; 13] = [
+        "Compiling",
+        "Scheduling",
+        "Running",
+        "Recovering",
+        "Rescaling",
+        "Restarting",
+        "Failing",
+        "Failed",
+        "Stopping",
+        "CheckpointStopping",
+        "Stopped",
+        "Finishing",
+        "Finished",
+    ];
 
     /// The deployability guarantee: a row written before the V33 migration takes the
     /// column's `DEFAULT ''`, and the job it describes keeps running on parquet.
@@ -1211,36 +1344,174 @@ mod tests {
         );
     }
 
-    /// The upgrade direction. A job that was running before this build existed recorded no
-    /// selector at all, but it does have a leader on record — and a build with no selector
-    /// could only have been running parquet. Recovering that, rather than falling back to
-    /// the row, is what keeps a job that is live across the upgrade from being
+    /// The upgrade direction, in **both** controller modes and in every state that means
+    /// the job has an execution.
+    ///
+    /// A job that was running before this build existed recorded no selector at all, and a
+    /// build with no selector could only have been running parquet. Recovering that, rather
+    /// than falling back to the row, is what keeps a job live across the upgrade from being
     /// re-baselined by an edit.
+    ///
+    /// Round 4 decided "does an execution exist?" from the presence of a leader context,
+    /// which is only ever written in worker-leader mode. A *controller*-mode job that was
+    /// running across the upgrade therefore had neither a selector nor a leader, read as a
+    /// job that had never started, and took its backend from the editable row. This test
+    /// covers `leader = false` for exactly that reason.
     #[test]
     fn an_execution_started_before_the_selector_existed_recovers_as_parquet() {
-        let status = job_status("Running", None, true);
+        for leader in [true, false] {
+            for state in STATES_WITH_AN_EXECUTION {
+                let status = job_status(state, None, leader);
+
+                let polled =
+                    classify_polled_row(job_row("stateengine"), &status).unwrap_or_else(|| {
+                        panic!(
+                            "a job with an execution must still be adopted \
+                                               ({state}, leader={leader})"
+                        )
+                    });
+                assert_eq!(
+                    polled.execution_selector,
+                    StateBackendSelector::Parquet,
+                    "{state}, leader={leader}: a pre-upgrade execution is parquet, not what \
+                     the row now says"
+                );
+                assert_eq!(
+                    polled.config.state_backend,
+                    StateBackendSelector::Parquet,
+                    "{state}, leader={leader}"
+                );
+                assert_eq!(
+                    polled.refusal,
+                    Some(StateBackendError::JobSelectorChanged {
+                        label: "job \"job_abc\"".to_string(),
+                        running: StateBackendSelector::Parquet,
+                        requested: StateBackendSelector::StateEngine,
+                    }),
+                    "{state}, leader={leader}: and the row's value must be refused"
+                );
+
+                // and the ordinary case for such a job — an untouched row — is not refused
+                let polled = classify_polled_row(job_row(""), &status).unwrap();
+                assert_eq!(polled.execution_selector, StateBackendSelector::Parquet);
+                assert!(
+                    polled.refusal.is_none(),
+                    "{state}, leader={leader}: a legacy all-parquet job must go on being \
+                     administered without complaint"
+                );
+            }
+        }
+    }
+
+    /// The same upgrade case with a row the controller cannot interpret at all. The job
+    /// must still be adopted under parquet and routed to its refusal path; skipping it
+    /// would leave a still-running job unadministered on every poll, forever.
+    #[test]
+    fn a_pre_upgrade_execution_with_an_unusable_row_is_adopted_under_parquet() {
+        for leader in [true, false] {
+            for state in STATES_WITH_AN_EXECUTION {
+                let status = job_status(state, None, leader);
+
+                let polled =
+                    classify_polled_row(job_row("rocksdb"), &status).unwrap_or_else(|| {
+                        panic!(
+                            "{state}, leader={leader}: a job with an execution must be \
+                               adopted even when its row is unusable"
+                        )
+                    });
+                assert_eq!(polled.execution_selector, StateBackendSelector::Parquet);
+                assert_eq!(polled.config.state_backend, StateBackendSelector::Parquet);
+                assert_eq!(
+                    polled.refusal,
+                    Some(StateBackendError::UnknownValue {
+                        label: "job job_abc".to_string(),
+                        value: "rocksdb".to_string(),
+                    }),
+                    "{state}, leader={leader}"
+                );
+            }
+        }
+    }
+
+    /// `start_time` is the second, independent proof that an execution exists: a status row
+    /// whose state name this build does not recognize, but which has run, is still not
+    /// re-baselined from its row.
+    #[test]
+    fn a_job_that_has_run_has_an_execution_whatever_its_state_name_says() {
+        let mut status = job_status("Created", None, false);
+        status.start_time = Some(OffsetDateTime::now_utc());
 
         let polled = classify_polled_row(job_row("stateengine"), &status)
-            .expect("a live job must still be adopted");
+            .expect("a job that has run must still be adopted");
         assert_eq!(polled.execution_selector, StateBackendSelector::Parquet);
         assert!(matches!(
             polled.refusal,
             Some(StateBackendError::JobSelectorChanged { .. })
         ));
-
-        // and the ordinary case for such a job — an untouched row — is not refused
-        let polled = classify_polled_row(job_row(""), &status).unwrap();
-        assert_eq!(polled.execution_selector, StateBackendSelector::Parquet);
-        assert!(polled.refusal.is_none());
     }
 
-    /// The execution record is persisted state and therefore untrusted. A value nobody
-    /// recognizes leaves the controller unable to say what the job is running with, and
-    /// picking one would be picking it for a job that is still running.
+    /// The execution record is persisted state and therefore untrusted. A recorded value
+    /// nobody recognizes leaves the controller unable to say what the job is running with,
+    /// and picking one would be picking it for a job that is still running.
+    ///
+    /// Renamed in round 5: this covers a `state_context` that *decoded* and named an
+    /// unknown backend. A `state_context` that cannot be decoded at all is a different
+    /// path, and is covered by `an_undecodable_execution_record_skips_only_that_job`.
     #[test]
-    fn an_unreadable_execution_record_is_never_guessed_at() {
-        let status = job_status("Running", Some("rocksdb"), true);
-        assert!(classify_polled_row(job_row("parquet"), &status).is_none());
+    fn an_execution_recording_an_unknown_backend_is_never_guessed_at() {
+        for leader in [true, false] {
+            let status = job_status("Running", Some("rocksdb"), leader);
+            assert!(classify_polled_row(job_row("parquet"), &status).is_none());
+            assert!(classify_polled_row(job_row("rocksdb"), &status).is_none());
+        }
+    }
+
+    /// Finding 4. A `state_context` blob that cannot be decoded is not turned into "this
+    /// job has no execution": that erases the job's only selector authority, after which
+    /// the editable row is adopted in its place. The job is skipped instead — and only
+    /// that job, so the rest of the cluster goes on being polled.
+    #[test]
+    fn an_undecodable_execution_record_skips_only_that_job() {
+        for broken in [
+            serde_json::json!("not an object"),
+            serde_json::json!({}),
+            serde_json::json!({ "version": "one" }),
+            serde_json::json!({ "version": 1, "leader": 7 }),
+            serde_json::json!({ "version": 1, "execution_selector": 3 }),
+            serde_json::Value::Null,
+        ] {
+            let mut row = job_row("stateengine");
+            row.state = Some("Running".to_string());
+            row.state_context = broken.clone();
+            assert!(
+                classify_polled_job(row).is_none(),
+                "an execution record that cannot be decoded must not be replaced by one \
+                 that says the job never started: {broken}"
+            );
+        }
+
+        // The control, through the same entry point: an ordinary row is still classified,
+        // so the skip above is about the broken record and not about the path.
+        let mut row = job_row("");
+        row.state = Some("Running".to_string());
+        let (polled, status) = classify_polled_job(row).expect("an ordinary row must classify");
+        assert_eq!(polled.execution_selector, StateBackendSelector::Parquet);
+        assert_eq!(status.state, "Running");
+        assert!(polled.refusal.is_none());
+
+        // ...and one carrying a real recorded selector round-trips through the decode.
+        let mut row = job_row("");
+        row.state = Some("Running".to_string());
+        row.state_context = serde_json::json!({
+            "version": 1,
+            "execution_selector": "stateengine",
+        });
+        let (polled, _) = classify_polled_job(row).expect("a recorded selector must decode");
+        assert_eq!(polled.execution_selector, StateBackendSelector::StateEngine);
+        assert!(matches!(
+            polled.refusal,
+            Some(StateBackendError::JobSelectorChanged { .. })
+        ));
     }
 
     /// Round 3's durability property, now enforced where the row is read: a refused row
@@ -1273,20 +1544,23 @@ mod tests {
     }
 
     /// The update thread must move on: one unusable row cannot be allowed to stop every
-    /// other job on the cluster from being polled. A structural pin — the loop lives
-    /// inside the spawned polling closure, which needs a live Postgres and a running
-    /// updater to drive.
+    /// other job on the cluster from being polled.
+    ///
+    /// A structural pin, named for what it actually checks — that the loop is *written*
+    /// this way. The loop itself lives inside the spawned polling closure and needs a live
+    /// Postgres and a running updater to drive. What it skips on, and that a skip is
+    /// scoped to one job, is covered behaviourally by `classify_polled_job`'s own tests.
     #[test]
-    fn one_unusable_row_does_not_stop_the_poll_loop() {
+    fn the_poll_loop_is_written_to_skip_a_row_it_cannot_use() {
         // Assembled rather than written out: this file is its own fixture, so a literal
         // would match the assertion itself and pass however the poll loop is written.
         let source = include_str!("lib.rs");
         assert!(
             source.contains(&format!(
-                "let Some(polled) = {}(p, &status) else {{\n",
-                "classify_polled_row"
+                "let Some((polled, status)) = {}(p) else {{\n",
+                "classify_polled_job"
             )),
-            "the poll loop must resolve every row against the job's execution record"
+            "the poll loop must resolve every row through the one classifier"
         );
         assert!(
             source.contains("                        continue;\n"),
@@ -1295,12 +1569,16 @@ mod tests {
         );
     }
 
-    /// Finding 4's other half, as a property of the signature rather than of a timing
-    /// test: the refusal is offered to the job's own queue without awaiting it, so the
-    /// update thread cannot end up waiting for one job's consumer while it holds the
-    /// global job map. `refuse_config` not being `async` is what makes that unwritable.
+    /// Round 4's finding 4, as a property of the signature rather than of a timing test:
+    /// the refusal is offered to the job's own queue without awaiting it, so the update
+    /// thread cannot end up waiting for one job's consumer while it holds the global job
+    /// map. A non-`async` `refuse_config` is what makes that unwritable.
+    ///
+    /// The behaviour itself is covered by `refusing_a_row_never_waits_for_the_jobs_own_queue`
+    /// in `states::tests`; this pins the signature that guarantees it, which is what the
+    /// name now says.
     #[test]
-    fn refusing_a_row_cannot_await_the_jobs_queue() {
+    fn refuse_config_is_not_async_so_it_cannot_await_the_jobs_queue() {
         let source = include_str!("states/mod.rs");
         assert!(
             source.contains(&format!(
