@@ -1,18 +1,22 @@
 use arroyo_rpc::grpc::rpc::{JobState, StartExecutionReq, TaskAssignment};
 use arroyo_rpc::identity::{WorkerClient, worker_client};
-use arroyo_types::{CLUSTER_ID_ENV, JobId, MachineId, WorkerId};
+use arroyo_types::{CLUSTER_ID_ENV, JobId, MachineId, PipelineId, WorkerId};
 use std::time::SystemTime;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::{select, sync::Mutex, task::JoinHandle};
+use tokio::{
+    select,
+    sync::Mutex,
+    task::{JoinError, JoinHandle},
+};
 use tonic::Request;
 use tracing::{debug, error, info, warn};
 
 use super::{
-    JobContext, State, Transition, check_config_update, leader_running::LeaderRunning,
+    Admission, JobContext, State, Transition, check_config_update, leader_running::LeaderRunning,
     running::Running,
 };
 use crate::job_controller::checkpoint_store::DbCheckpointMetadataStore;
@@ -205,6 +209,132 @@ async fn handle_worker_connect<'a>(
     }
 
     Ok(())
+}
+
+/// Everything every worker's `StartExecutionReq` shares.
+///
+/// Grouped so the fan-out below can be a function that takes an [`Admission`], rather than a
+/// block of statements that happens to sit inside a region: a function cannot be called
+/// without a guard in scope, and the guard is only in scope where a refusal cannot be
+/// published.
+struct ExecutionPlan {
+    assignments: Vec<TaskAssignment>,
+    program: api::ArrowProgram,
+    restore_epoch: Option<u64>,
+    start_epoch: u64,
+    min_epoch: u64,
+    /// The worker that runs the job controller, and its address — leader mode only.
+    leader: Option<(WorkerId, String)>,
+    checkpoint_manifest_ref: Option<String>,
+    checkpoint_interval_micros: u64,
+    /// The job's own selector, stamped into every worker of this execution.
+    state_backend: StateBackendSelector,
+}
+
+/// Sends every connected worker its `StartExecutionReq`, and waits for all of them to accept.
+///
+/// This is the point at which the job stops being a cluster of idle workers and becomes a
+/// running execution: each worker opens the state backend under
+/// [`ExecutionPlan::state_backend`], restores from the checkpoint the preamble prepared, and
+/// starts producing. None of that can be taken back, and none of it may happen for a
+/// configuration the controller has refused — which is why the caller must hand over an
+/// [`Admission`] to call this at all, and why the caller takes that admission by re-reading
+/// the gate rather than by trusting the message loop that just ended.
+async fn start_execution_on_workers(
+    admission: &Admission,
+    job_id: Arc<String>,
+    pipeline_id: PipelineId,
+    plan: ExecutionPlan,
+    workers: &mut HashMap<WorkerId, WorkerStatus>,
+    worker_connects: HashMap<WorkerId, WorkerClient>,
+) -> Result<HashMap<WorkerId, WorkerClient>, JoinError> {
+    // The whole of this — the spawns as much as the wait for them — is one effect inside one
+    // region: `tokio::spawn` is already the request going out, so nothing here may sit outside
+    // the guard.
+    admission
+        .effect("send every worker its StartExecution", async move {
+            let (leader_id, leader_addr) = plan.leader.unzip();
+
+            let tasks: Vec<_> = worker_connects
+                .into_iter()
+                .map(|(id, mut c)| {
+                    let assignments = plan.assignments.clone();
+                    let job_id = job_id.clone();
+                    let pipeline_id = pipeline_id.clone();
+                    let program = plan.program.clone();
+                    let machine_id = workers.get(&id).as_ref().unwrap().machine_id.clone();
+                    let leader_addr = leader_addr.clone();
+                    let checkpoint_manifest_ref = plan.checkpoint_manifest_ref.clone();
+                    let state_backend = plan.state_backend;
+                    let (restore_epoch, start_epoch, min_epoch, checkpoint_interval_micros) = (
+                        plan.restore_epoch,
+                        plan.start_epoch,
+                        plan.min_epoch,
+                        plan.checkpoint_interval_micros,
+                    );
+
+                    tokio::spawn(async move {
+                        info!(
+                            message = "starting execution on worker",
+                            job_id = %job_id,
+                            pipeline_id = *pipeline_id,
+                            worker_id = id.0,
+                            machine_id = *machine_id.0,
+                        );
+
+                        match c
+                            .start_execution(Request::new(StartExecutionReq {
+                                restore_epoch,
+                                start_epoch,
+                                min_epoch,
+                                program: Some(program),
+                                tasks: assignments,
+                                job_controller_addr: leader_addr,
+                                is_leader: leader_id.is_some_and(|l| l == id),
+                                wait_for_leader: leader_id.is_some(),
+                                checkpoint_interval_micros,
+                                checkpoint_manifest_ref,
+                                state_backend: state_backend.as_str().to_string(),
+                            }))
+                            .await
+                        {
+                            Ok(_) => {
+                                debug!(
+                                    message = "worker entered initialization phase",
+                                    job_id = %job_id,
+                                    pipeline_id = *pipeline_id,
+                                    worker_id = id.0,
+                                    machine_id = *machine_id.0,
+                                );
+                                (id, c)
+                            }
+                            Err(e) => {
+                                error!(
+                                    message = "failed to start execution on worker",
+                                    job_id = %job_id,
+                                    pipeline_id = *pipeline_id,
+                                    worker_id = id.0,
+                                    machine_id = *machine_id.0,
+                                    error = format!("{:?}", e),
+                                );
+                                panic!("Failed to start execution on worker {id:?}: {e}");
+                            }
+                        }
+                    })
+                })
+                .collect();
+
+            let mut started = HashMap::new();
+            for t in tasks {
+                let (id, c) = t.await?;
+                if let Some(worker) = workers.get_mut(&id) {
+                    worker.state = WorkerState::Initializing;
+                }
+                started.insert(id, c);
+            }
+            Ok(started)
+        })
+        .await
 }
 
 #[derive(Clone, Debug)]
@@ -777,28 +907,35 @@ impl State for Scheduling {
         // to schedule
         stop_if_desired_non_running!(self, &ctx.config);
 
-        // Everything from here to the first `ctx.rx.recv` below is this state's destructive
-        // preamble: it persists an incremented generation, tears down whatever cluster the
-        // job is running on, starts a replacement one and prepares checkpoint recovery, and
-        // it awaits — repeatedly, and for as long as the scheduler needs slots — in between.
-        // None of it is undoable, and none of it may happen for a configuration the
-        // controller has refused.
+        // `Scheduling` alternates between two kinds of phase, and the whole of this state's
+        // refusal safety is the boundary between them.
         //
-        // [`execute_state`]'s gate check settles that question at the state boundary, but a
-        // snapshot cannot settle it for the rest of the body: a refusal published a moment
-        // later would not be looked at again until the next state, which is after all of the
-        // above. Re-reading the gate at each effect would only shrink the window to the gap
-        // between the last read and the next effect.
+        // An *irreversible* phase does work that cannot be undone and never touches the job's
+        // channel: this preamble (persist an incremented generation, tear down whatever
+        // cluster the job is running on, start a replacement one, prepare checkpoint
+        // recovery), the `StartExecution` fan-out that puts the job's own program on those
+        // workers, and the publication of a restored checkpoint's commits. An *interruptible*
+        // phase does nothing irreversible and waits on `ctx.rx.recv`: the wait for workers to
+        // connect, and the wait for their tasks to start.
         //
-        // So the region is *admitted* instead. The guard returned here is the same lock
-        // `StateMachine::refuse_config` must take to publish a refusal at all, and it is
-        // held until the preamble is over: a refusal either exists before this line — in
-        // which case this call is where the job is failed, with nothing done to it — or it
-        // cannot be published until after the last effect, and reaches the job at the `recv`
-        // loop below, which handles it. There is no interleaving in which a refused job is
-        // rescheduled, and a later effect added anywhere inside the region inherits that
-        // without anyone having to remember it.
-        let admission = ctx.admit_destructive_scheduling().await?;
+        // Every irreversible phase runs under an `Admission` taken at its head, and there are
+        // exactly three of them. The guard is the same lock `StateMachine::refuse_config` must
+        // take to publish a refusal at all, so for as long as it is held nothing can be
+        // published; and the gate is re-read as it is taken, so whatever *was* published
+        // before the crossing stops the phase before its first effect.
+        //
+        // Re-reading at the crossing is the part that does not depend on the channel. An
+        // interruptible phase ends as soon as enough messages have arrived — enough slots,
+        // enough started tasks — and it ends on the message that made the count, so a refusal
+        // published while it waited can still be sitting behind those messages, unread, or
+        // never have been queued at all because the queue was full. The gate is written in
+        // either case, and the gate is what the crossing reads.
+        //
+        // The admission is dropped before each `recv`: holding it across a wait that can take
+        // minutes would make the job unrefusable for exactly as long as it is least able to
+        // defend itself. It must also be dropped before the next crossing takes it again — the
+        // guard does not re-enter.
+        let admission = ctx.admit_irreversible_scheduling().await?;
 
         // update the generation for this scheduling attempt
         ctx.status.generation += 1;
@@ -876,11 +1013,9 @@ impl State for Scheduling {
                 .await?
         };
 
-        // The preamble is over: every irreversible effect of this scheduling attempt has
-        // happened, and the loop below reads the job's channel, so a refusal raised from here
-        // on is both publishable and promptly acted on. Holding the admission across the
-        // wait for workers — which can be minutes — would instead make the job unrefusable
-        // for exactly as long as it is least able to defend itself.
+        // The preamble is over and the next phase only waits, so the admission is released:
+        // a refusal raised from here on is publishable again, and is read from the gate at the
+        // next crossing whether or not the loop below ever gets to its message.
         drop(admission);
 
         // wait for them to connect and make outbound RPC connections
@@ -995,84 +1130,46 @@ impl State for Scheduling {
         // from the database after every transition.
         let state_backend = ctx.execution_selector;
 
-        let tasks: Vec<_> = worker_connects
-            .into_iter()
-            .map(|(id, mut c)| {
-                let assignments = assignments.clone();
-                let job_id = ctx.config.id.clone();
-                let pipeline_id = ctx.pipeline_info.pipeline_id.clone();
-                let restore_epoch = checkpoint_info.as_ref().map(|info| info.epoch);
-                let program = program.clone();
-                let machine_id = workers.get(&id).as_ref().unwrap().machine_id.clone();
-                let (leader_id, leader_addr) = leader_info.clone().unzip();
+        let plan = ExecutionPlan {
+            assignments,
+            program,
+            restore_epoch: checkpoint_info.as_ref().map(|info| info.epoch),
+            start_epoch,
+            min_epoch,
+            leader: leader_info.clone(),
+            checkpoint_manifest_ref: leader_info
+                .as_ref()
+                .and(checkpoint_info.as_ref())
+                .map(|ci| ci.id.clone()),
+            checkpoint_interval_micros,
+            state_backend,
+        };
 
-                let checkpoint_manifest_ref =
-                    leader_id.and(checkpoint_info.as_ref().map(|ci| ci.id.clone()));
-                tokio::spawn(async move {
-                    info!(
-                        message = "starting execution on worker",
-                        job_id = %job_id,
-                        pipeline_id = *pipeline_id,
-                        worker_id = id.0,
-                        machine_id = *machine_id.0,
-                    );
+        // The second crossing. The loop above broke on a queued `WorkerConnect` the moment the
+        // slots added up; a refusal published while it was waiting can be behind that message,
+        // unread, or never have been queued at all. Neither is a reason to start executing a
+        // configuration the controller has refused, so the decision is taken from the gate
+        // here, and the admission is held across the fan-out below — which is where this job's
+        // program actually begins to run, restoring state under the job's selector and
+        // producing to its sinks.
+        let admission = ctx.admit_irreversible_scheduling().await?;
+        let started = start_execution_on_workers(
+            &admission,
+            ctx.config.id.clone(),
+            ctx.pipeline_info.pipeline_id.clone(),
+            plan,
+            &mut workers,
+            worker_connects,
+        )
+        .await;
+        drop(admission);
 
-                    match c
-                        .start_execution(Request::new(StartExecutionReq {
-                            restore_epoch,
-                            start_epoch,
-                            min_epoch,
-                            program: Some(program.clone()),
-                            tasks: assignments.clone(),
-                            job_controller_addr: leader_addr,
-                            is_leader: leader_id.is_some_and(|l| l == id),
-                            wait_for_leader: leader_id.is_some(),
-                            checkpoint_interval_micros,
-                            checkpoint_manifest_ref: checkpoint_manifest_ref.clone(),
-                            state_backend: state_backend.as_str().to_string(),
-                        }))
-                        .await
-                    {
-                        Ok(_) => {
-                            debug!(
-                                message = "worker entered initialization phase",
-                                job_id = %job_id,
-                                pipeline_id = *pipeline_id,
-                                worker_id = id.0,
-                                machine_id = *machine_id.0,
-                            );
-                            (id, c)
-                        }
-                        Err(e) => {
-                            error!(
-                                message = "failed to start execution on worker",
-                                job_id = %job_id,
-                                pipeline_id = *pipeline_id,
-                                worker_id = id.0,
-                                machine_id = *machine_id.0,
-                                error = format!("{:?}", e),
-                            );
-                            panic!("Failed to start execution on worker {id:?}: {e}");
-                        }
-                    }
-                })
-            })
-            .collect();
-
-        let mut worker_connects = HashMap::new();
-        for t in tasks {
-            match t.await {
-                Ok((id, c)) => {
-                    if let Some(worker) = workers.get_mut(&id) {
-                        worker.state = WorkerState::Initializing;
-                    }
-                    worker_connects.insert(id, c);
-                }
-                Err(e) => {
-                    return Err(ctx.retryable(self, "failed to initialize workers", e.into(), 10));
-                }
+        let worker_connects = match started {
+            Ok(connects) => connects,
+            Err(e) => {
+                return Err(ctx.retryable(self, "failed to initialize workers", e.into(), 10));
             }
-        }
+        };
 
         // Now wait until all tasks are running
         let start = Instant::now();
@@ -1234,10 +1331,20 @@ impl State for Scheduling {
                         pipeline_id = *ctx.pipeline_info.pipeline_id,
                         "restored checkpoint was in committing phase, sending commits"
                     );
-                    controller
-                        .send_commit_messages()
+                    // The third crossing, and the same argument as the second: the loop above
+                    // broke on a queued `TaskStarted` and a refusal published while it ran can
+                    // be behind that message. These commits finish a two-phase commit against
+                    // the job's sinks — they are visible outside the cluster and cannot be
+                    // withdrawn — so the gate is read again here, and held until they are out.
+                    let admission = ctx.admit_irreversible_scheduling().await?;
+                    admission
+                        .effect(
+                            "publish the restored checkpoint's commits",
+                            controller.send_commit_messages(),
+                        )
                         .await
                         .expect("failed to send commit messages");
+                    drop(admission);
                 }
 
                 ctx.job_controller = Some(controller);

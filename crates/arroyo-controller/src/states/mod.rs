@@ -745,23 +745,31 @@ impl JobContext<'_> {
         handle_unhandled_message(&self.config.id, &self.pipeline_info.pipeline_id, msg)
     }
 
-    /// Admits this state to the job's destructive scheduling work, or fails the job because
-    /// its configuration has been refused.
+    /// Admits this state to one region of irreversible scheduling work, or fails the job
+    /// because its configuration has been refused.
     ///
-    /// [`execute_state`]'s gate check is a snapshot taken before the state body: it settles
-    /// what was true at the boundary, and [`Scheduling`]'s preamble then persists the
-    /// incremented generation, tears the live cluster down, starts replacements and prepares
-    /// checkpoint recovery, awaiting several times on the way. This is what settles the rest
-    /// of that interval, and it does it by exclusion rather than by re-reading: the returned
-    /// [`Admission`] is the job's publication lock, so for as long as the caller holds it
-    /// [`StateMachine::refuse_config`] cannot publish at all. The refusal reported here is
-    /// therefore the last one that could exist before the region closed, and the first one
-    /// that can appear afterwards arrives at a state that is past every irreversible effect
-    /// and is reading its channel.
+    /// [`Scheduling`] is not one long region. It alternates: a stretch of irreversible work
+    /// with no `recv` in it, then an interruptible phase that waits on the job's channel,
+    /// then the next irreversible stretch. This is called at every *crossing* — every point
+    /// where an interruptible phase gives way to irreversible work — and it does two things
+    /// there that only work together:
     ///
-    /// Hold it across the whole preamble and drop it before the first `recv`. Dropping it
-    /// early would put back exactly the window this closes; holding it past the `recv` would
-    /// leave a job that waits minutes for its workers unable to be refused at all.
+    /// * it re-reads the gate, which is the authoritative record of what the state machine
+    ///   has refused, rather than trusting that a refusal has reached the front of the job's
+    ///   queue. The interruptible phases end on a *queued* message — enough worker connects,
+    ///   enough task starts — and a refusal published while they were waiting can be sitting
+    ///   behind those messages, unread, when they break. Channel order is delivery; the gate
+    ///   is the decision.
+    /// * it takes the job's publication lock, so for as long as the caller holds the returned
+    ///   [`Admission`] no refusal can be published at all. Without that, the re-read would be
+    ///   just another snapshot, and there would again be a last check and a first effect after
+    ///   it.
+    ///
+    /// So hold it across the irreversible work and drop it before the next `recv`. Dropping it
+    /// early reopens the window; holding it across a `recv` would leave a job that waits
+    /// minutes for its workers unable to be refused for exactly as long. Each region must also
+    /// drop before the next is entered — the guard does not re-enter, so a shadowed live one
+    /// would wedge the job on its own lock.
     ///
     /// # Errors
     ///
@@ -769,7 +777,7 @@ impl JobContext<'_> {
     /// produce, through the same [`handle_unhandled_message`] policy — including its
     /// superseded-version check, so a row repaired since the refusal was published lets the
     /// job schedule instead of failing it.
-    pub(crate) async fn admit_destructive_scheduling(&mut self) -> Result<Admission, StateError> {
+    pub(crate) async fn admit_irreversible_scheduling(&mut self) -> Result<Admission, StateError> {
         let (admission, refusal) = self.refusal_gate.admit_scheduling().await;
         if let Some(refusal) = refusal {
             self.handle(JobMessage::ConfigRefused(refusal))?;
@@ -1330,7 +1338,7 @@ enum RefusalDelivery {
 /// Held per job and cloned into that job's state task. There is no registry, no static and
 /// no global, for the same reason [`StateMachine::execution_selector`] has none.
 ///
-/// # Publishing a refusal and scheduling the job are one another's alternatives
+/// # Publishing a refusal and doing irreversible scheduling work are one another's alternatives
 ///
 /// Reading the gate once, at the state boundary, is a *snapshot*: [`Self::take`] clones what
 /// it finds and releases the lock, and [`Scheduling`] then runs a long, irreversible preamble
@@ -1341,18 +1349,36 @@ enum RefusalDelivery {
 /// only moves the interval; there is always a last check and a first effect after it.
 ///
 /// So the two are made mutually exclusive instead of merely ordered. [`Self::admission`] is
-/// the job's serialization point: [`JobContext::admit_destructive_scheduling`] holds it for
-/// the whole preamble, and [`StateMachine::refuse_config`] must take it — without waiting —
-/// to publish. Whichever gets it first decides the outcome for the whole preamble:
+/// the job's serialization point: [`JobContext::admit_irreversible_scheduling`] holds it
+/// across each region of irreversible work, and [`StateMachine::refuse_config`] must take it
+/// — without waiting — to publish. Whichever gets it first decides the outcome for that whole
+/// region:
 ///
-/// * the publisher first, and the gate is read *under the admission* it then acquires, so
-///   the preamble is refused before its first effect; or
-/// * the preamble first, and publication finds the admission taken, changes nothing at all,
-///   and is offered again by the next poll — reaching the job strictly after the preamble
-///   it could no longer have stopped, where `Scheduling`'s own `recv` handles it.
+/// * the publisher first, and the gate is read *under the admission* the region then
+///   acquires, so the region is refused before its first effect; or
+/// * the region first, and publication finds the admission taken, changes nothing at all,
+///   and is offered again by the next poll — reaching the job strictly after the region it
+///   could no longer have stopped, where the *next* crossing reads it from the gate.
 ///
 /// There is no third interleaving, which is what makes this a property of the operation
 /// rather than of how many places remembered to re-check.
+///
+/// # The gate is the decision; the channel is only delivery
+///
+/// [`Scheduling`] has more than one such region, separated by phases that wait on the job's
+/// message channel. Those phases end as soon as *enough* messages have arrived — enough
+/// worker connects for the slots, enough task starts for the tasks — and they end on the
+/// message that made the count, not on the last message in the queue. A refusal published
+/// while such a phase was waiting can therefore be sitting behind the messages it just
+/// consumed, still unread, when it breaks.
+///
+/// Draining or scanning the queue at that point would be the weaker answer, and not only
+/// because it is more work: a refusal that could not be *delivered* at all — the job's queue
+/// was full, so [`RefusalDelivery::Pending`] — is not in the queue to be found, and the same
+/// poll that could not deliver it did publish it here. `refuse_config` writes the gate before
+/// it offers the message and regardless of what becomes of it, so the gate is the record that
+/// exists in every case. Every crossing reads *that*, which is what makes the outcome
+/// independent of queue capacity and queue order alike.
 #[derive(Clone, Default)]
 pub(crate) struct RefusalGate {
     /// The refusal the state machine is under now, shared with the job's state task so a
@@ -1375,15 +1401,19 @@ pub(crate) struct RefusalGate {
     acted: u64,
 }
 
-/// Exclusive access to one job's destructive scheduling work.
+/// Exclusive access to one region of a job's irreversible scheduling work.
 ///
-/// Held by [`Scheduling`] across its whole preamble, and taken — without ever waiting — by
+/// Held by [`Scheduling`] across each such region, and taken — without ever waiting — by
 /// [`StateMachine::refuse_config`] for the instant it publishes. See [`RefusalGate`] for why
 /// those two are the same lock.
 ///
 /// The guard is what makes the region rather than any individual statement the unit: every
 /// effect between the acquisition and the drop is inside it, including effects added later,
-/// so the guarantee does not depend on a future author remembering to re-check anything.
+/// so the guarantee does not depend on a future author remembering to re-check anything
+/// *within* a region. What it cannot speak for is an effect written outside every region;
+/// that is what
+/// `the_source_of_scheduling_next_keeps_every_irreversible_effect_inside_an_admitted_region`
+/// pins, and why that pin enumerates the effects by name.
 pub(crate) struct Admission {
     _guard: tokio::sync::OwnedMutexGuard<()>,
 }
@@ -1391,12 +1421,12 @@ pub(crate) struct Admission {
 impl Admission {
     /// Performs one irreversible scheduling effect inside the admitted region.
     ///
-    /// Every effect of [`Scheduling`]'s preamble goes through here, and needing an
+    /// Every irreversible effect of [`Scheduling`] goes through here, and needing an
     /// `&Admission` to call it is the point: an effect can only be written where a guard is
-    /// in scope, and a guard is only in scope inside the region no refusal can be published
+    /// in scope, and a guard is only in scope inside a region no refusal can be published
     /// into. `what` names the effect for the log and for
-    /// `the_scheduling_preamble_is_written_to_run_every_irreversible_effect_under_admission`,
-    /// which pins the set of them.
+    /// `the_source_of_scheduling_next_keeps_every_irreversible_effect_inside_an_admitted_region`,
+    /// which pins the set of them and the boundaries they sit between.
     pub(crate) async fn effect<F: std::future::Future>(
         &self,
         what: &'static str,
@@ -1412,15 +1442,20 @@ impl Admission {
 
 impl RefusalGate {
     /// Takes the job's scheduling admission for a publication, if the job is not in the
-    /// middle of its destructive scheduling work.
+    /// middle of a region of irreversible scheduling work.
     ///
     /// Never waits, and must never be made to: the update thread calls
     /// [`StateMachine::refuse_config`] while it holds the global job map, so blocking here
     /// would block every other job's poll — the failure mode round 4 removed from this path
-    /// and the reason `refuse_config` is not `async`. `None` means the preamble is in flight
+    /// and the reason `refuse_config` is not `async`. `None` means such a region is in flight
     /// and the caller must leave the refusal [`RefusalDelivery::Pending`], changing *nothing*
     /// — not the refusal version, not the recorded delivery — so the next poll offers exactly
     /// the same refusal again.
+    ///
+    /// How long `None` can persist is bounded by the region in flight, and the longest of them
+    /// is the preamble's wait for slots (`pipeline.worker-startup-time`). The deferral is the
+    /// price of the interlock and is paid by one job's refusal latency only: nothing here
+    /// blocks the caller, no other job is affected, and the refusal itself is untouched.
     fn admit_publication(&self) -> Option<Admission> {
         Arc::clone(&self.admission)
             .try_lock_owned()
@@ -1428,13 +1463,16 @@ impl RefusalGate {
             .map(|guard| Admission { _guard: guard })
     }
 
-    /// Admits the caller to the job's destructive scheduling work, and reports the refusal
-    /// that must stop it.
+    /// Admits the caller to one region of the job's irreversible scheduling work, and reports
+    /// the refusal that must stop it.
     ///
     /// Waiting here is bounded and safe: the only other holder is a publication, which is
-    /// synchronous and does not await. The refusal is read *after* the admission is held, so
-    /// it is the last thing any publisher can have said before this region became closed to
-    /// them.
+    /// synchronous and does not await, or a region held by this same task, which must have
+    /// dropped before the next is entered. The refusal is read *after* the admission is held,
+    /// so it is the last thing any publisher can have said before this region became closed to
+    /// them — and it is read from the gate rather than from the job's queue, so a refusal a
+    /// preceding receive phase left unread, or that no queue ever took, stops this region all
+    /// the same.
     async fn admit_scheduling(&mut self) -> (Admission, Option<RefusedConfig>) {
         let guard = Arc::clone(&self.admission).lock_owned().await;
         let refusal = self.take();
@@ -1444,8 +1482,8 @@ impl RefusalGate {
     /// Publishes a refusal for the job's state task to apply before its next state.
     ///
     /// Only callable with the job's scheduling admission in hand, which is the whole of the
-    /// interlock: a refusal cannot appear while a preamble is running, so a preamble that
-    /// started with the gate clear can never be overtaken by one.
+    /// interlock: a refusal cannot appear while a region of irreversible work is running, so
+    /// a region that started with the gate clear can never be overtaken by one.
     fn publish(&self, _admission: &Admission, refusal: RefusedConfig) {
         *self.current.write().unwrap() = Some(refusal);
     }
@@ -2186,16 +2224,17 @@ impl StateMachine {
     /// every refusal is stamped with [`Self::refusal_version`], and a version the state
     /// machine has since moved past is discarded on receipt instead of failing the job.
     ///
-    /// # A refusal is never published into a scheduling preamble that has already started
+    /// # A refusal is never published into irreversible scheduling work that has already started
     ///
     /// Publishing takes the job's scheduling admission ([`RefusalGate::admit_publication`]),
-    /// which [`Scheduling`] holds for the whole of its destructive preamble. Nothing waits
-    /// for it — this function runs under the global job map — so a refusal raised while the
-    /// preamble is in flight simply does not happen yet: *nothing at all* is recorded, the
-    /// refusal version is not advanced, and the next 500ms poll offers the same refusal
-    /// again, by which time the preamble has either finished or is finishing. That is round
-    /// 6's rule for an undeliverable refusal applied to an unpublishable one, and it is why
-    /// contention defers a refusal rather than losing one.
+    /// which [`Scheduling`] holds across each region of irreversible work — its destructive
+    /// preamble, the `StartExecution` fan-out, and the publication of a restored checkpoint's
+    /// commits. Nothing waits for it — this function runs under the global job map — so a
+    /// refusal raised while one of those regions is in flight simply does not happen yet:
+    /// *nothing at all* is recorded, the refusal version is not advanced, and the next 500ms
+    /// poll offers the same refusal again, by which time the region has either finished or is
+    /// finishing. That is round 6's rule for an undeliverable refusal applied to an
+    /// unpublishable one, and it is why contention defers a refusal rather than losing one.
     ///
     /// Leaving the recorded state untouched is load-bearing rather than tidy. Advancing
     /// [`Self::refusal_version`] on a poll that publishes nothing would supersede a refusal
@@ -2335,12 +2374,22 @@ mod tests {
         JobConfig, JobMessage, JobStatus, PipelineInfo, PolledJob, RefusedConfig, StateContext,
         states::StateError,
     };
-    use arroyo_datastream::logical::LogicalProgram;
+    use arroyo_datastream::logical::{LogicalNode, LogicalProgram, OperatorName};
     use arroyo_rpc::grpc::api::ArrowProgram;
-    use arroyo_rpc::grpc::rpc::{HeartbeatNodeReq, RegisterNodeReq, WorkerFinishedReq};
+    use arroyo_rpc::grpc::rpc::worker_grpc_server::{WorkerGrpc, WorkerGrpcServer};
+    use arroyo_rpc::grpc::rpc::{
+        CheckpointMetadata, CheckpointReq, CheckpointResp, CommitReq, CommitResp,
+        GetWorkerPhaseReq, GetWorkerPhaseResp, GlobalKeyedTableConfig,
+        GlobalKeyedTableTaskCheckpointMetadata, HeartbeatNodeReq, JobControllerInitReq,
+        JobControllerInitResp, JobFinishedReq, JobFinishedResp, LoadCompactedDataReq,
+        LoadCompactedDataRes, MetricsReq, MetricsResp, OperatorCheckpointMetadata,
+        OperatorMetadata, RegisterNodeReq, StartExecutionReq, StartExecutionResp, StopExecutionReq,
+        StopExecutionResp, TableCheckpointMetadata, TableConfig, TableEnum, WorkerFinishedReq,
+    };
     use arroyo_rpc::state_backend::{StateBackendError, StateBackendSelector};
     use arroyo_server_common::shutdown::{Shutdown, SignalBehavior};
-    use arroyo_types::{PipelineId, WorkerId};
+    use arroyo_state::{BackingStore, StateBackend, StorageProviderFor};
+    use arroyo_types::{MachineId, PipelineId, WorkerId};
     use cornucopia_async::DatabaseSource;
     use futures::FutureExt as _;
     use prost::Message as _;
@@ -2402,6 +2451,34 @@ mod tests {
     struct RecordingScheduler {
         stopped: Mutex<Vec<(String, Option<u64>)>>,
         started: Mutex<Vec<(String, u64)>>,
+        /// Panics instead of starting the cluster, after recording the request.
+        ///
+        /// This is how the tests that need a panic *inside* the admitted region get one they
+        /// own. They used to rely on `Scheduling::start_workers` panicking at
+        /// `arroyo_server_common::get_cluster_id`, which no test set — but that is a
+        /// process-global `OnceCell`, so as soon as one test in this binary sets it, tests that
+        /// depended on it being unset would change behaviour depending on the order they ran
+        /// in. A panic the scheduler raises is under the same admission and depends on nothing
+        /// outside the test.
+        panic_on_start: bool,
+        /// Announces that the cluster has been asked for. See [`SchedulingBarriers`].
+        barriers: Option<Arc<SchedulingBarriers>>,
+    }
+
+    impl RecordingScheduler {
+        fn panicking() -> Self {
+            Self {
+                panic_on_start: true,
+                ..Default::default()
+            }
+        }
+
+        fn watching(barriers: Arc<SchedulingBarriers>) -> Self {
+            Self {
+                barriers: Some(barriers),
+                ..Default::default()
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -2411,6 +2488,13 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(((*req.job_id.0).clone(), req.generation));
+            if let Some(barriers) = &self.barriers {
+                barriers.workers_started.notify_one();
+            }
+            assert!(
+                !self.panic_on_start,
+                "the test asked for a panic while the job's scheduling admission is held"
+            );
             Ok(())
         }
         async fn register_node(&self, _: RegisterNodeReq) {}
@@ -2481,6 +2565,15 @@ mod tests {
                     proto_version INTEGER NOT NULL,
                     state_url TEXT,
                     tags TEXT NOT NULL
+                );
+                CREATE TABLE checkpoints (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    pub_id TEXT NOT NULL,
+                    job_id TEXT NOT NULL,
+                    epoch INTEGER NOT NULL,
+                    min_epoch INTEGER NOT NULL,
+                    state TEXT NOT NULL,
+                    state_backend TEXT NOT NULL DEFAULT ''
                 );
                 CREATE TABLE state_writes (
                     seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2645,12 +2738,18 @@ mod tests {
     struct Harness {
         status: JobStatus,
         program: LogicalProgram,
+        /// Kept alive, and handed out by [`Self::queue`]: a state that reads its channel has
+        /// to have one, and a test that queues messages ahead of a refusal has to be the
+        /// thing that queued them.
+        tx: Sender<JobMessage>,
         rx: Receiver<JobMessage>,
         scheduler: Arc<RecordingScheduler>,
         /// Unused by the tests that drive `next` directly, and the difference between a
         /// context and a whole state machine for the ones that drive [`execute_state`],
         /// which writes the job's status after every transition.
         db: DatabaseSource,
+        /// Where the job's checkpoints live, for the tests that restore from one.
+        state_url: Option<String>,
         /// Owned here rather than made inside [`Self::ctx`], so a test can publish to the
         /// same gate the state runs under and can ask, afterwards, whether the job's
         /// scheduling admission was left free.
@@ -2659,13 +2758,15 @@ mod tests {
 
     impl Harness {
         fn new(restart_nonce: i32) -> Self {
-            let (_tx, rx) = channel(16);
+            let (tx, rx) = channel(16);
             Self {
                 status: job_status(restart_nonce),
                 program: LogicalProgram::default(),
+                tx,
                 rx,
                 scheduler: Arc::new(RecordingScheduler::default()),
                 db: unused_db(),
+                state_url: None,
                 refusal_gate: RefusalGate::default(),
             }
         }
@@ -2675,6 +2776,26 @@ mod tests {
         fn with_db(mut self, db: DatabaseSource) -> Self {
             self.db = db;
             self
+        }
+
+        fn with_program(mut self, program: LogicalProgram) -> Self {
+            self.program = program;
+            self
+        }
+
+        fn with_state_url(mut self, state_url: String) -> Self {
+            self.state_url = Some(state_url);
+            self
+        }
+
+        fn with_scheduler(mut self, scheduler: RecordingScheduler) -> Self {
+            self.scheduler = Arc::new(scheduler);
+            self
+        }
+
+        /// The job's own queue, for a test that has to put messages in it in a known order.
+        fn queue(&self) -> Sender<JobMessage> {
+            self.tx.clone()
         }
 
         fn ctx(
@@ -2687,7 +2808,7 @@ mod tests {
                 execution_selector,
                 pipeline_info: Arc::new(PipelineInfo {
                     pipeline_id: PipelineId("pipeline_1".to_string().into()),
-                    state_url: None,
+                    state_url: self.state_url.clone(),
                     tags: HashMap::new(),
                 }),
                 status: &mut self.status,
@@ -4147,14 +4268,15 @@ mod tests {
     /// generation advance and no teardown" above would be a statement about the harness
     /// rather than about the refusal.
     ///
-    /// The task then panics inside `Scheduling::start_workers`, at
-    /// `arroyo_server_common::get_cluster_id`, which no test sets: the panic is expected and
-    /// is printed by the runtime. It happens *after* both things asserted here, and it is why
-    /// they are the generation and the teardown rather than the `start_workers` call itself.
+    /// The task then panics inside the scheduler's `start_workers`, which this test asks for:
+    /// the panic is expected, is printed by the runtime, and is what lets the spawned task
+    /// finish so the writes can be read back. It happens *after* both things asserted here,
+    /// and it is why they are the generation and the teardown rather than the `start_workers`
+    /// call itself.
     #[tokio::test]
     async fn an_unrefused_job_still_reaches_scheduling_and_advances_its_generation() {
         let db = sqlite_startable_job("Running", 2);
-        let scheduler = Arc::new(RecordingScheduler::default());
+        let scheduler = Arc::new(RecordingScheduler::panicking());
         let current = running_config(StateBackendSelector::Parquet);
         // Held for the whole test: the spawned task has to run, not just exist.
         let shutdown = LiveShutdown::new();
@@ -4304,16 +4426,23 @@ mod tests {
     /// a harness in which nothing schedules anyway. So the same path is run with the gate
     /// clear, and it must reach the effects the refused job reached none of.
     ///
-    /// It gets as far as `start_workers`, where `arroyo_server_common::get_cluster_id` panics
-    /// because no test sets a cluster id; that panic is the proof the preamble ran, and is
-    /// also the second thing checked here. A `tokio` mutex does not poison, so a state body
-    /// that panics under the admission leaves the job refusable rather than wedged for the
-    /// life of the controller — which a `std` mutex would not have.
+    /// It gets as far as the scheduler's `start_workers`, which this test asks to panic; that
+    /// panic is the proof the preamble ran, and is also the second thing checked here. A
+    /// `tokio` mutex does not poison, so a state body that panics under the admission leaves
+    /// the job refusable rather than wedged for the life of the controller — which a `std`
+    /// mutex would not have.
+    ///
+    /// The panic used to come from `arroyo_server_common::get_cluster_id`, which no test set.
+    /// It is asked for explicitly now because that is a process-global `OnceCell` and the
+    /// end-to-end tests below have to set it, which would otherwise make this test's premise
+    /// depend on the order the binary happened to run them in.
     #[tokio::test]
     async fn an_unrefused_job_still_schedules_and_a_panic_under_the_admission_releases_it() {
         let db = sqlite_startable_job("Scheduling", 2);
 
-        let mut harness = Harness::new(3).with_db(db.clone());
+        let mut harness = Harness::new(3)
+            .with_db(db.clone())
+            .with_scheduler(RecordingScheduler::panicking());
         harness.status.state = "Scheduling".to_string();
         let scheduler = harness.scheduler.clone();
         let gate = harness.refusal_gate.clone();
@@ -4428,47 +4557,703 @@ mod tests {
         );
     }
 
-    /// The region, pinned on source text rather than on behaviour.
+    // ---------------------------------------------------------------------------------------
+    // Round 9: the crossings after the preamble.
+    //
+    // `Scheduling` does not stop being destructive when its preamble ends. It still has to send
+    // every worker its `StartExecution`, and — for a checkpoint that died mid-commit — publish
+    // that checkpoint's commits. Both are externally visible and neither can be taken back.
+    //
+    // The tests below are end-to-end on purpose: a real gRPC worker on a real socket, the real
+    // `Scheduling::next`, and the reviewer's own scenario — enough queued messages ahead of the
+    // refusal to satisfy each receive loop, so the loop breaks without ever reading it. What is
+    // asserted is what arrived at the worker.
+    // ---------------------------------------------------------------------------------------
+
+    /// The process-global cluster id `Scheduling::start_workers` reads.
     ///
-    /// **This is a structural pin, and the name says so.** What it asserts is where the words
-    /// are in `scheduling.rs`, not what the job does; the behaviour is covered by
-    /// `a_refusal_published_after_the_gate_snapshot_still_stops_the_scheduling_preamble` and
-    /// its control above.
+    /// `arroyo_server_common::set_cluster_id` writes a `OnceCell` and can only happen once per
+    /// process, so it goes through a `Once`. The value is a well-formed uuid because that
+    /// function persists it to `~/.config/arroyo/cluster-info` — but only when that directory
+    /// already exists, and only when it does not already hold a valid id, so on an ordinary
+    /// checkout nothing is written at all.
+    fn cluster_id_is_set() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            arroyo_server_common::set_cluster_id("2f2a2f3c-0000-4000-8000-000000000001")
+        });
+    }
+
+    /// The points inside one run of `Scheduling::next` that a test can wait for.
+    ///
+    /// These are what make the tests below deterministic rather than timed. Each is announced
+    /// from inside a piece of work the state does, so "publish the refusal after the preamble
+    /// and before the fan-out" is an ordering the test enforces rather than one it hopes for.
+    #[derive(Default)]
+    struct SchedulingBarriers {
+        /// The scheduler has been asked for the replacement cluster: the last effect of the
+        /// destructive preamble, and so a point from which the preamble's admission is about
+        /// to be released.
+        workers_started: tokio::sync::Notify,
+        /// A worker has been asked to start executing: inside the second region, and so after
+        /// its gate read.
+        execution_started: tokio::sync::Notify,
+    }
+
+    /// What a worker was actually asked to do.
+    #[derive(Default)]
+    struct WorkerCalls {
+        /// One entry per `StartExecution`, carrying the selector it was stamped with.
+        start_execution: Mutex<Vec<String>>,
+        /// One entry per `Commit`, carrying its epoch.
+        commit: Mutex<Vec<u64>>,
+    }
+
+    impl WorkerCalls {
+        fn started(&self) -> Vec<String> {
+            self.start_execution.lock().unwrap().clone()
+        }
+
+        fn committed(&self) -> Vec<u64> {
+            self.commit.lock().unwrap().clone()
+        }
+    }
+
+    /// A worker, as far as the controller can tell.
+    ///
+    /// A real server on a real socket, because the claim under test is about real RPCs: the
+    /// controller connects to whatever address a `WorkerConnect` carries and sends
+    /// `StartExecution` and `Commit` over that channel, so "no execution RPC and no commit was
+    /// issued" is a question about what arrived here and nowhere else.
+    struct FakeWorker {
+        calls: Arc<WorkerCalls>,
+        barriers: Arc<SchedulingBarriers>,
+    }
+
+    #[tonic::async_trait]
+    impl WorkerGrpc for FakeWorker {
+        async fn start_execution(
+            &self,
+            request: tonic::Request<StartExecutionReq>,
+        ) -> Result<tonic::Response<StartExecutionResp>, tonic::Status> {
+            self.calls
+                .start_execution
+                .lock()
+                .unwrap()
+                .push(request.into_inner().state_backend);
+            self.barriers.execution_started.notify_one();
+            Ok(tonic::Response::new(StartExecutionResp {}))
+        }
+
+        async fn commit(
+            &self,
+            request: tonic::Request<CommitReq>,
+        ) -> Result<tonic::Response<CommitResp>, tonic::Status> {
+            self.calls
+                .commit
+                .lock()
+                .unwrap()
+                .push(request.into_inner().epoch);
+            Ok(tonic::Response::new(CommitResp {}))
+        }
+
+        async fn get_worker_phase(
+            &self,
+            _: tonic::Request<GetWorkerPhaseReq>,
+        ) -> Result<tonic::Response<GetWorkerPhaseResp>, tonic::Status> {
+            Ok(tonic::Response::new(GetWorkerPhaseResp::default()))
+        }
+
+        async fn checkpoint(
+            &self,
+            _: tonic::Request<CheckpointReq>,
+        ) -> Result<tonic::Response<CheckpointResp>, tonic::Status> {
+            Ok(tonic::Response::new(CheckpointResp {}))
+        }
+
+        async fn load_compacted_data(
+            &self,
+            _: tonic::Request<LoadCompactedDataReq>,
+        ) -> Result<tonic::Response<LoadCompactedDataRes>, tonic::Status> {
+            Ok(tonic::Response::new(LoadCompactedDataRes {}))
+        }
+
+        async fn stop_execution(
+            &self,
+            _: tonic::Request<StopExecutionReq>,
+        ) -> Result<tonic::Response<StopExecutionResp>, tonic::Status> {
+            Ok(tonic::Response::new(StopExecutionResp {}))
+        }
+
+        async fn job_finished(
+            &self,
+            _: tonic::Request<JobFinishedReq>,
+        ) -> Result<tonic::Response<JobFinishedResp>, tonic::Status> {
+            Ok(tonic::Response::new(JobFinishedResp {}))
+        }
+
+        async fn get_metrics(
+            &self,
+            _: tonic::Request<MetricsReq>,
+        ) -> Result<tonic::Response<MetricsResp>, tonic::Status> {
+            Ok(tonic::Response::new(MetricsResp::default()))
+        }
+
+        async fn job_controller_init(
+            &self,
+            _: tonic::Request<JobControllerInitReq>,
+        ) -> Result<tonic::Response<JobControllerInitResp>, tonic::Status> {
+            Ok(tonic::Response::new(JobControllerInitResp {}))
+        }
+    }
+
+    /// Serves a [`FakeWorker`] on a loopback port and returns the address a `WorkerConnect`
+    /// would carry.
+    async fn fake_worker(calls: Arc<WorkerCalls>, barriers: Arc<SchedulingBarriers>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(WorkerGrpcServer::new(FakeWorker { calls, barriers }))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+        format!("http://{addr}")
+    }
+
+    /// The `WorkerConnect` the fake worker would send, at the generation the preamble has just
+    /// advanced to and with exactly the slots [`one_operator_program`] needs.
+    fn worker_connect(rpc_address: &str) -> JobMessage {
+        JobMessage::WorkerConnect {
+            worker_id: WorkerId(7),
+            machine_id: MachineId(Arc::new("machine_1".to_string())),
+            generation: 2,
+            rpc_address: rpc_address.to_string(),
+            data_address: "127.0.0.1:1".to_string(),
+            slots: 1,
+        }
+    }
+
+    /// The `TaskStarted` that satisfies the second loop for [`one_operator_program`].
+    fn task_started() -> JobMessage {
+        JobMessage::TaskStarted {
+            worker_id: WorkerId(7),
+            task_id: 1,
+            subtask_idx: 0,
+        }
+    }
+
+    /// One operator at parallelism 1: one slot to fill, one task to start, one operator for the
+    /// restored checkpoint to cover.
+    fn one_operator_program() -> LogicalProgram {
+        let mut program = LogicalProgram::default();
+        program.graph.add_node(LogicalNode::single(
+            1,
+            OPERATOR_ID.to_string(),
+            OperatorName::ArrowValue,
+            vec![],
+            "the only operator".to_string(),
+            1,
+        ));
+        program
+    }
+
+    const OPERATOR_ID: &str = "node_1";
+    /// The epoch of the restored checkpoint, and the min epoch it is rewritten to. They differ
+    /// so the commit the job replays can be told apart from anything else.
+    const RESTORED_EPOCH: u32 = 4;
+    const RESTORED_MIN_EPOCH: u32 = 2;
+
+    /// A directory holding one job's checkpoints, removed with the test.
+    struct CheckpointDir(String);
+
+    impl CheckpointDir {
+        fn new(name: &str) -> Self {
+            let directory = std::env::temp_dir()
+                .join(format!(
+                    "arroyo-states-{name}-{}-{:?}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ))
+                .to_string_lossy()
+                .into_owned();
+            std::fs::create_dir_all(&directory).unwrap();
+            Self(directory)
+        }
+
+        fn url(&self) -> String {
+            format!("file://{}", self.0)
+        }
+
+        fn role(&self) -> StorageProviderFor {
+            StorageProviderFor::Controller {
+                storage_url: Some(self.url()),
+            }
+        }
+    }
+
+    impl Drop for CheckpointDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Lays down a checkpoint that died in its committing phase, so restoring from it makes the
+    /// job replay commits — the effect the third crossing guards.
+    async fn committing_checkpoint(dir: &CheckpointDir, db: &DatabaseSource) {
+        StateBackend::write_operator_checkpoint_metadata(
+            &dir.role(),
+            OperatorCheckpointMetadata {
+                operator_metadata: Some(OperatorMetadata {
+                    job_id: "job_abc".to_string(),
+                    operator_id: OPERATOR_ID.to_string(),
+                    epoch: RESTORED_EPOCH,
+                    min_watermark: None,
+                    max_watermark: None,
+                    parallelism: 1,
+                }),
+                start_time: 0,
+                finish_time: 0,
+                table_checkpoint_metadata: HashMap::from([(
+                    "g".to_string(),
+                    TableCheckpointMetadata {
+                        table_type: TableEnum::GlobalKeyValue as i32,
+                        data: GlobalKeyedTableTaskCheckpointMetadata {
+                            files: vec![],
+                            commit_data_by_subtask: HashMap::from([(0, b"commit".to_vec())]),
+                        }
+                        .encode_to_vec(),
+                    },
+                )]),
+                table_configs: HashMap::from([(
+                    "g".to_string(),
+                    TableConfig {
+                        table_type: TableEnum::GlobalKeyValue as i32,
+                        config: GlobalKeyedTableConfig {
+                            table_name: "g".to_string(),
+                            description: "global".to_string(),
+                            uses_two_phase_commit: true,
+                        }
+                        .encode_to_vec(),
+                        state_version: 0,
+                        state_backend: "parquet".to_string(),
+                    },
+                )]),
+            },
+        )
+        .await
+        .unwrap();
+
+        StateBackend::write_checkpoint_metadata(
+            &dir.role(),
+            CheckpointMetadata {
+                job_id: "job_abc".to_string(),
+                epoch: RESTORED_EPOCH,
+                min_epoch: 0,
+                start_time: 0,
+                finish_time: 0,
+                operator_ids: vec![OPERATOR_ID.to_string()],
+            },
+        )
+        .await
+        .unwrap();
+
+        let DatabaseSource::Sqlite(connection) = db else {
+            unreachable!("the fixture is always sqlite")
+        };
+        connection
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO checkpoints (pub_id, job_id, epoch, min_epoch, state, state_backend)
+                 VALUES ('cp_1', 'job_abc', ?1, ?2, 'committing', 'parquet')",
+                cornucopia_async::rusqlite::params![RESTORED_EPOCH, RESTORED_MIN_EPOCH],
+            )
+            .unwrap();
+    }
+
+    /// Everything a run of the real `Scheduling::next` against a real worker needs.
+    struct SchedulingRun {
+        db: DatabaseSource,
+        calls: Arc<WorkerCalls>,
+        barriers: Arc<SchedulingBarriers>,
+        worker_address: String,
+        harness: Harness,
+        /// Held for the test: dropping it takes the checkpoint away.
+        _checkpoints: CheckpointDir,
+    }
+
+    impl SchedulingRun {
+        async fn new(name: &str) -> Self {
+            cluster_id_is_set();
+            let db = sqlite_startable_job("Scheduling", 2);
+            let checkpoints = CheckpointDir::new(name);
+            committing_checkpoint(&checkpoints, &db).await;
+
+            let calls = Arc::new(WorkerCalls::default());
+            let barriers = Arc::new(SchedulingBarriers::default());
+            let worker_address = fake_worker(calls.clone(), barriers.clone()).await;
+
+            let mut harness = Harness::new(3)
+                .with_db(db.clone())
+                .with_program(one_operator_program())
+                .with_state_url(checkpoints.url())
+                .with_scheduler(RecordingScheduler::watching(barriers.clone()));
+            harness.status.state = "Scheduling".to_string();
+
+            Self {
+                db,
+                calls,
+                barriers,
+                worker_address,
+                harness,
+                _checkpoints: checkpoints,
+            }
+        }
+
+        /// Runs the real `Scheduling::next` against the real worker.
+        async fn schedule(&mut self) -> Result<Transition, StateError> {
+            let mut ctx = self.harness.ctx(
+                running_config(StateBackendSelector::Parquet),
+                StateBackendSelector::Parquet,
+            );
+            Box::new(Scheduling {}).next(&mut ctx).await
+        }
+    }
+
+    /// Publishes `refusal` to `gate` at the first instant a publication is possible, exactly as
+    /// a poll that found the admission taken would when it came round again.
+    ///
+    /// Spinning on `admit_publication` is not a timing hack: it is the only outcome
+    /// `refuse_config` has while a region is in flight — it changes nothing and the next poll
+    /// tries again — so the first success is by construction the first moment the region ended.
+    async fn publish_when_admitted(gate: &RefusalGate, refusal: RefusedConfig) {
+        loop {
+            if let Some(admission) = gate.admit_publication() {
+                gate.publish(&admission, refusal);
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// A refusal that reaches the gate while the job waits for its workers, with the connect
+    /// that ends that wait queued *ahead* of it, must stop the `StartExecution` RPCs.
+    ///
+    /// This is the reviewer's scenario for the first receive loop, and it is deterministic
+    /// rather than raced. The refusal is published the instant the preamble's admission is
+    /// released — the earliest a poll could have published it at all — and only then is the
+    /// `WorkerConnect` queued, with the refusal message behind it. The loop breaks on the
+    /// connect the moment the slots add up, so the refusal is still sitting unread in the job's
+    /// queue when the crossing is reached; nothing about the outcome may depend on that.
+    ///
+    /// Before the fix the fan-out ran here and a worker was told to start executing a
+    /// configuration the controller had already refused. It is a real gRPC call to a real
+    /// server, so what is asserted is what the worker received.
+    #[tokio::test]
+    async fn a_refusal_queued_behind_the_worker_connects_stops_the_execution_rpcs() {
+        let mut run = SchedulingRun::new("connects-refusal").await;
+        let gate = run.harness.refusal_gate.clone();
+        let queue = run.harness.queue();
+        let barriers = run.barriers.clone();
+        let address = run.worker_address.clone();
+
+        let version = Arc::new(AtomicU64::new(1));
+        let refusal = RefusedConfig::new(selector_changed(), 1, version);
+
+        let poll = tokio::spawn(async move {
+            // Strictly inside the preamble: the cluster has been asked for, so the preamble
+            // still holds the admission and nothing can be published yet.
+            barriers.workers_started.notified().await;
+            publish_when_admitted(&gate, refusal.clone()).await;
+            // Only now the messages, in the order that hides the refusal from the loop.
+            queue.send(worker_connect(&address)).await.unwrap();
+            queue
+                .send(JobMessage::ConfigRefused(refusal))
+                .await
+                .unwrap();
+        });
+
+        let outcome = run.schedule().await;
+        poll.await.unwrap();
+
+        assert_eq!(
+            run.calls.started(),
+            Vec::<String>::new(),
+            "no worker may be told to start executing a configuration the controller has \
+             refused — the refusal was on the gate before this crossing, whatever position it \
+             had reached in the job's queue"
+        );
+        assert_eq!(
+            run.calls.committed(),
+            Vec::<u64>::new(),
+            "and so nothing is committed either: the commits come after the execution that \
+             never started"
+        );
+
+        let Err(err) = outcome else {
+            panic!("a refused job must not be scheduled into an execution");
+        };
+        assert!(
+            matches!(
+                selector_error(&err),
+                StateBackendError::JobSelectorChanged { .. }
+            ),
+            "and must fail for the refusal itself, not for something the attempt hit: {err:?}"
+        );
+        assert_eq!(
+            state_writes(&run.db),
+            [("Scheduling".to_string(), 2)],
+            "the preamble did run — it was admitted with the gate clear — so this test is \
+             about the crossing after it and not about a job that never got started"
+        );
+    }
+
+    /// The same, one phase later: a refusal that reaches the gate while the job waits for its
+    /// tasks, with the `TaskStarted` that ends that wait queued ahead of it, must stop the
+    /// recovered commits.
+    ///
+    /// The barrier here is the worker's own `StartExecution` handler, which fires from inside
+    /// the second region — so the refusal is published strictly after that region's gate read
+    /// (execution is allowed to start, and does) and strictly before the `TaskStarted` that
+    /// makes the second loop exit. The refusal message is queued behind that `TaskStarted` and
+    /// is never read.
+    ///
+    /// Before the fix the job then published the restored checkpoint's commits: a two-phase
+    /// commit finished against the job's sinks, for a configuration the controller had refused,
+    /// and not something a later failure can take back.
+    #[tokio::test]
+    async fn a_refusal_queued_behind_the_task_starts_stops_the_recovered_commits() {
+        let mut run = SchedulingRun::new("task-starts-refusal").await;
+        let gate = run.harness.refusal_gate.clone();
+        let queue = run.harness.queue();
+        let barriers = run.barriers.clone();
+
+        // The connect is already in the queue, so the first loop is satisfied without the
+        // poll thread doing anything: this test is about the second one.
+        queue
+            .send(worker_connect(&run.worker_address))
+            .await
+            .unwrap();
+
+        let version = Arc::new(AtomicU64::new(1));
+        let refusal = RefusedConfig::new(selector_changed(), 1, version);
+
+        let poll = tokio::spawn(async move {
+            barriers.execution_started.notified().await;
+            publish_when_admitted(&gate, refusal.clone()).await;
+            queue.send(task_started()).await.unwrap();
+            queue
+                .send(JobMessage::ConfigRefused(refusal))
+                .await
+                .unwrap();
+        });
+
+        let outcome = run.schedule().await;
+        poll.await.unwrap();
+
+        assert_eq!(
+            run.calls.started(),
+            ["parquet".to_string()],
+            "execution did start, because nothing was refused when that crossing read the \
+             gate — which is what makes this test about the crossing after it"
+        );
+        assert_eq!(
+            run.calls.committed(),
+            Vec::<u64>::new(),
+            "but the restored checkpoint's commits are externally visible and must not be \
+             published for a refused configuration, however far behind the `TaskStarted` the \
+             refusal was queued"
+        );
+
+        let Err(err) = outcome else {
+            panic!("a refused job must not publish a checkpoint's commits");
+        };
+        assert!(
+            matches!(
+                selector_error(&err),
+                StateBackendError::JobSelectorChanged { .. }
+            ),
+            "and must fail for the refusal itself: {err:?}"
+        );
+    }
+
+    /// The control for both, and for every property an interlock at these crossings could
+    /// break.
+    ///
+    /// An ordinary job must still schedule, start its workers, start executing, wait for its
+    /// tasks, publish the restored checkpoint's commits and run. Two extra admissions on the
+    /// path are two extra chances to stall a job that nothing is wrong with, and the gate is
+    /// read twice more, so a false positive would fail a job that was never refused. Neither
+    /// happens here, and the assertions above are about the refusal rather than about a harness
+    /// in which nothing ever reaches a worker.
+    #[tokio::test]
+    async fn an_unrefused_job_starts_executing_publishes_its_commits_and_runs() {
+        let mut run = SchedulingRun::new("unrefused-control").await;
+        let queue = run.harness.queue();
+        queue
+            .send(worker_connect(&run.worker_address))
+            .await
+            .unwrap();
+        queue.send(task_started()).await.unwrap();
+
+        let outcome = run.schedule().await;
+
+        let Ok(Transition::Advance(next)) = outcome else {
+            panic!("an unrefused job must schedule and advance to `Running`");
+        };
+        assert_eq!(
+            next.state.name(),
+            "Running",
+            "and reach `Running`, which is the state the two tests above must never get to"
+        );
+        assert_eq!(
+            run.calls.started(),
+            ["parquet".to_string()],
+            "the worker was told to start executing, under the job's own selector"
+        );
+        assert_eq!(
+            run.calls.committed(),
+            [RESTORED_EPOCH as u64],
+            "and the restored checkpoint's commits were published: the effect the third \
+             crossing guards, still happening when nothing is refused"
+        );
+        assert_eq!(
+            run.harness.scheduler.started.lock().unwrap().as_slice(),
+            [("job_abc".to_string(), 2)],
+            "with the replacement cluster started at the new generation"
+        );
+        assert_eq!(
+            state_writes(&run.db),
+            [("Scheduling".to_string(), 2)],
+            "and the generation persisted exactly once"
+        );
+    }
+
+    /// The production half of `scheduling.rs` — everything before its own `#[cfg(test)]` — as
+    /// raw source.
+    ///
+    /// The audit below is about the code that runs, and the file's test module contains both
+    /// `file://` URLs and copies of the words being searched for.
+    fn scheduling_source() -> &'static str {
+        let source = include_str!("scheduling.rs");
+        &source[..source
+            .find("\n#[cfg(test)]")
+            .expect("scheduling.rs has a test module")]
+    }
+
+    /// The same, with line comments removed, so a needle found in it is code.
+    fn scheduling_source_without_comments() -> String {
+        scheduling_source()
+            .lines()
+            .map(|line| match line.find("//") {
+                // Sound only while no string literal in this half of the file contains `//`,
+                // which `the_region_audits_comment_stripper_is_sound_for_scheduling_rs` checks.
+                Some(at) => &line[..at],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The body of a function in `scheduling.rs`, by its signature, comments removed.
+    fn scheduling_body(source: &str, signature: &str) -> String {
+        let start = source
+            .find(signature)
+            .unwrap_or_else(|| panic!("{signature} has been renamed"));
+        let rest = &source[start..];
+        let end = rest
+            .find("\n    }\n")
+            .or_else(|| rest.find("\n}\n"))
+            .expect("unterminated function body");
+        rest[..end].to_string()
+    }
+
+    /// `Scheduling::next`, split into the stretches an [`Admission`] is held across and the
+    /// stretches it is not.
+    ///
+    /// A region opens at `ctx.admit_irreversible_scheduling(` and closes at `drop(admission)`.
+    /// They must strictly alternate, which is itself checked: two opens in a row would be the
+    /// state taking a lock it already holds, and `tokio`'s mutex does not re-enter — the job
+    /// would wedge on itself rather than fail.
+    fn admitted_and_interruptible(body: &str) -> (Vec<String>, Vec<String>) {
+        const OPEN: &str = "ctx.admit_irreversible_scheduling(";
+        const CLOSE: &str = "drop(admission)";
+
+        let mut marks: Vec<(usize, bool)> = body
+            .match_indices(OPEN)
+            .map(|(i, _)| (i, true))
+            .chain(body.match_indices(CLOSE).map(|(i, _)| (i, false)))
+            .collect();
+        marks.sort_unstable();
+        assert!(
+            marks
+                .iter()
+                .enumerate()
+                .all(|(n, (_, is_open))| *is_open == (n % 2 == 0)),
+            "every admitted region must be opened and then closed before the next is opened; \
+             found {:?}",
+            marks.iter().map(|(_, o)| *o).collect::<Vec<_>>()
+        );
+        assert!(
+            marks.len().is_multiple_of(2),
+            "an admitted region was opened and never closed"
+        );
+
+        let mut admitted = vec![];
+        let mut interruptible = vec![];
+        let mut prev = 0;
+        for pair in marks.chunks(2) {
+            let (open, close) = (pair[0].0, pair[1].0);
+            interruptible.push(body[prev..open].to_string());
+            admitted.push(body[open..close].to_string());
+            prev = close + CLOSE.len();
+        }
+        interruptible.push(body[prev..].to_string());
+        (admitted, interruptible)
+    }
+
+    /// The regions, and everything in them, pinned on source text rather than on behaviour.
+    ///
+    /// **This is a structural source pin, and the name says so.** What it asserts is where the
+    /// words are in `scheduling.rs`, not what the job does; the behaviour is covered by
+    /// `a_refusal_published_after_the_gate_snapshot_still_stops_the_scheduling_preamble`,
+    /// `a_refusal_queued_behind_the_worker_connects_stops_the_execution_rpcs`,
+    /// `a_refusal_queued_behind_the_task_starts_stops_the_recovered_commits` and their control.
     ///
     /// It exists because the guarantee is a property of a *region*: every irreversible effect
-    /// of the preamble sits between one `admit_destructive_scheduling` and one `drop`, and an
-    /// effect added inside it is covered without anyone remembering anything. What no test of
-    /// behaviour can notice is an effect added *outside* it — before the admission, or after
-    /// the drop — so the boundary is pinned here, together with the set of effects it
-    /// contains. A new one must be added to this list, which is the point at which its author
-    /// has to decide whether it belongs inside the region.
+    /// between an `admit_irreversible_scheduling` and its `drop` is covered without anyone
+    /// remembering anything. What no test of behaviour can notice is an effect added *outside*
+    /// every region — which is exactly how rounds 7, 8 and 9 each found the next unguarded
+    /// phase — so the boundaries are pinned here together with the whole inventory of effects
+    /// they contain, and with the inventory of what the *interruptible* stretches are allowed
+    /// to await. A new `await` outside a region fails this test, and its author then has to say
+    /// whether what it waits on is an effect. That is the intended reading of a failure here:
+    /// not "the test is stale", but "decide which side of the boundary this belongs on".
     #[test]
-    fn the_scheduling_preamble_is_written_to_run_every_irreversible_effect_under_admission() {
-        let source = include_str!("scheduling.rs");
-        let start = source
-            .find("    async fn next(mut self: Box<Self>, ctx: &mut JobContext)")
-            .expect("Scheduling::next has been renamed");
-        let body = &source[start..];
-        let body = &body[..body.find("\n    }\n").expect("unterminated function body")];
+    fn the_source_of_scheduling_next_keeps_every_irreversible_effect_inside_an_admitted_region() {
+        let source = scheduling_source_without_comments();
+        let body = scheduling_body(
+            &source,
+            "    async fn next(mut self: Box<Self>, ctx: &mut JobContext)",
+        );
+        let (admitted, interruptible) = admitted_and_interruptible(&body);
 
-        let at = |needle: &str| -> usize {
-            body.find(needle)
-                .unwrap_or_else(|| panic!("`Scheduling::next` no longer contains {needle}"))
+        assert_eq!(
+            admitted.len(),
+            3,
+            "three regions: the destructive preamble, the `StartExecution` fan-out, and the \
+             publication of a restored checkpoint's commits"
+        );
+
+        let count = |regions: &[String], needle: &str| -> usize {
+            regions.iter().map(|r| r.matches(needle).count()).sum()
         };
 
-        let admitted = at("ctx.admit_destructive_scheduling(");
-        let released = at("drop(admission)");
-        assert_eq!(
-            body.matches("ctx.admit_destructive_scheduling(").count(),
-            1,
-            "one region, entered once: a second entry would be a second gap between them"
-        );
-        assert_eq!(
-            body.matches("drop(admission)").count(),
-            1,
-            "and left once, at the end of the preamble"
-        );
-
+        // Every irreversible effect of this state, by the call that performs it. Each must
+        // appear, and every occurrence of it must be inside a region.
         for effect in [
             "ctx.status.generation += 1",
             "ctx.status.update_db(",
@@ -4476,31 +5261,66 @@ mod tests {
             "self.start_workers(",
             "get_and_register_checkpoint_info_leader(",
             "get_checkpoint_info_legacy(",
+            "start_execution_on_workers(",
+            "send_commit_messages(",
         ] {
-            let effect_at = at(effect);
-            assert!(
-                admitted < effect_at,
-                "`{effect}` is irreversible and must be inside the admitted region: a \
-                 refusal published before it would otherwise not be read until the next state"
+            assert_eq!(
+                count(&admitted, effect),
+                1,
+                "`{effect}` is irreversible and must appear exactly once, inside an admitted \
+                 region: a refusal published before it would otherwise not be read until the \
+                 next state, or not at all"
             );
-            assert!(
-                effect_at < released,
-                "`{effect}` must happen before the admission is released, or the region \
-                 stops covering it"
+            assert_eq!(
+                count(&interruptible, effect),
+                0,
+                "`{effect}` must not also appear outside every region"
             );
         }
 
-        assert!(
-            released < at("ctx.rx.recv()"),
-            "and the admission must be released before the wait for workers: holding it \
-             across a wait that can take minutes would make the job unrefusable for exactly \
-             as long"
+        // And the converse: the interruptible stretches wait, and do nothing else. Anything
+        // they await is listed here.
+        let interruptible_awaits = [
+            ("handle_worker_connect(", 1),
+            ("h.await", 1),
+            ("ctx.handle_task_error(", 1),
+            ("LeaderManager::connect(", 2),
+            ("poll_leader_status(", 1),
+            ("ctx.handle_job_failure(", 1),
+            ("ctx.metrics", 1),
+        ];
+        for (waited_on, times) in interruptible_awaits {
+            assert_eq!(
+                count(&interruptible, waited_on),
+                times,
+                "the interruptible phases are pinned to what they wait on, and `{waited_on}` \
+                 is no longer awaited {times} time(s) outside a region"
+            );
+        }
+        assert_eq!(
+            count(&interruptible, ".await"),
+            interruptible_awaits.iter().map(|(_, n)| n).sum::<usize>(),
+            "an `.await` appeared in `Scheduling` outside every admitted region. If it waits \
+             on something irreversible or externally visible it belongs inside one — that is \
+             the failure this pin exists to force a decision about — and if it does not, add \
+             it to the list above"
         );
 
-        let mut effects: Vec<&str> = body
-            .match_indices("effect(\n")
+        assert_eq!(
+            count(&admitted, "ctx.rx.recv()"),
+            0,
+            "and no admission is ever held across a wait on the job's channel: that would make \
+             the job unrefusable for as long as it waited, and could not terminate if what it \
+             waited for was the refusal"
+        );
+
+        // The names, which are the enumeration itself. Two of them are performed by helpers
+        // that take an `&Admission`, so they are named there rather than in `next`; the whole
+        // file's inventory is what is pinned.
+        let mut effects: Vec<&str> = source
+            .match_indices(".effect(")
             .map(|(i, _)| {
-                let rest = &body[i..];
+                let rest = &source[i + ".effect(".len()..];
                 let name = &rest[rest.find('"').expect("an effect is named") + 1..];
                 &name[..name.find('"').expect("an unterminated effect name")]
             })
@@ -4511,13 +5331,48 @@ mod tests {
             [
                 "persist the incremented scheduling generation",
                 "prepare the legacy recovery checkpoint",
+                "publish the restored checkpoint's commits",
                 "register the generation and prepare its recovery checkpoint",
+                "send every worker its StartExecution",
                 "start the job's replacement workers",
                 "tear down the job's existing cluster",
             ],
-            "these are the irreversible effects of the scheduling preamble; adding one means \
-             deciding, here, that it belongs under the same admission"
+            "these are the irreversible effects of `Scheduling`; adding one means deciding, \
+             here, which region it belongs in"
         );
+
+        // The one effect whose call is a helper rather than a statement: the RPCs must be
+        // inside the helper's own `effect`, not merely inside the function that owns it.
+        let fan_out = scheduling_body(&source, "async fn start_execution_on_workers(");
+        let effect_at = fan_out
+            .find(".effect(")
+            .expect("the fan-out must go through `Admission::effect`");
+        assert!(
+            fan_out
+                .match_indices(".start_execution(")
+                .all(|(i, _)| i > effect_at),
+            "the `StartExecution` RPCs must be issued inside the effect, not before it"
+        );
+    }
+
+    /// The assumption [`scheduling_source_without_comments`] rests on.
+    ///
+    /// **A source pin, like the test above, and it asserts about source text only.** Stripping
+    /// `//` to end-of-line is sound only while no string literal in the audited half of the
+    /// file contains `//`; a URL in a log message would silently truncate a line and could
+    /// hide an effect from the region audit.
+    #[test]
+    fn the_region_audits_comment_stripper_is_sound_for_scheduling_rs() {
+        for (n, line) in scheduling_source().lines().enumerate() {
+            let Some(at) = line.find("//") else { continue };
+            assert_eq!(
+                line[..at].matches('"').count() % 2,
+                0,
+                "line {} of scheduling.rs has `//` inside a string literal, which would make \
+                 the region audit strip real code: {line}",
+                n + 1
+            );
+        }
     }
 
     /// The ordering half of the fix, pinned on statement order rather than on behaviour.
