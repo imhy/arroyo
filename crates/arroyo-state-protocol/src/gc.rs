@@ -5,6 +5,7 @@ use arroyo_rpc::grpc::rpc::{
     CheckpointManifest, ExpiringKeyedTimeTableCheckpointMetadata,
     GlobalKeyedTableTaskCheckpointMetadata, TableCheckpointMetadata, TableEnum,
 };
+use arroyo_rpc::state_backend::{StateBackendSelector, validate_restored_manifest};
 use futures::{TryStreamExt, stream};
 use prost::Message;
 use std::collections::HashSet;
@@ -27,16 +28,30 @@ struct CleanupPlan {
     data_files: Vec<CheckpointRef>,
 }
 
+/// Deletes the leader-mode checkpoint history below `new_min_epoch`.
+///
+/// `job` is the state backend the job selected, handed in by the caller rather than read from
+/// anywhere ambient. Every manifest reachable from `head` — retained and expiring alike — is
+/// validated against it while the history is classified, which is strictly before the first
+/// delete: the reachable chain is the only thing that names the files this function removes, and
+/// a chain some other backend wrote must not have its files named by this one's traversal.
+///
+/// # Errors
+///
+/// Returns [`StoreError::StateBackend`] if any reachable manifest disagrees with `job`, in which
+/// case nothing has been deleted, alongside the storage and protocol failures traversal can
+/// otherwise produce.
 pub async fn cleanup_leader_checkpoints<S>(
     store: &S,
     paths: &ProtocolPaths,
+    job: StateBackendSelector,
     head: CheckpointRef,
     new_min_epoch: Epoch,
 ) -> Result<(), StoreError>
 where
     S: ProtocolStore + ?Sized,
 {
-    let cleanup = classify_checkpoint_history(store, head, new_min_epoch).await?;
+    let cleanup = classify_checkpoint_history(store, job, head, new_min_epoch).await?;
 
     let data_directories: HashSet<_> = cleanup
         .data_files
@@ -105,8 +120,13 @@ where
 /// references them. This intentionally buffers deduplicated candidate and protected file refs for
 /// the reachable chain, but not full manifests. That memory cost is required to safely handle
 /// cumulative table metadata such as expiring keyed-time tables.
+///
+/// Each manifest is checked against `job` at the point it is read, before its files are added to
+/// either set — so the selector check costs no extra reads, and a disagreement anywhere in the
+/// chain aborts classification with an empty plan rather than a partial one.
 async fn classify_checkpoint_history<S>(
     store: &S,
+    job: StateBackendSelector,
     current: CheckpointRef,
     new_min_epoch: Epoch,
 ) -> Result<CleanupPlan, StoreError>
@@ -132,6 +152,11 @@ where
             }
             break;
         };
+
+        // Untrusted bytes: this manifest was just read back from storage, and everything below
+        // — the parent link that continues the traversal and the file refs that become delete
+        // candidates — comes out of it. Check who wrote it before any of that is used.
+        validate_restored_manifest(job, &manifest)?;
 
         let owner = CheckpointOwner {
             generation: Generation(manifest.generation),

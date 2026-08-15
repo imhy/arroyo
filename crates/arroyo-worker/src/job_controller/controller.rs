@@ -829,6 +829,10 @@ impl WorkerJobController {
     fn start_cleanup(&mut self) -> Option<JoinHandle<anyhow::Result<Epoch>>> {
         let job_id = self.worker_context.job_id.clone();
         let paths = self.model.protocol_paths.clone();
+        // The job's authoritative selector, the same one the model checkpoints and compacts
+        // with. Leader GC deletes files named by manifests it reads back, so it is handed the
+        // selector explicitly and refuses a history any other backend wrote.
+        let state_backend = self.model.state_backend;
 
         let new_min = Epoch((*self.model.epoch).saturating_sub(CHECKPOINTS_TO_KEEP));
 
@@ -848,7 +852,14 @@ impl WorkerJobController {
         let start = Instant::now();
         Some(tokio::spawn(async move {
             let storage = get_storage_provider(&StorageProviderFor::Worker).await?;
-            cleanup_leader_checkpoints(storage.as_ref(), &paths, last_checkpoint, new_min).await?;
+            cleanup_leader_checkpoints(
+                storage.as_ref(),
+                &paths,
+                state_backend,
+                last_checkpoint,
+                new_min,
+            )
+            .await?;
 
             info!(
                 message = "Finished cleaning",

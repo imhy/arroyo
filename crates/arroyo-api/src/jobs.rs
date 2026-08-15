@@ -217,10 +217,43 @@ fn replaceable_job(jobs: Vec<(String, String)>) -> Result<String, ErrorResp> {
     Ok(job_id)
 }
 
+/// Copies the replaced job's configuration into its replacement row (PostgreSQL).
+///
+/// `state_backend` is copied like every other configuration column: a restart without state
+/// discards the job's *state*, not its *selection of where state lives*. Omitting it would give
+/// the replacement row the migration default — the empty string, which normalizes to parquet —
+/// and silently move a stateengine job onto another backend (M11.D13b).
+const POSTGRES_REPLACEMENT_JOB_CONFIG: &str = "INSERT INTO job_configs \
+     (id, organization_id, pipeline_name, created_by, updated_by, updated_at, \
+      ttl_micros, stop, pipeline_id, parallelism_overrides, \
+      checkpoint_interval_micros, env_vars, scheduler_config, state_backend) \
+     SELECT $1, organization_id, pipeline_name, created_by, $2, CURRENT_TIMESTAMP, \
+            ttl_micros, 'none', pipeline_id, parallelism_overrides, \
+            checkpoint_interval_micros, env_vars, scheduler_config, state_backend \
+     FROM job_configs WHERE id = $3";
+
+/// The SQLite spelling of [`POSTGRES_REPLACEMENT_JOB_CONFIG`].
+///
+/// The two statements are deliberately identical apart from their placeholder sigil, which is
+/// what `both_replacement_statements_copy_the_same_columns` pins: a column added to one backend's
+/// replacement and forgotten in the other's is exactly how a selector goes missing on one
+/// deployment and not the other.
+const SQLITE_REPLACEMENT_JOB_CONFIG: &str = "INSERT INTO job_configs \
+     (id, organization_id, pipeline_name, created_by, updated_by, updated_at, \
+      ttl_micros, stop, pipeline_id, parallelism_overrides, \
+      checkpoint_interval_micros, env_vars, scheduler_config, state_backend) \
+     SELECT ?1, organization_id, pipeline_name, created_by, ?2, CURRENT_TIMESTAMP, \
+            ttl_micros, 'none', pipeline_id, parallelism_overrides, \
+            checkpoint_interval_micros, env_vars, scheduler_config, state_backend \
+     FROM job_configs WHERE id = ?3";
+
 /// Replaces a pipeline's single terminal job with a fresh job.
 ///
 /// This is used for restart-without-state in leader mode. Keeping the replacement in a single
 /// transaction preserves the current one-job-per-pipeline assumption for all other API queries.
+///
+/// The replacement job keeps the replaced job's `state_backend`: restarting without state means
+/// starting from an empty state, not starting on a different backend.
 pub(crate) async fn replace_job_without_state(
     db: &DatabaseSource,
     pipeline_pub_id: &str,
@@ -266,14 +299,7 @@ pub(crate) async fn replace_job_without_state(
 
             let inserted = transaction
                 .execute(
-                    "INSERT INTO job_configs \
-                     (id, organization_id, pipeline_name, created_by, updated_by, updated_at, \
-                      ttl_micros, stop, pipeline_id, parallelism_overrides, \
-                      checkpoint_interval_micros, env_vars, scheduler_config) \
-                     SELECT $1, organization_id, pipeline_name, created_by, $2, CURRENT_TIMESTAMP, \
-                            ttl_micros, 'none', pipeline_id, parallelism_overrides, \
-                            checkpoint_interval_micros, env_vars, scheduler_config \
-                     FROM job_configs WHERE id = $3",
+                    POSTGRES_REPLACEMENT_JOB_CONFIG,
                     &[&new_job_id, &auth.user_id, &old_job_id],
                 )
                 .await
@@ -353,14 +379,7 @@ pub(crate) async fn replace_job_without_state(
 
             let inserted = transaction
                 .execute(
-                    "INSERT INTO job_configs \
-                     (id, organization_id, pipeline_name, created_by, updated_by, updated_at, \
-                      ttl_micros, stop, pipeline_id, parallelism_overrides, \
-                      checkpoint_interval_micros, env_vars, scheduler_config) \
-                     SELECT ?1, organization_id, pipeline_name, created_by, ?2, CURRENT_TIMESTAMP, \
-                            ttl_micros, 'none', pipeline_id, parallelism_overrides, \
-                            checkpoint_interval_micros, env_vars, scheduler_config \
-                     FROM job_configs WHERE id = ?3",
+                    SQLITE_REPLACEMENT_JOB_CONFIG,
                     rusqlite::params![new_job_id, auth.user_id, old_job_id],
                 )
                 .map_err(log_and_map)?;
@@ -851,6 +870,14 @@ mod tests {
     }
 
     fn sqlite_job(state: &str) -> DatabaseSource {
+        sqlite_job_with_state_backend(state, "stateengine")
+    }
+
+    /// The fixture mirrors the migrated `job_configs` schema, including the
+    /// `state_backend TEXT NOT NULL DEFAULT ''` column V11 adds. `state_backend` is the
+    /// selector the replaced job was running under; the replacement must come back with the
+    /// same one rather than with the column default.
+    fn sqlite_job_with_state_backend(state: &str, state_backend: &str) -> DatabaseSource {
         let connection = rusqlite::Connection::open_in_memory().unwrap();
         connection
             .execute_batch(
@@ -876,7 +903,8 @@ mod tests {
                     restart_mode TEXT DEFAULT 'safe' NOT NULL,
                     ignore_state_before_epoch INTEGER,
                     env_vars TEXT DEFAULT '{}' NOT NULL,
-                    scheduler_config TEXT DEFAULT '{}' NOT NULL
+                    scheduler_config TEXT DEFAULT '{}' NOT NULL,
+                    state_backend TEXT DEFAULT '' NOT NULL
                 );
                 CREATE TABLE job_statuses (
                     pub_id TEXT NOT NULL UNIQUE,
@@ -889,16 +917,22 @@ mod tests {
                 CREATE TABLE job_log_messages (job_id TEXT NOT NULL);
                 INSERT INTO pipelines (id, pub_id, organization_id)
                     VALUES (1, 'pl_1', 'org_1');
-                INSERT INTO job_configs
+                INSERT INTO checkpoints (job_id) VALUES ('job_old');
+                INSERT INTO job_log_messages (job_id) VALUES ('job_old');",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO job_configs
                     (id, organization_id, pipeline_name, created_by, updated_by, ttl_micros, stop,
                      parallelism_overrides, checkpoint_interval_micros, pipeline_id, restart_nonce,
-                     restart_mode, ignore_state_before_epoch, env_vars, scheduler_config)
+                     restart_mode, ignore_state_before_epoch, env_vars, scheduler_config,
+                     state_backend)
                     VALUES
                     ('job_old', 'org_1', 'pipeline', 'user_1', 'user_1', 123, 'immediate',
                      '{\"1\": 4}', 5000000, 1, 3, 'force', 42,
-                     '{\"ENV\": \"value\"}', '{\"scheduler\": true}');
-                INSERT INTO checkpoints (job_id) VALUES ('job_old');
-                INSERT INTO job_log_messages (job_id) VALUES ('job_old');",
+                     '{\"ENV\": \"value\"}', '{\"scheduler\": true}', ?1)",
+                [state_backend],
             )
             .unwrap();
         connection
@@ -935,10 +969,11 @@ mod tests {
             Option<i64>,
             String,
             String,
+            String,
         ) = connection
             .query_row(
                 "SELECT id, stop, restart_nonce, restart_mode, updated_by,
-                        ignore_state_before_epoch, env_vars, scheduler_config
+                        ignore_state_before_epoch, env_vars, scheduler_config, state_backend
                  FROM job_configs",
                 [],
                 |row| {
@@ -951,6 +986,7 @@ mod tests {
                         row.get(5)?,
                         row.get(6)?,
                         row.get(7)?,
+                        row.get(8)?,
                     ))
                 },
             )
@@ -966,6 +1002,9 @@ mod tests {
                 None,
                 "{\"ENV\": \"value\"}".to_string(),
                 "{\"scheduler\": true}".to_string(),
+                // The replaced job selected stateengine; the replacement must not silently
+                // fall back to the column default, which normalizes to parquet.
+                "stateengine".to_string(),
             )
         );
 
@@ -983,6 +1022,54 @@ mod tests {
                 })
                 .unwrap();
             assert_eq!(count, 0, "{table} should be cleared");
+        }
+    }
+
+    /// The old-data half of the same guarantee: a job row written before the selector
+    /// migration carries the empty string, which means parquet, and the replacement keeps
+    /// carrying exactly that rather than being rewritten to a spelled-out value.
+    #[tokio::test]
+    async fn replace_job_without_state_preserves_a_legacy_empty_selector() {
+        let database = sqlite_job_with_state_backend("Stopped", "");
+
+        let new_job_id = replace_job_without_state(&database, "pl_1", &auth())
+            .await
+            .unwrap();
+
+        let DatabaseSource::Sqlite(connection) = &database else {
+            unreachable!()
+        };
+        let connection = connection.lock().unwrap();
+        let selector: (String, String) = connection
+            .query_row("SELECT id, state_backend FROM job_configs", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(selector, (new_job_id, String::new()));
+    }
+
+    /// PostgreSQL has no in-process fixture here, so its replacement is covered by pinning it
+    /// against the SQLite one that *is* executed above: the two statements must stay identical
+    /// apart from their placeholder sigil. Adding a copied column to one and not the other —
+    /// which is how `state_backend` came to be missing from both — breaks this.
+    #[test]
+    fn both_replacement_statements_copy_the_same_columns() {
+        assert_eq!(
+            POSTGRES_REPLACEMENT_JOB_CONFIG.replace('$', "?"),
+            SQLITE_REPLACEMENT_JOB_CONFIG,
+        );
+
+        // Named explicitly so a wholesale rewrite of both statements cannot drop the selector
+        // from both at once and still satisfy the equality above.
+        for statement in [
+            POSTGRES_REPLACEMENT_JOB_CONFIG,
+            SQLITE_REPLACEMENT_JOB_CONFIG,
+        ] {
+            assert_eq!(
+                statement.matches("state_backend").count(),
+                2,
+                "{statement} must both name and select state_backend"
+            );
         }
     }
 

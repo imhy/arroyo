@@ -408,31 +408,44 @@ impl RunningJobModel {
         let storage_role = self.storage_role.clone();
         let mut worker_clients: Vec<WorkerClient> =
             self.workers.values().map(|w| w.connect.clone()).collect();
-        for node in self.program.graph.node_weights() {
-            for (op, _) in node.operator_chain.iter() {
-                let compacted_tables = ParquetBackend::compact_operator(
-                    // compact the operator's state and notify the workers to load the new files
-                    &storage_role,
-                    self.state_backend,
-                    self.job_id.0.clone(),
-                    &op.operator_id,
-                    *self.epoch as u32,
-                )
-                .await?;
 
-                if compacted_tables.is_empty() {
-                    continue;
-                }
+        let operator_ids: Vec<String> = self
+            .program
+            .graph
+            .node_weights()
+            .flat_map(|node| {
+                node.operator_chain
+                    .iter()
+                    .map(|(op, _)| op.operator_id.clone())
+            })
+            .collect();
 
-                // TODO: these should be put on separate tokio tasks.
-                for worker_client in &mut worker_clients {
-                    worker_client
-                        .load_compacted_data(LoadCompactedDataReq {
-                            operator_id: op.operator_id.clone(),
-                            compacted_metadata: compacted_tables.clone(),
-                        })
-                        .await?;
-                }
+        // The whole checkpoint is validated against the job's selector before its first
+        // operator is compacted, and no worker is told about compacted data until every
+        // operator has passed: a mismatch in the last operator must not leave earlier
+        // operators rewritten and workers already pointed at the rewritten files.
+        let compacted = ParquetBackend::compact_checkpoint(
+            &storage_role,
+            self.state_backend,
+            self.job_id.0.clone(),
+            operator_ids,
+            *self.epoch as u32,
+        )
+        .await?;
+
+        for (operator_id, compacted_tables) in compacted {
+            if compacted_tables.is_empty() {
+                continue;
+            }
+
+            // TODO: these should be put on separate tokio tasks.
+            for worker_client in &mut worker_clients {
+                worker_client
+                    .load_compacted_data(LoadCompactedDataReq {
+                        operator_id: operator_id.clone(),
+                        compacted_metadata: compacted_tables.clone(),
+                    })
+                    .await?;
             }
         }
         self.start_or_get_span(JobCheckpointEventType::Compacting)

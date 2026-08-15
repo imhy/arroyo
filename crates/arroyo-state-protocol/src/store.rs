@@ -1,5 +1,6 @@
 use crate::types::{CheckpointRef, ProtocolError};
 use arroyo_rpc::errors::StorageError;
+use arroyo_rpc::state_backend::StateBackendError;
 use arroyo_storage::StorageProvider;
 use async_trait::async_trait;
 use prost::Message;
@@ -43,6 +44,11 @@ pub enum StoreError {
     ExpectedObjectMissing { path: CheckpointRef },
     #[error("protocol error: {0}")]
     Protocol(#[from] ProtocolError),
+    /// A protocol object read back from storage names a state backend the job does not
+    /// select. Raised while classifying, never while deleting: the inner error is carried
+    /// through unchanged so the failure names the checkpoint and the table that disagreed.
+    #[error(transparent)]
+    StateBackend(#[from] StateBackendError),
 }
 
 /// Minimal storage interface required by the protocol workflows.

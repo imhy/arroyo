@@ -117,8 +117,9 @@ mod tests {
     use arroyo_rpc::grpc::rpc::{
         CheckpointManifest, ExpiringKeyedTimeTableCheckpointMetadata,
         GlobalKeyedTableTaskCheckpointMetadata, OperatorCheckpointMetadata, OperatorMetadata,
-        ParquetTimeFile, TableCheckpointMetadata, TableEnum,
+        ParquetTimeFile, TableCheckpointMetadata, TableConfig, TableEnum,
     };
+    use arroyo_rpc::state_backend::{StateBackendError, StateBackendSelector};
     use arroyo_types::{JobId, PipelineId, from_micros};
     use prost::Message;
     use std::time::SystemTime;
@@ -389,9 +390,15 @@ mod tests {
         )
         .await;
 
-        cleanup_leader_checkpoints(&store, &paths, checkpoint3_ref.clone(), Epoch(2))
-            .await
-            .unwrap();
+        cleanup_leader_checkpoints(
+            &store,
+            &paths,
+            StateBackendSelector::Parquet,
+            checkpoint3_ref.clone(),
+            Epoch(2),
+        )
+        .await
+        .unwrap();
 
         assert!(!exists(&store, &file1).await);
         assert!(!exists(&store, &paths.epoch_record(Epoch(1))).await);
@@ -461,17 +468,29 @@ mod tests {
         )
         .await;
 
-        cleanup_leader_checkpoints(&store, &paths, checkpoint2_ref.clone(), Epoch(2))
-            .await
-            .unwrap();
+        cleanup_leader_checkpoints(
+            &store,
+            &paths,
+            StateBackendSelector::Parquet,
+            checkpoint2_ref.clone(),
+            Epoch(2),
+        )
+        .await
+        .unwrap();
 
         assert!(exists(&store, &shared_file).await);
         assert!(!exists(&store, &expired_file).await);
 
         let deleted_count = store.deleted_objects().len();
-        cleanup_leader_checkpoints(&store, &paths, checkpoint2_ref, Epoch(2))
-            .await
-            .unwrap();
+        cleanup_leader_checkpoints(
+            &store,
+            &paths,
+            StateBackendSelector::Parquet,
+            checkpoint2_ref,
+            Epoch(2),
+        )
+        .await
+        .unwrap();
         assert_eq!(deleted_count, store.deleted_objects().len());
         assert!(exists(&store, &shared_file).await);
     }
@@ -509,6 +528,7 @@ mod tests {
         cleanup_leader_checkpoints(
             &store,
             &paths,
+            StateBackendSelector::Parquet,
             paths.checkpoint_manifest(Generation(1), Epoch(2)),
             Epoch(2),
         )
@@ -536,6 +556,7 @@ mod tests {
         cleanup_leader_checkpoints(
             &store,
             &paths,
+            StateBackendSelector::Parquet,
             paths.checkpoint_manifest(Generation(1), Epoch(3)),
             Epoch(3),
         )
@@ -609,6 +630,7 @@ mod tests {
         cleanup_leader_checkpoints(
             &store,
             &paths,
+            StateBackendSelector::Parquet,
             paths.checkpoint_manifest(Generation(1), Epoch(2)),
             Epoch(2),
         )
@@ -648,6 +670,7 @@ mod tests {
         let err = cleanup_leader_checkpoints(
             &store,
             &paths,
+            StateBackendSelector::Parquet,
             paths.checkpoint_manifest(Generation(1), Epoch(3)),
             Epoch(3),
         )
@@ -670,6 +693,7 @@ mod tests {
         cleanup_leader_checkpoints(
             &store,
             &paths,
+            StateBackendSelector::Parquet,
             paths.checkpoint_manifest(Generation(1), Epoch(3)),
             Epoch(3),
         )
@@ -709,6 +733,7 @@ mod tests {
         let err = cleanup_leader_checkpoints(
             &store,
             &paths,
+            StateBackendSelector::Parquet,
             paths.checkpoint_manifest(Generation(1), Epoch(2)),
             Epoch(2),
         )
@@ -732,9 +757,15 @@ mod tests {
         let head = paths.checkpoint_manifest(Generation(1), Epoch(2));
         write_gc_checkpoint(&store, &paths, 2, None, vec![global_operator(vec![])]).await;
 
-        let err = cleanup_leader_checkpoints(&store, &paths, head, Epoch(3))
-            .await
-            .unwrap_err();
+        let err = cleanup_leader_checkpoints(
+            &store,
+            &paths,
+            StateBackendSelector::Parquet,
+            head,
+            Epoch(3),
+        )
+        .await
+        .unwrap_err();
 
         assert!(matches!(
             err,
@@ -744,6 +775,246 @@ mod tests {
             })
         ));
         assert!(store.deleted_objects().is_empty());
+    }
+
+    /// Stamps `state_backend` onto every table config of `operator`, so a manifest can state
+    /// which backend wrote it.
+    fn operator_with_selector(
+        mut operator: OperatorCheckpointMetadata,
+        state_backend: &str,
+    ) -> OperatorCheckpointMetadata {
+        operator.table_configs = operator
+            .table_checkpoint_metadata
+            .keys()
+            .map(|table| {
+                (
+                    table.clone(),
+                    TableConfig {
+                        table_type: TableEnum::GlobalKeyValue as i32,
+                        config: vec![],
+                        state_version: 0,
+                        state_backend: state_backend.to_string(),
+                    },
+                )
+            })
+            .collect();
+        operator
+    }
+
+    /// Leader GC on a job whose history predates the selector: every table config is empty,
+    /// which means parquet, and a parquet job still garbage-collects its own state exactly as
+    /// before. The guard must not strand legacy deployments' checkpoints.
+    #[tokio::test]
+    async fn cleanup_still_collects_a_legacy_all_parquet_history() {
+        let store = MemoryProtocolStore::default();
+        let paths = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J"));
+        let old_file = data_ref(&paths, 1);
+        let kept_file = data_ref(&paths, 2);
+
+        store.put_bytes(&old_file, b"1".to_vec()).await.unwrap();
+        store.put_bytes(&kept_file, b"2".to_vec()).await.unwrap();
+        // Epoch 1 states parquet explicitly, epoch 2 says nothing at all: both are this
+        // parquet job's own, and both must be collectable.
+        write_gc_checkpoint(
+            &store,
+            &paths,
+            1,
+            None,
+            vec![operator_with_selector(
+                global_operator(vec![old_file.clone()]),
+                "parquet",
+            )],
+        )
+        .await;
+        write_gc_checkpoint(
+            &store,
+            &paths,
+            2,
+            Some(1),
+            vec![global_operator(vec![kept_file.clone()])],
+        )
+        .await;
+
+        cleanup_leader_checkpoints(
+            &store,
+            &paths,
+            StateBackendSelector::Parquet,
+            paths.checkpoint_manifest(Generation(1), Epoch(2)),
+            Epoch(2),
+        )
+        .await
+        .unwrap();
+
+        assert!(!exists(&store, &old_file).await);
+        assert!(exists(&store, &kept_file).await);
+    }
+
+    /// The hole this round closes: leader GC used to traverse manifests and delete the files
+    /// they name without ever asking who wrote them.
+    ///
+    /// The disagreeing manifest is the *oldest* one, reached last, and it is one of the ones
+    /// being collected — so an implementation that validated per-checkpoint as it deleted, or
+    /// did not validate at all, would already have deleted the newer expiring checkpoint's file
+    /// by the time it got there. Nothing may be deleted.
+    #[tokio::test]
+    async fn cleanup_rejects_a_history_written_by_another_backend() {
+        let store = MemoryProtocolStore::default();
+        let paths = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J"));
+        let foreign_file = data_ref(&paths, 1);
+        let old_file = data_ref(&paths, 2);
+        let kept_file = data_ref(&paths, 3);
+
+        store.put_bytes(&foreign_file, b"1".to_vec()).await.unwrap();
+        store.put_bytes(&old_file, b"2".to_vec()).await.unwrap();
+        store.put_bytes(&kept_file, b"3".to_vec()).await.unwrap();
+        write_gc_checkpoint(
+            &store,
+            &paths,
+            1,
+            None,
+            vec![operator_with_selector(
+                global_operator(vec![foreign_file.clone()]),
+                "stateengine",
+            )],
+        )
+        .await;
+        write_gc_checkpoint(
+            &store,
+            &paths,
+            2,
+            Some(1),
+            vec![global_operator(vec![old_file.clone()])],
+        )
+        .await;
+        write_gc_checkpoint(
+            &store,
+            &paths,
+            3,
+            Some(2),
+            vec![global_operator(vec![kept_file.clone()])],
+        )
+        .await;
+
+        let err = cleanup_leader_checkpoints(
+            &store,
+            &paths,
+            StateBackendSelector::Parquet,
+            paths.checkpoint_manifest(Generation(1), Epoch(3)),
+            Epoch(3),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                StoreError::StateBackend(StateBackendError::CheckpointMismatch { .. })
+            ),
+            "{err:?}"
+        );
+        let message = err.to_string();
+        assert!(message.contains("stateengine"), "{message}");
+
+        assert!(store.deleted_objects().is_empty());
+        assert!(store.deleted_directories().is_empty());
+        assert!(exists(&store, &foreign_file).await);
+        assert!(exists(&store, &old_file).await);
+        assert!(exists(&store, &kept_file).await);
+    }
+
+    /// A retained manifest — one *above* the retention boundary, whose files are only ever
+    /// protected, never deleted — is validated too. Everything reachable is inspected, because
+    /// the whole reachable chain is what names the files.
+    #[tokio::test]
+    async fn cleanup_rejects_a_retained_checkpoint_written_by_another_backend() {
+        let store = MemoryProtocolStore::default();
+        let paths = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J"));
+        let old_file = data_ref(&paths, 1);
+
+        store.put_bytes(&old_file, b"1".to_vec()).await.unwrap();
+        write_gc_checkpoint(
+            &store,
+            &paths,
+            1,
+            None,
+            vec![global_operator(vec![old_file.clone()])],
+        )
+        .await;
+        write_gc_checkpoint(
+            &store,
+            &paths,
+            2,
+            Some(1),
+            vec![operator_with_selector(
+                global_operator(vec![]),
+                "stateengine",
+            )],
+        )
+        .await;
+
+        let err = cleanup_leader_checkpoints(
+            &store,
+            &paths,
+            StateBackendSelector::Parquet,
+            paths.checkpoint_manifest(Generation(1), Epoch(2)),
+            Epoch(2),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                StoreError::StateBackend(StateBackendError::CheckpointMismatch { .. })
+            ),
+            "{err:?}"
+        );
+        assert!(store.deleted_objects().is_empty());
+        assert!(exists(&store, &old_file).await);
+    }
+
+    /// A persisted selector nobody recognizes is a hard failure at GC too, never a fallback to
+    /// the job's own backend — which would delete files under a layout nothing here understands.
+    #[tokio::test]
+    async fn cleanup_rejects_an_unknown_persisted_selector() {
+        let store = MemoryProtocolStore::default();
+        let paths = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J"));
+        let old_file = data_ref(&paths, 1);
+
+        store.put_bytes(&old_file, b"1".to_vec()).await.unwrap();
+        write_gc_checkpoint(
+            &store,
+            &paths,
+            1,
+            None,
+            vec![operator_with_selector(
+                global_operator(vec![old_file.clone()]),
+                "rocksdb",
+            )],
+        )
+        .await;
+        write_gc_checkpoint(&store, &paths, 2, Some(1), vec![global_operator(vec![])]).await;
+
+        let err = cleanup_leader_checkpoints(
+            &store,
+            &paths,
+            StateBackendSelector::Parquet,
+            paths.checkpoint_manifest(Generation(1), Epoch(2)),
+            Epoch(2),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                StoreError::StateBackend(StateBackendError::UnknownValue { ref value, .. })
+                    if value == "rocksdb"
+            ),
+            "{err:?}"
+        );
+        assert!(store.deleted_objects().is_empty());
+        assert!(exists(&store, &old_file).await);
     }
 
     #[tokio::test]
