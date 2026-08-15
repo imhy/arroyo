@@ -14,7 +14,7 @@ use tracing::{debug, error, info, warn};
 
 use super::{
     Admission, JobContext, State, Transition, check_config_update, leader_running::LeaderRunning,
-    running::Running,
+    running::Running, settle_under_admission,
 };
 use crate::job_controller::checkpoint_store::DbCheckpointMetadataStore;
 use crate::job_controller::leader_manager::LeaderManager;
@@ -238,133 +238,167 @@ struct ExecutionPlan {
 /// [`Admission`] to call this at all, and why the caller takes that admission by re-reading
 /// the gate rather than by trusting the message loop that just ended.
 ///
-/// # Why the requests are not spawned
+/// # Why the requests are not spawned, and why the admission travels with them
 ///
-/// The RPCs are concurrent but they are *not* separate tasks, and that is the whole of the
-/// lifetime guarantee. `tokio::spawn` hands the child an independent lifetime: dropping a
-/// [`JoinHandle`] detaches the task rather than cancelling it, so the first worker to fail
-/// used to end this function — through `?` on a `JoinError` — while every sibling request
-/// carried on. The caller then released the admission, a poll could publish a refusal, and a
-/// detached request could still make a worker execute the configuration that had just been
-/// refused. Cancelling the job's state task did the same thing to all of them at once.
+/// The RPCs are concurrent but they are *not* separate tasks. `tokio::spawn` hands the child an
+/// independent lifetime: dropping a [`JoinHandle`] detaches the task rather than cancelling it,
+/// so the first worker to fail used to end this function — through `?` on a `JoinError` — while
+/// every sibling request carried on, past the point where a refusal could be published.
 ///
-/// A [`FuturesUnordered`] of plain futures is polled *by this task*, so the requests are
-/// children of the region rather than peers of it. Every way out takes them with it:
+/// Making the requests children of this future was necessary but not sufficient, because
+/// dropping a `tonic` client future is not revocation. It resets the stream; it does not stop a
+/// server handler that has already been entered. The production worker's `start_execution` takes
+/// a `std::sync::Mutex` as its first statement and, on the `Idle` branch, sets the phase and
+/// spawns initialization without reaching an `.await`, so a handler blocked on that lock cannot
+/// be dropped and will start the worker once the lock frees — whatever the controller has since
+/// decided. Round 11's fail-fast `?` therefore released the admission on the strength of a
+/// cancellation the worker was under no obligation to honour.
 ///
-/// * the last request completing, which is the ordinary path;
-/// * `?` on the first failure, which drops the set and with it every request still in flight;
-/// * a panic, which drops the set while unwinding;
-/// * the caller's future being dropped — the job's task cancelled, the controller shutting
-///   down — which drops this future and the set inside it.
+/// So this function does not cancel anything. It **settles** everything:
 ///
-/// In all four the requests are gone *before* the admission is, because the admission is a
-/// local of the caller declared before the temporary holding this future, and locals are
-/// dropped in reverse. Dropping an in-flight request resets its gRPC stream, so a worker
-/// that has been asked but has not yet applied the request never applies it.
+/// * every request is awaited to an outcome, including the siblings of one that has already
+///   failed; the first error is remembered and reported once the last request is in;
+/// * the region owns its [`Admission`] and hands it back only when that is done, and
+///   [`settle_under_admission`] keeps both together if the job's state task is dropped
+///   underneath it, so a cancelled task cannot release the admission either.
 ///
-/// Nothing here needs a task of its own: the closures capture owned clones, the work is a
-/// `tonic` call and not a blocking one, and no request has any reason to outlive the region
-/// that authorised it.
+/// What that buys is the only property the controller can actually enforce from this side: at
+/// the first instant a refusal can be published, every `StartExecution` this job issued has an
+/// answer, and nothing is in flight to race it. It does not, and cannot, claim that a worker
+/// which accepted under an unrefused configuration is prevented from executing it; nor that a
+/// request the *transport* failed (a reset connection, the 90s per-request deadline) proves its
+/// handler did nothing. Either of those would need the worker to acknowledge an admission back,
+/// which is a protocol change across the proto, the worker and the controller.
+///
+/// # Latency
+///
+/// An error now costs the slowest sibling instead of returning at once. That is bounded by the
+/// per-request deadline the worker channels are built with (`Endpoint::timeout`, 90s, in
+/// [`handle_worker_connect`]) — the same bound the all-succeed path already had, so the region's
+/// worst case is unchanged and only its error path has moved to meet it.
 ///
 /// # Errors
 ///
-/// Returns the first worker's error, without waiting for the rest. An RPC failure is a plain
-/// error rather than a panic in a child task — the shape that produced the `JoinError` above
-/// — and the caller turns it into the same retryable [`StateError`] as before.
+/// Returns the first failing worker's error, after every request has settled. The caller turns
+/// it into the same retryable [`StateError`] as before.
 async fn start_execution_on_workers(
-    admission: &Admission,
+    admission: Admission,
     job_id: Arc<String>,
     pipeline_id: PipelineId,
     plan: ExecutionPlan,
-    workers: &mut HashMap<WorkerId, WorkerStatus>,
+    machine_ids: HashMap<WorkerId, MachineId>,
     worker_connects: HashMap<WorkerId, WorkerClient>,
-) -> anyhow::Result<HashMap<WorkerId, WorkerClient>> {
-    // The whole of this — issuing the requests as much as waiting for them — is one effect
-    // inside one region, and none of it may outlive the guard.
-    admission
-        .effect("send every worker its StartExecution", async move {
-            let (leader_id, leader_addr) = plan.leader.unzip();
+) -> (Admission, anyhow::Result<HashMap<WorkerId, WorkerClient>>) {
+    settle_under_admission(admission, move |admission| async move {
+        // The whole of this — issuing the requests as much as waiting for them — is one effect
+        // inside one region, and none of it may outlive the guard.
+        let started = admission
+            .effect("send every worker its StartExecution", async move {
+                let (leader_id, leader_addr) = plan.leader.unzip();
 
-            let mut requests: FuturesUnordered<_> = worker_connects
-                .into_iter()
-                .map(|(id, mut c)| {
-                    let assignments = plan.assignments.clone();
-                    let job_id = job_id.clone();
-                    let pipeline_id = pipeline_id.clone();
-                    let program = plan.program.clone();
-                    let machine_id = workers.get(&id).as_ref().unwrap().machine_id.clone();
-                    let leader_addr = leader_addr.clone();
-                    let checkpoint_manifest_ref = plan.checkpoint_manifest_ref.clone();
-                    let state_backend = plan.state_backend;
-                    let (restore_epoch, start_epoch, min_epoch, checkpoint_interval_micros) = (
-                        plan.restore_epoch,
-                        plan.start_epoch,
-                        plan.min_epoch,
-                        plan.checkpoint_interval_micros,
-                    );
-
-                    async move {
-                        info!(
-                            message = "starting execution on worker",
-                            job_id = %job_id,
-                            pipeline_id = *pipeline_id,
-                            worker_id = id.0,
-                            machine_id = *machine_id.0,
+                let mut requests: FuturesUnordered<_> = worker_connects
+                    .into_iter()
+                    .map(|(id, mut c)| {
+                        let assignments = plan.assignments.clone();
+                        let job_id = job_id.clone();
+                        let pipeline_id = pipeline_id.clone();
+                        let program = plan.program.clone();
+                        // For the log lines below and nothing else, so a worker that somehow has
+                        // no status entry is still asked to start rather than panicking the
+                        // region — the one panic site the fan-out's path used to contain.
+                        let machine_id = machine_ids
+                            .get(&id)
+                            .cloned()
+                            .unwrap_or_else(|| MachineId(Arc::new(format!("unknown-{}", id.0))));
+                        let leader_addr = leader_addr.clone();
+                        let checkpoint_manifest_ref = plan.checkpoint_manifest_ref.clone();
+                        let state_backend = plan.state_backend;
+                        let (restore_epoch, start_epoch, min_epoch, checkpoint_interval_micros) = (
+                            plan.restore_epoch,
+                            plan.start_epoch,
+                            plan.min_epoch,
+                            plan.checkpoint_interval_micros,
                         );
 
-                        match c
-                            .start_execution(Request::new(StartExecutionReq {
-                                restore_epoch,
-                                start_epoch,
-                                min_epoch,
-                                program: Some(program),
-                                tasks: assignments,
-                                job_controller_addr: leader_addr,
-                                is_leader: leader_id.is_some_and(|l| l == id),
-                                wait_for_leader: leader_id.is_some(),
-                                checkpoint_interval_micros,
-                                checkpoint_manifest_ref,
-                                state_backend: state_backend.as_str().to_string(),
-                            }))
-                            .await
-                        {
-                            Ok(_) => {
-                                debug!(
-                                    message = "worker entered initialization phase",
-                                    job_id = %job_id,
-                                    pipeline_id = *pipeline_id,
-                                    worker_id = id.0,
-                                    machine_id = *machine_id.0,
-                                );
-                                Ok((id, c))
+                        async move {
+                            info!(
+                                message = "starting execution on worker",
+                                job_id = %job_id,
+                                pipeline_id = *pipeline_id,
+                                worker_id = id.0,
+                                machine_id = *machine_id.0,
+                            );
+
+                            match c
+                                .start_execution(Request::new(StartExecutionReq {
+                                    restore_epoch,
+                                    start_epoch,
+                                    min_epoch,
+                                    program: Some(program),
+                                    tasks: assignments,
+                                    job_controller_addr: leader_addr,
+                                    is_leader: leader_id.is_some_and(|l| l == id),
+                                    wait_for_leader: leader_id.is_some(),
+                                    checkpoint_interval_micros,
+                                    checkpoint_manifest_ref,
+                                    state_backend: state_backend.as_str().to_string(),
+                                }))
+                                .await
+                            {
+                                Ok(_) => {
+                                    debug!(
+                                        message = "worker entered initialization phase",
+                                        job_id = %job_id,
+                                        pipeline_id = *pipeline_id,
+                                        worker_id = id.0,
+                                        machine_id = *machine_id.0,
+                                    );
+                                    Ok((id, c))
+                                }
+                                Err(e) => {
+                                    error!(
+                                        message = "failed to start execution on worker",
+                                        job_id = %job_id,
+                                        pipeline_id = *pipeline_id,
+                                        worker_id = id.0,
+                                        machine_id = *machine_id.0,
+                                        error = format!("{:?}", e),
+                                    );
+                                    Err(anyhow!("failed to start execution on worker {id:?}: {e}"))
+                                }
                             }
-                            Err(e) => {
-                                error!(
-                                    message = "failed to start execution on worker",
-                                    job_id = %job_id,
-                                    pipeline_id = *pipeline_id,
-                                    worker_id = id.0,
-                                    machine_id = *machine_id.0,
-                                    error = format!("{:?}", e),
-                                );
-                                Err(anyhow!("failed to start execution on worker {id:?}: {e}"))
+                        }
+                    })
+                    .collect();
+
+                let mut started = HashMap::new();
+                let mut first_error: Option<anyhow::Error> = None;
+                // Every request, to an outcome. Leaving on the first error would drop the
+                // siblings' client futures, and a client future dropped is not a worker stopped:
+                // see this function's documentation. The loop is what makes "settled" a fact
+                // rather than a hope, and the admission is not handed back until it ends.
+                while let Some(outcome) = requests.next().await {
+                    match outcome {
+                        Ok((id, c)) => {
+                            started.insert(id, c);
+                        }
+                        Err(e) => {
+                            if first_error.is_none() {
+                                first_error = Some(e);
                             }
                         }
                     }
-                })
-                .collect();
-
-            let mut started = HashMap::new();
-            // `?` here drops `requests`, and every request still in flight with it.
-            while let Some((id, c)) = requests.next().await.transpose()? {
-                if let Some(worker) = workers.get_mut(&id) {
-                    worker.state = WorkerState::Initializing;
                 }
-                started.insert(id, c);
-            }
-            Ok(started)
-        })
-        .await
+                match first_error {
+                    Some(e) => Err(e),
+                    None => Ok(started),
+                }
+            })
+            .await;
+
+        (admission, started)
+    })
+    .await
 }
 
 #[derive(Clone, Debug)]
@@ -1186,19 +1220,23 @@ impl State for Scheduling {
         // program actually begins to run, restoring state under the job's selector and
         // producing to its sinks.
         //
-        // The fan-out's requests are children of this future rather than spawned tasks, so
-        // every exit from it — success, the first worker's failure, a panic, or this task
-        // being cancelled — takes the requests still in flight with it, and does so before
-        // `admission` is dropped: `admission` is declared first, and locals drop in reverse.
-        // Nothing can therefore still be asking a worker to start once a refusal can again be
-        // published. See `start_execution_on_workers`.
+        // The fan-out owns the admission for as long as the requests it issued are unsettled,
+        // and hands it back only once every one of them has an outcome — a sibling's failure
+        // no longer ends it early, and this task being cancelled no longer releases the
+        // admission out from under it. A dropped client future is not a stopped worker, so
+        // "nothing is still asking a worker to start" is established by waiting for the
+        // answers rather than by taking the requests away. See `start_execution_on_workers`.
+        let machine_ids: HashMap<WorkerId, MachineId> = workers
+            .iter()
+            .map(|(id, status)| (*id, status.machine_id.clone()))
+            .collect();
         let admission = ctx.admit_irreversible_scheduling().await?;
-        let started = start_execution_on_workers(
-            &admission,
+        let (admission, started) = start_execution_on_workers(
+            admission,
             ctx.config.id.clone(),
             ctx.pipeline_info.pipeline_id.clone(),
             plan,
-            &mut workers,
+            machine_ids,
             worker_connects,
         )
         .await;
@@ -1210,6 +1248,11 @@ impl State for Scheduling {
                 return Err(ctx.retryable(self, "failed to initialize workers", e, 10));
             }
         };
+        for id in worker_connects.keys() {
+            if let Some(worker) = workers.get_mut(id) {
+                worker.state = WorkerState::Initializing;
+            }
+        }
 
         // Now wait until all tasks are running
         let start = Instant::now();

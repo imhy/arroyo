@@ -1453,6 +1453,135 @@ impl Admission {
     }
 }
 
+/// Runs a region that has issued work the controller cannot revoke, and does not release its
+/// [`Admission`] until that work has settled — including when this future is dropped.
+///
+/// # Why a region cannot simply be cancelled
+///
+/// Round 11 made the `StartExecution` fan-out's requests children of the state task rather than
+/// spawned tasks, so that every exit from the region took the requests with it. That is true of
+/// the *client* futures and only of them. Dropping a `tonic` client future resets its stream; it
+/// does not revoke work the server has already begun. The production worker's handler takes a
+/// `std::sync::Mutex` as its first statement and, on the `Idle` branch, sets the phase to
+/// `Initializing` and spawns initialization without reaching a single `.await`
+/// (`arroyo-worker/src/lib.rs`, `WorkerGrpc::start_execution`). A future blocked *inside* `poll`
+/// cannot be dropped, so a handler that was waiting for that lock when the controller gave up on
+/// it still runs to completion, and still starts the worker, after the reset.
+///
+/// So "the request was cancelled" is not an observation the controller can make, and the safety
+/// claim must not rest on it. What the controller *can* know is whether an RPC it issued has
+/// come back with an outcome. This type turns that into the invariant: **the admission is not
+/// released while any work the region issued is still unsettled**, so at the first instant a
+/// refusal can be published every worker's answer is already in hand and there is nothing left
+/// in flight for the refusal to race.
+///
+/// # What happens when the region is dropped
+///
+/// The job's state task is dropped as a whole when the controller's shutdown token fires — see
+/// `ShutdownGuard::into_spawn_task`, whose `select!` drops `run_to_completion` mid-flight — and
+/// then the admission would go at the same instant as the requests. The region is therefore
+/// owned by this future, and on drop it is moved into a task that finishes it. The task is
+/// detached, but the round-10 hole it might look like is precisely the one it cannot reopen:
+/// what round 10 detached was a *request*, which then outlived the admission that authorised it;
+/// what is detached here is the *admission itself*, wrapped around those requests. A refusal
+/// cannot be published while that task lives, because the task is holding the lock a publication
+/// needs — and [`RefusalGate::admit_publication`] never waits, so contention with it defers a
+/// refusal to the next poll rather than blocking anything (round 6's rule).
+///
+/// The region is bounded by the RPC deadline the worker channels are built with
+/// (`Endpoint::timeout`, 90s in `handle_worker_connect`), so the detached task, and with it the
+/// deferral of any refusal for that job, is bounded by the same.
+///
+/// # Two cases it does not cover, both deliberate
+///
+/// * **A panic inside the region.** Its future is poisoned and cannot be resumed, so unwinding
+///   drops the requests with the admission, exactly as before this type existed. A `Scheduling`
+///   that panics is failing the job anyway, and the fan-out's own path has no panicking
+///   operation left on it.
+/// * **No Tokio runtime at drop time.** Then the controller is already gone and nothing is left
+///   that could publish a refusal.
+pub(crate) async fn settle_under_admission<T, F>(
+    admission: Admission,
+    region: impl FnOnce(Admission) -> F,
+) -> (Admission, T)
+where
+    F: std::future::Future<Output = (Admission, T)> + Send + 'static,
+    T: Send + 'static,
+{
+    SettlingUnderAdmission {
+        region: Some(Box::pin(region(admission))),
+    }
+    .await
+}
+
+/// The owner [`settle_under_admission`] wraps a region in. Constructed only there.
+///
+/// The region hands the [`Admission`] back as part of its output rather than merely borrowing
+/// it, which is what makes "the admission is inside the thing that gets rescued" a fact of the
+/// type rather than a convention: a future that did not own an admission could not produce one.
+struct SettlingUnderAdmission<T: Send + 'static> {
+    /// `None` once the region has settled, which is what tells [`Drop`] there is nothing left
+    /// to rescue.
+    region: Option<
+        std::pin::Pin<Box<dyn std::future::Future<Output = (Admission, T)> + Send + 'static>>,
+    >,
+}
+
+impl<T: Send + 'static> std::future::Future for SettlingUnderAdmission<T> {
+    type Output = (Admission, T);
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = &mut *self;
+        let region = this
+            .region
+            .as_mut()
+            .expect("a region that has settled is not polled again");
+        match region.as_mut().poll(cx) {
+            std::task::Poll::Ready(settled) => {
+                this.region = None;
+                std::task::Poll::Ready(settled)
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+impl<T: Send + 'static> Drop for SettlingUnderAdmission<T> {
+    fn drop(&mut self) {
+        let Some(region) = self.region.take() else {
+            // Settled: the admission has already been handed back to the caller, which drops it
+            // where it means to.
+            return;
+        };
+
+        if std::thread::panicking() {
+            // A poisoned future cannot be resumed. See the type's documentation.
+            return;
+        }
+
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            error!(
+                "a region of irreversible scheduling work was dropped with no Tokio runtime to \
+                 finish it in; its admission is released with it"
+            );
+            return;
+        };
+
+        warn!(
+            "a region of irreversible scheduling work was dropped while the requests it issued \
+             were still unsettled; holding the job's admission until they are, so that no \
+             refusal can be published behind them"
+        );
+        runtime.spawn(async move {
+            // The admission is inside `region`, and is released only by this drop.
+            drop(region.await);
+        });
+    }
+}
+
 impl RefusalGate {
     /// Takes the job's scheduling admission for a publication, if the job is not in the
     /// middle of a region of irreversible scheduling work.
@@ -2417,7 +2546,7 @@ mod tests {
     use futures::FutureExt as _;
     use prost::Message as _;
     use std::collections::HashMap;
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex, RwLock};
     use std::time::{Duration, Instant};
     use tokio::sync::mpsc::{Receiver, Sender, channel};
@@ -4662,6 +4791,10 @@ mod tests {
         /// Announces that it has been asked and then waits, so the controller has a
         /// `StartExecution` in flight for as long as the test wants one.
         Pausing(Arc<PausedWorker>),
+        /// Blocks the thread *inside a single poll* until the test lets it go, which is the
+        /// production handler's shape and the one no cancellation can reach. See
+        /// [`BlockedWorker`].
+        Blocking(Arc<BlockedWorker>),
     }
 
     /// A worker that has been asked to start executing and has not answered yet.
@@ -4731,22 +4864,136 @@ mod tests {
         }
     }
 
-    /// How long a test waits for a cut-off that the fix makes immediate.
+    /// A worker whose `StartExecution` handler blocks the thread inside one poll.
     ///
-    /// **Not a synchronisation point.** With the fix, the controller dropping an in-flight
-    /// request resets its stream and the worker end announces the cut-off by itself, in
-    /// microseconds over loopback; nothing in the passing path waits on this deadline. It is
-    /// here because the *unfixed* shape detaches the request instead, so nothing would ever
-    /// announce anything — and a regression must fail the assertions rather than hang the
-    /// suite. On expiry the test releases the worker, and the assertions then report what a
-    /// request nobody was waiting for still managed to do.
-    const CUT_OFF_DEADLINE: Duration = Duration::from_secs(30);
+    /// Round 11's [`PausedWorker`] holds its request open at `Notify::notified().await`, which
+    /// is a *cooperative* suspension point: the handler is parked between polls, so when the
+    /// controller drops the client future `tonic` can drop the handler and the request really
+    /// is taken back. That is why round 11's tests passed and the hole stayed open.
+    ///
+    /// The production handler does not yield. `WorkerGrpc::start_execution` takes
+    /// `self.state.phase.lock()` — a `std::sync::Mutex` — as its first statement and, on the
+    /// `Idle` branch, sets the phase to `Initializing` and spawns initialization without
+    /// reaching an `.await`. A future blocked *inside* `poll` cannot be dropped; the poll runs
+    /// to its end whatever has happened to the stream, and the worker starts.
+    ///
+    /// This reproduces exactly that: from the moment the handler is entered to the moment it
+    /// returns there is no `.await`, and it blocks on a `std::sync::Mutex` in between. Nothing
+    /// the controller does can take the request back, so the only question a test can ask is
+    /// the one the invariant is actually about — what had the controller already done by the
+    /// time the handler got through?
+    struct BlockedWorker {
+        /// The blocking point, and the handshake with the test in one lock: the handler
+        /// records that it is inside before it waits, so "the request is unstoppable now" is a
+        /// fact the test observes rather than a delay it hopes is long enough.
+        state: Mutex<BlockedState>,
+        changed: std::sync::Condvar,
+        /// The signal a [`StartsExecution::FailingOnce`] sibling waits on. Fired by the test
+        /// once the handler is provably inside, not by the handler itself.
+        asked_relay: Arc<tokio::sync::Notify>,
+        /// The job's gate, so the handler can answer "had a refusal been published by the time
+        /// I started this worker?" from inside the worker. Set once the harness exists.
+        gate: std::sync::OnceLock<RefusalGate>,
+        saw_refusal: std::sync::atomic::AtomicBool,
+        started: std::sync::atomic::AtomicBool,
+    }
+
+    #[derive(Default)]
+    struct BlockedState {
+        /// The handler is inside its blocking wait and can no longer be cancelled.
+        inside: bool,
+        /// The test has let it go.
+        released: bool,
+    }
+
+    impl BlockedWorker {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                state: Mutex::new(BlockedState::default()),
+                changed: std::sync::Condvar::new(),
+                asked_relay: Arc::new(tokio::sync::Notify::new()),
+                gate: std::sync::OnceLock::new(),
+                saw_refusal: std::sync::atomic::AtomicBool::new(false),
+                started: std::sync::atomic::AtomicBool::new(false),
+            })
+        }
+
+        /// Gives the handler the gate it reports against. The harness owns the gate, and the
+        /// worker has to exist before the harness does.
+        fn watch(&self, gate: RefusalGate) {
+            self.gate.set(gate).ok().expect("the gate is set once");
+        }
+
+        fn asked_relay(&self) -> Arc<tokio::sync::Notify> {
+            self.asked_relay.clone()
+        }
+
+        /// Waits until the handler is inside its blocking wait.
+        ///
+        /// On a blocking thread, because that is what waiting on a `Condvar` is; the point of
+        /// the whole instrument is that this handler does not participate in async
+        /// cancellation.
+        async fn wait_until_inside(self: &Arc<Self>) {
+            let worker = Arc::clone(self);
+            tokio::task::spawn_blocking(move || {
+                let mut state = worker.state.lock().unwrap();
+                while !state.inside {
+                    state = worker.changed.wait(state).unwrap();
+                }
+            })
+            .await
+            .unwrap();
+        }
+
+        /// Lets the handler out. Whatever the controller has done by now, it is about to
+        /// start executing.
+        fn release(&self) {
+            let mut state = self.state.lock().unwrap();
+            state.released = true;
+            self.changed.notify_all();
+        }
+
+        fn saw_refusal(&self) -> bool {
+            self.saw_refusal.load(Ordering::SeqCst)
+        }
+
+        fn started(&self) -> bool {
+            self.started.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Lets a [`BlockedWorker`] out however its test ends.
+    ///
+    /// A handler blocked inside its own poll owns a runtime worker thread until it is released,
+    /// and a `tokio` runtime cannot finish shutting down while one of its threads is inside a
+    /// task. Without this, an assertion that fired *before* the test reached its own release
+    /// would hang the suite instead of reporting — which is the one thing a regression must
+    /// never do, and is exactly what the round-13 cancellation test does on unfixed code.
+    struct ReleasedOnDrop(Arc<BlockedWorker>);
+
+    impl Drop for ReleasedOnDrop {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    /// How long a test waits to establish that a refusal *cannot* be published.
+    ///
+    /// A negative is the one thing no handshake can observe, so this is the only deadline in
+    /// the suite that the *fixed* code is expected to reach — and reaching it is what then lets
+    /// the blocked worker out so the assertions can run. It cannot turn a violation into a
+    /// pass in any realistic case: the unfixed fan-out releases the admission the instant a
+    /// sibling's error lands, so the publication it permits succeeds over loopback in
+    /// microseconds, and the assertions are about a recorded order rather than about a time.
+    const SETTLEMENT_GRACE: Duration = Duration::from_secs(3);
 
     /// Records that a paused handler was dropped rather than resumed.
     ///
-    /// `tonic` drops a request handler when its stream is reset or its connection closes,
-    /// which is what the controller dropping an in-flight request does to the worker end. So
-    /// this guard firing *is* the observation "the worker was never asked to start after all".
+    /// `tonic` drops a request handler when its stream is reset or its connection closes, which
+    /// is what the controller dropping an in-flight request does to a worker that suspends
+    /// cooperatively. Round 11 asked for this to happen; since round 13 nothing may cut a
+    /// request off before it has answered, so this guard firing is a regression report rather
+    /// than the expected outcome.
     struct CutOffOnDrop(Option<Arc<PausedWorker>>);
 
     impl CutOffOnDrop {
@@ -4789,6 +5036,34 @@ mod tests {
                     return Err(tonic::Status::internal(
                         "this worker cannot start executing",
                     ));
+                }
+                StartsExecution::Blocking(blocked) => {
+                    // No `.await` from here to the return. The thread is blocked inside this
+                    // poll, so `tonic` cannot drop this future however the client's stream
+                    // ends — exactly as in `WorkerGrpc::start_execution`, which blocks on
+                    // `phase.lock()` and then starts the worker without yielding once.
+                    let mut state = blocked.state.lock().unwrap();
+                    state.inside = true;
+                    blocked.changed.notify_all();
+                    while !state.released {
+                        state = blocked.changed.wait(state).unwrap();
+                    }
+                    drop(state);
+
+                    // What the controller had already decided by the time this worker started.
+                    let refused = blocked
+                        .gate
+                        .get()
+                        .expect("the blocked worker is given the job's gate")
+                        .current
+                        .read()
+                        .unwrap()
+                        .is_some();
+                    blocked.saw_refusal.store(refused, Ordering::SeqCst);
+                    blocked.started.store(true, Ordering::SeqCst);
+                    self.calls.start_execution.lock().unwrap().push(selector);
+                    self.barriers.execution_started.notify_one();
+                    return Ok(tonic::Response::new(StartExecutionResp {}));
                 }
                 StartsExecution::Pausing(paused) => {
                     paused.announce();
@@ -5333,23 +5608,31 @@ mod tests {
     // The two tests below are the two ways out that leaked: a sibling failing, and the parent
     // being dropped. Both hold one worker inside its own `StartExecution` handler across that
     // moment and ask what happened to it. A real server on a real socket is what makes the
-    // question answerable at all: cutting a request off is something the worker end observes.
+    // question answerable at all.
+    //
+    // What they *ask for* changed in round 13. Round 11 asked that the request be cut off, and
+    // a cut-off is only a client-side event: see the round 13 block below, and `BlockedWorker`.
+    // These two now ask for the same thing that block does, from a worker that could have been
+    // cancelled — so that the answer does not depend on the handler's shape.
     // ---------------------------------------------------------------------------------------
 
-    /// A worker still inside its `StartExecution` must be cut off when a sibling request fails,
-    /// so that nothing is left able to start it once a refusal can be published again.
+    /// A worker still inside its `StartExecution` must be *waited for* when a sibling request
+    /// fails, so that no refusal can be published while its answer is still outstanding.
     ///
-    /// The reviewer's scenario, deterministically: two workers, one that fails and one that is
-    /// held inside its handler when the failure lands. The failing worker waits for the paused
-    /// one to be inside before it fails, so "a request was outstanding" is enforced rather than
-    /// hoped for. The refusal is then published at the first instant a publication is possible
-    /// — which is by construction the first instant after the fan-out released the admission.
+    /// Round 11 asserted the opposite here — that the request was cut off — and round 13
+    /// replaced that claim rather than strengthening it. Cutting a request off is the most a
+    /// client can do and it is not enough: a stream reset stops nobody, it only stops anyone
+    /// listening. The scenario is unchanged (two workers, one that fails and one held inside its
+    /// handler when the failure lands, the failure held back until the second is provably
+    /// inside); what is asked of the controller is now settlement instead of cancellation.
     ///
-    /// Before the fix the paused worker's request was a detached task: the helper returned the
-    /// failing worker's `JoinError`, the admission went, the refusal was published, and the
-    /// detached request went on to tell a worker to start executing the refused configuration.
+    /// This worker suspends cooperatively, so the fan-out *could* still take its request away.
+    /// The point of keeping it alongside
+    /// `a_sibling_failure_cannot_release_the_admission_while_a_blocked_worker_is_unsettled` is
+    /// that both now get the same answer: the guarantee no longer depends on which kind of
+    /// handler the worker happens to have.
     #[tokio::test]
-    async fn a_worker_still_inside_start_execution_is_cut_off_when_a_sibling_request_fails() {
+    async fn a_sibling_failure_waits_for_the_request_it_used_to_cut_off() {
         let paused = PausedWorker::new();
         let mut run = SchedulingRun::with_workers(
             "sibling-failure",
@@ -5380,52 +5663,45 @@ mod tests {
             // running once the fan-out has already been entered and has failed.
             watching.asked.notified().await;
 
-            // Publishing is impossible for as long as a region is in flight, so the first
-            // success is the first instant after the fan-out gave the admission up. The
-            // deadline is for the *unfixed* helper, which awaited its spawned handles in queue
-            // order and so could be sitting on this very worker forever.
-            let published = tokio::time::timeout(
-                CUT_OFF_DEADLINE,
-                publish_when_admitted(&gate, refusal.clone()),
-            )
-            .await
-            .is_ok();
+            // Publishing is impossible for as long as a region is in flight, so this asks
+            // directly whether the fan-out kept its admission across a sibling's failure. See
+            // `SETTLEMENT_GRACE` for why establishing that it did needs a deadline.
+            let published_while_unsettled =
+                tokio::time::timeout(SETTLEMENT_GRACE, publish_when_admitted(&gate, refusal))
+                    .await
+                    .is_ok();
 
-            // See `CUT_OFF_DEADLINE`: with the fix the request has already been taken back
-            // and this returns at once; without it, nothing will ever take it back, and
-            // releasing the worker is what turns a hang into the assertion below.
-            if tokio::time::timeout(CUT_OFF_DEADLINE, watching.outcome())
-                .await
-                .is_err()
-            {
-                watching.released.notify_one();
-            }
-            if !published {
-                publish_when_admitted(&gate, refusal).await;
-            }
+            // However that went, let the worker out so the assertions can run.
+            watching.released.notify_one();
+            published_while_unsettled
         });
 
         let outcome = run.schedule().await;
-        poll.await.unwrap();
+        let published_while_unsettled = poll.await.unwrap();
 
+        assert!(
+            !published_while_unsettled,
+            "a refusal was published while a `StartExecution` this job had issued was still \
+             unsettled: the fan-out gave its admission up on a sibling's failure, and a request \
+             it has stopped waiting for is not a request the worker has stopped serving"
+        );
         assert_eq!(
             paused.outcome().await,
-            PausedOutcome::CutOff,
-            "the request the fan-out stopped waiting for must have been taken back, not \
-             detached: the controller released the job's admission on the strength of having \
-             finished with its workers"
+            PausedOutcome::Applied,
+            "and the request must have been waited for rather than taken back: round 11 cut \
+             this one off, which is all a client can do to a handler and says nothing about \
+             what the handler did"
         );
         assert_eq!(
             run.calls.started(),
-            Vec::<String>::new(),
-            "so no worker may be told to start executing — one refused the request and the \
-             other was cut off before it could apply one, and by the time it was released a \
-             refusal had been published for the very configuration it was holding"
+            ["parquet".to_string()],
+            "so the surviving worker did start executing — under a configuration that was \
+             unrefused when it was admitted, which is the order this test is about"
         );
         assert_eq!(
             run.calls.committed(),
             Vec::<u64>::new(),
-            "and nothing is committed: the commits come after an execution that never started"
+            "and nothing is committed: the commits come after a fan-out that succeeded"
         );
 
         let Err(err) = outcome else {
@@ -5433,24 +5709,25 @@ mod tests {
         };
         assert!(
             format!("{err:?}").contains("failed to initialize workers"),
-            "and the state fails for the worker that refused it: {err:?}"
+            "and draining the siblings must still report the worker that refused: {err:?}"
         );
     }
 
-    /// Cancelling the job's state task must take its outstanding `StartExecution` requests with
-    /// it, because the admission goes at the same moment and cannot cover them afterwards.
+    /// Cancelling the job's state task must not release its admission while an outstanding
+    /// `StartExecution` is unanswered, because nothing else can speak for that request now.
     ///
-    /// The other way a spawned request outlived its admission, and the one no error path
-    /// reaches: the state task is simply dropped — the controller shutting down, the job being
-    /// torn down — while the fan-out is in flight. Dropping the task dropped the `JoinHandle`s
-    /// and Tokio detached every one of them, so the requests carried on after the admission
-    /// they were authorised by no longer existed and a refusal could be published behind them.
+    /// The other ordering, and the one no error path reaches: the state task is simply dropped —
+    /// `ShutdownGuard::into_spawn_task` drops `run_to_completion` when the shutdown token fires
+    /// — while the fan-out is in flight. Round 10 left the requests detached and running past
+    /// the admission; round 11 made them die with the task, which is the right thing to do with
+    /// a client future and still no answer at all about the handler behind it.
     ///
-    /// Here the fan-out is dropped with a worker held inside its handler. A publication then
-    /// succeeds — the admission really is gone — and the worker is let go, and must never have
-    /// been asked to start.
+    /// So round 13 sends the admission with them instead: the region owns it, and a region
+    /// dropped with work outstanding is finished in a task that carries the admission inside it.
+    /// A publication is therefore impossible the instant after the state task is gone, and
+    /// becomes possible only once the worker has answered.
     #[tokio::test]
-    async fn dropping_the_scheduling_task_cuts_off_the_start_execution_it_had_in_flight() {
+    async fn a_cancelled_fan_out_holds_its_admission_until_the_request_it_issued_settles() {
         let paused = PausedWorker::new();
         let mut run = SchedulingRun::with_workers(
             "cancelled-fan-out",
@@ -5477,35 +5754,244 @@ mod tests {
             // The job's state task, cancelled with a request in flight.
         }
 
-        let admission = gate.admit_publication().expect(
-            "the admission must have gone with the task that held it — this is the moment the \
-             detached requests of the unfixed fan-out were still running in",
+        // Deterministic, and the assertion round 11 had backwards: the admission is inside the
+        // rescued region, so it is still held the instant the task that opened it is gone.
+        assert!(
+            gate.admit_publication().is_none(),
+            "the admission must have outlived the cancelled state task, because the request it \
+             authorised has: a refusal published now would be published behind a worker that is \
+             still deciding what to do with its `StartExecution`"
         );
-        gate.publish(
-            &admission,
-            RefusedConfig::new(selector_changed(), 1, Arc::new(AtomicU64::new(1))),
-        );
-        drop(admission);
 
-        // See `CUT_OFF_DEADLINE`.
-        if tokio::time::timeout(CUT_OFF_DEADLINE, paused.outcome())
-            .await
-            .is_err()
-        {
-            paused.released.notify_one();
-        }
-
+        paused.released.notify_one();
         assert_eq!(
             paused.outcome().await,
-            PausedOutcome::CutOff,
-            "the request must have gone with the task: a task that is no longer running cannot \
-             be holding an admission for it"
+            PausedOutcome::Applied,
+            "the rescued region must carry its request through to an answer, not merely hold a \
+             lock for a while"
+        );
+
+        tokio::time::timeout(
+            SETTLEMENT_GRACE,
+            publish_when_admitted(
+                &gate,
+                RefusedConfig::new(selector_changed(), 1, Arc::new(AtomicU64::new(1))),
+            ),
+        )
+        .await
+        .expect(
+            "and it must be released once that answer is in — holding it any longer would wedge \
+             the job's next scheduling attempt on a task nobody is waiting for",
+        );
+
+        assert_eq!(
+            run.calls.started(),
+            ["parquet".to_string()],
+            "the worker did start executing: it was asked under an admitted, unrefused \
+             configuration, and the guarantee is that no refusal was published while that was \
+             still in doubt"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Round 13: settlement, not cancellation.
+    //
+    // Round 11 stopped the fan-out from *detaching* its requests, and the tests above prove it
+    // for a handler that yields. They prove nothing about the handler the controller actually
+    // talks to. `WorkerGrpc::start_execution` blocks on a `std::sync::Mutex` inside one poll
+    // and then sets the phase and spawns initialization without an `.await`, so a request the
+    // controller has "taken back" still starts the worker; the reset only means nobody is
+    // listening to the answer. Round 11's guarantee therefore rested on a cancellation the
+    // worker was under no obligation to honour.
+    //
+    // What replaces it is a claim about what the controller knows rather than about what it can
+    // stop: **no refusal is published while any `StartExecution` this job issued is unsettled**.
+    // The two orderings that broke it are a sibling's failure and the state task being dropped,
+    // and the two tests below are those, with a handler that cannot be cancelled at all.
+    //
+    // Note what is deliberately *not* asserted: that the worker does not start. It does — it
+    // accepted a configuration that was unrefused when it was admitted, and revoking that would
+    // need the worker to acknowledge an admission back. What is asserted is that it started
+    // before any refusal existed, which is the whole of what the controller can enforce from
+    // this side.
+    // ---------------------------------------------------------------------------------------
+
+    /// A sibling request failing must not release the admission while a worker that cannot be
+    /// cancelled is still inside its `StartExecution`.
+    ///
+    /// The reviewer's counterexample, made deterministic. Two workers: one fails, and one is
+    /// blocked inside its handler in a way no stream reset can reach. The failure is held back
+    /// until the blocked handler is provably inside, so "a request was outstanding" is enforced
+    /// rather than hoped for; a refusal is then published at the first instant a publication is
+    /// possible.
+    ///
+    /// Before the fix the fan-out left on the first error, dropped the sibling's client future,
+    /// and released the admission. The publication then succeeded — and the worker, which had
+    /// never stopped, went on to start executing the configuration that had just been refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_sibling_failure_cannot_release_the_admission_while_a_blocked_worker_is_unsettled() {
+        let blocked = BlockedWorker::new();
+        // Declared first, so it is dropped last: whatever fails below, the worker is let go
+        // before the runtime is torn down. See `ReleasedOnDrop`.
+        let _released = ReleasedOnDrop(blocked.clone());
+        let mut run = SchedulingRun::with_workers(
+            "blocked-sibling-failure",
+            vec![
+                StartsExecution::FailingOnce(blocked.asked_relay()),
+                StartsExecution::Blocking(blocked.clone()),
+            ],
+        )
+        .await;
+        blocked.watch(run.harness.refusal_gate.clone());
+
+        let gate = run.harness.refusal_gate.clone();
+        let queue = run.harness.queue();
+        for (n, worker_id) in [WorkerId(7), WorkerId(8)].into_iter().enumerate() {
+            queue
+                .send(worker_connect_from(worker_id, &run.address(n)))
+                .await
+                .unwrap();
+        }
+
+        let refusal = RefusedConfig::new(selector_changed(), 1, Arc::new(AtomicU64::new(1)));
+        let watching = blocked.clone();
+        let relay = blocked.asked_relay();
+        let probe = tokio::spawn(async move {
+            // Only once the blocked handler is past the point of no return: from here on the
+            // controller cannot stop it, whatever it does with the request.
+            watching.wait_until_inside().await;
+            relay.notify_one();
+
+            // A publication succeeds at the first instant a region is not in flight, so this
+            // asks directly whether the admission survived the sibling's failure. See
+            // `SETTLEMENT_GRACE` for why establishing a negative needs a deadline.
+            let published_while_unsettled =
+                tokio::time::timeout(SETTLEMENT_GRACE, publish_when_admitted(&gate, refusal))
+                    .await
+                    .is_ok();
+
+            // However that went, let the worker out so the assertions can run.
+            watching.release();
+            published_while_unsettled
+        });
+
+        let outcome = run.schedule().await;
+        let published_while_unsettled = probe.await.unwrap();
+
+        assert!(
+            !published_while_unsettled,
+            "a refusal was published while a `StartExecution` this job had issued was still \
+             unsettled: the fan-out gave the admission up on a sibling's failure, and the \
+             request it stopped waiting for was one no cancellation could reach"
+        );
+        assert!(
+            blocked.started(),
+            "the blocked handler must have run to completion — past the point at which the \
+             unfixed fan-out had already given up on it — or this test proves nothing"
+        );
+        assert!(
+            !blocked.saw_refusal(),
+            "and it must have started the worker before any refusal existed: a worker that \
+             cannot be cancelled must have its answer in hand before a refusal can be published"
         );
         assert_eq!(
             run.calls.started(),
-            Vec::<String>::new(),
-            "so the worker was never told to start executing, and in particular not after the \
-             refusal above"
+            ["parquet".to_string()],
+            "the blocked worker did start executing, which is the point: it accepted a \
+             configuration that was unrefused when it was admitted, and the guarantee is about \
+             the order of that against the refusal, not about revoking it"
+        );
+
+        let Err(err) = outcome else {
+            panic!("a fan-out in which a worker refused the request cannot have succeeded");
+        };
+        assert!(
+            format!("{err:?}").contains("failed to initialize workers"),
+            "and draining the siblings must still report the worker that refused: {err:?}"
+        );
+    }
+
+    /// Cancelling the job's state task must not release the admission while a worker that
+    /// cannot be cancelled is still inside its `StartExecution`.
+    ///
+    /// The other ordering, and the one no error path reaches: the state task is dropped whole —
+    /// `ShutdownGuard::into_spawn_task` drops `run_to_completion` when the shutdown token fires
+    /// — while the fan-out is in flight. Round 11 made the requests die with it, which is the
+    /// right thing to do with a client future and no answer at all about the handler behind it.
+    ///
+    /// So the admission goes with the requests instead of before them: the region owns it, and
+    /// a region dropped with work outstanding is finished in a task that carries the admission
+    /// inside it. This asserts that directly — a publication is impossible the instant after
+    /// the task is gone, and becomes possible only once the worker has been let out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dropping_the_scheduling_task_keeps_the_admission_until_its_blocked_request_settles() {
+        let blocked = BlockedWorker::new();
+        // Declared first, so it is dropped last. The assertion below fires on unfixed code
+        // while the worker is still blocked, and without this the suite would hang there
+        // rather than report. See `ReleasedOnDrop`.
+        let _released = ReleasedOnDrop(blocked.clone());
+        let mut run = SchedulingRun::with_workers(
+            "blocked-cancelled-fan-out",
+            vec![StartsExecution::Blocking(blocked.clone())],
+        )
+        .await;
+        blocked.watch(run.harness.refusal_gate.clone());
+
+        let gate = run.harness.refusal_gate.clone();
+        let queue = run.harness.queue();
+        queue
+            .send(worker_connect_from(WorkerId(7), &run.address(0)))
+            .await
+            .unwrap();
+
+        {
+            let mut scheduling = std::pin::pin!(run.schedule());
+            let mut inside = std::pin::pin!(blocked.wait_until_inside());
+            tokio::select! {
+                _ = &mut scheduling => {
+                    panic!("the state cannot have finished: the worker is still blocked inside \
+                            its `StartExecution`")
+                }
+                _ = &mut inside => {}
+            }
+            // The job's state task, cancelled with a request in flight that nothing can recall.
+        }
+
+        assert!(
+            gate.admit_publication().is_none(),
+            "the admission must have outlived the cancelled state task, because the request it \
+             authorised has: the worker is inside a handler that no stream reset can drop, and \
+             a refusal published now would be published behind it"
+        );
+
+        blocked.release();
+
+        tokio::time::timeout(
+            SETTLEMENT_GRACE,
+            publish_when_admitted(
+                &gate,
+                RefusedConfig::new(selector_changed(), 1, Arc::new(AtomicU64::new(1))),
+            ),
+        )
+        .await
+        .expect(
+            "and it must be released once the request settles — holding it past that would \
+             wedge the job's next scheduling attempt on a task nobody is waiting for",
+        );
+
+        assert!(
+            blocked.started(),
+            "the blocked handler must have run to completion, or this test proves nothing"
+        );
+        assert!(
+            !blocked.saw_refusal(),
+            "and it started the worker before any refusal existed"
+        );
+        assert_eq!(
+            run.calls.started(),
+            ["parquet".to_string()],
+            "the worker did start: a request the controller could not recall was answered \
+             before the refusal, which is the order the invariant is about"
         );
     }
 
@@ -5733,6 +6219,26 @@ mod tests {
 
         // And the lifetime half of the same guarantee, which no region boundary can express.
         //
+        // Round 11 read this as "the requests must not outlive the region", and made them
+        // children of the state task so that every exit took them with it. That is all a
+        // *client* future can be made to do. Dropping one resets its stream; it does not stop a
+        // server handler that has already been entered, and the production worker's handler
+        // blocks on a `std::sync::Mutex` inside a single poll and then starts the worker
+        // without yielding, so it cannot be dropped and does not care that nobody is listening.
+        //
+        // So the fan-out no longer ends its requests: it waits for them, and owns the admission
+        // while it does. `settle_under_admission` is what makes that survive the state task
+        // being dropped — the region and its admission are rescued together, so the one thing
+        // that outlives cancellation is the interlock itself.
+        assert!(
+            fan_out.contains("settle_under_admission("),
+            "the `StartExecution` fan-out must own its admission through \
+             `settle_under_admission`, so that neither a sibling's failure nor the job's state \
+             task being dropped can release the admission while a request it issued is still \
+             unsettled. Taking an `&Admission` again would put the guarantee back on the \
+             caller's drop order, which says nothing about a worker that is already running"
+        );
+
         // A region covers the work *this task* does between its boundaries. `tokio::spawn`
         // hands its child an independent lifetime — dropping a `JoinHandle` detaches the task
         // rather than cancelling it — so a spawned effect is precisely an effect the region
@@ -5740,6 +6246,11 @@ mod tests {
         // setup, which is outside every region, does nothing irreversible, and is awaited to
         // completion by the phase that started it. A second one means someone has given a
         // piece of `Scheduling` a life of its own, and has to say which region ends it.
+        //
+        // `settle_under_admission` does spawn, on the cancellation path, and it lives in
+        // `states/mod.rs` rather than here for exactly that reason: what it detaches is the
+        // *admission*, wrapped around the unsettled requests, which is the opposite of what
+        // round 10 detached and is why this count can stay honest at one.
         assert_eq!(
             source.matches("tokio::spawn").count(),
             1,
