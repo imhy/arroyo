@@ -19,7 +19,10 @@
 //! 3. **One selector per job.** Mixed-backend jobs are rejected, as is any disagreement
 //!    between the job value and a table config or a restored checkpoint.
 //!    [`validate_agreement`] is the single implementation of that check; callers adapt
-//!    their own inputs into `(label, raw value)` pairs.
+//!    their own inputs into `(label, raw value)` pairs. The value is also fixed for the
+//!    life of the job: a configuration that changes it on an existing job is refused by
+//!    [`validate_unchanged_job_selector`], because the running workers, their table
+//!    configs, and every checkpoint they have written already carry the old value.
 
 use std::fmt;
 use thiserror::Error;
@@ -268,11 +271,69 @@ pub enum StateBackendError {
         /// The job's authoritative selector.
         job: StateBackendSelector,
     },
+
+    /// A job that is already running was handed a different selector than the one it
+    /// started with. See [`validate_unchanged_job_selector`].
+    #[error(
+        "{label} is running with state backend \"{running}\", but its configuration now \
+         says \"{requested}\"; a job's state backend cannot be changed while it exists — \
+         stop the job and create a new one, or restore the previous value"
+    )]
+    JobSelectorChanged {
+        /// Which job's selector changed, e.g. `job "job_abc"`.
+        label: String,
+        /// The selector the job's workers, checkpoints, and cleanup are using.
+        running: StateBackendSelector,
+        /// The selector the new configuration asks for.
+        requested: StateBackendSelector,
+    },
+}
+
+/// Checks that a job's selector has not changed underneath a job that already exists.
+///
+/// Rule 3 — one selector per job — is a property of the job, not of one config read. The
+/// selector is captured when a job's workers are started and is then baked into their
+/// `TaskInfo`, into every `TableConfig` they stamp, and into every checkpoint they write.
+/// A later configuration that names a different backend does not migrate any of that; it
+/// only creates a second authority, so the database says one thing while the running job
+/// says another. Cleanup, compaction, and the next restore then disagree about which
+/// backend owns the state on disk.
+///
+/// Refusing the change is the recoverable direction. The job's state stays exactly as its
+/// own backend wrote it, and an operator can either put the old value back or stop the job
+/// and create a new one with the new backend. Accepting the change is not recoverable: the
+/// job would keep writing state under one authority while being administered under
+/// another.
+///
+/// `running` is the selector the job is actually running with and `requested` is the one
+/// the new configuration carries; both are already-normalized values, so a row that
+/// changes from `""` to `"parquet"` is not a change at all.
+///
+/// # Errors
+///
+/// Returns [`StateBackendError::JobSelectorChanged`] if the two differ.
+pub fn validate_unchanged_job_selector(
+    label: &str,
+    running: StateBackendSelector,
+    requested: StateBackendSelector,
+) -> Result<(), StateBackendError> {
+    if running == requested {
+        return Ok(());
+    }
+
+    Err(StateBackendError::JobSelectorChanged {
+        label: format!("job {label:?}"),
+        running,
+        requested,
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{SelectorScope, StateBackendError, StateBackendSelector, validate_agreement};
+    use super::{
+        SelectorScope, StateBackendError, StateBackendSelector, validate_agreement,
+        validate_unchanged_job_selector,
+    };
 
     #[test]
     fn empty_value_normalizes_to_parquet() {
@@ -482,6 +543,64 @@ mod tests {
         assert!(matches!(
             err,
             StateBackendError::TableMismatch { ref label, .. } if label.contains("s:source")
+        ));
+    }
+
+    /// The selector is a property of the job, so it cannot change while the job exists.
+    /// Both directions matter: a real change is refused, and a value that only *looks*
+    /// different — the pre-selector empty string against an explicit `"parquet"` — is not
+    /// a change, because both normalize to the same selector before they get here.
+    #[test]
+    fn a_jobs_selector_cannot_change_while_the_job_exists() {
+        validate_unchanged_job_selector(
+            "job_abc",
+            StateBackendSelector::Parquet,
+            StateBackendSelector::Parquet,
+        )
+        .unwrap();
+        validate_unchanged_job_selector(
+            "job_abc",
+            StateBackendSelector::normalize("", "job").unwrap(),
+            StateBackendSelector::normalize("parquet", "job").unwrap(),
+        )
+        .unwrap();
+        validate_unchanged_job_selector(
+            "job_abc",
+            StateBackendSelector::StateEngine,
+            StateBackendSelector::StateEngine,
+        )
+        .unwrap();
+
+        let err = validate_unchanged_job_selector(
+            "job_abc",
+            StateBackendSelector::Parquet,
+            StateBackendSelector::StateEngine,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            StateBackendError::JobSelectorChanged {
+                label: "job \"job_abc\"".to_string(),
+                running: StateBackendSelector::Parquet,
+                requested: StateBackendSelector::StateEngine,
+            }
+        );
+        let message = err.to_string();
+        assert!(message.contains("job_abc"), "{message}");
+        assert!(message.contains("cannot be changed"), "{message}");
+
+        // and symmetrically, so a stateengine job cannot be quietly demoted to parquet
+        assert!(matches!(
+            validate_unchanged_job_selector(
+                "job_abc",
+                StateBackendSelector::StateEngine,
+                StateBackendSelector::Parquet,
+            ),
+            Err(StateBackendError::JobSelectorChanged {
+                running: StateBackendSelector::StateEngine,
+                requested: StateBackendSelector::Parquet,
+                ..
+            })
         ));
     }
 }

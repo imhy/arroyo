@@ -235,6 +235,75 @@ impl ParquetBackend {
         Self::compact_loaded_operator(role, operator_checkpoint_metadata).await
     }
 
+    /// Loads and validates every operator's metadata for one checkpoint, without touching
+    /// anything.
+    ///
+    /// This is the preflight for restoring: a checkpoint is restored by rewriting its
+    /// top-level metadata and then starting workers that build one operator's tables at a
+    /// time, and each of those steps is only safe if the *whole* checkpoint belongs to
+    /// this job's backend. Validating each operator as it is reached would let the earlier
+    /// operators be rebuilt, and the metadata be rewritten, before a later operator's
+    /// disagreement is seen.
+    ///
+    /// Operators are loaded concurrently and returned in `operator_ids` order, so the
+    /// caller reuses these objects instead of reading them again — restoring a checkpoint
+    /// with this preflight costs the same reads it did without one, as long as the caller
+    /// consumes what it is given.
+    ///
+    /// An operator listed in the checkpoint with no metadata object is returned as `None`
+    /// rather than rejected. Absence carries no selector, and it is the caller's existing
+    /// business how much of a checkpoint it requires; this function only refuses
+    /// checkpoints it can prove belong to another backend.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateError::StateBackendError`] if any operator's table configs disagree
+    /// with `job`, name an unknown backend, or disagree with each other, alongside the
+    /// storage failures reading the metadata can produce. Nothing is written or deleted in
+    /// any case.
+    pub async fn load_checkpoint_operators(
+        role: &StorageProviderFor,
+        job: StateBackendSelector,
+        metadata: &CheckpointMetadata,
+    ) -> Result<Vec<(String, Option<OperatorCheckpointMetadata>)>, StateError> {
+        let mut loading: FuturesUnordered<_> = metadata
+            .operator_ids
+            .iter()
+            .map(|operator_id| async move {
+                let loaded = Self::load_operator_metadata(
+                    role,
+                    &metadata.job_id,
+                    operator_id,
+                    metadata.epoch,
+                )
+                .await?;
+                if let Some(loaded) = &loaded {
+                    validate_restored_operator_metadata(job, loaded)?;
+                }
+                Ok::<_, StateError>((operator_id.clone(), loaded))
+            })
+            .collect();
+
+        let mut validated = HashMap::with_capacity(metadata.operator_ids.len());
+        while let Some(loaded) = loading.next().await {
+            let (operator_id, loaded) = loaded?;
+            validated.insert(operator_id, loaded);
+        }
+        drop(loading);
+
+        Ok(metadata
+            .operator_ids
+            .iter()
+            .filter_map(|operator_id| {
+                // `remove` rather than `get`: a checkpoint that lists the same operator
+                // twice yields it once, which is also what the loading pass produced.
+                validated
+                    .remove(operator_id)
+                    .map(|loaded| (operator_id.clone(), loaded))
+            })
+            .collect())
+    }
+
     /// Compacts a whole checkpoint, one operator at a time, after the whole checkpoint has
     /// been validated
     ///
@@ -818,6 +887,68 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("node_2"), "{message}");
         assert!(message.contains("stateengine"), "{message}");
+    }
+
+    /// The restore preflight refuses the whole checkpoint, and reads nothing more than the
+    /// operators it was asked about. `node_1` agrees with the job and `node_2` does not, so
+    /// a preflight that stopped at the first disagreement would still have handed `node_1`
+    /// back to be restored.
+    #[tokio::test]
+    async fn loading_a_checkpoints_operators_refuses_one_a_later_operator_disagrees_with() {
+        let store = LocalCheckpointStore::new("restore-preflight-mixed");
+        write_epoch(&store, "node_1", 1, "parquet").await;
+        write_epoch(&store, "node_2", 1, "stateengine").await;
+
+        let err = ParquetBackend::load_checkpoint_operators(
+            &store.role,
+            StateBackendSelector::Parquet,
+            &checkpoint_metadata(&["node_1", "node_2"], 1),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                StateError::StateBackendError(StateBackendError::CheckpointMismatch { .. })
+            ),
+            "{err:?}"
+        );
+        let message = err.to_string();
+        assert!(message.contains("node_2"), "{message}");
+        assert!(message.contains("stateengine"), "{message}");
+    }
+
+    /// The compatibility direction of the restore preflight, plus the property the caller
+    /// depends on to avoid reading twice: a legacy all-parquet checkpoint is accepted, and
+    /// every operator comes back in `operator_ids` order with the metadata that was read.
+    /// An operator the checkpoint lists but has no metadata object for is reported as
+    /// absent rather than refused — absence states no backend.
+    #[tokio::test]
+    async fn loading_a_legacy_all_parquet_checkpoints_operators_returns_them_in_order() {
+        let store = LocalCheckpointStore::new("restore-preflight-legacy");
+        write_epoch(&store, "node_1", 1, "").await;
+        write_epoch(&store, "node_2", 1, "").await;
+
+        let operators = ParquetBackend::load_checkpoint_operators(
+            &store.role,
+            StateBackendSelector::Parquet,
+            &checkpoint_metadata(&["node_1", "node_2", "node_3"], 1),
+        )
+        .await
+        .unwrap();
+
+        let ids: Vec<&str> = operators.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["node_1", "node_2", "node_3"]);
+        assert_eq!(
+            operators[0].1.as_ref().unwrap().table_configs["g"].state_backend,
+            ""
+        );
+        assert!(operators[1].1.is_some());
+        assert!(
+            operators[2].1.is_none(),
+            "an operator with no metadata object is absent, not a mismatch"
+        );
     }
 
     /// The compatibility direction of the compaction guard: a legacy all-parquet checkpoint

@@ -163,6 +163,9 @@ impl WorkerJobController {
                 job_id: worker_context.job_id.clone(),
                 generation: Generation(worker_context.generation),
                 updated_at: SystemTime::now(),
+                // The leader validates the checkpoint it is about to recover from against
+                // the job's selector, and does so before this generation is published.
+                state_backend,
             },
             false,
         )
@@ -171,6 +174,7 @@ impl WorkerJobController {
             GenerationInitialization::Initialized {
                 generation_manifest,
                 recovery,
+                ..
             } => (generation_manifest, recovery),
             GenerationInitialization::StaleGeneration { current_generation } => {
                 return Err(RetireWorkerLeader {

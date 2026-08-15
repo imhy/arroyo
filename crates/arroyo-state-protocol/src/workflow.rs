@@ -13,6 +13,7 @@ use crate::types::{
     validate_epoch_record_matches_checkpoint,
 };
 use arroyo_rpc::grpc::rpc::CheckpointManifest;
+use arroyo_rpc::state_backend::{StateBackendSelector, validate_restored_manifest};
 use arroyo_types::{JobId, PipelineId, to_micros};
 use std::time::SystemTime;
 
@@ -71,6 +72,11 @@ pub struct InitializeGenerationRequest {
     pub job_id: JobId,
     pub generation: Generation,
     pub updated_at: SystemTime,
+    /// The state backend the job selects. The recovery checkpoint this initialization
+    /// would restore from is checked against it before the generation is published, so a
+    /// job cannot advance persistent protocol state towards a checkpoint it is not
+    /// allowed to read.
+    pub state_backend: StateBackendSelector,
 }
 
 /// Checkpoint, if any, that a newly initialized generation should restore from.
@@ -87,12 +93,23 @@ pub enum GenerationRecovery {
 }
 
 /// Result of [`initialize_generation`].
+///
+/// Not `Eq`: it carries a [`CheckpointManifest`], whose generated `PartialEq` is all
+/// prost provides.
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum GenerationInitialization {
     Initialized {
         generation_manifest: GenerationManifest,
         recovery: GenerationRecovery,
+        /// The recovery checkpoint's manifest, already read and already validated against
+        /// the job's selector, or `None` when there is nothing to recover from.
+        ///
+        /// It is returned rather than left for the caller to fetch because it had to be
+        /// read here anyway, before publication: re-reading it afterwards would pay twice
+        /// for the same bytes and would let the caller act on a different object than the
+        /// one that was validated.
+        recovery_checkpoint: Option<CheckpointManifest>,
     },
     StaleGeneration {
         current_generation: Generation,
@@ -220,6 +237,26 @@ pub enum CommitAuthorization {
 ///
 /// If `update_current_generation` is set, this method will write the current generation
 /// file. If not set, it will read the current generation and enforce conformance.
+///
+/// # Selector validation and write ordering
+///
+/// Publishing a generation is what commits this job to a recovery checkpoint: the current
+/// generation file names the generation, and the generation manifest records its link to
+/// the checkpoint it will restore from. Both are persistent protocol state, so the
+/// recovery checkpoint has to be resolved, read, and checked against
+/// `request.state_backend` *before* either of them is written — validating afterwards
+/// would report the mismatch only once the job had already advanced.
+///
+/// The resolved manifest is returned in
+/// [`GenerationInitialization::Initialized::recovery_checkpoint`] so callers use the same
+/// object that was validated rather than reading it again.
+///
+/// # Errors
+///
+/// Returns [`StoreError::StateBackend`] if the recovery checkpoint was written by a
+/// different backend than the job selects, or names an unknown one. In that case nothing
+/// has been written: the previous generation and its manifest are untouched, and the
+/// checkpoint remains restorable by a job that does select its backend.
 pub async fn initialize_generation<S>(
     store: &S,
     request: InitializeGenerationRequest,
@@ -243,14 +280,6 @@ where
                 ProtocolError::NonMonotonicGenerationUpdate,
             ));
         }
-
-        let current_generation = CurrentGeneration::new(
-            request.pipeline_id.clone(),
-            request.job_id.clone(),
-            request.generation,
-            SystemTime::now(),
-        );
-        put_json(store, &paths.current_generation(), &current_generation).await?;
     } else if let Some(cur) = &current_generation
         && cur.generation != request.generation
     {
@@ -259,6 +288,8 @@ where
         });
     }
 
+    // Resolve, read and validate before publishing anything. The search and the read are
+    // the reads this function would have done anyway; only their position has moved.
     let recovery = find_recovery_checkpoint(store, &paths, request.generation).await?;
     let base_checkpoint_ref = match &recovery {
         RecoverySearch::Found(recovery) => match recovery {
@@ -268,6 +299,37 @@ where
                 Some(checkpoint_ref.clone())
             }
         },
+        RecoverySearch::StopOrphaned { .. } | RecoverySearch::Failed(_) => None,
+    };
+
+    let recovery_checkpoint = match &base_checkpoint_ref {
+        Some(checkpoint_ref) => {
+            let checkpoint = read_protobuf::<_, CheckpointManifest>(store, checkpoint_ref)
+                .await?
+                .ok_or_else(|| {
+                    StoreError::Protocol(ProtocolError::MissingCheckpointManifest {
+                        checkpoint_ref: checkpoint_ref.clone(),
+                    })
+                })?;
+            validate_restored_manifest(request.state_backend, &checkpoint)?;
+            Some(checkpoint)
+        }
+        None => None,
+    };
+
+    if update_current_generation {
+        let current_generation = CurrentGeneration::new(
+            request.pipeline_id.clone(),
+            request.job_id.clone(),
+            request.generation,
+            SystemTime::now(),
+        );
+        put_json(store, &paths.current_generation(), &current_generation).await?;
+    }
+
+    // Reported only after the current generation has been claimed, as before: an orphaned
+    // or unresolvable history is a state this generation still owns.
+    match &recovery {
         RecoverySearch::StopOrphaned { canonical_ref } => {
             return Ok(GenerationInitialization::StopOrphaned {
                 canonical_ref: canonical_ref.clone(),
@@ -276,7 +338,8 @@ where
         RecoverySearch::Failed(failure) => {
             return Ok(GenerationInitialization::Failed(failure.clone()));
         }
-    };
+        RecoverySearch::Found(_) => {}
+    }
 
     let generation_manifest = GenerationManifest::new(
         request.pipeline_id,
@@ -300,6 +363,7 @@ where
     Ok(GenerationInitialization::Initialized {
         generation_manifest,
         recovery,
+        recovery_checkpoint,
     })
 }
 

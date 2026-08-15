@@ -35,6 +35,8 @@ pub enum ProtocolError {
     CommittedMarkerMismatch,
     #[error("checkpoint manifest does not match protocol record")]
     CheckpointManifestMismatch,
+    #[error("recovery checkpoint manifest `{checkpoint_ref}` is missing")]
+    MissingCheckpointManifest { checkpoint_ref: CheckpointRef },
     #[error("update to current generation would have caused a non-monotonic generation update")]
     NonMonotonicGenerationUpdate,
     #[error("checkpoint parent chain contains a cycle at generation {generation}, epoch {epoch}")]

@@ -271,11 +271,25 @@ pub(crate) mod tests {
     #[derive(Debug, Default, Clone)]
     pub(crate) struct MemoryProtocolStore {
         objects: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
+        written_objects: Arc<Mutex<Vec<String>>>,
         deleted_objects: Arc<Mutex<Vec<String>>>,
         deleted_directories: Arc<Mutex<Vec<String>>>,
     }
 
     impl MemoryProtocolStore {
+        /// Every path this store has been asked to write, in order, whether the write
+        /// created the object or replaced one. Fixtures a test lays down before the call
+        /// under test are recorded too, so tests that assert "nothing was written" clear
+        /// the log with [`Self::forget_writes`] once the fixture is in place.
+        pub(crate) fn written_objects(&self) -> Vec<String> {
+            self.written_objects.lock().unwrap().clone()
+        }
+
+        /// Drops the record of writes made so far, keeping the objects themselves.
+        pub(crate) fn forget_writes(&self) {
+            self.written_objects.lock().unwrap().clear();
+        }
+
         pub(crate) fn deleted_objects(&self) -> Vec<String> {
             self.deleted_objects.lock().unwrap().clone()
         }
@@ -292,6 +306,10 @@ pub(crate) mod tests {
         }
 
         async fn put_bytes(&self, path: &CheckpointRef, bytes: Vec<u8>) -> Result<(), StoreError> {
+            self.written_objects
+                .lock()
+                .unwrap()
+                .push(path.as_str().to_string());
             self.objects
                 .lock()
                 .unwrap()
@@ -309,6 +327,10 @@ pub(crate) mod tests {
                 return Ok(CreateResult::AlreadyExists(existing.clone()));
             }
 
+            self.written_objects
+                .lock()
+                .unwrap()
+                .push(path.as_str().to_string());
             objects.insert(path.as_str().to_string(), bytes);
             Ok(CreateResult::Created)
         }

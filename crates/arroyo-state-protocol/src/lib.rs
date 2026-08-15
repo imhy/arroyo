@@ -1030,6 +1030,7 @@ mod tests {
                 job_id: JobId::new("J"),
                 generation: Generation(1),
                 updated_at: from_micros(123),
+                state_backend: StateBackendSelector::Parquet,
             },
             false,
         )
@@ -1047,7 +1048,8 @@ mod tests {
             initialization,
             GenerationInitialization::Initialized {
                 generation_manifest: expected_manifest.clone(),
-                recovery: GenerationRecovery::NoCheckpoint
+                recovery: GenerationRecovery::NoCheckpoint,
+                recovery_checkpoint: None,
             }
         );
 
@@ -1057,6 +1059,144 @@ mod tests {
                 .unwrap()
                 .expect("new generation manifest should be written");
         assert_eq!(written_manifest, expected_manifest);
+    }
+
+    /// Publishing a generation is what commits a job to a recovery checkpoint, so a
+    /// checkpoint written by another backend has to be refused *before* either the current
+    /// generation file or the new generation manifest is written. The recording store is
+    /// the assertion: after the fixture is in place, a rejected initialization must not
+    /// write a single object.
+    #[tokio::test]
+    async fn initialize_generation_writes_nothing_when_the_recovery_checkpoint_disagrees() {
+        let store = MemoryProtocolStore::default();
+        let paths = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J"));
+        write_current_generation(&store, &paths, Generation(1)).await;
+
+        let checkpoint_ref = paths.checkpoint_manifest(Generation(1), Epoch(1));
+        let mut checkpoint = checkpoint_for_generation(Generation(1), 1, None, false);
+        checkpoint.operators = vec![operator_with_selector(
+            global_operator(vec![]),
+            "stateengine",
+        )];
+        write_canonical_checkpoint(&store, &paths, &checkpoint_ref, &checkpoint).await;
+        put_json(
+            &store,
+            &paths.generation_manifest(Generation(1)),
+            &generation_manifest_for_generation(Generation(1), None, Some(checkpoint_ref.clone())),
+        )
+        .await
+        .unwrap();
+
+        store.forget_writes();
+
+        let err = initialize_generation(
+            &store,
+            InitializeGenerationRequest {
+                pipeline_id: PipelineId::new("P"),
+                job_id: JobId::new("J"),
+                generation: Generation(2),
+                updated_at: from_micros(456),
+                state_backend: StateBackendSelector::Parquet,
+            },
+            true,
+        )
+        .await
+        .expect_err("a recovery checkpoint from another backend must not be published");
+
+        assert!(
+            matches!(
+                err,
+                StoreError::StateBackend(StateBackendError::CheckpointMismatch { .. })
+            ),
+            "{err:?}"
+        );
+
+        assert_eq!(
+            store.written_objects(),
+            Vec::<String>::new(),
+            "no protocol state may be published for a rejected recovery checkpoint"
+        );
+        // and specifically, neither of the two objects publication consists of
+        let current: CurrentGeneration = read_json(&store, &paths.current_generation())
+            .await
+            .unwrap()
+            .expect("the previous current generation should still be there");
+        assert_eq!(current.generation, Generation(1));
+        assert!(
+            read_json::<_, GenerationManifest>(&store, &paths.generation_manifest(Generation(2)))
+                .await
+                .unwrap()
+                .is_none(),
+            "the new generation manifest must not have been written"
+        );
+    }
+
+    /// The compatibility direction: a recovery checkpoint written before the selector
+    /// existed carries no table configs at all, which means parquet, and a parquet job
+    /// still initializes its next generation from it and gets the validated manifest back.
+    #[tokio::test]
+    async fn initialize_generation_publishes_a_legacy_recovery_checkpoint() {
+        let store = MemoryProtocolStore::default();
+        let paths = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J"));
+        write_current_generation(&store, &paths, Generation(1)).await;
+
+        let checkpoint_ref = paths.checkpoint_manifest(Generation(1), Epoch(1));
+        let mut checkpoint = checkpoint_for_generation(Generation(1), 1, None, false);
+        checkpoint.operators = vec![operator_with_selector(global_operator(vec![]), "")];
+        write_canonical_checkpoint(&store, &paths, &checkpoint_ref, &checkpoint).await;
+        put_json(
+            &store,
+            &paths.generation_manifest(Generation(1)),
+            &generation_manifest_for_generation(Generation(1), None, Some(checkpoint_ref.clone())),
+        )
+        .await
+        .unwrap();
+
+        let initialization = initialize_generation(
+            &store,
+            InitializeGenerationRequest {
+                pipeline_id: PipelineId::new("P"),
+                job_id: JobId::new("J"),
+                generation: Generation(2),
+                updated_at: from_micros(456),
+                state_backend: StateBackendSelector::Parquet,
+            },
+            true,
+        )
+        .await
+        .expect("a legacy recovery checkpoint must still be restorable");
+
+        let GenerationInitialization::Initialized {
+            recovery,
+            recovery_checkpoint,
+            ..
+        } = initialization
+        else {
+            panic!("expected the generation to be initialized, got {initialization:?}");
+        };
+        assert_eq!(
+            recovery,
+            GenerationRecovery::Ready {
+                checkpoint_ref: checkpoint_ref.clone()
+            }
+        );
+        assert_eq!(
+            recovery_checkpoint.as_ref(),
+            Some(&checkpoint),
+            "the validated manifest should be handed back rather than left to be re-read"
+        );
+
+        let current: CurrentGeneration = read_json(&store, &paths.current_generation())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.generation, Generation(2));
+        assert!(
+            read_json::<_, GenerationManifest>(&store, &paths.generation_manifest(Generation(2)))
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -1085,6 +1225,7 @@ mod tests {
                 job_id: JobId::new("J"),
                 generation: Generation(2),
                 updated_at: from_micros(456),
+                state_backend: StateBackendSelector::Parquet,
             },
             false,
         )
@@ -1104,7 +1245,8 @@ mod tests {
                 generation_manifest: expected_manifest.clone(),
                 recovery: GenerationRecovery::Ready {
                     checkpoint_ref: checkpoint_ref.clone()
-                }
+                },
+                recovery_checkpoint: Some(checkpoint.clone()),
             }
         );
 
@@ -1142,6 +1284,7 @@ mod tests {
                 job_id: JobId::new("J"),
                 generation: Generation(2),
                 updated_at: from_micros(456),
+                state_backend: StateBackendSelector::Parquet,
             },
             false,
         )
@@ -1161,7 +1304,8 @@ mod tests {
                 recovery: GenerationRecovery::ReplayCommit {
                     checkpoint_ref: checkpoint_ref.clone(),
                     commit_permit: commit_permit(checkpoint_ref, &checkpoint),
-                }
+                },
+                recovery_checkpoint: Some(checkpoint.clone()),
             }
         );
     }
@@ -1190,6 +1334,7 @@ mod tests {
                 job_id: JobId::new("J"),
                 generation: Generation(3),
                 updated_at: from_micros(789),
+                state_backend: StateBackendSelector::Parquet,
             },
             false,
         )
@@ -1237,6 +1382,7 @@ mod tests {
                 job_id: JobId::new("J"),
                 generation: Generation(2),
                 updated_at: from_micros(456),
+                state_backend: StateBackendSelector::Parquet,
             },
             false,
         )
@@ -1293,6 +1439,7 @@ mod tests {
                 job_id: JobId::new("J"),
                 generation: Generation(3),
                 updated_at: from_micros(456),
+                state_backend: StateBackendSelector::Parquet,
             },
             false,
         )
@@ -1311,7 +1458,8 @@ mod tests {
                 ),
                 recovery: GenerationRecovery::Ready {
                     checkpoint_ref: winner_ref.clone()
-                }
+                },
+                recovery_checkpoint: Some(winner_checkpoint.clone()),
             }
         );
         let written_manifest: GenerationManifest =
@@ -1358,6 +1506,7 @@ mod tests {
                 job_id: JobId::new("J"),
                 generation: Generation(3),
                 updated_at: from_micros(456),
+                state_backend: StateBackendSelector::Parquet,
             },
             false,
         )
@@ -1377,7 +1526,8 @@ mod tests {
                 recovery: GenerationRecovery::ReplayCommit {
                     checkpoint_ref: winner_ref.clone(),
                     commit_permit: commit_permit(winner_ref, &winner_checkpoint),
-                }
+                },
+                recovery_checkpoint: Some(winner_checkpoint.clone()),
             }
         );
     }
@@ -1395,6 +1545,7 @@ mod tests {
                 job_id: JobId::new("J"),
                 generation: Generation(2),
                 updated_at: from_micros(456),
+                state_backend: StateBackendSelector::Parquet,
             },
             false,
         )

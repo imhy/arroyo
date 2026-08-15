@@ -1,4 +1,4 @@
-use arroyo_rpc::grpc::rpc::{CheckpointManifest, JobState, StartExecutionReq, TaskAssignment};
+use arroyo_rpc::grpc::rpc::{JobState, StartExecutionReq, TaskAssignment};
 use arroyo_rpc::identity::{WorkerClient, worker_client};
 use arroyo_types::{CLUSTER_ID_ENV, JobId, MachineId, WorkerId};
 use std::time::SystemTime;
@@ -25,10 +25,10 @@ use crate::{
 use anyhow::{anyhow, bail};
 use arroyo_datastream::logical::LogicalProgram;
 use arroyo_rpc::config::{JobControllerMode, config};
+use arroyo_rpc::errors::StateError as StateStoreError;
 use arroyo_rpc::grpc::api;
 use arroyo_rpc::state_backend::{
-    StateBackendError, validate_restored_checkpoint, validate_restored_manifest,
-    validate_restored_operator_metadata,
+    StateBackendError, StateBackendSelector, validate_restored_checkpoint,
 };
 use arroyo_rpc::worker_types::RunningMessage;
 use arroyo_rpc::{LeaderContext, grpc_channel_builder};
@@ -36,7 +36,6 @@ use arroyo_state::{
     BackingStore, StateBackend, StorageProviderFor, get_storage_provider,
     tables::{ErasedTable, global_keyed_map::GlobalKeyedTable},
 };
-use arroyo_state_protocol::store::read_protobuf;
 use arroyo_state_protocol::types::Generation;
 use arroyo_state_protocol::workflow::{
     GenerationInitialization, GenerationRecovery, InitializeGenerationRequest,
@@ -338,146 +337,215 @@ async fn get_checkpoint_info_legacy<'a>(
         }
     }
 
-    let mut committing_state = None;
+    let committing_state = match &checkpoint_info {
+        Some(info) => {
+            let storage_role = StorageProviderFor::Controller {
+                storage_url: ctx.pipeline_info.state_url.clone(),
+            };
+            let parallelism_for = |operator_id: &str| {
+                ctx.program
+                    .graph
+                    .node_weights()
+                    .find(|node| node.operator_chain.first().operator_id == operator_id)
+                    .map(|node| node.parallelism)
+            };
 
-    // clear all of the epochs after the one we're loading so that we don't read in-progress data
-    if let Some(CheckpointInfo {
+            match prepare_restored_checkpoint(
+                &storage_role,
+                ctx.config.state_backend,
+                &ctx.config.id,
+                info,
+                &parallelism_for,
+            )
+            .await
+            {
+                Ok(committing_state) => committing_state,
+                Err(RestorePreparationError::Retryable { message, source }) => {
+                    return Err(ctx.retryable(state, message, source, 10));
+                }
+                Err(RestorePreparationError::Fatal { message, source }) => {
+                    return Err(fatal(message, source));
+                }
+            }
+        }
+        None => None,
+    };
+
+    Ok((state, checkpoint_info, committing_state))
+}
+
+/// Why a checkpoint the job is about to restore from could not be prepared.
+///
+/// Splitting the two is the caller's whole interest in this error: a storage failure is
+/// worth retrying and a checkpoint this job may not read is not, however many times it is
+/// tried.
+#[derive(Debug)]
+enum RestorePreparationError {
+    /// Reading or writing checkpoint metadata failed; the same attempt may succeed later.
+    Retryable {
+        message: String,
+        source: anyhow::Error,
+    },
+    /// The checkpoint cannot be restored by this job at all.
+    Fatal {
+        message: String,
+        source: anyhow::Error,
+    },
+}
+
+/// Prepares the checkpoint a legacy-mode job is about to restore from, and derives the
+/// commit replay it implies.
+///
+/// The order here is the point of this function. A restore rewrites the checkpoint's
+/// top-level metadata and then starts workers that build one operator's tables at a time,
+/// so the whole checkpoint has to be classified before either happens:
+///
+/// 1. load the checkpoint's own metadata,
+/// 2. load **every** operator's metadata and check each one's table configs against the
+///    job's selector — this is the preflight, and it writes nothing,
+/// 3. derive any committing state from the metadata already loaded in step 2,
+/// 4. only then rewrite the top-level metadata with the new min epoch.
+///
+/// Validating each operator as it was reached, which is what step 2 replaced, still let
+/// the operators before the disagreeing one be rebuilt, and let the metadata rewrite
+/// happen, before the disagreement was seen. Steps 3 and 4 are also in this order for the
+/// same reason: a checkpoint whose committing data cannot be derived is left exactly as it
+/// was found.
+///
+/// Step 3 consumes the objects step 2 loaded rather than reading them again, so a
+/// checkpoint that needs commits costs the same reads it did before the preflight existed;
+/// a `ready` checkpoint pays one metadata read per operator, which is the read each worker
+/// was about to do anyway as it built that operator.
+///
+/// `parallelism_for` resolves an operator's parallelism from the job's program.
+///
+/// # Errors
+///
+/// Returns [`RestorePreparationError::Fatal`] if the checkpoint was written by a different
+/// backend than the job selects, if an operator listed in a commit-replaying checkpoint
+/// has no metadata, or if its tables cannot be interpreted — in each case nothing has been
+/// rewritten. Returns [`RestorePreparationError::Retryable`] for the storage failures
+/// reading or writing metadata can produce.
+async fn prepare_restored_checkpoint(
+    storage_role: &StorageProviderFor,
+    job: StateBackendSelector,
+    job_id: &str,
+    checkpoint: &CheckpointInfo,
+    parallelism_for: &(dyn Fn(&str) -> Option<usize> + Sync),
+) -> Result<Option<CommittingState>, RestorePreparationError> {
+    let CheckpointInfo {
         id,
         epoch,
         min_epoch,
         needs_commits,
-    }) = checkpoint_info.clone()
-    {
-        let storage_role = StorageProviderFor::Controller {
-            storage_url: ctx.pipeline_info.state_url.clone(),
-        };
+    } = checkpoint;
+    let epoch = *epoch;
 
-        let mut metadata = match StateBackend::load_checkpoint_metadata(
-            &storage_role,
-            &ctx.config.id,
-            epoch as u32,
-        )
+    let retryable = |message: String| {
+        move |err: StateStoreError| RestorePreparationError::Retryable {
+            message,
+            source: err.into(),
+        }
+    };
+
+    let mut metadata = StateBackend::load_checkpoint_metadata(storage_role, job_id, epoch as u32)
         .await
-        {
-            Ok(m) => m,
-            Err(err) => {
-                return Err(ctx.retryable(
-                    state,
-                    format!("Failed to load checkpoint metadata for epoch {epoch}"),
-                    err.into(),
-                    10,
-                ));
-            }
-        };
+        .map_err(retryable(format!(
+            "Failed to load checkpoint metadata for epoch {epoch}"
+        )))?;
 
-        metadata.min_epoch = min_epoch as u32;
-        if needs_commits {
-            let mut commit_subtasks = HashSet::new();
-            // (operator_id => (table_name => (subtask => data)))
-            let mut committing_data: HashMap<String, HashMap<String, HashMap<u32, Vec<u8>>>> =
-                HashMap::new();
-            for operator_id in &metadata.operator_ids {
-                let operator_metadata = match StateBackend::load_operator_metadata(
-                    &storage_role,
-                    &ctx.config.id,
-                    operator_id,
-                    epoch as u32,
-                )
-                .await
-                {
-                    Ok(m) => m,
-                    Err(err) => {
-                        return Err(ctx.retryable(
-                            state,
-                            format!("Failed to load operator metadata for {operator_id} in epoch {epoch}"),
-                            err.into(),
-                            10,
-                        ));
-                    }
-                };
-                let Some(operator_metadata) = operator_metadata else {
-                    return Err(fatal(
-                        "missing operator metadata",
-                        anyhow!(
-                            "operator metadata for {} not found for job {}",
-                            operator_id,
-                            ctx.config.id
+    metadata.min_epoch = *min_epoch as u32;
+
+    // The preflight. The checkpoint row said which backend wrote this checkpoint; each
+    // operator's own table configs say it per table, and every one of them is checked
+    // here — before the rewrite below, and before any worker is started.
+    let operators = StateBackend::load_checkpoint_operators(storage_role, job, &metadata)
+        .await
+        .map_err(|err| match err {
+            StateStoreError::StateBackendError(e) => RestorePreparationError::Fatal {
+                message: "cannot restore a checkpoint written with a different state backend"
+                    .to_string(),
+                source: e.into(),
+            },
+            err => RestorePreparationError::Retryable {
+                message: format!("Failed to load operator metadata for epoch {epoch}"),
+                source: err.into(),
+            },
+        })?;
+
+    let mut committing_state = None;
+    if *needs_commits {
+        let mut commit_subtasks = HashSet::new();
+        // (operator_id => (table_name => (subtask => data)))
+        let mut committing_data: HashMap<String, HashMap<String, HashMap<u32, Vec<u8>>>> =
+            HashMap::new();
+        for (operator_id, operator_metadata) in &operators {
+            let Some(operator_metadata) = operator_metadata else {
+                return Err(RestorePreparationError::Fatal {
+                    message: "missing operator metadata".to_string(),
+                    source: anyhow!(
+                        "operator metadata for {} not found for job {}",
+                        operator_id,
+                        job_id
+                    ),
+                });
+            };
+
+            for (table_name, table_metadata) in &operator_metadata.table_checkpoint_metadata {
+                let config = operator_metadata
+                    .table_configs
+                    .get(table_name)
+                    .ok_or_else(|| RestorePreparationError::Fatal {
+                        message: format!(
+                            "Failed to restore job; table config for {table_name} not found."
                         ),
-                    ));
-                };
-
-                // The checkpoint row said which backend wrote this checkpoint; the
-                // operator's own table configs say it per table. Both are checked, and
-                // this one runs before a single table's committing data is rebuilt.
-                if let Err(e) = validate_restored_operator_metadata(
-                    ctx.config.state_backend,
-                    &operator_metadata,
-                ) {
-                    return Err(fatal(
-                        "cannot commit a checkpoint written with a different state backend",
-                        e.into(),
-                    ));
-                }
-
-                for (table_name, table_metadata) in &operator_metadata.table_checkpoint_metadata {
-                    let config =
-                        operator_metadata
-                            .table_configs
-                            .get(table_name)
-                            .ok_or_else(|| {
-                                fatal(
-                                    format!(
-                                        "Failed to restore job; table config for {table_name} not found."
-                                    ),
-                                    anyhow!("table config for {} not found", table_name),
-                                )
-                            })?;
-                    if let Some(commit_data) = match config.table_type() {
-                        arroyo_rpc::grpc::rpc::TableEnum::MissingTableType => {
-                            return Err(fatal(
-                                "Missing table type",
-                                anyhow!("table type not found"),
-                            ));
+                        source: anyhow!("table config for {} not found", table_name),
+                    })?;
+                if let Some(commit_data) = match config.table_type() {
+                    arroyo_rpc::grpc::rpc::TableEnum::MissingTableType => {
+                        return Err(RestorePreparationError::Fatal {
+                            message: "Missing table type".to_string(),
+                            source: anyhow!("table type not found"),
+                        });
+                    }
+                    arroyo_rpc::grpc::rpc::TableEnum::GlobalKeyValue => {
+                        GlobalKeyedTable::committing_data(config.clone(), table_metadata)
+                    }
+                    arroyo_rpc::grpc::rpc::TableEnum::ExpiringKeyedTimeTable => None,
+                } {
+                    committing_data
+                        .entry(operator_id.clone())
+                        .or_default()
+                        .insert(table_name.to_string(), commit_data);
+                    let parallelism = parallelism_for(operator_id).ok_or_else(|| {
+                        RestorePreparationError::Fatal {
+                            message: format!(
+                                "Failed to restore job; operator {operator_id} is not in the \
+                                 job's program."
+                            ),
+                            source: anyhow!("operator {} not found in program", operator_id),
                         }
-                        arroyo_rpc::grpc::rpc::TableEnum::GlobalKeyValue => {
-                            GlobalKeyedTable::committing_data(config.clone(), table_metadata)
-                        }
-                        arroyo_rpc::grpc::rpc::TableEnum::ExpiringKeyedTimeTable => None,
-                    } {
-                        committing_data
-                            .entry(operator_id.clone())
-                            .or_default()
-                            .insert(table_name.to_string(), commit_data);
-                        let program_node = ctx
-                            .program
-                            .graph
-                            .node_weights()
-                            .find(|node| node.operator_chain.first().operator_id == *operator_id)
-                            .unwrap();
-                        for subtask_index in 0..program_node.parallelism {
-                            commit_subtasks.insert((operator_id.clone(), subtask_index as u32));
-                        }
+                    })?;
+                    for subtask_index in 0..parallelism {
+                        commit_subtasks.insert((operator_id.clone(), subtask_index as u32));
                     }
                 }
             }
-            committing_state = Some(CommittingState::new(
-                CheckpointIdOrRef::CheckpointId(id),
-                commit_subtasks,
-                committing_data,
-            ));
         }
-
-        if let Err(err) = StateBackend::write_checkpoint_metadata(&storage_role, metadata).await {
-            return Err(ctx.retryable(
-                state,
-                format!("Failed to write checkpoint metadata for epoch {epoch}"),
-                err.into(),
-                10,
-            ));
-        }
+        committing_state = Some(CommittingState::new(
+            CheckpointIdOrRef::CheckpointId(id.clone()),
+            commit_subtasks,
+            committing_data,
+        ));
     }
 
-    Ok((state, checkpoint_info, committing_state))
+    StateBackend::write_checkpoint_metadata(storage_role, metadata)
+        .await
+        .map_err(retryable(format!(
+            "Failed to write checkpoint metadata for epoch {epoch}"
+        )))?;
+
+    Ok(committing_state)
 }
 
 async fn get_and_register_checkpoint_info_leader<'a>(
@@ -503,6 +571,12 @@ async fn get_and_register_checkpoint_info_leader<'a>(
         );
     }
 
+    // Leader mode keeps no `checkpoints` row, so the recovery manifest's own table configs
+    // are the whole persisted record of which backend wrote the checkpoint this generation
+    // would restore from. `initialize_generation` reads and checks them against the job's
+    // selector before it writes either the current-generation file or the new generation
+    // manifest, so a mismatch leaves no published state pointing at a checkpoint this job
+    // may not read, and returns the manifest it validated for use here.
     let new_gen = initialize_generation(
         storage_provider.as_ref(),
         InitializeGenerationRequest {
@@ -510,12 +584,13 @@ async fn get_and_register_checkpoint_info_leader<'a>(
             job_id: JobId(ctx.config.id.clone()),
             generation: Generation(ctx.status.generation),
             updated_at: SystemTime::now(),
+            state_backend: ctx.config.state_backend,
         },
         true,
     )
     .await?;
 
-    let checkpoint_ref = match new_gen {
+    let recovery_checkpoint = match new_gen {
         GenerationInitialization::Initialized {
             recovery: GenerationRecovery::NoCheckpoint,
             ..
@@ -524,8 +599,9 @@ async fn get_and_register_checkpoint_info_leader<'a>(
             recovery:
                 GenerationRecovery::Ready { checkpoint_ref }
                 | GenerationRecovery::ReplayCommit { checkpoint_ref, .. },
+            recovery_checkpoint,
             ..
-        } => Some(checkpoint_ref),
+        } => Some((checkpoint_ref, recovery_checkpoint)),
         GenerationInitialization::StaleGeneration { .. } => {
             unreachable!(
                 "cannot end up with stale generation given that we updated the generation\
@@ -547,17 +623,12 @@ async fn get_and_register_checkpoint_info_leader<'a>(
         }
     };
 
-    Ok(if let Some(r) = checkpoint_ref {
-        let manifest = read_protobuf::<_, CheckpointManifest>(storage_provider.as_ref(), &r)
-            .await?
-            .ok_or_else(|| anyhow!("recovery checkpoint manifest {r} is missing!"))?;
-
-        // Leader mode keeps no `checkpoints` row, so the manifest's own table configs are
-        // the whole persisted record of which backend wrote this checkpoint. Checking them
-        // here is what stops a disagreeing manifest from ever being handed to a worker:
-        // `checkpoint_manifest_ref` is only put in a `StartExecutionReq` after this
-        // returns, and the leader replays commits from exactly this manifest.
-        validate_restored_manifest(ctx.config.state_backend, &manifest)?;
+    Ok(if let Some((r, manifest)) = recovery_checkpoint {
+        // Already read and already validated inside `initialize_generation`, above; using
+        // it rather than re-reading is also what guarantees the checkpoint this generation
+        // was published against is the one that passed validation.
+        let manifest =
+            manifest.ok_or_else(|| anyhow!("recovery checkpoint manifest {r} is missing!"))?;
 
         Some(CheckpointInfo {
             epoch: manifest.epoch,
@@ -1119,5 +1190,331 @@ impl State for Scheduling {
                 ))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CheckpointInfo, RestorePreparationError, StateBackendError, StateBackendSelector,
+        prepare_restored_checkpoint,
+    };
+    use arroyo_rpc::grpc::rpc::{
+        CheckpointMetadata, GlobalKeyedTableConfig, GlobalKeyedTableTaskCheckpointMetadata,
+        OperatorCheckpointMetadata, OperatorMetadata, TableCheckpointMetadata, TableConfig,
+        TableEnum,
+    };
+    use arroyo_state::{BackingStore, StateBackend, StorageProviderFor};
+    use prost::Message;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    const JOB_ID: &str = "job_1";
+    const EPOCH: u32 = 4;
+    /// The min epoch the checkpoint is stored with, and the one it is asked to be rewritten
+    /// to. They differ so that "was the metadata rewritten?" is answerable by reading it
+    /// back.
+    const STORED_MIN_EPOCH: u32 = 0;
+    const NEW_MIN_EPOCH: u32 = 2;
+
+    /// A checkpoint store on the local filesystem, so the metadata rewrite this preparation
+    /// performs — or does not perform — is observable as bytes that did or did not change.
+    struct LocalCheckpointStore {
+        role: StorageProviderFor,
+        directory: String,
+    }
+
+    impl LocalCheckpointStore {
+        fn new(name: &str) -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let unique = format!(
+                "{}-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+                COUNTER.fetch_add(1, Ordering::Relaxed),
+            );
+            let directory = std::env::temp_dir()
+                .join(format!("arroyo-scheduling-{name}-{unique}"))
+                .to_string_lossy()
+                .into_owned();
+            std::fs::create_dir_all(&directory).unwrap();
+
+            Self {
+                role: StorageProviderFor::Controller {
+                    storage_url: Some(format!("file://{directory}")),
+                },
+                directory,
+            }
+        }
+
+        /// The min epoch currently recorded in the checkpoint's top-level metadata. This is
+        /// the only thing `prepare_restored_checkpoint` rewrites, so it is how a test says
+        /// whether the rewrite happened.
+        async fn stored_min_epoch(&self) -> u32 {
+            StateBackend::load_checkpoint_metadata(&self.role, JOB_ID, EPOCH)
+                .await
+                .unwrap()
+                .min_epoch
+        }
+    }
+
+    impl Drop for LocalCheckpointStore {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    fn table_config(state_backend: &str, table_type: TableEnum) -> TableConfig {
+        TableConfig {
+            table_type: table_type as i32,
+            config: GlobalKeyedTableConfig {
+                table_name: "g".to_string(),
+                description: "global".to_string(),
+                uses_two_phase_commit: true,
+            }
+            .encode_to_vec(),
+            state_version: 0,
+            state_backend: state_backend.to_string(),
+        }
+    }
+
+    /// One operator's checkpoint metadata: a single global table whose config states
+    /// `state_backend` and whose declared type is `table_type`.
+    fn operator_metadata(
+        operator_id: &str,
+        state_backend: &str,
+        table_type: TableEnum,
+    ) -> OperatorCheckpointMetadata {
+        OperatorCheckpointMetadata {
+            operator_metadata: Some(OperatorMetadata {
+                job_id: JOB_ID.to_string(),
+                operator_id: operator_id.to_string(),
+                epoch: EPOCH,
+                min_watermark: None,
+                max_watermark: None,
+                parallelism: 1,
+            }),
+            start_time: 0,
+            finish_time: 0,
+            table_checkpoint_metadata: HashMap::from([(
+                "g".to_string(),
+                TableCheckpointMetadata {
+                    table_type: TableEnum::GlobalKeyValue as i32,
+                    data: GlobalKeyedTableTaskCheckpointMetadata {
+                        files: vec![],
+                        commit_data_by_subtask: HashMap::from([(0, b"commit".to_vec())]),
+                    }
+                    .encode_to_vec(),
+                },
+            )]),
+            table_configs: HashMap::from([(
+                "g".to_string(),
+                table_config(state_backend, table_type),
+            )]),
+        }
+    }
+
+    /// Lays down a checkpoint whose operators are `operators`, in that order, and returns
+    /// the store holding it.
+    async fn checkpoint_with(
+        name: &str,
+        operators: &[(&str, &str, TableEnum)],
+    ) -> LocalCheckpointStore {
+        let store = LocalCheckpointStore::new(name);
+
+        for (operator_id, state_backend, table_type) in operators {
+            StateBackend::write_operator_checkpoint_metadata(
+                &store.role,
+                operator_metadata(operator_id, state_backend, *table_type),
+            )
+            .await
+            .unwrap();
+        }
+
+        StateBackend::write_checkpoint_metadata(
+            &store.role,
+            CheckpointMetadata {
+                job_id: JOB_ID.to_string(),
+                epoch: EPOCH,
+                min_epoch: STORED_MIN_EPOCH,
+                start_time: 0,
+                finish_time: 0,
+                operator_ids: operators
+                    .iter()
+                    .map(|(operator_id, _, _)| operator_id.to_string())
+                    .collect(),
+            },
+        )
+        .await
+        .unwrap();
+
+        store
+    }
+
+    fn checkpoint_info(needs_commits: bool) -> CheckpointInfo {
+        CheckpointInfo {
+            epoch: EPOCH as u64,
+            min_epoch: NEW_MIN_EPOCH as u64,
+            id: "checkpoint_1".to_string(),
+            needs_commits,
+        }
+    }
+
+    fn one_subtask(_operator_id: &str) -> Option<usize> {
+        Some(1)
+    }
+
+    fn selector_error(err: &RestorePreparationError) -> &StateBackendError {
+        let RestorePreparationError::Fatal { source, .. } = err else {
+            panic!("expected a fatal error, got {err:?}");
+        };
+        source
+            .downcast_ref::<StateBackendError>()
+            .unwrap_or_else(|| panic!("expected a typed selector error, got {source:?}"))
+    }
+
+    /// A `ready` checkpoint — one that needs no commit replay — is the case that reached
+    /// the metadata rewrite without any operator being looked at. Here the first operator
+    /// agrees with the job and the second does not, and the checkpoint must be refused
+    /// with its top-level metadata untouched: the rewrite is the controller's half of
+    /// "before starting workers", and the workers are only started if this returns.
+    #[tokio::test]
+    async fn a_ready_checkpoint_with_a_disagreeing_operator_is_refused_before_the_rewrite() {
+        let store = checkpoint_with(
+            "ready-mixed",
+            &[
+                ("node_1", "parquet", TableEnum::GlobalKeyValue),
+                ("node_2", "stateengine", TableEnum::GlobalKeyValue),
+            ],
+        )
+        .await;
+
+        let Err(err) = prepare_restored_checkpoint(
+            &store.role,
+            StateBackendSelector::Parquet,
+            JOB_ID,
+            &checkpoint_info(false),
+            &one_subtask,
+        )
+        .await
+        else {
+            panic!("a checkpoint with a disagreeing operator must not be prepared");
+        };
+
+        assert!(
+            matches!(
+                selector_error(&err),
+                StateBackendError::CheckpointMismatch { .. }
+            ),
+            "{err:?}"
+        );
+        let message = selector_error(&err).to_string();
+        assert!(message.contains("node_2"), "{message}");
+
+        assert_eq!(
+            store.stored_min_epoch().await,
+            STORED_MIN_EPOCH,
+            "the checkpoint's metadata must not have been rewritten"
+        );
+    }
+
+    /// The ordering, made observable. `node_1` agrees with the job but declares a table
+    /// whose type is missing — a failure only reachable by interpreting that operator's
+    /// tables — while `node_2` disagrees with the job. Whichever error comes back says
+    /// which operator was reached first: `Missing table type` means `node_1`'s tables were
+    /// walked before `node_2` was ever looked at.
+    ///
+    /// Both operators do the same work up to the divergence: each is loaded, and each has
+    /// one global table with commit data, so neither can fail for an unrelated reason
+    /// first.
+    #[tokio::test]
+    async fn a_later_operators_mismatch_is_found_before_an_earlier_operators_tables_are_read() {
+        let store = checkpoint_with(
+            "commit-mixed",
+            &[
+                ("node_1", "parquet", TableEnum::MissingTableType),
+                ("node_2", "stateengine", TableEnum::GlobalKeyValue),
+            ],
+        )
+        .await;
+
+        let Err(err) = prepare_restored_checkpoint(
+            &store.role,
+            StateBackendSelector::Parquet,
+            JOB_ID,
+            &checkpoint_info(true),
+            &one_subtask,
+        )
+        .await
+        else {
+            panic!("a checkpoint with a disagreeing operator must not be prepared");
+        };
+
+        assert!(
+            matches!(
+                selector_error(&err),
+                StateBackendError::CheckpointMismatch { .. }
+            ),
+            "expected the selector rejection rather than an earlier operator's table \
+             failure, got {err:?}"
+        );
+
+        assert_eq!(
+            store.stored_min_epoch().await,
+            STORED_MIN_EPOCH,
+            "the checkpoint's metadata must not have been rewritten"
+        );
+    }
+
+    /// The compatibility direction. A multi-operator checkpoint written before the
+    /// selector existed carries `""` in every table config, and it must still restore into
+    /// a parquet job — both as a plain `ready` checkpoint and as one that replays commits,
+    /// which is the path that consumes the operator metadata the preflight loaded.
+    #[tokio::test]
+    async fn a_legacy_all_parquet_multi_operator_checkpoint_still_restores() {
+        let operators = [
+            ("node_1", "", TableEnum::GlobalKeyValue),
+            ("node_2", "", TableEnum::GlobalKeyValue),
+        ];
+
+        let store = checkpoint_with("legacy-ready", &operators).await;
+        let Ok(committing) = prepare_restored_checkpoint(
+            &store.role,
+            StateBackendSelector::Parquet,
+            JOB_ID,
+            &checkpoint_info(false),
+            &one_subtask,
+        )
+        .await
+        else {
+            panic!("a legacy checkpoint must still restore");
+        };
+        assert!(committing.is_none());
+        assert_eq!(store.stored_min_epoch().await, NEW_MIN_EPOCH);
+
+        let store = checkpoint_with("legacy-commit", &operators).await;
+        let Ok(committing) = prepare_restored_checkpoint(
+            &store.role,
+            StateBackendSelector::Parquet,
+            JOB_ID,
+            &checkpoint_info(true),
+            &one_subtask,
+        )
+        .await
+        else {
+            panic!("a legacy checkpoint needing commit replay must still restore");
+        };
+        let committing = committing.expect("commit replay should have been derived");
+        assert_eq!(
+            committing.committing_data().len(),
+            2,
+            "both operators' commit data should have been rebuilt from the preflight's \
+             metadata"
+        );
+        assert_eq!(store.stored_min_epoch().await, NEW_MIN_EPOCH);
     }
 }

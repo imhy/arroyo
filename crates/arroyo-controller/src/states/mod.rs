@@ -31,7 +31,7 @@ use self::scheduling::Scheduling;
 use self::stopping::Stopping;
 use crate::job_controller::JobController;
 use crate::queries::controller_queries;
-use crate::types::public::{LogLevel, StopMode};
+use crate::types::public::{LogLevel, RestartMode, StopMode};
 use crate::{JobConfig, JobMessage, JobStatus, PipelineInfo, queries, schedulers::Scheduler};
 use arroyo_datastream::logical::LogicalProgram;
 use arroyo_rpc::config::{JobControllerMode, config};
@@ -39,6 +39,7 @@ use arroyo_rpc::errors::ErrorDomain;
 use arroyo_rpc::grpc::rpc;
 use arroyo_rpc::grpc::rpc::JobFailure;
 use arroyo_rpc::public_ids::{IdTypes, generate_id};
+use arroyo_rpc::state_backend::validate_unchanged_job_selector;
 use arroyo_rpc::worker_types::{RunningMessage, TaskFailedEvent};
 use arroyo_rpc::{errors, log_event};
 use arroyo_server_common::shutdown::ShutdownGuard;
@@ -508,6 +509,74 @@ macro_rules! leader_stop_if_desired_running {
             }
         }
     };
+}
+
+/// What a configuration update means for a job whose workers are already running.
+///
+/// Produced by [`classify_running_config_update`], which is the one place both running
+/// modes decide that question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunningConfigUpdate {
+    /// Nothing in the update requires the workers to be rescheduled; the state may apply
+    /// it in place.
+    Apply,
+    /// The update changes something that is only read when workers are (re)scheduled, so
+    /// it takes effect only after a restart in this mode's restarting state.
+    Restart(RestartMode),
+}
+
+/// Decides what a running job must do about a new configuration, before it applies any of
+/// it.
+///
+/// Legacy and worker-leader running states share this so the two modes cannot drift: both
+/// restart for a restart-nonce, env-var, or scheduler-config change, and both refuse a
+/// state-backend change outright.
+///
+/// The state backend is deliberately *not* a restartable change. A restart restores from
+/// the job's last checkpoint, and that checkpoint was written by the backend the job is
+/// running with, so restarting under a different selector would only move the failure to
+/// the restore path. The alternative — discarding the state so the new backend can start
+/// clean — destroys data on the strength of a configuration edit, and M11.T08 ships no
+/// user-facing way to make that edit deliberately. Refusing it keeps the job's state
+/// exactly as it is and leaves an operator both remedies: restore the previous value, or
+/// stop this job and create a new one under the new backend.
+///
+/// The parallelism overrides are not considered here: the two modes look up a running
+/// operator's actual parallelism differently, so each checks those itself, after this.
+///
+/// # Errors
+///
+/// Returns a fatal [`StateError`] carrying
+/// [`StateBackendError::JobSelectorChanged`](arroyo_rpc::state_backend::StateBackendError::JobSelectorChanged)
+/// if `updated` names a different state backend than the job is running with.
+pub(crate) fn classify_running_config_update(
+    current: &JobConfig,
+    updated: &JobConfig,
+    restart_nonce: i32,
+) -> Result<RunningConfigUpdate, StateError> {
+    // Checked before anything else is acted on: a job whose selector has changed must not
+    // be restarted into the new one, and must not go on running while the database claims
+    // a backend its workers are not using.
+    validate_unchanged_job_selector(&current.id, current.state_backend, updated.state_backend)
+        .map_err(|e| {
+            fatal(
+                "the state backend of a running job cannot be changed",
+                e.into(),
+            )
+        })?;
+
+    if updated.restart_nonce != restart_nonce {
+        return Ok(RunningConfigUpdate::Restart(updated.restart_mode));
+    }
+
+    // env_vars and scheduler_config are only applied when workers are (re)scheduled, so a
+    // change to either while the job is running requires a restart to take effect.
+    if updated.scheduler_config != current.scheduler_config || updated.env_vars != current.env_vars
+    {
+        return Ok(RunningConfigUpdate::Restart(RestartMode::safe));
+    }
+
+    Ok(RunningConfigUpdate::Apply)
 }
 
 pub fn controller_job_failure(
@@ -1236,6 +1305,184 @@ impl StateMachine {
                     self.start(status, shutdown_guard.clone_temporary()).await;
                 }
             _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RunningConfigUpdate, StateError, classify_running_config_update};
+    use crate::JobConfig;
+    use crate::types::public::{RestartMode, StopMode};
+    use arroyo_rpc::state_backend::{StateBackendError, StateBackendSelector};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// A running job's config. Only the fields the classifier reads vary between the
+    /// cases below; everything else is fixed so a difference in the result can only come
+    /// from the field under test.
+    fn running_config(state_backend: StateBackendSelector) -> JobConfig {
+        JobConfig {
+            id: Arc::new("job_abc".to_string()),
+            organization_id: "org".to_string(),
+            pipeline_name: "pipeline".to_string(),
+            pipeline_id: 1,
+            stop_mode: StopMode::none,
+            checkpoint_interval: Duration::from_secs(10),
+            ttl: None,
+            parallelism_overrides: HashMap::new(),
+            restart_nonce: 3,
+            restart_mode: RestartMode::safe,
+            ignore_state_before_epoch: None,
+            env_vars: serde_json::json!({}),
+            scheduler_config: serde_json::json!({}),
+            state_backend,
+        }
+    }
+
+    fn selector_error(err: &StateError) -> &StateBackendError {
+        let StateError::FatalError { source, .. } = err else {
+            panic!("expected a fatal error, got {err:?}");
+        };
+        source
+            .downcast_ref::<StateBackendError>()
+            .unwrap_or_else(|| panic!("expected a typed selector error, got {source:?}"))
+    }
+
+    /// A configuration that changes the state backend of a job whose workers are already
+    /// running is refused outright, in both running modes — they share this classifier,
+    /// so there is one rule rather than two.
+    ///
+    /// The database can only get into this state through a direct edit: M11.T08 adds no
+    /// API that sets the column on an existing job.
+    #[test]
+    fn a_state_backend_change_on_a_running_job_is_fatal() {
+        let current = running_config(StateBackendSelector::Parquet);
+        let updated = running_config(StateBackendSelector::StateEngine);
+
+        let err = classify_running_config_update(&current, &updated, current.restart_nonce)
+            .expect_err("a selector change must not be accepted");
+        assert_eq!(
+            selector_error(&err),
+            &StateBackendError::JobSelectorChanged {
+                label: "job \"job_abc\"".to_string(),
+                running: StateBackendSelector::Parquet,
+                requested: StateBackendSelector::StateEngine,
+            }
+        );
+
+        // and in the other direction, so a stateengine job cannot be demoted either
+        let err = classify_running_config_update(&updated, &current, updated.restart_nonce)
+            .expect_err("a selector change must not be accepted");
+        assert!(
+            matches!(
+                selector_error(&err),
+                StateBackendError::JobSelectorChanged {
+                    running: StateBackendSelector::StateEngine,
+                    requested: StateBackendSelector::Parquet,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// The selector is refused *before* anything else in the update is acted on. A
+    /// restart-nonce bump arriving in the same update must not turn into a restart: a
+    /// restart restores from a checkpoint the old backend wrote, so it would only move
+    /// the failure to the restore path.
+    #[test]
+    fn a_state_backend_change_is_refused_even_when_the_update_also_restarts() {
+        let current = running_config(StateBackendSelector::Parquet);
+        let mut updated = running_config(StateBackendSelector::StateEngine);
+        updated.restart_nonce = current.restart_nonce + 1;
+        updated.env_vars = serde_json::json!({ "A": "1" });
+        updated.scheduler_config = serde_json::json!({ "slots": 2 });
+
+        let err = classify_running_config_update(&current, &updated, current.restart_nonce)
+            .expect_err("a selector change must not be accepted");
+        assert!(
+            matches!(
+                selector_error(&err),
+                StateBackendError::JobSelectorChanged { .. }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// The compatibility direction: everything a running job's configuration was allowed
+    /// to change before still changes, and an unchanged selector — including the
+    /// pre-selector empty string, which was normalized to `parquet` when the row was read
+    /// — is not a change.
+    #[test]
+    fn updates_that_do_not_change_the_state_backend_are_classified_as_before() {
+        for selector in [
+            StateBackendSelector::Parquet,
+            StateBackendSelector::StateEngine,
+        ] {
+            let current = running_config(selector);
+
+            assert_eq!(
+                classify_running_config_update(&current, &current, current.restart_nonce).unwrap(),
+                RunningConfigUpdate::Apply
+            );
+
+            let mut restarted = running_config(selector);
+            restarted.restart_nonce = current.restart_nonce + 1;
+            restarted.restart_mode = RestartMode::force;
+            assert_eq!(
+                classify_running_config_update(&current, &restarted, current.restart_nonce)
+                    .unwrap(),
+                RunningConfigUpdate::Restart(RestartMode::force)
+            );
+
+            let mut env = running_config(selector);
+            env.env_vars = serde_json::json!({ "A": "1" });
+            assert_eq!(
+                classify_running_config_update(&current, &env, current.restart_nonce).unwrap(),
+                RunningConfigUpdate::Restart(RestartMode::safe)
+            );
+
+            let mut scheduler = running_config(selector);
+            scheduler.scheduler_config = serde_json::json!({ "slots": 2 });
+            assert_eq!(
+                classify_running_config_update(&current, &scheduler, current.restart_nonce)
+                    .unwrap(),
+                RunningConfigUpdate::Restart(RestartMode::safe)
+            );
+        }
+
+        // "" and "parquet" are the same selector by the time a JobConfig exists, so a row
+        // edited from one to the other is not a selector change.
+        let empty = running_config(StateBackendSelector::normalize("", "job").unwrap());
+        let explicit = running_config(StateBackendSelector::normalize("parquet", "job").unwrap());
+        assert_eq!(
+            classify_running_config_update(&empty, &explicit, empty.restart_nonce).unwrap(),
+            RunningConfigUpdate::Apply
+        );
+    }
+
+    /// Both running modes must route their config updates through the one classifier;
+    /// neither may keep a private copy of the restart rules that would then not carry the
+    /// selector guard. This is a structural pin rather than a behavioural one — driving
+    /// either state's `next` needs a live scheduler, database, and worker set.
+    #[test]
+    fn both_running_modes_classify_config_updates_through_one_rule() {
+        for (name, source) in [
+            ("running.rs", include_str!("running.rs")),
+            ("leader_running.rs", include_str!("leader_running.rs")),
+        ] {
+            assert!(
+                source.contains(
+                    "classify_running_config_update(&ctx.config, &c, ctx.status.restart_nonce)?"
+                ),
+                "{name} must classify config updates through classify_running_config_update"
+            );
+            assert!(
+                !source.contains("c.restart_nonce != ctx.status.restart_nonce"),
+                "{name} must not keep its own copy of the restart-nonce rule"
+            );
         }
     }
 }
