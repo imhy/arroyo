@@ -745,6 +745,38 @@ impl JobContext<'_> {
         handle_unhandled_message(&self.config.id, &self.pipeline_info.pipeline_id, msg)
     }
 
+    /// Admits this state to the job's destructive scheduling work, or fails the job because
+    /// its configuration has been refused.
+    ///
+    /// [`execute_state`]'s gate check is a snapshot taken before the state body: it settles
+    /// what was true at the boundary, and [`Scheduling`]'s preamble then persists the
+    /// incremented generation, tears the live cluster down, starts replacements and prepares
+    /// checkpoint recovery, awaiting several times on the way. This is what settles the rest
+    /// of that interval, and it does it by exclusion rather than by re-reading: the returned
+    /// [`Admission`] is the job's publication lock, so for as long as the caller holds it
+    /// [`StateMachine::refuse_config`] cannot publish at all. The refusal reported here is
+    /// therefore the last one that could exist before the region closed, and the first one
+    /// that can appear afterwards arrives at a state that is past every irreversible effect
+    /// and is reading its channel.
+    ///
+    /// Hold it across the whole preamble and drop it before the first `recv`. Dropping it
+    /// early would put back exactly the window this closes; holding it past the `recv` would
+    /// leave a job that waits minutes for its workers unable to be refused at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same fatal [`StateError`] the queued [`JobMessage::ConfigRefused`] would
+    /// produce, through the same [`handle_unhandled_message`] policy — including its
+    /// superseded-version check, so a row repaired since the refusal was published lets the
+    /// job schedule instead of failing it.
+    pub(crate) async fn admit_destructive_scheduling(&mut self) -> Result<Admission, StateError> {
+        let (admission, refusal) = self.refusal_gate.admit_scheduling().await;
+        if let Some(refusal) = refusal {
+            self.handle(JobMessage::ConfigRefused(refusal))?;
+        }
+        Ok(admission)
+    }
+
     pub fn retryable(
         &self,
         state: Box<dyn State>,
@@ -1297,11 +1329,44 @@ enum RefusalDelivery {
 ///
 /// Held per job and cloned into that job's state task. There is no registry, no static and
 /// no global, for the same reason [`StateMachine::execution_selector`] has none.
+///
+/// # Publishing a refusal and scheduling the job are one another's alternatives
+///
+/// Reading the gate once, at the state boundary, is a *snapshot*: [`Self::take`] clones what
+/// it finds and releases the lock, and [`Scheduling`] then runs a long, irreversible preamble
+/// — persist the incremented generation, tear the live cluster down, start replacements,
+/// prepare checkpoint recovery — with several awaits in it and no further reference to the
+/// gate. A refusal published anywhere in that interval would be seen only by the *next* state
+/// boundary, which is after all of it. Adding a second read somewhere inside the preamble
+/// only moves the interval; there is always a last check and a first effect after it.
+///
+/// So the two are made mutually exclusive instead of merely ordered. [`Self::admission`] is
+/// the job's serialization point: [`JobContext::admit_destructive_scheduling`] holds it for
+/// the whole preamble, and [`StateMachine::refuse_config`] must take it — without waiting —
+/// to publish. Whichever gets it first decides the outcome for the whole preamble:
+///
+/// * the publisher first, and the gate is read *under the admission* it then acquires, so
+///   the preamble is refused before its first effect; or
+/// * the preamble first, and publication finds the admission taken, changes nothing at all,
+///   and is offered again by the next poll — reaching the job strictly after the preamble
+///   it could no longer have stopped, where `Scheduling`'s own `recv` handles it.
+///
+/// There is no third interleaving, which is what makes this a property of the operation
+/// rather than of how many places remembered to re-check.
 #[derive(Clone, Default)]
 pub(crate) struct RefusalGate {
     /// The refusal the state machine is under now, shared with the job's state task so a
     /// refusal raised after the task started is seen at its next state boundary.
     current: Arc<RwLock<Option<RefusedConfig>>>,
+    /// Exclusive access to the job's destructive scheduling work, shared with the job's
+    /// state task. See the type's documentation: this is what makes publishing a refusal
+    /// and entering [`Scheduling`]'s preamble alternatives rather than a race.
+    ///
+    /// A `tokio` mutex rather than a `std` one for two reasons that both matter here: the
+    /// guard is held across the preamble's awaits and so must be `Send`, and it does not
+    /// poison, so a state body that panics under it leaves the next attempt able to acquire
+    /// it rather than wedging the job for the life of the controller.
+    admission: Arc<tokio::sync::Mutex<()>>,
     /// The highest refusal version this task has already turned fatal.
     ///
     /// Per task rather than shared. It is what stops the gate from failing the job a second
@@ -1310,14 +1375,88 @@ pub(crate) struct RefusalGate {
     acted: u64,
 }
 
+/// Exclusive access to one job's destructive scheduling work.
+///
+/// Held by [`Scheduling`] across its whole preamble, and taken — without ever waiting — by
+/// [`StateMachine::refuse_config`] for the instant it publishes. See [`RefusalGate`] for why
+/// those two are the same lock.
+///
+/// The guard is what makes the region rather than any individual statement the unit: every
+/// effect between the acquisition and the drop is inside it, including effects added later,
+/// so the guarantee does not depend on a future author remembering to re-check anything.
+pub(crate) struct Admission {
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl Admission {
+    /// Performs one irreversible scheduling effect inside the admitted region.
+    ///
+    /// Every effect of [`Scheduling`]'s preamble goes through here, and needing an
+    /// `&Admission` to call it is the point: an effect can only be written where a guard is
+    /// in scope, and a guard is only in scope inside the region no refusal can be published
+    /// into. `what` names the effect for the log and for
+    /// `the_scheduling_preamble_is_written_to_run_every_irreversible_effect_under_admission`,
+    /// which pins the set of them.
+    pub(crate) async fn effect<F: std::future::Future>(
+        &self,
+        what: &'static str,
+        effect: F,
+    ) -> F::Output {
+        debug!(
+            effect = what,
+            "performing an irreversible scheduling effect under admission"
+        );
+        effect.await
+    }
+}
+
 impl RefusalGate {
+    /// Takes the job's scheduling admission for a publication, if the job is not in the
+    /// middle of its destructive scheduling work.
+    ///
+    /// Never waits, and must never be made to: the update thread calls
+    /// [`StateMachine::refuse_config`] while it holds the global job map, so blocking here
+    /// would block every other job's poll — the failure mode round 4 removed from this path
+    /// and the reason `refuse_config` is not `async`. `None` means the preamble is in flight
+    /// and the caller must leave the refusal [`RefusalDelivery::Pending`], changing *nothing*
+    /// — not the refusal version, not the recorded delivery — so the next poll offers exactly
+    /// the same refusal again.
+    fn admit_publication(&self) -> Option<Admission> {
+        Arc::clone(&self.admission)
+            .try_lock_owned()
+            .ok()
+            .map(|guard| Admission { _guard: guard })
+    }
+
+    /// Admits the caller to the job's destructive scheduling work, and reports the refusal
+    /// that must stop it.
+    ///
+    /// Waiting here is bounded and safe: the only other holder is a publication, which is
+    /// synchronous and does not await. The refusal is read *after* the admission is held, so
+    /// it is the last thing any publisher can have said before this region became closed to
+    /// them.
+    async fn admit_scheduling(&mut self) -> (Admission, Option<RefusedConfig>) {
+        let guard = Arc::clone(&self.admission).lock_owned().await;
+        let refusal = self.take();
+        (Admission { _guard: guard }, refusal)
+    }
+
     /// Publishes a refusal for the job's state task to apply before its next state.
-    fn publish(&self, refusal: RefusedConfig) {
+    ///
+    /// Only callable with the job's scheduling admission in hand, which is the whole of the
+    /// interlock: a refusal cannot appear while a preamble is running, so a preamble that
+    /// started with the gate clear can never be overtaken by one.
+    fn publish(&self, _admission: &Admission, refusal: RefusedConfig) {
         *self.current.write().unwrap() = Some(refusal);
     }
 
     /// Withdraws whatever was published, because it no longer describes the job or is being
     /// answered by a stop rather than by a failure.
+    ///
+    /// Deliberately not admitted. Withdrawal only ever *removes* a reason to stop the job, so
+    /// it cannot make a preamble run for a configuration that is refused; and it has to work
+    /// while a preamble is in flight, because the row the operator has just repaired is
+    /// exactly the one that must stop gating the states after it.
     fn withdraw(&self) {
         *self.current.write().unwrap() = None;
     }
@@ -2046,8 +2185,34 @@ impl StateMachine {
     /// remedy the refusal itself asks for — and the queued message cannot be retracted. So
     /// every refusal is stamped with [`Self::refusal_version`], and a version the state
     /// machine has since moved past is discarded on receipt instead of failing the job.
+    ///
+    /// # A refusal is never published into a scheduling preamble that has already started
+    ///
+    /// Publishing takes the job's scheduling admission ([`RefusalGate::admit_publication`]),
+    /// which [`Scheduling`] holds for the whole of its destructive preamble. Nothing waits
+    /// for it — this function runs under the global job map — so a refusal raised while the
+    /// preamble is in flight simply does not happen yet: *nothing at all* is recorded, the
+    /// refusal version is not advanced, and the next 500ms poll offers the same refusal
+    /// again, by which time the preamble has either finished or is finishing. That is round
+    /// 6's rule for an undeliverable refusal applied to an unpublishable one, and it is why
+    /// contention defers a refusal rather than losing one.
+    ///
+    /// Leaving the recorded state untouched is load-bearing rather than tidy. Advancing
+    /// [`Self::refusal_version`] on a poll that publishes nothing would supersede a refusal
+    /// already on the gate or in the queue, and a state reading it would discard it as stale
+    /// — a refusal silently dropped by the very contention that was supposed to defer it.
     pub(crate) fn refuse_config(&mut self, error: StateBackendError) {
         let job_id = self.config.read().unwrap().0.id.clone();
+
+        // Taken before anything is decided, so a poll that cannot publish leaves no trace.
+        let Some(admission) = self.refusal_gate.admit_publication() else {
+            debug!(
+                job_id = %job_id,
+                "the job is in the middle of its scheduling work; keeping the refusal pending \
+                 so the next poll offers it again"
+            );
+            return;
+        };
 
         let version = match &self.refusal {
             // Already with the state machine, and unchanged. Nothing to say and nothing
@@ -2081,7 +2246,11 @@ impl StateMachine {
         // — and this is also what lets a caller record the refusal and only then restart the
         // job, so the task it starts is gated at its first state instead of after it has
         // rescheduled a live execution.
-        self.refusal_gate.publish(refused.clone());
+        //
+        // Under the admission taken at the head of this function, so a preamble that has not
+        // started yet reads this refusal before its first effect and one that is already
+        // running could not have reached here at all.
+        self.refusal_gate.publish(&admission, refused.clone());
 
         let delivery = match self.offer(JobMessage::ConfigRefused(refused)) {
             Delivery::Delivered => RefusalDelivery::Sent,
@@ -2154,12 +2323,13 @@ impl StateMachine {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppliedStatus, Failed, Failing, JobContext, LeaderRunning, RefusalGate, Running,
+        Admission, AppliedStatus, Failed, Failing, JobContext, LeaderRunning, RefusalGate, Running,
         RunningConfigUpdate, State, StateMachine, Transition, adopt_refreshed_config,
         check_config_update, classify_running_config_update, execute_state,
         handle_unhandled_message,
     };
     use crate::schedulers::{Scheduler, SchedulerError, StartPipelineReq};
+    use crate::states::scheduling::Scheduling;
     use crate::types::public::{RestartMode, StopMode};
     use crate::{
         JobConfig, JobMessage, JobStatus, PipelineInfo, PolledJob, RefusedConfig, StateContext,
@@ -2172,6 +2342,7 @@ mod tests {
     use arroyo_server_common::shutdown::{Shutdown, SignalBehavior};
     use arroyo_types::{PipelineId, WorkerId};
     use cornucopia_async::DatabaseSource;
+    use futures::FutureExt as _;
     use prost::Message as _;
     use std::collections::HashMap;
     use std::sync::atomic::AtomicU64;
@@ -2199,6 +2370,16 @@ mod tests {
             scheduler_config: serde_json::json!({}),
             state_backend,
         }
+    }
+
+    /// The job's scheduling admission, for a test that publishes to the gate directly.
+    ///
+    /// A publication only ever happens under this, so a test that stands in for one takes it
+    /// too. It is never contended in the tests that use this helper, which is why they can
+    /// insist on getting it.
+    fn admitted(gate: &RefusalGate) -> Admission {
+        gate.admit_publication()
+            .expect("nothing is scheduling in this test, so the admission must be free")
     }
 
     fn selector_error(err: &StateError) -> &StateBackendError {
@@ -2470,6 +2651,10 @@ mod tests {
         /// context and a whole state machine for the ones that drive [`execute_state`],
         /// which writes the job's status after every transition.
         db: DatabaseSource,
+        /// Owned here rather than made inside [`Self::ctx`], so a test can publish to the
+        /// same gate the state runs under and can ask, afterwards, whether the job's
+        /// scheduling admission was left free.
+        refusal_gate: RefusalGate,
     }
 
     impl Harness {
@@ -2481,6 +2666,7 @@ mod tests {
                 rx,
                 scheduler: Arc::new(RecordingScheduler::default()),
                 db: unused_db(),
+                refusal_gate: RefusalGate::default(),
             }
         }
 
@@ -2509,7 +2695,7 @@ mod tests {
                 db: self.db.clone(),
                 scheduler: self.scheduler.clone(),
                 rx: &mut self.rx,
-                refusal_gate: RefusalGate::default(),
+                refusal_gate: self.refusal_gate.clone(),
                 retries_attempted: 0,
                 job_controller: None,
                 leader_manager: None,
@@ -4003,6 +4189,337 @@ mod tests {
         );
     }
 
+    /// The poll thread reaching the job in the one instant round 7's gate did not cover: the
+    /// snapshot [`execute_state`] takes before the state body has already been read, and
+    /// `Scheduling`'s preamble has not yet done anything.
+    ///
+    /// This is a barrier, not a race. The publication happens at a point this state controls,
+    /// strictly after the gate snapshot and strictly before the first statement of the real
+    /// [`Scheduling::next`] it then delegates to, so the interleaving under test is the one
+    /// that runs, every time, on any runtime. It is also the *latest* such point: a
+    /// publication that lands here has beaten the preamble by nothing at all, and must still
+    /// stop it.
+    #[derive(Debug)]
+    struct PublishesAfterTheGateSnapshot(RefusedConfig);
+
+    #[async_trait::async_trait]
+    impl State for PublishesAfterTheGateSnapshot {
+        fn name(&self) -> &'static str {
+            "PublishesAfterTheGateSnapshot"
+        }
+
+        async fn next(self: Box<Self>, ctx: &mut JobContext) -> Result<Transition, StateError> {
+            assert!(
+                ctx.refusal_gate.clone().take().is_none(),
+                "the state body starts with the gate clear: `execute_state`'s snapshot is \
+                 spent, which is the whole premise of this test"
+            );
+            ctx.refusal_gate
+                .publish(&admitted(&ctx.refusal_gate), self.0.clone());
+            Box::new(Scheduling {}).next(ctx).await
+        }
+    }
+
+    /// A refusal published after the gate snapshot must still stop the scheduling preamble.
+    ///
+    /// Round 7 made [`execute_state`] apply a known refusal before every state body, and
+    /// argued that covered a job whose state task was already live. It did not: `take`
+    /// clones under its lock and releases it, and `Scheduling` then persists an incremented
+    /// generation, tears down the live cluster, starts replacements and prepares checkpoint
+    /// recovery — awaiting throughout — without looking at the gate again. A refusal raised
+    /// anywhere in there was not read until the next state, which is after all of it.
+    ///
+    /// The four things the reviewer named are asserted here, and all four are `zero`: no
+    /// generation was persisted, no unscoped teardown (`stop_workers(_, None, _)`) was asked
+    /// for, no replacement workers were started, and no recovery was prepared — the last
+    /// because preparing it is strictly after starting workers, which never happened.
+    ///
+    /// Without the interlock this test does not merely mis-assert: the preamble runs on into
+    /// `start_workers`, whose `get_cluster_id` no test sets, and panics. That is caught here
+    /// so the failure reports what was done to the job rather than where it happened to
+    /// stop.
+    #[tokio::test]
+    async fn a_refusal_published_after_the_gate_snapshot_still_stops_the_scheduling_preamble() {
+        let db = sqlite_startable_job("Scheduling", 2);
+        let refusal = RefusedConfig::new(selector_changed(), 1, Arc::new(AtomicU64::new(1)));
+
+        let mut harness = Harness::new(3).with_db(db.clone());
+        harness.status.state = "Scheduling".to_string();
+        let scheduler = harness.scheduler.clone();
+        let ctx = harness.ctx(
+            running_config(StateBackendSelector::Parquet),
+            StateBackendSelector::Parquet,
+        );
+
+        let outcome = std::panic::AssertUnwindSafe(async {
+            let (next, ctx) =
+                execute_state(Box::new(PublishesAfterTheGateSnapshot(refusal)), ctx).await;
+            (next.map(|s| s.name().to_string()), ctx.status.generation)
+        })
+        .catch_unwind()
+        .await;
+
+        let Ok((next, generation)) = outcome else {
+            panic!(
+                "the preamble ran for a refused configuration and got as far as \
+                 `start_workers`; it persisted {:?} and asked for the teardowns {:?}",
+                state_writes(&db),
+                scheduler.stopped.lock().unwrap()
+            );
+        };
+
+        assert_eq!(
+            next.as_deref(),
+            Some("Failing"),
+            "a refusal published after the gate snapshot must still fail the job"
+        );
+        assert_eq!(
+            generation, 1,
+            "and the generation this scheduling attempt would have run under must not even \
+             be incremented in memory"
+        );
+        assert_eq!(
+            state_writes(&db),
+            [("Failing".to_string(), 1)],
+            "the only status write is the failure itself: no generation was ever persisted"
+        );
+        assert_eq!(
+            scheduler.stopped.lock().unwrap().as_slice(),
+            [],
+            "no unscoped teardown — `Scheduling`'s `stop_workers(_, None, _)` is what \
+             destroys a live execution"
+        );
+        assert_eq!(
+            scheduler.started.lock().unwrap().as_slice(),
+            [],
+            "no replacement workers, and so no checkpoint recovery either: preparing it is \
+             strictly after starting them"
+        );
+    }
+
+    /// The control for the interlock, and for the two properties an interlock can break.
+    ///
+    /// An ordinary job must still run its scheduling preamble — the admission must not stall
+    /// or deadlock it — and the assertions above must be about the refusal rather than about
+    /// a harness in which nothing schedules anyway. So the same path is run with the gate
+    /// clear, and it must reach the effects the refused job reached none of.
+    ///
+    /// It gets as far as `start_workers`, where `arroyo_server_common::get_cluster_id` panics
+    /// because no test sets a cluster id; that panic is the proof the preamble ran, and is
+    /// also the second thing checked here. A `tokio` mutex does not poison, so a state body
+    /// that panics under the admission leaves the job refusable rather than wedged for the
+    /// life of the controller — which a `std` mutex would not have.
+    #[tokio::test]
+    async fn an_unrefused_job_still_schedules_and_a_panic_under_the_admission_releases_it() {
+        let db = sqlite_startable_job("Scheduling", 2);
+
+        let mut harness = Harness::new(3).with_db(db.clone());
+        harness.status.state = "Scheduling".to_string();
+        let scheduler = harness.scheduler.clone();
+        let gate = harness.refusal_gate.clone();
+        let ctx = harness.ctx(
+            running_config(StateBackendSelector::Parquet),
+            StateBackendSelector::Parquet,
+        );
+
+        let outcome = std::panic::AssertUnwindSafe(async {
+            execute_state(Box::new(Scheduling {}), ctx).await;
+        })
+        .catch_unwind()
+        .await;
+
+        assert!(
+            outcome.is_err(),
+            "the control only means anything if the unrefused job really ran the preamble \
+             through to `start_workers`; it wrote {:?}",
+            state_writes(&db)
+        );
+        assert_eq!(
+            state_writes(&db),
+            [("Scheduling".to_string(), 2)],
+            "an unrefused job advances and persists its generation exactly as before: the \
+             admission is an interlock, not a stall"
+        );
+        assert_eq!(
+            scheduler.stopped.lock().unwrap().as_slice(),
+            [("job_abc".to_string(), None)],
+            "and clears the cluster it is replacing"
+        );
+        assert!(
+            gate.admit_publication().is_some(),
+            "and a state body that panics under the admission releases it: a refusal raised \
+             after this must still be publishable"
+        );
+    }
+
+    /// The other half of the interlock: a refusal that arrives *during* a preamble.
+    ///
+    /// Publication takes the same admission `Scheduling` holds across its preamble, and takes
+    /// it without ever waiting — the update thread calls `refuse_config` under the global job
+    /// map. So a refusal raised mid-preamble is not published, not queued, and above all not
+    /// recorded: round 6's rule for a refusal nothing can receive, applied to one nothing can
+    /// publish. The next 500ms poll offers the same refusal, at the same version, and by then
+    /// the preamble is over and the job's own `recv` is what acts on it.
+    ///
+    /// The version is the part that has to be left alone rather than merely re-derived.
+    /// Advancing it on a poll that publishes nothing would supersede whatever refusal is
+    /// already on the gate or in the queue, and a state reading that one would discard it as
+    /// stale — losing the refusal to the very contention that was meant to defer it.
+    #[tokio::test]
+    async fn a_refusal_raised_during_a_scheduling_preamble_is_deferred_rather_than_lost() {
+        let current = running_config(StateBackendSelector::Parquet);
+        let (mut sm, mut rx) = state_machine(current.clone(), StateBackendSelector::Parquet);
+        let mut gate = sm.refusal_gate.clone();
+
+        // `Scheduling`, in its preamble: it holds the job's admission from before its first
+        // effect until after its last.
+        let (preamble, refusal) = gate.admit_scheduling().await;
+        assert!(
+            refusal.is_none(),
+            "the preamble was admitted with the gate clear, which is the interleaving \
+             this test is about"
+        );
+
+        sm.refuse_config(selector_changed());
+
+        assert!(
+            sm.refusal_gate.clone().take().is_none(),
+            "nothing may be published into a preamble that has already started: the states \
+             after it read the gate, and the preamble itself is past reading anything"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "and nothing is queued for it either, so the poll leaves no trace at all"
+        );
+        assert!(
+            sm.refusal.is_none(),
+            "and nothing is recorded as delivered, so the next poll does not short-circuit \
+             on a refusal that was never raised"
+        );
+        assert_eq!(
+            sm.refusal_version.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "and the refusal version is untouched: advancing it here would supersede a \
+             refusal already on the gate or in the queue"
+        );
+
+        // The preamble finishes; the next poll finds the same row still bad.
+        drop(preamble);
+        sm.refuse_config(selector_changed());
+
+        assert_eq!(
+            sm.refusal_gate
+                .clone()
+                .take()
+                .and_then(RefusedConfig::into_current_error),
+            Some(selector_changed()),
+            "the deferred refusal is published the moment the preamble is over, so it gates \
+             every state after it"
+        );
+        assert_eq!(
+            refusal_if_current(rx.try_recv().expect("the refusal must be delivered too")),
+            Some(selector_changed()),
+            "and is delivered to the state that is now reading its channel"
+        );
+        assert_eq!(
+            sm.refusal_version.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "at the first version: this is the same refusal deferred, not a second one"
+        );
+    }
+
+    /// The region, pinned on source text rather than on behaviour.
+    ///
+    /// **This is a structural pin, and the name says so.** What it asserts is where the words
+    /// are in `scheduling.rs`, not what the job does; the behaviour is covered by
+    /// `a_refusal_published_after_the_gate_snapshot_still_stops_the_scheduling_preamble` and
+    /// its control above.
+    ///
+    /// It exists because the guarantee is a property of a *region*: every irreversible effect
+    /// of the preamble sits between one `admit_destructive_scheduling` and one `drop`, and an
+    /// effect added inside it is covered without anyone remembering anything. What no test of
+    /// behaviour can notice is an effect added *outside* it — before the admission, or after
+    /// the drop — so the boundary is pinned here, together with the set of effects it
+    /// contains. A new one must be added to this list, which is the point at which its author
+    /// has to decide whether it belongs inside the region.
+    #[test]
+    fn the_scheduling_preamble_is_written_to_run_every_irreversible_effect_under_admission() {
+        let source = include_str!("scheduling.rs");
+        let start = source
+            .find("    async fn next(mut self: Box<Self>, ctx: &mut JobContext)")
+            .expect("Scheduling::next has been renamed");
+        let body = &source[start..];
+        let body = &body[..body.find("\n    }\n").expect("unterminated function body")];
+
+        let at = |needle: &str| -> usize {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("`Scheduling::next` no longer contains {needle}"))
+        };
+
+        let admitted = at("ctx.admit_destructive_scheduling(");
+        let released = at("drop(admission)");
+        assert_eq!(
+            body.matches("ctx.admit_destructive_scheduling(").count(),
+            1,
+            "one region, entered once: a second entry would be a second gap between them"
+        );
+        assert_eq!(
+            body.matches("drop(admission)").count(),
+            1,
+            "and left once, at the end of the preamble"
+        );
+
+        for effect in [
+            "ctx.status.generation += 1",
+            "ctx.status.update_db(",
+            "stop_workers(",
+            "self.start_workers(",
+            "get_and_register_checkpoint_info_leader(",
+            "get_checkpoint_info_legacy(",
+        ] {
+            let effect_at = at(effect);
+            assert!(
+                admitted < effect_at,
+                "`{effect}` is irreversible and must be inside the admitted region: a \
+                 refusal published before it would otherwise not be read until the next state"
+            );
+            assert!(
+                effect_at < released,
+                "`{effect}` must happen before the admission is released, or the region \
+                 stops covering it"
+            );
+        }
+
+        assert!(
+            released < at("ctx.rx.recv()"),
+            "and the admission must be released before the wait for workers: holding it \
+             across a wait that can take minutes would make the job unrefusable for exactly \
+             as long"
+        );
+
+        let mut effects: Vec<&str> = body
+            .match_indices("effect(\n")
+            .map(|(i, _)| {
+                let rest = &body[i..];
+                let name = &rest[rest.find('"').expect("an effect is named") + 1..];
+                &name[..name.find('"').expect("an unterminated effect name")]
+            })
+            .collect();
+        effects.sort_unstable();
+        assert_eq!(
+            effects,
+            [
+                "persist the incremented scheduling generation",
+                "prepare the legacy recovery checkpoint",
+                "register the generation and prepare its recovery checkpoint",
+                "start the job's replacement workers",
+                "tear down the job's existing cluster",
+            ],
+            "these are the irreversible effects of the scheduling preamble; adding one means \
+             deciding, here, that it belongs under the same admission"
+        );
+    }
+
     /// The ordering half of the fix, pinned on statement order rather than on behaviour.
     ///
     /// The gate can only stop a state task that was handed a refusal before that task ran,
@@ -4195,7 +4712,8 @@ mod tests {
         }
 
         async fn next(self: Box<Self>, ctx: &mut JobContext) -> Result<Transition, StateError> {
-            ctx.refusal_gate.publish(self.0.clone());
+            ctx.refusal_gate
+                .publish(&admitted(&ctx.refusal_gate), self.0.clone());
             ctx.handle(JobMessage::ConfigRefused(self.0))?;
             unreachable!("a current refusal fails the job")
         }
@@ -4245,11 +4763,10 @@ mod tests {
     fn the_gate_applies_each_refusal_once_and_a_later_one_afresh() {
         let mut gate = RefusalGate::default();
         let version = Arc::new(AtomicU64::new(7));
-        gate.publish(RefusedConfig::new(
-            selector_changed(),
-            7,
-            Arc::clone(&version),
-        ));
+        gate.publish(
+            &admitted(&gate),
+            RefusedConfig::new(selector_changed(), 7, Arc::clone(&version)),
+        );
 
         // What a state that read the refusal off its own channel leaves behind.
         gate.disarm();
@@ -4261,7 +4778,10 @@ mod tests {
         // A *later* refusal is a different fact about the job and still gates, which is what
         // keeps a job restarting out of `Failed` from restarting into a refused row.
         version.store(8, std::sync::atomic::Ordering::SeqCst);
-        gate.publish(RefusedConfig::new(selector_changed(), 8, version));
+        gate.publish(
+            &admitted(&gate),
+            RefusedConfig::new(selector_changed(), 8, version),
+        );
         assert!(gate.take().is_some());
         assert!(
             gate.take().is_none(),

@@ -777,9 +777,38 @@ impl State for Scheduling {
         // to schedule
         stop_if_desired_non_running!(self, &ctx.config);
 
+        // Everything from here to the first `ctx.rx.recv` below is this state's destructive
+        // preamble: it persists an incremented generation, tears down whatever cluster the
+        // job is running on, starts a replacement one and prepares checkpoint recovery, and
+        // it awaits — repeatedly, and for as long as the scheduler needs slots — in between.
+        // None of it is undoable, and none of it may happen for a configuration the
+        // controller has refused.
+        //
+        // [`execute_state`]'s gate check settles that question at the state boundary, but a
+        // snapshot cannot settle it for the rest of the body: a refusal published a moment
+        // later would not be looked at again until the next state, which is after all of the
+        // above. Re-reading the gate at each effect would only shrink the window to the gap
+        // between the last read and the next effect.
+        //
+        // So the region is *admitted* instead. The guard returned here is the same lock
+        // `StateMachine::refuse_config` must take to publish a refusal at all, and it is
+        // held until the preamble is over: a refusal either exists before this line — in
+        // which case this call is where the job is failed, with nothing done to it — or it
+        // cannot be published until after the last effect, and reaches the job at the `recv`
+        // loop below, which handles it. There is no interleaving in which a refused job is
+        // rescheduled, and a later effect added anywhere inside the region inherits that
+        // without anyone having to remember it.
+        let admission = ctx.admit_destructive_scheduling().await?;
+
         // update the generation for this scheduling attempt
         ctx.status.generation += 1;
-        if let Err(e) = ctx.status.update_db(&ctx.db).await {
+        if let Err(e) = admission
+            .effect(
+                "persist the incremented scheduling generation",
+                ctx.status.update_db(&ctx.db),
+            )
+            .await
+        {
             return Err(ctx.retryable(
                 self,
                 "failed to advance generation for scheduling retry",
@@ -789,7 +818,13 @@ impl State for Scheduling {
         }
 
         // clear out any existing workers for this job
-        if let Err(e) = ctx.scheduler.stop_workers(&ctx.config.id, None, true).await {
+        if let Err(e) = admission
+            .effect(
+                "tear down the job's existing cluster",
+                ctx.scheduler.stop_workers(&ctx.config.id, None, true),
+            )
+            .await
+        {
             warn!(
                 message = "failed to clean cluster prior to scheduling",
                 job_id = %ctx.config.id,
@@ -802,12 +837,23 @@ impl State for Scheduling {
             .update_parallelism(&ctx.config.parallelism_overrides);
 
         let slots_needed: usize = slots_for_job(&*ctx.program);
-        self = self.start_workers(ctx, slots_needed).await?;
+        self = admission
+            .effect(
+                "start the job's replacement workers",
+                self.start_workers(ctx, slots_needed),
+            )
+            .await?;
 
         let leader_mode = matches!(config().job_controller, JobControllerMode::Worker);
 
         let (self, checkpoint_info, committing_state) = if leader_mode {
-            match get_and_register_checkpoint_info_leader(ctx).await {
+            match admission
+                .effect(
+                    "register the generation and prepare its recovery checkpoint",
+                    get_and_register_checkpoint_info_leader(ctx),
+                )
+                .await
+            {
                 Ok(ci) => (self, ci, None),
                 // A rejected selector is not a transient failure: every attempt resolves
                 // the same recovery manifest, so retrying only delays the report.
@@ -822,8 +868,20 @@ impl State for Scheduling {
                 }
             }
         } else {
-            get_checkpoint_info_legacy(self, ctx).await?
+            admission
+                .effect(
+                    "prepare the legacy recovery checkpoint",
+                    get_checkpoint_info_legacy(self, ctx),
+                )
+                .await?
         };
+
+        // The preamble is over: every irreversible effect of this scheduling attempt has
+        // happened, and the loop below reads the job's channel, so a refusal raised from here
+        // on is both publishable and promptly acted on. Holding the admission across the
+        // wait for workers — which can be minutes — would instead make the job unrefusable
+        // for exactly as long as it is least able to defend itself.
+        drop(admission);
 
         // wait for them to connect and make outbound RPC connections
         let mut workers = HashMap::new();
