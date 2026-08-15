@@ -639,6 +639,12 @@ pub struct JobContext<'a> {
     pub db: DatabaseSource,
     pub scheduler: Arc<dyn Scheduler>,
     pub rx: &'a mut Receiver<JobMessage>,
+    /// The refusal this task must apply before its next state runs, if any.
+    ///
+    /// Not `pub`, unlike the rest: no state reads it. [`execute_state`] consults it on every
+    /// state's behalf precisely because a state that had to remember to consult it would be
+    /// a state that could forget — which is the shape of the bug this exists for.
+    pub(crate) refusal_gate: RefusalGate,
     pub retries_attempted: usize,
     pub job_controller: Option<JobController>,
     pub leader_manager: Option<LeaderManager>,
@@ -942,7 +948,29 @@ async fn execute_state<'a>(
         config = format!("{:?}", ctx.config)
     );
 
-    let next: Option<Box<dyn State>> = match state.next(&mut ctx).await {
+    // A refusal the job is *already* under is applied here, before the state body, and not
+    // somewhere inside it. Queueing it ahead of the state is not enough: `Compiling` never
+    // reads the job's channel, and `Scheduling` increments and persists the generation,
+    // stops the job's workers, starts replacements and prepares checkpoint recovery before
+    // its first `recv`. Doing this once, for every state, is what makes "a refused
+    // configuration is adopted nowhere" a property of the loop rather than of each state
+    // remembering to receive before it acts.
+    //
+    // The refusal is applied through the same [`handle_unhandled_message`] policy the queued
+    // message goes through, including its superseded-version check, so a row repaired while
+    // the previous state was running still saves the job.
+    let known_refusal = ctx.refusal_gate.take();
+    let gated = match known_refusal {
+        Some(refusal) => ctx.handle(JobMessage::ConfigRefused(refusal)),
+        None => Ok(()),
+    };
+
+    let outcome = match gated {
+        Ok(()) => state.next(&mut ctx).await,
+        Err(refused) => Err(refused),
+    };
+
+    let next: Option<Box<dyn State>> = match outcome {
         Ok(Transition::Advance(s)) => {
             info!(
                 message = "state transition",
@@ -997,6 +1025,10 @@ async fn execute_state<'a>(
                     "retries": 0,
                 }
             );
+            // The job is failing; there is nothing left for the gate to protect, and a
+            // refusal a state has just turned fatal through its own channel must not be
+            // turned fatal a second time before `Failing` gets to run.
+            ctx.refusal_gate.disarm();
             ctx.status.failure_message = Some(message);
             ctx.status.failure_domain = Some(domain.as_str().to_string());
             ctx.status.finish_time = Some(OffsetDateTime::now_utc());
@@ -1106,6 +1138,7 @@ pub(crate) async fn state_backoff(retries_attempted: usize, job_id: &str, pipeli
 async fn run_to_completion(
     job_config_and_status: Arc<RwLock<(JobConfig, AppliedStatus)>>,
     execution_selector: StateBackendSelector,
+    refusal_gate: RefusalGate,
     pipeline_info: Arc<PipelineInfo>,
     mut program: LogicalProgram,
     mut status: JobStatus,
@@ -1154,6 +1187,7 @@ async fn run_to_completion(
         db: db.clone(),
         scheduler,
         rx: &mut rx,
+        refusal_gate,
         retries_attempted: 0,
         job_controller: None,
         leader_manager,
@@ -1242,6 +1276,80 @@ enum RefusalDelivery {
     AnsweredByStop,
 }
 
+/// The refusal a job's state task must apply *before* it runs a state.
+///
+/// A refusal reaches the state task two ways, and only one of them is prompt. The queued
+/// [`JobMessage::ConfigRefused`] wakes a state that is already blocked on the job's channel
+/// — which is what fails a long-running [`Running`] job — but a state that acts before it
+/// receives never sees it. [`Compiling`] does not receive at all, and [`Scheduling`]
+/// increments and persists the job's generation, stops its workers, starts replacements and
+/// prepares checkpoint recovery before its first `ctx.rx.recv`. Queueing a refusal ahead of
+/// such a state is therefore not the same as applying it: "the refusal is applied before the
+/// job is rescheduled" is a claim about the operation, not about a queue position.
+///
+/// So every refusal the state machine intends to *fail* the job with is published here as
+/// well, and [`execute_state`] applies it ahead of every state body it runs — including the
+/// very first state of a task that the refused row's own poll started.
+///
+/// Only refusals that are to be delivered as failures are published. One a stop is
+/// answering ([`RefusalDelivery::AnsweredByStop`]) is withdrawn instead, because failing the
+/// job would destroy exactly the final-checkpoint semantics that stop exists for.
+///
+/// Held per job and cloned into that job's state task. There is no registry, no static and
+/// no global, for the same reason [`StateMachine::execution_selector`] has none.
+#[derive(Clone, Default)]
+pub(crate) struct RefusalGate {
+    /// The refusal the state machine is under now, shared with the job's state task so a
+    /// refusal raised after the task started is seen at its next state boundary.
+    current: Arc<RwLock<Option<RefusedConfig>>>,
+    /// The highest refusal version this task has already turned fatal.
+    ///
+    /// Per task rather than shared. It is what stops the gate from failing the job a second
+    /// time on its way through [`Failing`] to [`Failed`], while a task started later still
+    /// applies a refusal an earlier one already did.
+    acted: u64,
+}
+
+impl RefusalGate {
+    /// Publishes a refusal for the job's state task to apply before its next state.
+    fn publish(&self, refusal: RefusedConfig) {
+        *self.current.write().unwrap() = Some(refusal);
+    }
+
+    /// Withdraws whatever was published, because it no longer describes the job or is being
+    /// answered by a stop rather than by a failure.
+    fn withdraw(&self) {
+        *self.current.write().unwrap() = None;
+    }
+
+    /// The refusal this task must apply before it runs another state, if any.
+    ///
+    /// Each refusal is returned at most once. `is_current` is checked here as well as in
+    /// [`RefusedConfig::into_current_error`], so a row the operator repaired while the
+    /// previous state was running is never failed for a refusal that no longer exists.
+    fn take(&mut self) -> Option<RefusedConfig> {
+        let refusal = self.current.read().unwrap().clone()?;
+        if !refusal.is_current() || refusal.version() <= self.acted {
+            return None;
+        }
+        self.acted = refusal.version();
+        Some(refusal)
+    }
+
+    /// Records that the job is already failing, so a refusal one of its own states has just
+    /// turned fatal is not turned fatal again before [`Failing`] runs.
+    ///
+    /// The gate and the job's message channel are two routes to one policy, and the job may
+    /// only be failed once per refusal whichever route reached it first. A refusal raised
+    /// *after* this — at a higher version — still gates, which is what keeps a job that
+    /// restarts out of [`Failed`] from restarting into a configuration that is refused now.
+    fn disarm(&mut self) {
+        if let Some(refusal) = self.current.read().unwrap().as_ref() {
+            self.acted = self.acted.max(refusal.version());
+        }
+    }
+}
+
 /// A refused configuration, its version, and what has been done about it.
 ///
 /// `version` is the sending half of [`crate::RefusedConfig`]: a queued refusal cannot be
@@ -1308,6 +1416,14 @@ pub struct StateMachine {
     /// It is per job and threaded through the job's own messages — no static, thread-local
     /// or global registry — for the same reason [`Self::execution_selector`] is.
     refusal_version: Arc<AtomicU64>,
+    /// The same refusal, on the receiving side, for the job's state task to apply *before*
+    /// it runs a state rather than only when a state happens to read its channel.
+    ///
+    /// The job's queue and this cell are two routes to one policy. The queue is the prompt
+    /// one — it wakes a state already blocked on `recv` — and this one is the safe one: it
+    /// is consulted before every state body, so a refusal that is known when a state is
+    /// about to run stops it, whether or not that state ever receives. See [`RefusalGate`].
+    refusal_gate: RefusalGate,
     pub(crate) state: Arc<RwLock<String>>,
     metrics: Arc<tokio::sync::RwLock<HashMap<Arc<String>, JobMetrics>>>,
     db: DatabaseSource,
@@ -1347,11 +1463,27 @@ impl StateMachine {
             execution_selector,
             refusal: None,
             refusal_version: Arc::new(AtomicU64::new(0)),
+            refusal_gate: RefusalGate::default(),
             state: Arc::new(RwLock::new(status.state.clone())),
             metrics,
             db,
             scheduler,
         };
+
+        // Recorded *before* the adoption starts the job's state task, and separately from
+        // acting on it below.
+        //
+        // A cold controller adopting a controller-mode `Running` job starts it in
+        // [`Compiling`], which advances to [`Scheduling`] without ever reading the job's
+        // channel — and `Scheduling` increments and persists the generation, stops the live
+        // workers, starts replacements and prepares checkpoint recovery before its first
+        // `recv`. So a refusal recorded after the start could not stop any of it. Recording
+        // it here publishes it to [`RefusalGate`], which the task consults before its first
+        // state body.
+        if let Some(error) = &refusal {
+            let refused = this.config.read().unwrap().0.clone();
+            this.note_refused_row(error.clone(), &refused);
+        }
 
         this.start(status.clone(), shutdown_guard.clone_temporary())
             .await;
@@ -1468,6 +1600,10 @@ impl StateMachine {
                 // to the execution rather than re-read from the shared config it is the
                 // authority for.
                 let execution_selector = self.execution_selector;
+                // The task's half of the refusal gate. Cloned rather than re-derived, so a
+                // refusal already published when this task is created gates its very first
+                // state, and one raised later reaches it at the next state boundary.
+                let refusal_gate = self.refusal_gate.clone();
                 let db = self.db.clone();
                 let scheduler = self.scheduler.clone();
                 let metrics = self.metrics.clone();
@@ -1514,6 +1650,7 @@ impl StateMachine {
                             run_to_completion(
                                 config,
                                 execution_selector,
+                                refusal_gate,
                                 pipeline_info,
                                 program,
                                 status,
@@ -1665,6 +1802,16 @@ impl StateMachine {
     /// restart the job under its own immutable selector and its own unrefused
     /// configuration, which is why refusing a row still cannot restart the job into the
     /// value being refused.
+    ///
+    /// And either way the refusal is *recorded* first, by [`Self::note_refused_row`], before
+    /// anything below can start a state task. Round 6 ordered the restart first so that the
+    /// poll which finally got a task up would also deliver the refusal to it; the restart is
+    /// kept, but delivery is not application. [`Compiling`] never reads the job's channel,
+    /// and [`Scheduling`] increments and persists the generation, stops the job's workers,
+    /// starts replacements and prepares checkpoint recovery before its first `recv` — so a
+    /// task started before the refusal was recorded could reschedule a live execution for a
+    /// configuration that must be adopted nowhere. Recording it first publishes it to
+    /// [`RefusalGate`], which stops the restarted task at its very first state.
     async fn apply_refused_row(
         &mut self,
         error: StateBackendError,
@@ -1672,8 +1819,9 @@ impl StateMachine {
         status: JobStatus,
         shutdown_guard: &ShutdownGuard,
     ) {
+        self.note_refused_row(error, refused);
+
         if refused.stop_mode != StopMode::none {
-            self.note_refusal(error);
             self.request_stop(refused.stop_mode, &refused.id, status, shutdown_guard)
                 .await;
             return;
@@ -1696,14 +1844,35 @@ impl StateMachine {
         // of. The refused selector and the refused restart nonce are in neither, so this
         // restarts the job as itself and never under the value being refused.
         //
-        // Ordered before the refusal so that the poll which finally gets a state task up
-        // also delivers the refusal to it; if nothing came up, the refusal stays pending
-        // and both are tried again 500ms later.
+        // What the task it starts may then *do* is settled above rather than here: the
+        // refusal is already published, so the task is failed at its first state instead of
+        // being allowed to reschedule the job on its way to reading its channel.
         let applied = self.config.read().unwrap().1;
         self.restart_if_needed(applied, status, shutdown_guard)
             .await;
+    }
 
-        self.refuse_config(error);
+    /// Records what the controller has decided about a refused row, without yet doing
+    /// anything to the job.
+    ///
+    /// Split out of [`Self::apply_refused_row`] because the decision has to be published
+    /// strictly before anything can start the job's state task, and two callers start one:
+    /// `apply_refused_row` itself, through `request_stop` or `restart_if_needed`, and
+    /// [`Self::new`], which starts a cold-adopted job before it has looked at the row's
+    /// refusal at all. Recording is idempotent — a refusal already raised at a version is
+    /// re-offered at that same version, and one a stop is already answering is left alone —
+    /// so calling it twice around a start costs nothing.
+    ///
+    /// A row that also asks for a stop records the refusal as answered by that stop
+    /// ([`Self::note_refusal`]) and publishes *nothing* to [`RefusalGate`], because failing
+    /// the job would lose exactly the final-checkpoint semantics the stop asked for.
+    /// Everything else raises the refusal for delivery ([`Self::refuse_config`]).
+    fn note_refused_row(&mut self, error: StateBackendError, refused: &JobConfig) {
+        if refused.stop_mode != StopMode::none {
+            self.note_refusal(error);
+        } else {
+            self.refuse_config(error);
+        }
     }
 
     /// Asks the job to stop, under the configuration it is already running with.
@@ -1808,6 +1977,11 @@ impl StateMachine {
             version,
             delivery: RefusalDelivery::AnsweredByStop,
         });
+        // Nothing is published to the gate, and anything already there is withdrawn: this
+        // refusal is being answered by a stop, and a gate that failed the job first would
+        // destroy the final-checkpoint semantics the stop exists for. The version bump above
+        // already supersedes any queued message; this is its receiving-side counterpart.
+        self.refusal_gate.withdraw();
     }
 
     /// Supersedes whatever refusal the job was under, and returns the version that
@@ -1828,6 +2002,10 @@ impl StateMachine {
     fn clear_refusal(&mut self) {
         if self.refusal.take().is_some() {
             self.next_refusal_version();
+            // The gate is checked before every state, so a repaired row has to clear it as
+            // well as the queue. The version bump alone would already make the gate discard
+            // what it holds; withdrawing means it never holds a refusal the job is not under.
+            self.refusal_gate.withdraw();
         }
     }
 
@@ -1855,6 +2033,13 @@ impl StateMachine {
     /// [`Self::apply_refused_row`] does it, because only the caller holds the job's status
     /// and shutdown guard, and because this function must stay non-`async`: the update
     /// thread calls it while it holds the global job map.
+    ///
+    /// Delivery is not the same as application, so the refusal is also published to the job's
+    /// [`RefusalGate`], which every state is checked against before it runs. A queued message
+    /// only reaches a state that receives, and [`Compiling`] never does while [`Scheduling`]
+    /// does its generation write, worker teardown, worker start and checkpoint restore first.
+    /// Publishing here, before the offer, is also what makes it safe for a caller to record a
+    /// refusal and only then restart the job.
     ///
     /// Coalescing alone does not make the refusal safe to deliver late. Between the poll
     /// that queues it and the state that reads it, the operator can repair the row — the
@@ -1887,11 +2072,18 @@ impl StateMachine {
             }
         };
 
-        let delivery = match self.offer(JobMessage::ConfigRefused(RefusedConfig::new(
-            error.clone(),
-            version,
-            Arc::clone(&self.refusal_version),
-        ))) {
+        let refused = RefusedConfig::new(error.clone(), version, Arc::clone(&self.refusal_version));
+
+        // Published before the message is offered, and regardless of what becomes of it.
+        // Whether the job's queue took the refusal decides how *promptly* a state blocked on
+        // `recv` learns of it; it does not decide whether the next state may run. A refusal
+        // the queue was full for, or that has no queue at all, must still stop the next state
+        // — and this is also what lets a caller record the refusal and only then restart the
+        // job, so the task it starts is gated at its first state instead of after it has
+        // rescheduled a live execution.
+        self.refusal_gate.publish(refused.clone());
+
+        let delivery = match self.offer(JobMessage::ConfigRefused(refused)) {
             Delivery::Delivered => RefusalDelivery::Sent,
             Delivery::Inactive => {
                 debug!(
@@ -1962,9 +2154,10 @@ impl StateMachine {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppliedStatus, Failed, Failing, JobContext, LeaderRunning, Running, RunningConfigUpdate,
-        State, StateMachine, Transition, adopt_refreshed_config, check_config_update,
-        classify_running_config_update, handle_unhandled_message,
+        AppliedStatus, Failed, Failing, JobContext, LeaderRunning, RefusalGate, Running,
+        RunningConfigUpdate, State, StateMachine, Transition, adopt_refreshed_config,
+        check_config_update, classify_running_config_update, execute_state,
+        handle_unhandled_message,
     };
     use crate::schedulers::{Scheduler, SchedulerError, StartPipelineReq};
     use crate::types::public::{RestartMode, StopMode};
@@ -2017,16 +2210,26 @@ mod tests {
             .unwrap_or_else(|| panic!("expected a typed selector error, got {source:?}"))
     }
 
-    /// A scheduler that does nothing and records the teardowns the terminal states ask
-    /// for. Enough to run the states that only tear a cluster down.
+    /// A scheduler that does nothing and records what was asked of a job's cluster.
+    ///
+    /// The generation is recorded with every teardown because it is what tells the two kinds
+    /// apart: a terminal state tears down the generation it knows (`Some(g)`), while
+    /// [`Scheduling`] clears whatever is there before it schedules (`None`). Only the second
+    /// is destructive to a running execution, so a test that must prove nothing was
+    /// rescheduled has to be able to see the difference.
     #[derive(Default)]
     struct RecordingScheduler {
-        stopped: Mutex<Vec<String>>,
+        stopped: Mutex<Vec<(String, Option<u64>)>>,
+        started: Mutex<Vec<(String, u64)>>,
     }
 
     #[async_trait::async_trait]
     impl Scheduler for RecordingScheduler {
-        async fn start_workers(&self, _: StartPipelineReq) -> Result<(), SchedulerError> {
+        async fn start_workers(&self, req: StartPipelineReq) -> Result<(), SchedulerError> {
+            self.started
+                .lock()
+                .unwrap()
+                .push(((*req.job_id.0).clone(), req.generation));
             Ok(())
         }
         async fn register_node(&self, _: RegisterNodeReq) {}
@@ -2034,8 +2237,16 @@ mod tests {
             Ok(())
         }
         async fn worker_finished(&self, _: WorkerFinishedReq) {}
-        async fn stop_workers(&self, job_id: &str, _: Option<u64>, _: bool) -> anyhow::Result<()> {
-            self.stopped.lock().unwrap().push(job_id.to_string());
+        async fn stop_workers(
+            &self,
+            job_id: &str,
+            generation: Option<u64>,
+            _: bool,
+        ) -> anyhow::Result<()> {
+            self.stopped
+                .lock()
+                .unwrap()
+                .push((job_id.to_string(), generation));
             Ok(())
         }
         async fn workers_for_job(&self, _: &str, _: Option<u64>) -> anyhow::Result<Vec<WorkerId>> {
@@ -2058,6 +2269,11 @@ mod tests {
     /// runs `proto_version = 2` pipelines, so `1` is the "this is a bad/old pipeline" path
     /// — the one that leaves `start` with a job it cannot run while it explicitly promises
     /// to retry on the next poll.
+    ///
+    /// A trigger records every status write into `state_writes`. Reading the final row only
+    /// says where a job ended up; a test that has to prove a job never *reached* a state, and
+    /// never advanced the generation on the way, needs the whole sequence — see
+    /// [`state_writes`].
     fn sqlite_startable_job(state: &str, proto_version: i32) -> DatabaseSource {
         let connection = cornucopia_async::rusqlite::Connection::open_in_memory().unwrap();
         connection
@@ -2084,7 +2300,16 @@ mod tests {
                     proto_version INTEGER NOT NULL,
                     state_url TEXT,
                     tags TEXT NOT NULL
-                );",
+                );
+                CREATE TABLE state_writes (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    state TEXT NOT NULL,
+                    run_id INTEGER NOT NULL
+                );
+                CREATE TRIGGER record_state_writes AFTER UPDATE ON job_statuses
+                BEGIN
+                    INSERT INTO state_writes (state, run_id) VALUES (NEW.state, NEW.run_id);
+                END;",
             )
             .unwrap();
         connection
@@ -2149,6 +2374,69 @@ mod tests {
         (state, context.execution_selector)
     }
 
+    /// Every status write the job made, in order, as `(state, generation)`.
+    ///
+    /// `generation` is `job_statuses.run_id`, which [`JobStatus::update_db`] is the only
+    /// writer of, and [`Scheduling`] advances it as the first thing it does. So this
+    /// sequence answers both halves of "did the job schedule anything": whether it ever
+    /// entered `Scheduling` at all, and whether the generation it would have rescheduled
+    /// under was ever persisted.
+    fn state_writes(db: &DatabaseSource) -> Vec<(String, u64)> {
+        let DatabaseSource::Sqlite(connection) = db else {
+            unreachable!("the fixture is always sqlite")
+        };
+        let connection = connection.lock().unwrap();
+        let mut stmt = connection
+            .prepare("SELECT state, run_id FROM state_writes ORDER BY seq")
+            .unwrap();
+        stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+    }
+
+    /// The failure the job's durable record now reports, if any.
+    fn recorded_failure(db: &DatabaseSource) -> Option<String> {
+        let DatabaseSource::Sqlite(connection) = db else {
+            unreachable!("the fixture is always sqlite")
+        };
+        connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT failure_message FROM job_statuses WHERE id = 'job_abc'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// Lets the job's spawned state task run to the end, and reports every status write it
+    /// made on the way.
+    ///
+    /// The point of the tests that use this is what the task *does*, so they have to let it
+    /// actually run: a test that returns as soon as the state machine reports that a task
+    /// exists cannot see the state that task goes on to enter, which is how a job that
+    /// rescheduled itself before it was failed went unnoticed.
+    ///
+    /// The wait is on the task releasing the job's channel — [`StateMachine::done`] — rather
+    /// than on the writes going quiet, because "nothing has been written for a while" is
+    /// also what a task that has simply not been scheduled yet looks like.
+    async fn drive_to_completion(sm: &StateMachine, db: &DatabaseSource) -> Vec<(String, u64)> {
+        for _ in 0..2000 {
+            if sm.done() {
+                return state_writes(db);
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!(
+            "the job's state task never finished; wrote {:?}",
+            state_writes(db)
+        );
+    }
+
     fn job_status(restart_nonce: i32) -> JobStatus {
         JobStatus {
             id: Arc::new("job_abc".to_string()),
@@ -2178,6 +2466,10 @@ mod tests {
         program: LogicalProgram,
         rx: Receiver<JobMessage>,
         scheduler: Arc<RecordingScheduler>,
+        /// Unused by the tests that drive `next` directly, and the difference between a
+        /// context and a whole state machine for the ones that drive [`execute_state`],
+        /// which writes the job's status after every transition.
+        db: DatabaseSource,
     }
 
     impl Harness {
@@ -2188,7 +2480,15 @@ mod tests {
                 program: LogicalProgram::default(),
                 rx,
                 scheduler: Arc::new(RecordingScheduler::default()),
+                db: unused_db(),
             }
+        }
+
+        /// A harness whose status writes go somewhere, for tests that run `execute_state`
+        /// rather than a state's `next`.
+        fn with_db(mut self, db: DatabaseSource) -> Self {
+            self.db = db;
+            self
         }
 
         fn ctx(
@@ -2206,9 +2506,10 @@ mod tests {
                 }),
                 status: &mut self.status,
                 program: &mut self.program,
-                db: unused_db(),
+                db: self.db.clone(),
                 scheduler: self.scheduler.clone(),
                 rx: &mut self.rx,
+                refusal_gate: RefusalGate::default(),
                 retries_attempted: 0,
                 job_controller: None,
                 leader_manager: None,
@@ -2244,6 +2545,7 @@ mod tests {
             execution_selector,
             refusal: None,
             refusal_version: Arc::new(AtomicU64::new(0)),
+            refusal_gate: RefusalGate::default(),
             state: Arc::new(RwLock::new("Running".to_string())),
             metrics: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             db,
@@ -2262,6 +2564,37 @@ mod tests {
 
     fn shutdown_guard() -> arroyo_server_common::shutdown::ShutdownGuard {
         Shutdown::new("test", SignalBehavior::None).guard("test")
+    }
+
+    /// A shutdown whose owner outlives the tasks it spawns.
+    ///
+    /// [`shutdown_guard`] hands out a guard whose `Shutdown` has already been dropped, so
+    /// its cancellation token is cancelled before the guard is ever used. Nothing notices
+    /// while a test only asks whether a task was *spawned* — the task is cancelled at its
+    /// first poll, which still leaves the job's channel open long enough to observe. A test
+    /// that needs the task to actually *run* has to hold the owner, and this is that owner.
+    struct LiveShutdown {
+        _shutdown: Shutdown,
+        guard: arroyo_server_common::shutdown::ShutdownGuard,
+    }
+
+    impl LiveShutdown {
+        fn new() -> Self {
+            let shutdown = Shutdown::new("test", SignalBehavior::None);
+            let guard = shutdown.guard("test");
+            Self {
+                _shutdown: shutdown,
+                guard,
+            }
+        }
+
+        /// The one guard, borrowed. Handing out fresh ones would not help: a non-temporary
+        /// guard cancels the token when *it* drops, which is what
+        /// `ShutdownGuard::clone_temporary` — the thing `start` spawns under — exists to
+        /// avoid.
+        fn guard(&self) -> &arroyo_server_common::shutdown::ShutdownGuard {
+            &self.guard
+        }
     }
 
     /// A polled row as [`crate::classify_polled_row`] hands it on.
@@ -3219,9 +3552,17 @@ mod tests {
     /// did not exist. Every later poll then short-circuited on "already sent": program
     /// loading was never retried, the job was never adopted, and its workers kept running
     /// with nothing administering them — even after the database recovered.
+    ///
+    /// Round 6 stopped at "a state task now exists", which is why it could not see round 7's
+    /// finding: what the adopted task went on to do. The task is driven to a standstill here,
+    /// so the retry is proved by the job actually running and being failed by the refusal it
+    /// was restarted to receive — and proved to have rescheduled nothing on the way.
     #[tokio::test]
-    async fn cold_adoption_is_retried_for_a_refused_row_that_asks_for_no_stop() {
+    async fn cold_adoption_is_retried_for_a_refused_row_and_the_adopted_job_never_schedules() {
         let db = sqlite_startable_job("Running", 2);
+        let scheduler = Arc::new(RecordingScheduler::default());
+        // Held for the whole test: the adopted task has to run, not just exist.
+        let shutdown = LiveShutdown::new();
         program_loadable(&db, false);
 
         let current = running_config(StateBackendSelector::Parquet);
@@ -3242,8 +3583,8 @@ mod tests {
             refused_poll(),
             job_status(current.restart_nonce),
             db.clone(),
-            Arc::new(RecordingScheduler::default()),
-            shutdown_guard(),
+            scheduler.clone(),
+            shutdown.guard().clone_temporary(),
             Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         )
         .await;
@@ -3262,7 +3603,7 @@ mod tests {
             sm.update(
                 refused_poll(),
                 job_status(current.restart_nonce),
-                &shutdown_guard(),
+                shutdown.guard(),
             )
             .await;
         }
@@ -3274,7 +3615,7 @@ mod tests {
         sm.update(
             refused_poll(),
             job_status(current.restart_nonce),
-            &shutdown_guard(),
+            shutdown.guard(),
         )
         .await;
 
@@ -3284,10 +3625,36 @@ mod tests {
              it cannot be told about is not a reason to stop trying to reach it"
         );
         assert_eq!(
-            recorded_status(&db),
-            ("Compiling".to_string(), Some("parquet".to_string())),
+            recorded_status(&db).1,
+            Some("parquet".to_string()),
             "and the execution that has now begun is recorded under the job's own \
              immutable selector, never the refused row's"
+        );
+
+        // What the adopted task then does. Round 6 asserted only that it existed.
+        let writes = drive_to_completion(&sm, &db).await;
+        assert!(
+            writes
+                .iter()
+                .all(|(state, generation)| state != "Scheduling" && *generation == 1),
+            "the job is adopted so the refusal can be applied to it, not so the refused row \
+             can reschedule it: it may never reach `Scheduling`, and the generation it would \
+             reschedule under may never advance; wrote {writes:?}"
+        );
+        assert!(
+            writes.ends_with(&[("Failing".to_string(), 1), ("Failed".to_string(), 1)]),
+            "and the adoption ends in the failure the refusal asked for; wrote {writes:?}"
+        );
+        assert_eq!(
+            scheduler.started.lock().unwrap().as_slice(),
+            [],
+            "no replacement workers for a configuration that must be adopted nowhere"
+        );
+        assert_eq!(
+            scheduler.stopped.lock().unwrap().as_slice(),
+            [("job_abc".to_string(), Some(1))],
+            "and the only teardown is the terminal one, under the generation the job already \
+             had — never `Scheduling`'s pre-scheduling `stop_workers(_, None, _)`"
         );
     }
 
@@ -3298,8 +3665,16 @@ mod tests {
     /// The version matters as much as the message. The refusal that finally arrives has to
     /// be one the state machine still holds, or `handle_unhandled_message` discards it and
     /// the job keeps running under a row the controller has already rejected.
+    ///
+    /// This drives no state task by construction: it injects a sender so it can read the
+    /// message off the queue and inspect it, which a real task would consume instead. That
+    /// is why it also checks the refusal is on the job's [`RefusalGate`] the whole time —
+    /// the queue is what a state blocked on `recv` gets, and the gate is what a state that
+    /// does not receive gets, and a pending refusal has to be on both. What the gate then
+    /// does to a running task is covered behaviourally by
+    /// `a_known_refusal_fails_the_restarted_task_before_it_can_reschedule_the_job`.
     #[tokio::test]
-    async fn a_refusal_with_no_state_task_is_delivered_once_the_job_has_one() {
+    async fn a_refusal_with_no_state_task_gates_it_and_is_delivered_once_it_has_one() {
         let current = running_config(StateBackendSelector::Parquet);
         let mut sm = state_machine_with(
             current.clone(),
@@ -3323,6 +3698,15 @@ mod tests {
                 sm.done(),
                 "poll {poll}: the program still cannot be loaded, so nothing can receive \
                  the refusal"
+            );
+            assert_eq!(
+                sm.refusal_gate
+                    .clone()
+                    .take()
+                    .and_then(RefusedConfig::into_current_error),
+                Some(selector_changed()),
+                "poll {poll}: a refusal nothing can receive must still stop the first state \
+                 of whatever task comes up next"
             );
         }
 
@@ -3421,6 +3805,467 @@ mod tests {
             refusal_if_current(rx.try_recv().expect("the new refusal must be delivered")),
             Some(selector_changed()),
             "the test would not detect the supersession if no refusal ever arrived"
+        );
+    }
+
+    /// Round 7's finding, on the route the reviewer traced: a job the controller has already
+    /// rejected must not be able to reschedule its own live execution on the way to being
+    /// failed.
+    ///
+    /// Round 6 made the refused-row branch restart the job's state task so the refusal could
+    /// be delivered at all. But a controller-mode `Running` job restarts into [`Compiling`],
+    /// which never reads the job's channel and advances straight to [`Scheduling`] — and
+    /// `Scheduling` increments and persists the generation, stops the live workers, starts
+    /// replacements and prepares checkpoint recovery *before* its first `ctx.rx.recv` can
+    /// turn the refusal fatal. Queueing the refusal ahead of that task did not help; it had
+    /// to be applied before the task's first state body ran.
+    ///
+    /// So this drives the spawned task rather than observing that one exists, and asserts
+    /// the four things it must not have done: no generation advance, no `Scheduling`
+    /// teardown, no worker start, and no checkpoint restore — the last because the job never
+    /// enters the state that prepares one.
+    #[tokio::test]
+    async fn a_known_refusal_fails_the_restarted_task_before_it_can_reschedule_the_job() {
+        let db = sqlite_startable_job("Running", 2);
+        let scheduler = Arc::new(RecordingScheduler::default());
+        let current = running_config(StateBackendSelector::Parquet);
+        // Held for the whole test: the spawned task has to run, not just exist.
+        let shutdown = LiveShutdown::new();
+
+        // An inactive state machine for a job whose status says it is still running: what a
+        // controller is left with after `start` could not load the program, and what round
+        // 6's `restart_if_needed` exists to bring back up.
+        let mut sm = state_machine_with(
+            current.clone(),
+            StateBackendSelector::Parquet,
+            None,
+            db.clone(),
+        );
+        sm.scheduler = scheduler.clone();
+        assert!(sm.done(), "the job starts with no state task");
+
+        // The refused row asks for no stop, so this is round 6's branch exactly.
+        sm.update(
+            polled(
+                StateBackendSelector::Parquet,
+                current.clone(),
+                Some(selector_changed()),
+            ),
+            job_status(current.restart_nonce),
+            shutdown.guard(),
+        )
+        .await;
+
+        assert!(
+            !sm.done(),
+            "round 6's liveness property: the job is still adopted, because a refusal it \
+             cannot be told about is not a reason to stop trying to reach it"
+        );
+
+        let writes = drive_to_completion(&sm, &db).await;
+
+        assert_eq!(
+            writes,
+            [
+                ("Compiling".to_string(), 1),
+                ("Failing".to_string(), 1),
+                ("Failed".to_string(), 1),
+            ],
+            "the adopted task must be failed by the refusal at its very first state: it may \
+             never reach `Scheduling`, and the generation it would reschedule under may never \
+             advance"
+        );
+        assert_eq!(
+            scheduler.started.lock().unwrap().as_slice(),
+            [],
+            "and no replacement workers may be started for a configuration that must be \
+             adopted nowhere"
+        );
+        assert_eq!(
+            scheduler.stopped.lock().unwrap().as_slice(),
+            [("job_abc".to_string(), Some(1))],
+            "the only teardown is the terminal one, under the generation the job already had \
+             — `Scheduling`'s pre-scheduling `stop_workers(_, None, _)` must not happen"
+        );
+        assert_eq!(
+            recorded_status(&db),
+            ("Failed".to_string(), Some("parquet".to_string())),
+            "and the execution is recorded under the job's own immutable selector, never the \
+             refused row's"
+        );
+        assert!(
+            recorded_failure(&db)
+                .expect("the job must be failed")
+                .contains("refused"),
+            "and failed for the refusal, not for something the rescheduling attempt hit"
+        );
+    }
+
+    /// The same guarantee on the constructor route, where nothing had recorded the refusal
+    /// before the job's state task existed at all.
+    ///
+    /// [`StateMachine::new`] adopts a job and *then* looks at the row's refusal, so a cold
+    /// controller picking up a still-running job whose row already names another backend
+    /// started a task into `Compiling` before anything about the refusal had been recorded.
+    /// The refusal now reaches the job's gate before the adoption starts anything.
+    #[tokio::test]
+    async fn a_cold_adopted_job_is_failed_by_its_refusal_before_it_schedules_anything() {
+        let db = sqlite_startable_job("Running", 2);
+        let scheduler = Arc::new(RecordingScheduler::default());
+        let current = running_config(StateBackendSelector::Parquet);
+        // Held for the whole test: the spawned task has to run, not just exist.
+        let shutdown = LiveShutdown::new();
+
+        let sm = StateMachine::new(
+            polled(
+                StateBackendSelector::Parquet,
+                current.clone(),
+                Some(selector_changed()),
+            ),
+            job_status(current.restart_nonce),
+            db.clone(),
+            scheduler.clone(),
+            shutdown.guard().clone_temporary(),
+            Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+        )
+        .await;
+
+        assert!(
+            !sm.done(),
+            "the still-running job is adopted — the refusal has to reach it, and a job with \
+             no state task can be told nothing"
+        );
+
+        assert_eq!(
+            drive_to_completion(&sm, &db).await,
+            [
+                ("Compiling".to_string(), 1),
+                ("Failing".to_string(), 1),
+                ("Failed".to_string(), 1),
+            ],
+            "but the adopted task is failed at its first state, so a row the controller has \
+             already rejected never reschedules the execution it was adopted to administer"
+        );
+        assert_eq!(scheduler.started.lock().unwrap().as_slice(), []);
+        assert_eq!(
+            scheduler.stopped.lock().unwrap().as_slice(),
+            [("job_abc".to_string(), Some(1))]
+        );
+    }
+
+    /// The other direction, and the control that makes the two tests above mean something.
+    ///
+    /// The gate must fire for a refused job and for nothing else. An ordinary job — same
+    /// fixture, same scheduler, same states — must still reach [`Scheduling`], advance its
+    /// generation there and clear whatever cluster was there before it. If it did not, "no
+    /// generation advance and no teardown" above would be a statement about the harness
+    /// rather than about the refusal.
+    ///
+    /// The task then panics inside `Scheduling::start_workers`, at
+    /// `arroyo_server_common::get_cluster_id`, which no test sets: the panic is expected and
+    /// is printed by the runtime. It happens *after* both things asserted here, and it is why
+    /// they are the generation and the teardown rather than the `start_workers` call itself.
+    #[tokio::test]
+    async fn an_unrefused_job_still_reaches_scheduling_and_advances_its_generation() {
+        let db = sqlite_startable_job("Running", 2);
+        let scheduler = Arc::new(RecordingScheduler::default());
+        let current = running_config(StateBackendSelector::Parquet);
+        // Held for the whole test: the spawned task has to run, not just exist.
+        let shutdown = LiveShutdown::new();
+
+        let sm = StateMachine::new(
+            polled(StateBackendSelector::Parquet, current.clone(), None),
+            job_status(current.restart_nonce),
+            db.clone(),
+            scheduler.clone(),
+            shutdown.guard().clone_temporary(),
+            Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+        )
+        .await;
+        assert!(!sm.done(), "an unrefused running job is adopted");
+
+        let writes = drive_to_completion(&sm, &db).await;
+        assert!(
+            writes.starts_with(&[
+                ("Compiling".to_string(), 1),
+                ("Scheduling".to_string(), 1),
+                ("Scheduling".to_string(), 2),
+            ]),
+            "a job with nothing wrong with it must reach `Scheduling` and advance its \
+             generation there, which is exactly what the refused job above must not do; \
+             wrote {writes:?}"
+        );
+        assert_eq!(
+            scheduler.stopped.lock().unwrap().as_slice(),
+            [("job_abc".to_string(), None)],
+            "and it must clear the existing cluster before scheduling — the destructive \
+             teardown the refused job must never reach"
+        );
+    }
+
+    /// The ordering half of the fix, pinned on statement order rather than on behaviour.
+    ///
+    /// The gate can only stop a state task that was handed a refusal before that task ran,
+    /// so every path that starts one has to record the refusal first. On the multi-threaded
+    /// runtime the controller actually runs on, a task spawned before the refusal is recorded
+    /// can reach `Compiling` — and from there `Scheduling` — on another worker thread while
+    /// the poll that spawned it is still on its way to recording it. There are exactly two
+    /// such paths, and both are covered here.
+    ///
+    /// **This is a structural pin, not a behavioural test, and deliberately so.** The window
+    /// it closes is a thread interleaving of a few instructions: a test that raced it would
+    /// pass or fail by scheduling luck, and every `#[tokio::test]` here runs on a
+    /// current-thread runtime where the window does not exist at all. What the gate does once
+    /// the refusal *is* recorded is covered behaviourally, by
+    /// `a_known_refusal_fails_the_restarted_task_before_it_can_reschedule_the_job` and
+    /// `a_cold_adopted_job_is_failed_by_its_refusal_before_it_schedules_anything`.
+    #[test]
+    fn both_paths_that_start_a_job_are_written_to_record_the_refusal_first() {
+        let source = include_str!("mod.rs");
+
+        let body_of = |signature: &str| -> &str {
+            let start = source
+                .find(signature)
+                .unwrap_or_else(|| panic!("{signature} has been renamed"));
+            let rest = &source[start..];
+            &rest[..rest.find("\n    }\n").expect("unterminated function body")]
+        };
+
+        for (name, signature, starters) in [
+            (
+                "apply_refused_row",
+                "    async fn apply_refused_row(",
+                ["self.request_stop(", "self.restart_if_needed("].as_slice(),
+            ),
+            (
+                "StateMachine::new",
+                "    pub async fn new(",
+                ["this.start(", "this.apply_refused_row("].as_slice(),
+            ),
+        ] {
+            let body = body_of(signature);
+            let recorded = body.find("note_refused_row(").unwrap_or_else(|| {
+                panic!("{name} must record the refused row before it does anything else")
+            });
+            for starter in starters {
+                let started = body
+                    .find(starter)
+                    .unwrap_or_else(|| panic!("{name} must still call {starter}"));
+                assert!(
+                    recorded < started,
+                    "{name} must record the refusal before {starter}: a state task started \
+                     first can reach `Scheduling` on another thread before anything has \
+                     applied the refusal to it"
+                );
+            }
+        }
+    }
+
+    /// A refused row that asks for a stop must still be answered by the stop, not by the
+    /// gate.
+    ///
+    /// The gate fails the job wherever it is, which is the right policy for a refusal that
+    /// has no other answer and the wrong one for a refusal that does: a `checkpoint` or
+    /// `graceful` stop exists to take a final checkpoint, and a job failed on its way into
+    /// [`Stopping`] would end in `Failed` without one. So a refusal recorded as answered by
+    /// a stop publishes nothing to the gate, and supersedes anything already published.
+    #[tokio::test]
+    async fn a_refusal_a_stop_is_answering_never_reaches_the_gate() {
+        for stop_mode in [
+            StopMode::checkpoint,
+            StopMode::graceful,
+            StopMode::immediate,
+            StopMode::force,
+        ] {
+            let current = running_config(StateBackendSelector::Parquet);
+            let (mut sm, _rx) = state_machine(current.clone(), StateBackendSelector::Parquet);
+
+            // First the row is only bad, so a refusal is published for the gate to apply.
+            sm.update(
+                polled(
+                    StateBackendSelector::Parquet,
+                    current.clone(),
+                    Some(selector_changed()),
+                ),
+                job_status(current.restart_nonce),
+                &shutdown_guard(),
+            )
+            .await;
+            assert!(
+                sm.refusal_gate.clone().take().is_some(),
+                "{stop_mode:?}: a refusal with no other answer must gate the next state"
+            );
+
+            // Then the operator applies the remedy the refusal itself documents.
+            let mut stopping = running_config(StateBackendSelector::Parquet);
+            stopping.stop_mode = stop_mode;
+            sm.update(
+                polled(
+                    StateBackendSelector::Parquet,
+                    stopping,
+                    Some(selector_changed()),
+                ),
+                job_status(current.restart_nonce),
+                &shutdown_guard(),
+            )
+            .await;
+
+            assert!(
+                sm.refusal_gate.clone().take().is_none(),
+                "{stop_mode:?}: once a stop is answering the refusal, the gate must let the \
+                 job reach `Stopping` — failing it first is what loses the final checkpoint"
+            );
+            assert_eq!(
+                sm.config.read().unwrap().0.stop_mode,
+                stop_mode,
+                "{stop_mode:?}: and the stop is the thing that was actually issued"
+            );
+        }
+    }
+
+    /// A repaired row clears the gate as well as the queue.
+    ///
+    /// Round 5's versioning saves a repaired job from a refusal already sitting in its queue.
+    /// The gate is a second holder of the same refusal and must be superseded by the same
+    /// repair — otherwise the gate would fail a job for a configuration that no longer
+    /// exists, which is round 5's bug reintroduced on a new route.
+    #[tokio::test]
+    async fn a_repair_supersedes_the_refusal_the_gate_is_holding() {
+        let current = running_config(StateBackendSelector::Parquet);
+        let (mut sm, _rx) = state_machine(current.clone(), StateBackendSelector::Parquet);
+
+        sm.update(
+            polled(
+                StateBackendSelector::Parquet,
+                current.clone(),
+                Some(selector_changed()),
+            ),
+            job_status(current.restart_nonce),
+            &shutdown_guard(),
+        )
+        .await;
+        assert!(
+            sm.refusal_gate.clone().take().is_some(),
+            "the refusal must gate the next state while the row is bad"
+        );
+
+        sm.update(
+            polled(StateBackendSelector::Parquet, current.clone(), None),
+            job_status(current.restart_nonce),
+            &shutdown_guard(),
+        )
+        .await;
+        assert!(
+            sm.refusal_gate.clone().take().is_none(),
+            "and must stop gating the moment the operator repairs the row"
+        );
+
+        // The control: the gate is still live, so a row that goes bad again gates afresh.
+        sm.update(
+            polled(
+                StateBackendSelector::Parquet,
+                current.clone(),
+                Some(selector_changed()),
+            ),
+            job_status(current.restart_nonce),
+            &shutdown_guard(),
+        )
+        .await;
+        assert!(
+            sm.refusal_gate.clone().take().is_some(),
+            "the test would not detect the supersession if the gate never fired again"
+        );
+    }
+
+    /// A state that stands in for one already blocked on the job's channel when a refusal
+    /// arrives: the poll thread reaches the job while the state is running, so the refusal is
+    /// published to the gate *and* queued, and the state reads it off the channel itself.
+    ///
+    /// That is the prompt route the gate does not replace, and the only way to reach
+    /// [`execute_state`]'s fatal handling with a refusal the gate has not already applied.
+    /// The real states that take it — `Running`, `Scheduling`'s worker loop, `LeaderRunning`
+    /// — all need a live scheduler, worker set and `JobController` to run.
+    #[derive(Debug)]
+    struct ReadsItsRefusal(RefusedConfig);
+
+    #[async_trait::async_trait]
+    impl State for ReadsItsRefusal {
+        fn name(&self) -> &'static str {
+            "ReadsItsRefusal"
+        }
+
+        async fn next(self: Box<Self>, ctx: &mut JobContext) -> Result<Transition, StateError> {
+            ctx.refusal_gate.publish(self.0.clone());
+            ctx.handle(JobMessage::ConfigRefused(self.0))?;
+            unreachable!("a current refusal fails the job")
+        }
+    }
+
+    /// One refusal fails the job once, whichever of its two routes reached the job first.
+    ///
+    /// The gate is consulted before every state, so a refusal a state has already read off
+    /// its own channel would otherwise be applied a second time — failing the job again
+    /// before [`Failing`] could tear the cluster down, and reporting the same fatal error
+    /// twice on the way to `Failed`.
+    #[tokio::test]
+    async fn a_refusal_a_state_read_itself_does_not_gate_the_failure_that_follows_it() {
+        let db = sqlite_startable_job("Running", 2);
+        let refusal = RefusedConfig::new(selector_changed(), 1, Arc::new(AtomicU64::new(1)));
+
+        let mut harness = Harness::new(3).with_db(db.clone());
+        let ctx = harness.ctx(
+            running_config(StateBackendSelector::Parquet),
+            StateBackendSelector::Parquet,
+        );
+
+        let (next, ctx) = execute_state(Box::new(ReadsItsRefusal(refusal)), ctx).await;
+        assert_eq!(
+            next.as_ref().map(|s| s.name()),
+            Some("Failing"),
+            "a refusal a state reads for itself still fails the job"
+        );
+
+        let (next, _ctx) = execute_state(next.unwrap(), ctx).await;
+        assert_eq!(
+            next.as_ref().map(|s| s.name()),
+            Some("Failed"),
+            "and the gate must then let the failure run: one refusal is one failure, \
+             whichever of its two routes reached the job first"
+        );
+        assert_eq!(
+            state_writes(&db),
+            [("Failing".to_string(), 1), ("Failed".to_string(), 1)],
+            "so the job goes to `Failed` through one `Failing`, not two"
+        );
+    }
+
+    /// The same rule at the level of the gate itself, including that a *later* refusal is a
+    /// different fact about the job and still applies.
+    #[test]
+    fn the_gate_applies_each_refusal_once_and_a_later_one_afresh() {
+        let mut gate = RefusalGate::default();
+        let version = Arc::new(AtomicU64::new(7));
+        gate.publish(RefusedConfig::new(
+            selector_changed(),
+            7,
+            Arc::clone(&version),
+        ));
+
+        // What a state that read the refusal off its own channel leaves behind.
+        gate.disarm();
+        assert!(
+            gate.take().is_none(),
+            "a refusal a state has already turned fatal must not be turned fatal again"
+        );
+
+        // A *later* refusal is a different fact about the job and still gates, which is what
+        // keeps a job restarting out of `Failed` from restarting into a refused row.
+        version.store(8, std::sync::atomic::Ordering::SeqCst);
+        gate.publish(RefusedConfig::new(selector_changed(), 8, version));
+        assert!(gate.take().is_some());
+        assert!(
+            gate.take().is_none(),
+            "and each refusal is applied at most once"
         );
     }
 
@@ -3582,8 +4427,9 @@ mod tests {
         );
         assert_eq!(
             harness.scheduler.stopped.lock().unwrap().as_slice(),
-            ["job_abc"],
-            "`Failed` still tears the cluster down; refusing the row does not skip cleanup"
+            [("job_abc".to_string(), Some(1))],
+            "`Failed` still tears the cluster down, under the generation it knows; refusing \
+             the row does not skip cleanup"
         );
 
         // the control: had the new nonce been adopted, Failed would have restarted

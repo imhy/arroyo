@@ -493,6 +493,14 @@ impl RefusedConfig {
         self.current.load(atomic::Ordering::SeqCst) == self.version
     }
 
+    /// The version this refusal was raised at.
+    ///
+    /// Read by the state task's `RefusalGate`, which is consulted before every state and
+    /// so has to be able to tell a refusal it has already turned fatal from a new one.
+    pub(crate) fn version(&self) -> u64 {
+        self.version
+    }
+
     /// The error this refusal reports, or `None` if it has been superseded since it was
     /// queued and must not be acted on.
     pub(crate) fn into_current_error(self) -> Option<StateBackendError> {
