@@ -246,13 +246,11 @@ struct ExecutionPlan {
 /// every sibling request carried on, past the point where a refusal could be published.
 ///
 /// Making the requests children of this future was necessary but not sufficient, because
-/// dropping a `tonic` client future is not revocation. It resets the stream; it does not stop a
-/// server handler that has already been entered. The production worker's `start_execution` takes
-/// a `std::sync::Mutex` as its first statement and, on the `Idle` branch, sets the phase and
-/// spawns initialization without reaching an `.await`, so a handler blocked on that lock cannot
-/// be dropped and will start the worker once the lock frees — whatever the controller has since
-/// decided. Round 11's fail-fast `?` therefore released the admission on the strength of a
-/// cancellation the worker was under no obligation to honour.
+/// dropping a `tonic` client future is not revocation. It resets the stream; it does not prove
+/// what a server handler already did. The worker therefore never blocks inside the handler: a
+/// contended phase lock returns `Aborted` without applying anything, and the controller retries
+/// that same ID under the admission. Once the worker acquires the lock, recording the ID, setting
+/// `Initializing`, and spawning initialization are one synchronous poll.
 ///
 /// So this function does not cancel anything. It **settles** everything:
 ///
@@ -263,10 +261,12 @@ struct ExecutionPlan {
 ///   underneath it, so a cancelled task cannot release the admission either.
 ///
 /// A transport error is not an answer from the worker: `Endpoint::timeout` is client-side and a
-/// reset stream does not revoke a handler that already entered the server. Every request therefore
-/// carries a stable non-empty `start_execution_id`. On an ambiguous timeout/reset this function
-/// retries the same ID while retaining the admission; the worker acknowledges a duplicate ID
-/// without applying it twice. Only an `Ok` or an explicit server status settles the attempt.
+/// reset stream does not prove whether the synchronous application completed. Every request
+/// therefore carries a stable non-empty `start_execution_id`. On an ambiguous timeout/reset this
+/// function retries the same ID while retaining the admission; the worker acknowledges a
+/// duplicate ID without applying it twice. `Aborted` is also retried because it is the worker's
+/// definitive "phase lock busy, nothing applied" response. Other explicit statuses settle the
+/// attempt.
 ///
 /// # Latency
 ///
@@ -366,10 +366,11 @@ async fn start_execution_on_workers(
                                                 | Code::Unknown
                                                 | Code::DeadlineExceeded
                                                 | Code::Unavailable
+                                                | Code::Aborted
                                         ) =>
                                     {
                                         warn!(
-                                            message = "StartExecution transport outcome is ambiguous; retrying the same id under admission",
+                                            message = "StartExecution is not settled; retrying the same id under admission",
                                             job_id = %job_id,
                                             pipeline_id = *pipeline_id,
                                             worker_id = id.0,

@@ -35,7 +35,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Display, Formatter};
 use std::mem;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, TryLockError};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::net::TcpListener;
 use tokio::select;
@@ -945,7 +945,19 @@ impl WorkerGrpc for WorkerServer {
         request: Request<StartExecutionReq>,
     ) -> Result<Response<StartExecutionResp>, Status> {
         let req = request.into_inner();
-        let mut phase = self.state.phase.lock().unwrap();
+        // Never park a server handler inside one synchronous poll. A client stream (or its
+        // controller process) can disappear while a blocking mutex wait is in progress, and
+        // tonic cannot cancel that poll; the stale handler could otherwise acquire the lock
+        // later and start behind a refusal published by a replacement controller.
+        let mut phase = match self.state.phase.try_lock() {
+            Ok(phase) => phase,
+            Err(TryLockError::WouldBlock) => {
+                return Err(Status::aborted("Worker execution phase is busy; retry"));
+            }
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(Status::internal("Worker execution phase lock is poisoned"));
+            }
+        };
 
         // A lost response is not a lost decision. The controller keeps the same admission
         // while retrying this ID, and this acknowledgement is what lets it resolve an
@@ -1588,6 +1600,7 @@ mod tests {
     use arroyo_rpc::state_backend::validate_leader_selector;
     use arroyo_server_common::shutdown::{Shutdown, SignalBehavior};
     use arroyo_types::TaskInfo;
+    use futures::FutureExt;
 
     fn req(state_backend: &str) -> StartExecutionReq {
         StartExecutionReq {
@@ -1651,6 +1664,19 @@ mod tests {
             start_execution_id: "attempt_1".to_string(),
             ..Default::default()
         };
+
+        let busy = {
+            let _phase = server.state.phase.lock().unwrap();
+            WorkerGrpc::start_execution(&server, Request::new(request.clone()))
+                .now_or_never()
+                .expect("a contended start returns synchronously")
+                .expect_err("a contended phase must not accept the request")
+        };
+        assert_eq!(busy.code(), tonic::Code::Aborted);
+        assert!(
+            server.state.start_execution_id.get().is_none(),
+            "returning Aborted must not record or apply the attempt"
+        );
 
         WorkerGrpc::start_execution(&server, Request::new(request.clone()))
             .await

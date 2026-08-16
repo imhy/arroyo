@@ -4791,13 +4791,39 @@ mod tests {
         /// Announces that it has been asked and then waits, so the controller has a
         /// `StartExecution` in flight for as long as the test wants one.
         Pausing(Arc<PausedWorker>),
-        /// Blocks the thread *inside a single poll* until the test lets it go, which is the
-        /// production handler's shape and the one no cancellation can reach. See
-        /// [`BlockedWorker`].
+        /// Blocks the thread *inside a single poll* until the test lets it go. This preserves
+        /// the legacy/adversarial server shape that no client cancellation can reach; current
+        /// production workers use `try_lock` and never create this window. See [`BlockedWorker`].
         Blocking(Arc<BlockedWorker>),
         /// Returns an ambiguous deadline once while server-side work carrying the request
         /// remains live, then acknowledges an idempotent retry of the same execution ID.
         AmbiguousOnce(Arc<AmbiguousStart>),
+        /// Returns the production worker's definitive lock-contention response once, then
+        /// accepts the retry. Both calls must carry the same execution ID.
+        BusyOnce(Arc<BusyStart>),
+    }
+
+    struct BusyStart {
+        calls: AtomicU64,
+        expected_id: Mutex<Option<String>>,
+    }
+
+    impl BusyStart {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                calls: AtomicU64::new(0),
+                expected_id: Mutex::new(None),
+            })
+        }
+
+        fn remember_or_check(&self, id: &str) {
+            assert!(!id.is_empty(), "every new controller attempt has an ID");
+            let mut expected = self.expected_id.lock().unwrap();
+            match expected.as_deref() {
+                Some(expected) => assert_eq!(expected, id, "a retry must keep its attempt ID"),
+                None => *expected = Some(id.to_string()),
+            }
+        }
     }
 
     /// Models the ordering a client-side timeout creates: the client has an `Err`, but work
@@ -4912,11 +4938,11 @@ mod tests {
     /// controller drops the client future `tonic` can drop the handler and the request really
     /// is taken back. That is why round 11's tests passed and the hole stayed open.
     ///
-    /// The production handler does not yield. `WorkerGrpc::start_execution` takes
-    /// `self.state.phase.lock()` — a `std::sync::Mutex` — as its first statement and, on the
-    /// `Idle` branch, sets the phase to `Initializing` and spawns initialization without
-    /// reaching an `.await`. A future blocked *inside* `poll` cannot be dropped; the poll runs
-    /// to its end whatever has happened to the stream, and the worker starts.
+    /// The production handler used to take `self.state.phase.lock()` as its first statement.
+    /// A future blocked *inside* `poll` cannot be dropped; the poll runs to its end whatever
+    /// happened to the stream, and the worker could start later. Production now uses
+    /// `try_lock`, but this instrument remains as defense-in-depth coverage for a legacy or
+    /// independently implemented worker that still has the hostile shape.
     ///
     /// This reproduces exactly that: from the moment the handler is entered to the moment it
     /// returns there is no `.await`, and it blocks on a `std::sync::Mutex` in between. Nothing
@@ -5082,8 +5108,7 @@ mod tests {
                 StartsExecution::Blocking(blocked) => {
                     // No `.await` from here to the return. The thread is blocked inside this
                     // poll, so `tonic` cannot drop this future however the client's stream
-                    // ends — exactly as in `WorkerGrpc::start_execution`, which blocks on
-                    // `phase.lock()` and then starts the worker without yielding once.
+                    // ends — the legacy worker shape that `try_lock` removed from production.
                     let mut state = blocked.state.lock().unwrap();
                     state.inside = true;
                     blocked.changed.notify_all();
@@ -5144,6 +5169,14 @@ mod tests {
                         self.barriers.execution_started.notify_one();
                     }
                     return Ok(tonic::Response::new(StartExecutionResp {}));
+                }
+                StartsExecution::BusyOnce(busy) => {
+                    busy.remember_or_check(&request.start_execution_id);
+                    if busy.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        return Err(tonic::Status::aborted(
+                            "the worker phase lock is busy; nothing was applied",
+                        ));
+                    }
                 }
             }
             self.calls.start_execution.lock().unwrap().push(selector);
@@ -5866,12 +5899,10 @@ mod tests {
     // Round 13: settlement, not cancellation.
     //
     // Round 11 stopped the fan-out from *detaching* its requests, and the tests above prove it
-    // for a handler that yields. They prove nothing about the handler the controller actually
-    // talks to. `WorkerGrpc::start_execution` blocks on a `std::sync::Mutex` inside one poll
-    // and then sets the phase and spawns initialization without an `.await`, so a request the
-    // controller has "taken back" still starts the worker; the reset only means nobody is
-    // listening to the answer. Round 11's guarantee therefore rested on a cancellation the
-    // worker was under no obligation to honour.
+    // for a handler that yields. At the time, production `WorkerGrpc::start_execution` blocked
+    // on a `std::sync::Mutex` inside one poll and then started without an `.await`, so a reset
+    // only meant nobody was listening. Production now uses `try_lock`, but these tests retain
+    // the hostile handler as defense in depth and for mixed/legacy peers.
     //
     // What replaces it is a claim about what the controller knows rather than about what it can
     // stop: **no refusal is published while any `StartExecution` this job issued is unsettled**.
@@ -6065,10 +6096,9 @@ mod tests {
     }
 
     /// A client-side deadline is not a worker answer. The first handler here escapes the
-    /// failed RPC and remains able to apply the request, exactly as a production handler that
-    /// is blocked inside `phase.lock()` does. The controller must retain the admission, retry
-    /// the same execution ID, and receive an idempotent acknowledgement before a refusal can
-    /// be published.
+    /// failed RPC and remains able to apply the request, as a legacy handler blocked inside
+    /// `phase.lock()` could. The controller must retain the admission, retry the same execution
+    /// ID, and receive an idempotent acknowledgement before a refusal can be published.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_transport_error_is_reconciled_before_the_start_admission_is_released() {
         let ambiguous = AmbiguousStart::new();
@@ -6126,6 +6156,41 @@ mod tests {
             calls.started(),
             ["parquet".to_string()],
             "the stable execution ID makes the retry idempotent"
+        );
+    }
+
+    /// A busy worker phase is a definitive non-application, but it is transient. The worker
+    /// returns `Aborted` without parking a handler inside its mutex, and the controller retries
+    /// the same execution ID while the admission remains held.
+    #[tokio::test]
+    async fn a_busy_worker_phase_is_retried_under_the_same_start_admission() {
+        let busy = BusyStart::new();
+        let mut run = SchedulingRun::with_workers(
+            "busy-start-execution",
+            vec![StartsExecution::BusyOnce(busy.clone())],
+        )
+        .await;
+        let queue = run.harness.queue();
+        queue
+            .send(worker_connect_from(WorkerId(7), &run.address(0)))
+            .await
+            .unwrap();
+        queue.send(task_started()).await.unwrap();
+
+        let outcome = run.schedule().await;
+        let Ok(Transition::Advance(next)) = outcome else {
+            panic!("a transient busy phase must be retried rather than fail scheduling");
+        };
+        assert_eq!(next.state.name(), "Running");
+        assert_eq!(
+            busy.calls.load(Ordering::SeqCst),
+            2,
+            "the Aborted response must be retried exactly once in this fixture"
+        );
+        assert_eq!(
+            run.calls.started(),
+            ["parquet".to_string()],
+            "only the accepted retry starts the worker"
         );
     }
 
@@ -6356,9 +6421,9 @@ mod tests {
         // Round 11 read this as "the requests must not outlive the region", and made them
         // children of the state task so that every exit took them with it. That is all a
         // *client* future can be made to do. Dropping one resets its stream; it does not stop a
-        // server handler that has already been entered, and the production worker's handler
-        // blocks on a `std::sync::Mutex` inside a single poll and then starts the worker
-        // without yielding, so it cannot be dropped and does not care that nobody is listening.
+        // server handler that has already been entered. The current worker uses `try_lock` so
+        // it never parks there, but the fan-out still has to tolerate legacy or independently
+        // implemented handlers that block inside one poll and ignore the reset.
         //
         // So the fan-out no longer ends its requests: it waits for them, and owns the admission
         // while it does. `settle_under_admission` is what makes that survive the state task
