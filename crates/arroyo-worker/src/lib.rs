@@ -892,6 +892,14 @@ impl WorkerServer {
                     slots: std::thread::available_parallelism().unwrap().get() as u64,
                 }),
                 slots: config.worker.task_slots as u64,
+                // Asserted here because `WorkerGrpc::start_execution` below implements all
+                // three clauses of the contract: it acknowledges a repeat of an accepted
+                // `start_execution_id` without applying it twice, it answers a contended
+                // phase lock with `Aborted` from `try_lock` rather than parking inside its
+                // own poll, and it reserves `Unavailable` for transport by answering every
+                // authoritative phase with `failed_precondition`. A worker that does not
+                // set this is not sent a `StartExecution` at all.
+                reconciles_start_execution: true,
             }))
             .await?;
 

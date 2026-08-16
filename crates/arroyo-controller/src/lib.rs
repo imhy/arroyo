@@ -529,6 +529,14 @@ pub enum JobMessage {
         rpc_address: String,
         data_address: String,
         slots: usize,
+        /// Whether this worker advertised `RegisterWorkerReq::reconciles_start_execution`.
+        ///
+        /// Carried from registration rather than probed later because it has to be known
+        /// *before* the first `StartExecution`, and registration is the only worker→
+        /// controller message that is guaranteed to precede one. `false` is the proto3
+        /// default and so is what a worker predating the field reports; see
+        /// `states::scheduling::Scheduling::next`, which refuses to fan out to one.
+        reconciles_start_execution: bool,
     },
     WorkerInitializationComplete {
         worker_id: WorkerId,
@@ -589,6 +597,7 @@ impl ControllerGrpc for ControllerServer {
                 rpc_address: req.rpc_address,
                 data_address: req.data_address,
                 slots: req.slots as usize,
+                reconciles_start_execution: req.reconciles_start_execution,
             },
         )
         .await?;

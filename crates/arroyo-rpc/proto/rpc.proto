@@ -26,6 +26,20 @@ message RegisterWorkerReq {
   string data_address = 5;
   WorkerResources resources = 6;
   uint64 slots = 8;
+  // Set by a worker that implements the StartExecution reconciliation contract, all three
+  // clauses of which the controller relies on and none of which it can observe:
+  //
+  //   1. a repeated non-empty `start_execution_id` is acknowledged idempotently, so a lost
+  //      response can be resolved by replaying the same attempt;
+  //   2. a contended execution phase returns `Aborted` having applied nothing, rather than
+  //      parking the handler inside one synchronous poll where no reset can reach it;
+  //   3. no authoritative answer about the worker's phase uses `Unavailable`, so that code
+  //      means "transport" and nothing else.
+  //
+  // False is the proto3 default and is therefore exactly what a worker predating this field
+  // reports. The controller does not issue StartExecution to such a worker at all: see
+  // `Scheduling::next` in arroyo-controller, which fails the scheduling attempt instead.
+  bool reconciles_start_execution = 9;
 }
 
 message RegisterWorkerResp {

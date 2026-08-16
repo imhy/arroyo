@@ -48,6 +48,23 @@ use arroyo_state_protocol::workflow::{
 use arroyo_worker::job_controller::committing_state::{CheckpointIdOrRef, CommittingState};
 use arroyo_worker::job_controller::job_metrics::JobMetrics;
 
+/// How many times the fan-out re-offers an unsettled `start_execution_id` to a worker before
+/// it gives the attempt up, on top of the first request.
+///
+/// This bounds how long the controller tries to *learn* an outcome. It is deliberately not a
+/// deadline on the admission, and the distinction is the whole of why ending the loop is safe:
+/// see the terminal-path section of [`start_execution_on_workers`]. Every peer the fan-out can
+/// reach has advertised the reconciliation contract — `Scheduling::next` refuses to schedule
+/// otherwise — so its handler decides within one synchronous poll of receiving a request and
+/// can never be parked. What the controller loses by stopping is knowledge of whether the
+/// worker started, and that is recovered by failing the attempt: the retry's preamble raises
+/// the generation and tears the old one down.
+pub(crate) const START_EXECUTION_RECONCILE_ATTEMPTS: usize = 8;
+
+/// The pause between those attempts. Short, because the common case is a worker that is
+/// momentarily busy rather than one that is gone.
+const START_EXECUTION_RECONCILE_DELAY: Duration = Duration::from_millis(250);
+
 #[derive(Debug, Clone)]
 struct WorkerStatus {
     id: WorkerId,
@@ -56,6 +73,9 @@ struct WorkerStatus {
     data_address: String,
     slots: usize,
     state: WorkerState,
+    /// Whether this worker advertised the `StartExecution` reconciliation contract at
+    /// registration. See [`JobMessage::WorkerConnect`] and [`START_EXECUTION_RECONCILE_ATTEMPTS`].
+    reconciles_start_execution: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -121,6 +141,7 @@ async fn handle_worker_connect<'a>(
             rpc_address,
             data_address,
             slots,
+            reconciles_start_execution,
             ..
         } => {
             let job_id = ctx.config.id.clone();
@@ -146,6 +167,7 @@ async fn handle_worker_connect<'a>(
                     data_address,
                     slots,
                     state: WorkerState::Connected,
+                    reconciles_start_execution,
                 },
             );
 
@@ -268,13 +290,50 @@ struct ExecutionPlan {
 /// definitive "phase lock busy, nothing applied" response. Other explicit statuses settle the
 /// attempt.
 ///
+/// # Why every peer here is one that can be reconciled
+///
+/// All three of those readings are claims about the *peer*, not about the protocol: that a
+/// repeated ID is idempotent, that `Aborted` means nothing was applied, and that `Unavailable`
+/// is never an answer. A worker predating the contract satisfies none of them, so
+/// `Scheduling::next` fails the attempt rather than fan out to one — see the check above the
+/// call site. That is a precondition of this function, and the terminal path below depends on
+/// it as much as the retry does.
+///
+/// # The terminal path, and why it is not a deadline
+///
+/// Retrying an ID no one ever answers cannot go on forever: the loop owns the admission, so a
+/// worker that dies or stays partitioned during `StartExecution` would wedge the job — unable
+/// to reschedule and unable to accept a refusal — for the life of the controller process.
+///
+/// After [`START_EXECUTION_RECONCILE_ATTEMPTS`] unsettled attempts the request is given up and
+/// reported as an error, which the caller turns into the same retryable [`StateError`] as any
+/// other failure. What makes that safe is not that enough time has passed — a deadline would
+/// release the admission while a request could still be applied, which is exactly the hazard
+/// this region exists for. It is that **for a peer that advertised the contract there is no
+/// state in which a received request is pending application**: the handler takes `try_lock`
+/// and, on the `Idle` branch, records the ID, sets the phase and spawns initialization within
+/// one synchronous poll, without an `.await` anywhere between. So a request that reached the
+/// worker was decided at the instant it arrived, and the only thing that can cause a *new*
+/// application after this function stops is this function issuing another attempt. Ceasing to
+/// offer it is therefore the terminal event, and the loop bound decides how long the controller
+/// tries to *learn* the outcome, not whether it is still exposed to one.
+///
+/// What is lost by stopping is that knowledge — whether the worker started. It is recovered by
+/// failing the attempt rather than by holding the admission: the next `Scheduling` pass raises
+/// the job's generation, persists it, and tears the previous generation down before it starts
+/// replacements, so a worker that did start is stopped by the ordinary path.
+///
+/// The residual is the one already disclosed for this region: a request still in transit when
+/// the last attempt's stream is reset can arrive afterwards, and that is bounded by the
+/// transport rather than by anything the controller holds.
+///
 /// # Latency
 ///
 /// An explicit server error costs the slowest sibling instead of returning at once. An ambiguous
-/// transport failure intentionally has no local deadline: the admission remains held until the
-/// worker can authoritatively acknowledge or reject the stable attempt ID. This favors refusal
-/// safety over retry latency during a partition; state-task cancellation still hands the whole
-/// settling region to [`settle_under_admission`].
+/// transport failure costs up to [`START_EXECUTION_RECONCILE_ATTEMPTS`] further attempts, each
+/// separated by [`START_EXECUTION_RECONCILE_DELAY`] and each bounded by the channel's own 90s
+/// `Endpoint::timeout`; state-task cancellation still hands the whole settling region to
+/// [`settle_under_admission`].
 ///
 /// # Errors
 ///
@@ -347,6 +406,7 @@ async fn start_execution_on_workers(
                                     state_backend: state_backend.as_str().to_string(),
                                     start_execution_id,
                                 };
+                            let mut unsettled = 0usize;
                             loop {
                                 match c.start_execution(Request::new(request.clone())).await {
                                     Ok(_) => {
@@ -369,6 +429,29 @@ async fn start_execution_on_workers(
                                                 | Code::Aborted
                                         ) =>
                                     {
+                                        unsettled += 1;
+                                        if unsettled > START_EXECUTION_RECONCILE_ATTEMPTS {
+                                            // The terminal path. Not a deadline on the
+                                            // admission: what ends the attempt is the
+                                            // controller ceasing to offer it, and a peer that
+                                            // advertised the contract cannot be holding a
+                                            // parked handler for it.
+                                            error!(
+                                                message = "StartExecution never settled; giving the attempt up so the job can be rescheduled",
+                                                job_id = %job_id,
+                                                pipeline_id = *pipeline_id,
+                                                worker_id = id.0,
+                                                machine_id = *machine_id.0,
+                                                start_execution_id = %request.start_execution_id,
+                                                attempts = unsettled,
+                                                error = format!("{:?}", e),
+                                            );
+                                            break Err(anyhow!(
+                                                "worker {id:?} never settled StartExecution \
+                                                 {} after {unsettled} attempts: {e}",
+                                                request.start_execution_id
+                                            ));
+                                        }
                                         warn!(
                                             message = "StartExecution is not settled; retrying the same id under admission",
                                             job_id = %job_id,
@@ -376,9 +459,10 @@ async fn start_execution_on_workers(
                                             worker_id = id.0,
                                             machine_id = *machine_id.0,
                                             start_execution_id = %request.start_execution_id,
+                                            attempt = unsettled,
                                             error = format!("{:?}", e),
                                         );
-                                        tokio::time::sleep(Duration::from_millis(250)).await;
+                                        tokio::time::sleep(START_EXECUTION_RECONCILE_DELAY).await;
                                     }
                                     Err(e) => {
                                         error!(
@@ -1254,6 +1338,41 @@ impl State for Scheduling {
         // admission out from under it. A dropped client future is not a stopped worker, so
         // "nothing is still asking a worker to start" is established by waiting for the
         // answers rather than by taking the requests away. See `start_execution_on_workers`.
+        // Nothing below may be issued to a worker that has not advertised the reconciliation
+        // contract, and this is where that is enforced — before the admission is taken, because
+        // refusing to schedule is not an irreversible effect and awaits nothing.
+        //
+        // Everything the fan-out does with an unsettled request assumes all three clauses of
+        // that contract: it replays the same `start_execution_id` expecting an idempotent
+        // acknowledgement, it reads `Unavailable` as transport rather than as an answer, and it
+        // ends the attempt in the knowledge that no handler can be parked waiting for a phase
+        // lock. A worker predating the contract satisfies none of them — it ignores the ID, it
+        // answers `Unavailable` from its `Initializing` branch, and it takes the phase lock
+        // blocking, so a handler of its can still be inside `poll` when the controller that
+        // issued it exits and cannot be reached by any refusal a replacement publishes.
+        //
+        // So the mixed-version case is removed rather than reasoned about. This is the
+        // worker-first rollout requirement made mechanical: a controller of this version never
+        // puts a request into a worker that cannot reconcile it, which is what lets the
+        // interlock below be a property of the operation instead of a property of the peer.
+        let unreconciled: Vec<u64> = workers
+            .values()
+            .filter(|w| !w.reconciles_start_execution)
+            .map(|w| w.id.0)
+            .collect();
+        if !unreconciled.is_empty() {
+            return Err(ctx.retryable(
+                self,
+                "workers predating the StartExecution reconciliation contract",
+                anyhow!(
+                    "workers {unreconciled:?} did not advertise \
+                     `reconciles_start_execution`; upgrade the worker image to at least this \
+                     controller's version before scheduling this job"
+                ),
+                10,
+            ));
+        }
+
         let machine_ids: HashMap<WorkerId, MachineId> = workers
             .iter()
             .map(|(id, status)| (*id, status.machine_id.clone()))

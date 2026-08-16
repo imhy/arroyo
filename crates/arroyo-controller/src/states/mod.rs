@@ -1488,9 +1488,19 @@ impl Admission {
 /// needs — and [`RefusalGate::admit_publication`] never waits, so contention with it defers a
 /// refusal to the next poll rather than blocking anything (round 6's rule).
 ///
-/// The region is bounded by the RPC deadline the worker channels are built with
-/// (`Endpoint::timeout`, 90s in `handle_worker_connect`), so the detached task, and with it the
-/// deferral of any refusal for that job, is bounded by the same.
+/// # What bounds the region
+///
+/// Not the RPC deadline alone. The worker channels are built with `Endpoint::timeout` (90s in
+/// `handle_worker_connect`), but the fan-out treats an ambiguous transport outcome as a reason
+/// to *retry* the same attempt ID, so one deadline expiring only started another wait: this
+/// paragraph used to claim a 90s bound that the retry loop had already made false, and a worker
+/// that stayed unreachable held the region — and with it the deferral of any refusal for that
+/// job — indefinitely.
+///
+/// The bound is now the fan-out's own terminal path: at most
+/// `START_EXECUTION_RECONCILE_ATTEMPTS` further attempts, each bounded by that same deadline,
+/// after which the attempt is given up and the region ends. See `start_execution_on_workers`
+/// for why ending it is a statement about the peer's handler rather than about elapsed time.
 ///
 /// # Two cases it does not cover, both deliberate
 ///
@@ -2520,7 +2530,7 @@ mod tests {
         handle_unhandled_message,
     };
     use crate::schedulers::{Scheduler, SchedulerError, StartPipelineReq};
-    use crate::states::scheduling::Scheduling;
+    use crate::states::scheduling::{START_EXECUTION_RECONCILE_ATTEMPTS, Scheduling};
     use crate::types::public::{RestartMode, StopMode};
     use crate::{
         JobConfig, JobMessage, JobStatus, PipelineInfo, PolledJob, RefusedConfig, StateContext,
@@ -4801,6 +4811,37 @@ mod tests {
         /// Returns the production worker's definitive lock-contention response once, then
         /// accepts the retry. Both calls must carry the same execution ID.
         BusyOnce(Arc<BusyStart>),
+        /// Answers `Unavailable` to every attempt, forever, and never applies anything.
+        ///
+        /// A worker that is reachable but permanently unable to settle — the shape a partition
+        /// or a half-dead peer presents to the controller, and the one the retry loop used to
+        /// spin on at 250ms for the life of the process.
+        NeverSettling(Arc<NeverSettles>),
+    }
+
+    /// Counts the attempts a [`StartsExecution::NeverSettling`] worker refuses, and checks that
+    /// every one of them replays the same attempt ID rather than inventing a new one.
+    struct NeverSettles {
+        calls: AtomicU64,
+        expected_id: Mutex<Option<String>>,
+    }
+
+    impl NeverSettles {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                calls: AtomicU64::new(0),
+                expected_id: Mutex::new(None),
+            })
+        }
+
+        fn remember_or_check(&self, id: &str) {
+            assert!(!id.is_empty(), "every new controller attempt has an ID");
+            let mut expected = self.expected_id.lock().unwrap();
+            match expected.as_deref() {
+                Some(expected) => assert_eq!(expected, id, "a retry must keep its attempt ID"),
+                None => *expected = Some(id.to_string()),
+            }
+        }
     }
 
     struct BusyStart {
@@ -5178,6 +5219,15 @@ mod tests {
                         ));
                     }
                 }
+                StartsExecution::NeverSettling(never) => {
+                    never.remember_or_check(&request.start_execution_id);
+                    never.calls.fetch_add(1, Ordering::SeqCst);
+                    // Nothing is ever recorded in `calls.start_execution`: this worker does
+                    // not apply, it only fails to settle.
+                    return Err(tonic::Status::unavailable(
+                        "this worker can never settle the request",
+                    ));
+                }
             }
             self.calls.start_execution.lock().unwrap().push(selector);
             self.barriers.execution_started.notify_one();
@@ -5272,7 +5322,26 @@ mod tests {
     ///
     /// One slot per worker throughout, so "how many workers" and "how many slots the program
     /// needs" are the same number and a test states it once.
+    ///
+    /// Advertises the `StartExecution` reconciliation contract, which is what a worker of this
+    /// version does. [`legacy_worker_connect_from`] is the other generation.
     fn worker_connect_from(worker_id: WorkerId, rpc_address: &str) -> JobMessage {
+        worker_connect_advertising(worker_id, rpc_address, true)
+    }
+
+    /// The `WorkerConnect` a worker predating the reconciliation contract would send.
+    ///
+    /// `reconciles_start_execution` is a proto3 `bool`, so a registration from such a worker
+    /// decodes with it `false` — this is that registration, not a synthetic marker.
+    fn legacy_worker_connect_from(worker_id: WorkerId, rpc_address: &str) -> JobMessage {
+        worker_connect_advertising(worker_id, rpc_address, false)
+    }
+
+    fn worker_connect_advertising(
+        worker_id: WorkerId,
+        rpc_address: &str,
+        reconciles_start_execution: bool,
+    ) -> JobMessage {
         JobMessage::WorkerConnect {
             worker_id,
             machine_id: MachineId(Arc::new(format!("machine_{}", worker_id.0))),
@@ -5280,6 +5349,7 @@ mod tests {
             rpc_address: rpc_address.to_string(),
             data_address: "127.0.0.1:1".to_string(),
             slots: 1,
+            reconciles_start_execution,
         }
     }
 
@@ -6191,6 +6261,252 @@ mod tests {
             run.calls.started(),
             ["parquet".to_string()],
             "only the accepted retry starts the worker"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Round 15: a peer that never answers, and a peer that cannot be reasoned with.
+    //
+    // Rounds 13 and 14 made the admission survive every way the *controller* could let go of a
+    // request early. What neither addressed is a request that never settles at all: the retry
+    // loop had no terminal path, so a worker that died or stayed partitioned during
+    // `StartExecution` held the admission — and with it the job's ability to reschedule or to
+    // accept a refusal — for the life of the controller process.
+    //
+    // That had a deterministic mixed-version form. A worker predating the reconciliation
+    // contract answers its `Initializing` phase with `Unavailable`, which this loop reads as
+    // "transport, retry"; every authoritative answer such a worker can give was therefore
+    // classified as ambiguous and retried forever. The same worker takes its phase lock
+    // *blocking*, so one of its handlers can still be inside `poll` when the controller that
+    // issued it exits, where no refusal a replacement controller publishes can reach it.
+    //
+    // Both are answered by the same two-part fix, and each part is load-bearing for the other:
+    //
+    //   * `Scheduling::next` will not fan out to a worker that has not advertised the contract,
+    //     so every peer the loop can be talking to is one whose handler cannot park; and
+    //   * because of that, the loop can end. Ceasing to offer the attempt is the terminal
+    //     event — not the passage of time — since a peer that received it decided within one
+    //     synchronous poll.
+    // ---------------------------------------------------------------------------------------
+
+    /// How long these tests allow for an outcome that the fixed code reaches in about two
+    /// seconds of bounded retries, and that the unfixed code never reaches at all.
+    ///
+    /// Generous on purpose: it is not measuring anything. It exists so that "the fan-out never
+    /// terminates" is reported as a failure instead of hanging the suite.
+    const TERMINAL_PATH_GRACE: Duration = Duration::from_secs(60);
+
+    /// A `StartExecution` that never settles must end the fan-out, not hold the admission for
+    /// the life of the controller.
+    ///
+    /// The worker here is reachable and capable — it advertised the contract — and answers
+    /// `Unavailable` to every attempt, which is what a partition or a half-dead peer looks
+    /// like from the controller. Before the fix the loop retried that at 250ms with no exit:
+    /// the admission was never released, so the job could neither be rescheduled nor be
+    /// refused, and the "bounded by the RPC deadline" claim on `settle_under_admission` was
+    /// false because each expiry started another attempt.
+    ///
+    /// What is asserted is the pair: the attempt is given up after a bounded number of
+    /// *replays of the same ID* (not a new attempt each time, which would be a second way to
+    /// start a worker twice), and a refusal can be published the moment it is.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_permanently_unsettled_start_execution_ends_the_fan_out_and_releases_the_admission() {
+        let never = NeverSettles::new();
+        let mut run = SchedulingRun::with_workers(
+            "never-settling-start-execution",
+            vec![StartsExecution::NeverSettling(never.clone())],
+        )
+        .await;
+        let gate = run.harness.refusal_gate.clone();
+        run.harness
+            .queue()
+            .send(worker_connect_from(WorkerId(7), &run.address(0)))
+            .await
+            .unwrap();
+
+        let outcome = tokio::time::timeout(TERMINAL_PATH_GRACE, run.schedule())
+            .await
+            .expect(
+                "the fan-out must give an unsettleable attempt up: with no terminal path the \
+                 loop retries at 250ms forever and the job can never reschedule or be refused",
+            );
+
+        let Err(err) = outcome else {
+            panic!("a fan-out no worker ever accepted cannot have succeeded");
+        };
+        assert!(
+            format!("{err:?}").contains("failed to initialize workers"),
+            "and it must fail as a retryable scheduling error, so the next attempt raises the \
+             generation and tears the old one down: {err:?}"
+        );
+        assert_eq!(
+            never.calls.load(Ordering::SeqCst) as usize,
+            START_EXECUTION_RECONCILE_ATTEMPTS + 1,
+            "the first request plus a bounded number of reconciliation attempts, every one of \
+             them a replay of the same attempt ID"
+        );
+        assert!(
+            gate.admit_publication().is_some(),
+            "and the admission must be free once the attempt is over: holding it past the last \
+             request the controller will ever issue defers every refusal for this job forever"
+        );
+        assert_eq!(
+            run.calls.started(),
+            Vec::<String>::new(),
+            "nothing started: this worker never applied anything, which is why giving the \
+             attempt up loses knowledge rather than safety"
+        );
+    }
+
+    /// A worker predating the reconciliation contract must never be sent a `StartExecution` at
+    /// all.
+    ///
+    /// This is the mixed-version case of both round-15 findings, and it is removed rather than
+    /// reasoned about. The worker here has the legacy shape end to end: it registers with
+    /// `reconciles_start_execution` at its proto3 default of `false`, and its handler blocks
+    /// the thread *inside one poll* on a `std::sync::Mutex`, which no stream reset and no
+    /// controller exit can reach.
+    ///
+    /// Before the fix the controller sent it a request, that handler parked, and the fan-out
+    /// spun on `Unavailable` forever. The assertion is that the handler is never entered — a
+    /// request that was never issued is the only kind that certainly cannot be parked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_worker_predating_the_reconciliation_contract_is_never_sent_a_start_execution() {
+        let blocked = BlockedWorker::new();
+        // Declared first, so it is dropped last: on unfixed code the handler is inside its
+        // wait when the assertions fire, and without this the suite hangs there instead of
+        // reporting. See `ReleasedOnDrop`.
+        let _released = ReleasedOnDrop(blocked.clone());
+        let mut run = SchedulingRun::with_workers(
+            "legacy-worker-not-scheduled",
+            vec![StartsExecution::Blocking(blocked.clone())],
+        )
+        .await;
+        blocked.watch(run.harness.refusal_gate.clone());
+        run.harness
+            .queue()
+            .send(legacy_worker_connect_from(WorkerId(7), &run.address(0)))
+            .await
+            .unwrap();
+
+        let outcome = tokio::time::timeout(TERMINAL_PATH_GRACE, run.schedule())
+            .await
+            .expect(
+                "scheduling must fail on the legacy worker rather than issue it a request that \
+                 parks a handler nothing can reach",
+            );
+
+        let Err(err) = outcome else {
+            panic!("a job whose workers cannot reconcile a StartExecution must not be scheduled");
+        };
+        assert!(
+            format!("{err:?}").contains("reconciles_start_execution"),
+            "and it must say which worker property is missing, because the remedy is an \
+             operator action — upgrade the worker image: {err:?}"
+        );
+        assert!(
+            !blocked.started(),
+            "the legacy handler must never have been entered: this is the whole guarantee, \
+             since a handler blocked inside its own poll cannot be taken back once it has been"
+        );
+        assert_eq!(
+            run.calls.started(),
+            Vec::<String>::new(),
+            "and nothing was started under any selector"
+        );
+    }
+
+    /// Replacing the controller must not leave a legacy handler behind a fresh refusal gate.
+    ///
+    /// The reviewer's scenario, and the one the in-memory admission cannot answer on its own: a
+    /// `RefusalGate` lives in the `StateMachine`, so a replacement controller builds a new one
+    /// and its `admit_publication` succeeds immediately, however many handlers the previous
+    /// controller left parked in a worker.
+    ///
+    /// The fix does not make that gate durable. It removes what the durability would have been
+    /// for: a controller of this version never issues a `StartExecution` to a worker that could
+    /// park one, so after any number of controller replacements there is no parked legacy
+    /// handler for a fresh gate to be raced by. This runs that end to end — schedule under the
+    /// first controller, drop it whole, publish a refusal on the replacement's brand-new gate,
+    /// and only then let the handler out — and asserts the handler was never entered by either.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_controller_replacement_leaves_no_legacy_start_execution_handler_behind_its_gate() {
+        let blocked = BlockedWorker::new();
+        let _released = ReleasedOnDrop(blocked.clone());
+
+        // The first controller, with its own gate, which goes away with it.
+        let mut first = SchedulingRun::with_workers(
+            "legacy-across-controller-replacement",
+            vec![StartsExecution::Blocking(blocked.clone())],
+        )
+        .await;
+        let worker_address = first.address(0);
+        first
+            .harness
+            .queue()
+            .send(legacy_worker_connect_from(WorkerId(7), &worker_address))
+            .await
+            .unwrap();
+        let first_outcome = tokio::time::timeout(TERMINAL_PATH_GRACE, first.schedule())
+            .await
+            .expect("the first controller must not park a handler in the legacy worker");
+        assert!(
+            first_outcome.is_err(),
+            "the first controller refuses to schedule onto a legacy worker"
+        );
+
+        // The controller process is replaced: a different `StateMachine`, and with it a
+        // different `RefusalGate` and a different admission mutex. Nothing in memory survives.
+        drop(first);
+        let mut replacement = SchedulingRun::with_workers(
+            "legacy-across-controller-replacement-2",
+            vec![StartsExecution::Blocking(blocked.clone())],
+        )
+        .await;
+        let fresh_gate = replacement.harness.refusal_gate.clone();
+        blocked.watch(fresh_gate.clone());
+        replacement
+            .harness
+            .queue()
+            .send(legacy_worker_connect_from(
+                WorkerId(7),
+                &replacement.address(0),
+            ))
+            .await
+            .unwrap();
+        let replacement_outcome = tokio::time::timeout(TERMINAL_PATH_GRACE, replacement.schedule())
+            .await
+            .expect("nor may the replacement");
+        assert!(replacement_outcome.is_err());
+
+        // The refusal the old handler was supposed to be able to start behind.
+        let admission = fresh_gate
+            .admit_publication()
+            .expect("the replacement's gate is free: nothing was ever issued under it");
+        fresh_gate.publish(
+            &admission,
+            RefusedConfig::new(selector_changed(), 1, Arc::new(AtomicU64::new(1))),
+        );
+        drop(admission);
+
+        // And now let the handler out, which is where the hazard would materialise.
+        blocked.release();
+        tokio::task::yield_now().await;
+
+        assert!(
+            !blocked.started(),
+            "a legacy handler started behind a refusal published by a replacement controller: \
+             the only defence against that is never to have issued it a request, and one was \
+             issued"
+        );
+        assert!(
+            !blocked.saw_refusal(),
+            "and it cannot have observed the replacement's refusal, because it never ran"
+        );
+        assert_eq!(
+            replacement.calls.started(),
+            Vec::<String>::new(),
+            "nothing started under the replacement either"
         );
     }
 
