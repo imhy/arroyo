@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{select, sync::Mutex, task::JoinHandle};
-use tonic::Request;
+use tonic::{Code, Request};
 use tracing::{debug, error, info, warn};
 
 use super::{
@@ -262,20 +262,19 @@ struct ExecutionPlan {
 ///   [`settle_under_admission`] keeps both together if the job's state task is dropped
 ///   underneath it, so a cancelled task cannot release the admission either.
 ///
-/// What that buys is the only property the controller can actually enforce from this side: at
-/// the first instant a refusal can be published, every `StartExecution` this job issued has an
-/// answer, and nothing is in flight to race it. It does not, and cannot, claim that a worker
-/// which accepted under an unrefused configuration is prevented from executing it; nor that a
-/// request the *transport* failed (a reset connection, the 90s per-request deadline) proves its
-/// handler did nothing. Either of those would need the worker to acknowledge an admission back,
-/// which is a protocol change across the proto, the worker and the controller.
+/// A transport error is not an answer from the worker: `Endpoint::timeout` is client-side and a
+/// reset stream does not revoke a handler that already entered the server. Every request therefore
+/// carries a stable non-empty `start_execution_id`. On an ambiguous timeout/reset this function
+/// retries the same ID while retaining the admission; the worker acknowledges a duplicate ID
+/// without applying it twice. Only an `Ok` or an explicit server status settles the attempt.
 ///
 /// # Latency
 ///
-/// An error now costs the slowest sibling instead of returning at once. That is bounded by the
-/// per-request deadline the worker channels are built with (`Endpoint::timeout`, 90s, in
-/// [`handle_worker_connect`]) — the same bound the all-succeed path already had, so the region's
-/// worst case is unchanged and only its error path has moved to meet it.
+/// An explicit server error costs the slowest sibling instead of returning at once. An ambiguous
+/// transport failure intentionally has no local deadline: the admission remains held until the
+/// worker can authoritatively acknowledge or reject the stable attempt ID. This favors refusal
+/// safety over retry latency during a partition; state-task cancellation still hands the whole
+/// settling region to [`settle_under_admission`].
 ///
 /// # Errors
 ///
@@ -313,6 +312,11 @@ async fn start_execution_on_workers(
                         let leader_addr = leader_addr.clone();
                         let checkpoint_manifest_ref = plan.checkpoint_manifest_ref.clone();
                         let state_backend = plan.state_backend;
+                        let start_execution_id = format!(
+                            "{:016x}{:016x}",
+                            rand::random::<u64>(),
+                            rand::random::<u64>()
+                        );
                         let (restore_epoch, start_epoch, min_epoch, checkpoint_interval_micros) = (
                             plan.restore_epoch,
                             plan.start_epoch,
@@ -329,8 +333,7 @@ async fn start_execution_on_workers(
                                 machine_id = *machine_id.0,
                             );
 
-                            match c
-                                .start_execution(Request::new(StartExecutionReq {
+                            let request = StartExecutionReq {
                                     restore_epoch,
                                     start_epoch,
                                     min_epoch,
@@ -342,10 +345,11 @@ async fn start_execution_on_workers(
                                     checkpoint_interval_micros,
                                     checkpoint_manifest_ref,
                                     state_backend: state_backend.as_str().to_string(),
-                                }))
-                                .await
-                            {
-                                Ok(_) => {
+                                    start_execution_id,
+                                };
+                            loop {
+                                match c.start_execution(Request::new(request.clone())).await {
+                                    Ok(_) => {
                                     debug!(
                                         message = "worker entered initialization phase",
                                         job_id = %job_id,
@@ -353,10 +357,30 @@ async fn start_execution_on_workers(
                                         worker_id = id.0,
                                         machine_id = *machine_id.0,
                                     );
-                                    Ok((id, c))
-                                }
-                                Err(e) => {
-                                    error!(
+                                        break Ok((id, c));
+                                    }
+                                    Err(e)
+                                        if matches!(
+                                            e.code(),
+                                            Code::Cancelled
+                                                | Code::Unknown
+                                                | Code::DeadlineExceeded
+                                                | Code::Unavailable
+                                        ) =>
+                                    {
+                                        warn!(
+                                            message = "StartExecution transport outcome is ambiguous; retrying the same id under admission",
+                                            job_id = %job_id,
+                                            pipeline_id = *pipeline_id,
+                                            worker_id = id.0,
+                                            machine_id = *machine_id.0,
+                                            start_execution_id = %request.start_execution_id,
+                                            error = format!("{:?}", e),
+                                        );
+                                        tokio::time::sleep(Duration::from_millis(250)).await;
+                                    }
+                                    Err(e) => {
+                                        error!(
                                         message = "failed to start execution on worker",
                                         job_id = %job_id,
                                         pipeline_id = *pipeline_id,
@@ -364,7 +388,10 @@ async fn start_execution_on_workers(
                                         machine_id = *machine_id.0,
                                         error = format!("{:?}", e),
                                     );
-                                    Err(anyhow!("failed to start execution on worker {id:?}: {e}"))
+                                        break Err(anyhow!(
+                                            "failed to start execution on worker {id:?}: {e}"
+                                        ));
+                                    }
                                 }
                             }
                         }

@@ -507,6 +507,10 @@ message StartExecutionReq {
   // "parquet", which is also what a request from a controller predating this field
   // decodes as
   string state_backend = 11;
+  // Identifies one controller attempt. Workers must treat a repeated non-empty ID as an
+  // idempotent retry, so a client-side timeout can be reconciled without starting twice or
+  // releasing the controller's admission while the first handler may still be running.
+  string start_execution_id = 12;
 }
 
 message StartExecutionResp {

@@ -240,6 +240,13 @@ pub struct WorkerState {
     /// lets that controller detect a disagreement before it administers the job. Set from
     /// [`StartExecutionReq::state_backend`] as the execution starts and never reassigned.
     state_backend: Arc<OnceLock<StateBackendSelector>>,
+    /// The non-empty idempotency key of the execution this worker accepted.
+    ///
+    /// A controller retries the same `StartExecution` after an ambiguous transport outcome.
+    /// Keeping the key beside the phase lets the worker acknowledge that retry without
+    /// starting the execution twice. A worker process is generation-scoped, so this is never
+    /// cleared: even a retry delayed until after `JobFinished` must not replay the execution.
+    start_execution_id: Arc<OnceLock<String>>,
 }
 
 impl WorkerState {
@@ -774,6 +781,7 @@ impl WorkerServer {
                 checkpoint_history: Arc::new(Mutex::new(CheckpointHistory::default())),
                 metrics: Arc::new(OnceLock::new()),
                 state_backend: Arc::new(OnceLock::new()),
+                start_execution_id: Arc::new(OnceLock::new()),
             },
             shutdown_guard,
         }
@@ -936,17 +944,38 @@ impl WorkerGrpc for WorkerServer {
         &self,
         request: Request<StartExecutionReq>,
     ) -> Result<Response<StartExecutionResp>, Status> {
+        let req = request.into_inner();
         let mut phase = self.state.phase.lock().unwrap();
+
+        // A lost response is not a lost decision. The controller keeps the same admission
+        // while retrying this ID, and this acknowledgement is what lets it resolve an
+        // otherwise ambiguous client timeout/reset without applying the request twice.
+        if !req.start_execution_id.is_empty()
+            && self.state.start_execution_id.get().map(String::as_str)
+                == Some(req.start_execution_id.as_str())
+        {
+            return Ok(Response::new(StartExecutionResp {}));
+        }
 
         match &*phase {
             WorkerExecutionPhase::Idle => {
+                if !req.start_execution_id.is_empty()
+                    && self
+                        .state
+                        .start_execution_id
+                        .set(req.start_execution_id.clone())
+                        .is_err()
+                {
+                    return Err(Status::failed_precondition(
+                        "Worker already accepted another execution",
+                    ));
+                }
                 *phase = WorkerExecutionPhase::Initializing {
                     started_at: SystemTime::now(),
                 };
 
                 // Spawn async initialization
                 let state = self.state.clone();
-                let req = request.into_inner();
                 let shutdown_guard = self.shutdown_guard.clone_temporary();
 
                 self.shutdown_guard.spawn_temporary(async move {
@@ -957,7 +986,10 @@ impl WorkerGrpc for WorkerServer {
                 Ok(Response::new(StartExecutionResp {}))
             }
             WorkerExecutionPhase::Initializing { .. } => {
-                Err(Status::unavailable("Worker is initializing"))
+                // `Unavailable` is reserved for ambiguous transport outcomes: the controller
+                // retries those under its admission. This is an authoritative application
+                // response for another attempt, so it must use a definitive status.
+                Err(Status::failed_precondition("Worker is initializing"))
             }
             WorkerExecutionPhase::WaitingOnLeader { .. } => {
                 Err(Status::failed_precondition("Worker is waiting for leader"))
@@ -1554,6 +1586,7 @@ mod tests {
     use crate::job_controller::JobControllerStatus;
     use arroyo_rpc::checkpoints::{CheckpointMetadataStore, CreateCheckpointReq};
     use arroyo_rpc::state_backend::validate_leader_selector;
+    use arroyo_server_common::shutdown::{Shutdown, SignalBehavior};
     use arroyo_types::TaskInfo;
 
     fn req(state_backend: &str) -> StartExecutionReq {
@@ -1597,6 +1630,57 @@ mod tests {
             assert_eq!(decoded.state_backend, selector.as_str());
             assert_eq!(request_state_backend(&decoded, "job_1").unwrap(), selector);
         }
+    }
+
+    /// A controller retries the same ID after a client-side timeout because that timeout says
+    /// nothing about whether this handler ran. The retry must acknowledge the first decision
+    /// without starting twice; a different attempt must still be rejected while this execution
+    /// owns the worker.
+    #[tokio::test]
+    async fn start_execution_retries_are_idempotent_by_execution_id() {
+        let shutdown = Shutdown::new("start-execution-id-test", SignalBehavior::None);
+        let server = WorkerServer::new(
+            MachineId(Arc::new("machine_1".to_string())),
+            WorkerId(1),
+            PipelineId(Arc::new("pipeline_1".to_string())),
+            JobId(Arc::new("job_1".to_string())),
+            1,
+            shutdown.guard("worker"),
+        );
+        let request = StartExecutionReq {
+            start_execution_id: "attempt_1".to_string(),
+            ..Default::default()
+        };
+
+        WorkerGrpc::start_execution(&server, Request::new(request.clone()))
+            .await
+            .expect("the first attempt is accepted");
+        WorkerGrpc::start_execution(&server, Request::new(request.clone()))
+            .await
+            .expect("the identical retry acknowledges the accepted attempt");
+
+        WorkerGrpc::job_finished(&server, Request::new(JobFinishedReq {}))
+            .await
+            .expect("the worker can finish the accepted execution");
+        WorkerGrpc::start_execution(&server, Request::new(request))
+            .await
+            .expect("a delayed retry after completion is acknowledged, not replayed");
+        assert!(
+            matches!(
+                *server.state.phase.lock().unwrap(),
+                WorkerExecutionPhase::Idle
+            ),
+            "acknowledging the delayed retry must not initialize the worker again"
+        );
+
+        let different = StartExecutionReq {
+            start_execution_id: "attempt_2".to_string(),
+            ..Default::default()
+        };
+        let error = WorkerGrpc::start_execution(&server, Request::new(different))
+            .await
+            .expect_err("a different attempt cannot reuse a busy worker");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     }
 
     /// An unrecognized value fails the worker start with a typed error naming the job,

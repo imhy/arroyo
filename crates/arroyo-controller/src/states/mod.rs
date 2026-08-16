@@ -4795,6 +4795,47 @@ mod tests {
         /// production handler's shape and the one no cancellation can reach. See
         /// [`BlockedWorker`].
         Blocking(Arc<BlockedWorker>),
+        /// Returns an ambiguous deadline once while server-side work carrying the request
+        /// remains live, then acknowledges an idempotent retry of the same execution ID.
+        AmbiguousOnce(Arc<AmbiguousStart>),
+    }
+
+    /// Models the ordering a client-side timeout creates: the client has an `Err`, but work
+    /// carrying that request is still alive on the server. The original work and the retry
+    /// rendezvous before applying, and the stable execution ID makes exactly one of them the
+    /// application while the other is an acknowledgement.
+    struct AmbiguousStart {
+        calls: AtomicU64,
+        expected_id: Mutex<Option<String>>,
+        applied: std::sync::atomic::AtomicBool,
+        retry_entered: tokio::sync::Notify,
+        rendezvous: tokio::sync::Barrier,
+    }
+
+    impl AmbiguousStart {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                calls: AtomicU64::new(0),
+                expected_id: Mutex::new(None),
+                applied: std::sync::atomic::AtomicBool::new(false),
+                retry_entered: tokio::sync::Notify::new(),
+                // The escaped first handler, its retry, and the test that releases both.
+                rendezvous: tokio::sync::Barrier::new(3),
+            })
+        }
+
+        fn remember_or_check(&self, id: &str) {
+            assert!(!id.is_empty(), "every new controller attempt has an ID");
+            let mut expected = self.expected_id.lock().unwrap();
+            match expected.as_deref() {
+                Some(expected) => assert_eq!(expected, id, "a retry must keep its attempt ID"),
+                None => *expected = Some(id.to_string()),
+            }
+        }
+
+        fn apply_once(&self) -> bool {
+            !self.applied.swap(true, Ordering::SeqCst)
+        }
     }
 
     /// A worker that has been asked to start executing and has not answered yet.
@@ -5028,7 +5069,8 @@ mod tests {
             &self,
             request: tonic::Request<StartExecutionReq>,
         ) -> Result<tonic::Response<StartExecutionResp>, tonic::Status> {
-            let selector = request.into_inner().state_backend;
+            let request = request.into_inner();
+            let selector = request.state_backend.clone();
             match &self.starts_execution {
                 StartsExecution::Accepting => {}
                 StartsExecution::FailingOnce(after) => {
@@ -5074,6 +5116,33 @@ mod tests {
                     self.calls.start_execution.lock().unwrap().push(selector);
                     paused.settle(PausedOutcome::Applied);
                     self.barriers.execution_started.notify_one();
+                    return Ok(tonic::Response::new(StartExecutionResp {}));
+                }
+                StartsExecution::AmbiguousOnce(ambiguous) => {
+                    ambiguous.remember_or_check(&request.start_execution_id);
+                    if ambiguous.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        // This is the server work the client-side deadline cannot revoke.
+                        let ambiguous = ambiguous.clone();
+                        let calls = self.calls.clone();
+                        let barriers = self.barriers.clone();
+                        tokio::spawn(async move {
+                            ambiguous.rendezvous.wait().await;
+                            if ambiguous.apply_once() {
+                                calls.start_execution.lock().unwrap().push(selector);
+                                barriers.execution_started.notify_one();
+                            }
+                        });
+                        return Err(tonic::Status::deadline_exceeded(
+                            "the client stopped waiting while the handler remained live",
+                        ));
+                    }
+
+                    ambiguous.retry_entered.notify_one();
+                    ambiguous.rendezvous.wait().await;
+                    if ambiguous.apply_once() {
+                        self.calls.start_execution.lock().unwrap().push(selector);
+                        self.barriers.execution_started.notify_one();
+                    }
                     return Ok(tonic::Response::new(StartExecutionResp {}));
                 }
             }
@@ -5992,6 +6061,71 @@ mod tests {
             ["parquet".to_string()],
             "the worker did start: a request the controller could not recall was answered \
              before the refusal, which is the order the invariant is about"
+        );
+    }
+
+    /// A client-side deadline is not a worker answer. The first handler here escapes the
+    /// failed RPC and remains able to apply the request, exactly as a production handler that
+    /// is blocked inside `phase.lock()` does. The controller must retain the admission, retry
+    /// the same execution ID, and receive an idempotent acknowledgement before a refusal can
+    /// be published.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_transport_error_is_reconciled_before_the_start_admission_is_released() {
+        let ambiguous = AmbiguousStart::new();
+        let mut run = SchedulingRun::with_workers(
+            "ambiguous-start-execution",
+            vec![StartsExecution::AmbiguousOnce(ambiguous.clone())],
+        )
+        .await;
+
+        let gate = run.harness.refusal_gate.clone();
+        let queue = run.harness.queue();
+        let execution_started = run.barriers.clone();
+        let calls = run.calls.clone();
+        queue
+            .send(worker_connect_from(WorkerId(7), &run.address(0)))
+            .await
+            .unwrap();
+
+        let mut scheduling = std::pin::pin!(run.schedule());
+        tokio::select! {
+            _ = &mut scheduling => {
+                panic!("an ambiguous transport result must be retried under admission")
+            }
+            retry = tokio::time::timeout(
+                SETTLEMENT_GRACE,
+                ambiguous.retry_entered.notified(),
+            ) => {
+                retry.expect("the ambiguous result must cause an idempotent retry");
+            }
+        }
+
+        assert!(
+            gate.admit_publication().is_none(),
+            "the admission must remain held after the client deadline while the original \
+             server work can still apply the request"
+        );
+
+        // Release the escaped handler and its idempotent retry together. Exactly one applies;
+        // the other acknowledges the same stable execution ID.
+        ambiguous.rendezvous.wait().await;
+        execution_started.execution_started.notified().await;
+        queue.send(task_started()).await.unwrap();
+
+        let outcome = scheduling.await;
+        let Ok(Transition::Advance(next)) = outcome else {
+            panic!("the reconciled execution must continue scheduling");
+        };
+        assert_eq!(next.state.name(), "Running");
+        assert_eq!(
+            ambiguous.calls.load(Ordering::SeqCst),
+            2,
+            "the ambiguous call must be retried"
+        );
+        assert_eq!(
+            calls.started(),
+            ["parquet".to_string()],
+            "the stable execution ID makes the retry idempotent"
         );
     }
 
