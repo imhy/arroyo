@@ -29,15 +29,20 @@
 //! An interruption in M11.T25 therefore ends the same way the landed M11.T08 path ends one —
 //! by returning the [`StateError`] that caused it, after reconciling what can be reconciled
 //! in memory. Nothing here claims that a partitioned worker has been fenced.
+//!
+//! The one thing an interruption does *not* have to end as is a failure. What the job's single
+//! writer said while the attempt was fencing decides that: a stop it decided on ends the
+//! attempt as a stop, and a configuration it has since repaired stops the attempt being fatal
+//! for one the job no longer has. See [`Fencing::coalesce_intent`].
 
 use std::collections::BTreeSet;
 
 use arroyo_types::WorkerId;
 use tracing::info;
 
-use super::admission::PhaseContext;
+use super::admission::{FencedIntent, PhaseContext};
 use super::fanout::IssuedAttempts;
-use crate::states::StateError;
+use crate::states::{StateError, Transition};
 
 /// The worker generations a stale request issued by this scheduling attempt could still be
 /// delivered to.
@@ -115,13 +120,27 @@ impl FenceReconciliation {
     }
 }
 
-/// Whether coalescing found a newer lifecycle intent.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Whether coalescing found a newer lifecycle intent, and what it did about it.
 pub(crate) enum IntentCoalescing {
-    /// The job's writer has said nothing new since the last look.
+    /// The job's writer has said nothing that changes how this attempt ends.
     Unchanged,
     /// A newer decision was folded into the standing reason for fencing.
     Coalesced,
+    /// The writer decided the job stops. The attempt ends as that stop rather than as a
+    /// failure, and this is the transition it ends with.
+    Leave(Transition),
+}
+
+impl IntentCoalescing {
+    /// What happened, for the log. A word rather than a `Debug` derive because the stop
+    /// carries a [`Transition`], which is a state to move to and not a value to print.
+    fn as_str(&self) -> &'static str {
+        match self {
+            IntentCoalescing::Unchanged => "unchanged",
+            IntentCoalescing::Coalesced => "coalesced",
+            IntentCoalescing::Leave(_) => "leaving",
+        }
+    }
 }
 
 /// A job that is fencing: reconciling what it issued, and publishing nothing.
@@ -223,24 +242,65 @@ impl<'a, 'ctx> Fencing<'a, 'ctx> {
         changed
     }
 
-    /// Folds whatever the job's single writer has decided since the last look into the
-    /// standing reason for fencing.
+    /// Folds whatever the job's single writer has decided since the last look into how this
+    /// attempt ends.
     ///
-    /// While a job fences, a further decision is not a further transition: there is nothing
-    /// left to stop and nothing that may be published. So an intent read here is *coalesced*
-    /// — recorded as the reason this attempt ends — rather than applied.
-    /// A stop decided here is deliberately *not* turned into a transition. There is nothing
-    /// left to leave for: the attempt has already ended, and this is the reason it ended being
-    /// recorded rather than a phase deciding what to do next. Only a refusal — which changes
-    /// what the job is reported as failing for — is folded in.
+    /// A fencing job has stopped *doing* things — there is no admission to spend and nothing
+    /// that may be published — so nothing read here is applied as work. What it still has to
+    /// decide is what the attempt is **reported as**, and that is not a question a stale answer
+    /// may settle: the standing reason was produced under a configuration the writer may since
+    /// have replaced, and failing a job for a configuration it no longer has is the same defect
+    /// `RefusedConfig::into_current_error` closes on the M11.T08 path.
+    ///
+    /// So every kind of newer decision changes something here, not only a refusal:
+    ///
+    /// * **A newer refusal** replaces the standing reason. It is the newest thing known about
+    ///   the job's configuration and it is fatal either way.
+    /// * **A stop** ends the attempt as a stop. Earlier revisions of this method argued that a
+    ///   stop read while fencing was not worth turning into a transition because the attempt
+    ///   had already ended — which is true of the *work* and false of the *outcome*. A job that
+    ///   has been asked to stop must end in `Stopped`, with whatever final checkpoint its stop
+    ///   mode asks for, and not in `Failed` for a refusal the stop was the operator's answer
+    ///   to. That is D96 row 7, `stop_wins_over_refusal`, read at this end of the mechanism.
+    /// * **A repaired configuration** — an adoption that does not ask the job to stop — cannot
+    ///   undo what already went wrong, so a standing *retryable* reason is left exactly as it
+    ///   is, with its own budget and its own message: the workers still failed to start. What
+    ///   it can do is remove the one thing that would have made this attempt **fatal**, because
+    ///   a fatal reason here is the job being failed outright for a configuration that has since
+    ///   been replaced. That is D96 row 9, `repaired_row_not_failed_by_stale_intent`.
+    ///
+    /// Nothing here publishes `Refused` or touches a fence: that needs the durable record
+    /// M11.T26 owns.
     pub(crate) fn coalesce_intent(&mut self, standing: &mut StateError) -> IntentCoalescing {
-        match self.ctx.observe_intent_in_wait() {
-            Ok(_) => IntentCoalescing::Unchanged,
+        match self.ctx.observe_intent_in_fencing() {
+            Ok(FencedIntent::Unchanged) => IntentCoalescing::Unchanged,
+            Ok(FencedIntent::Leave(stop)) => IntentCoalescing::Leave(stop),
+            Ok(FencedIntent::Superseded) => self.supersede(standing),
             Err(newer) => {
                 *standing = newer;
                 IntentCoalescing::Coalesced
             }
         }
+    }
+
+    /// Applies a newer, successful decision to the standing reason.
+    ///
+    /// Fatal becomes retryable and nothing else changes — see [`Self::coalesce_intent`] for
+    /// why the two cases are not symmetric.
+    fn supersede(&self, standing: &mut StateError) -> IntentCoalescing {
+        if matches!(standing, StateError::RetryableError { .. }) {
+            return IntentCoalescing::Unchanged;
+        }
+        *standing = self.ctx.retryable(
+            "the configuration this scheduling attempt failed under has been superseded",
+            anyhow::anyhow!(
+                "the job's lifecycle writer adopted a newer configuration while the attempt was \
+                 fencing; rescheduling under it rather than failing the job for one it no longer \
+                 has"
+            ),
+            10,
+        );
+        IntentCoalescing::Coalesced
     }
 
     /// The targets this job is fencing against.
@@ -284,14 +344,22 @@ impl<'a, 'ctx> Interrupted<'a, 'ctx> {
     /// exactly as the selected one does. Turning a settled reconciliation into a published
     /// `Refused` is M11.T26's, and needs the durable fence this half deliberately does not
     /// have.
-    pub(crate) fn reconcile_and_report(mut self) -> StateError {
+    ///
+    /// The `Ok` half is a job that ends by *stopping*: an interruption is not always a failure,
+    /// because the writer may have answered the refusal that caused it by asking the job to
+    /// stop. Reporting that as an error would fail a job the operator asked to be stopped, and
+    /// would throw away the final checkpoint its stop mode called for.
+    pub(crate) fn reconcile_and_report(mut self) -> Result<Transition, StateError> {
         let reconciliation = self.fencing.reconcile();
         let coalescing = self.fencing.coalesce_intent(&mut self.reason);
         info!(
             settled = reconciliation.is_settled(),
-            coalesced = matches!(coalescing, IntentCoalescing::Coalesced),
+            coalescing = coalescing.as_str(),
             "a scheduling attempt ended in token-free fencing"
         );
-        self.reason
+        match coalescing {
+            IntentCoalescing::Leave(stop) => Ok(stop),
+            IntentCoalescing::Unchanged | IntentCoalescing::Coalesced => Err(self.reason),
+        }
     }
 }

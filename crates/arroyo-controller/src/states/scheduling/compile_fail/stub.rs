@@ -110,7 +110,7 @@ pub mod scheduling {
             ) -> (Admission, IssuedAttempts, Result<(), StateError>) {
                 unimplemented!()
             }
-            pub fn settlement_owner(&self) -> Option<&dyn SettlementOwner> {
+            pub fn settlement_owner(&self) -> Option<std::sync::Arc<dyn SettlementOwner>> {
                 None
             }
             pub async fn await_message_from_tasks(&mut self) -> Result<PhaseWait, StateError> {
@@ -153,7 +153,7 @@ pub mod scheduling {
             }
         }
 
-        pub trait SettlementOwner {
+        pub trait SettlementOwner: Send + Sync {
             fn take_over(&self, bundle: SettlementBundle);
         }
 
@@ -178,7 +178,7 @@ pub mod scheduling {
 
     pub mod fencing {
         use super::admission::PhaseContext;
-        use crate::states::StateError;
+        use crate::states::{StateError, Transition};
 
         pub struct Fencing<'a, 'ctx> {
             marker: std::marker::PhantomData<PhaseContext<'a, 'ctx>>,
@@ -196,7 +196,7 @@ pub mod scheduling {
             pub fn fencing_mut(&mut self) -> &mut Fencing<'a, 'ctx> {
                 unimplemented!()
             }
-            pub fn reconcile_and_report(self) -> StateError {
+            pub fn reconcile_and_report(self) -> Result<Transition, StateError> {
                 unimplemented!()
             }
         }

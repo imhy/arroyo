@@ -8,9 +8,9 @@
 //! * [`IssuedAttempts`] and the live [`AttemptLedger`] the fan-out writes it through — the
 //!   explicit inventory of what was issued, the fan-out's own record of what it is waiting to
 //!   hear about, rather than an inference from which futures are still alive; and
-//! * [`SettlementBundle`] and [`SettlementOwner`], the typed means by which an interrupted
-//!   fan-out hands that inventory **and** the lifecycle authority to an owner that outlives
-//!   it, as one unit.
+//! * [`SettlementBundle`] and [`SettlementOwner`] — in the [`settlement`] child module — the
+//!   typed means by which an interrupted fan-out hands that inventory **and** the lifecycle
+//!   authority to an owner that outlives it, as one unit.
 //!
 //! # What M11.T25 does not claim
 //!
@@ -25,19 +25,23 @@
 //! [`PhaseContext::settlement_owner`] is always `None`, so the only outcome a transfer can
 //! have in this half is [`SettlementOutcome::SettledInPlace`] — the landed
 //! [`settle_under_admission`](crate::states::settle_under_admission) rescue, which is
-//! retained unchanged on the production path. M11.T26 supplies the cancellation-resistant
-//! per-job owner and the durable recovery that make a transfer meaningful.
+//! retained on the production path and whose behaviour with no owner is what it always was.
+//! M11.T26 supplies the cancellation-resistant per-job owner and the durable recovery that
+//! make a transfer meaningful.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use arroyo_rpc::grpc::api;
 use arroyo_types::{MachineId, WorkerId};
-use tracing::info;
 
 use super::ExecutionPlan;
 use super::admission::PhaseContext;
-use crate::states::{Admission, StateError};
+use crate::states::{Admission, SettlementRescue, StateError};
+
+pub(crate) mod settlement;
+
+pub(crate) use settlement::{SettlementBundle, SettlementOutcome, SettlementOwner, hand_over};
 
 /// One `StartExecution` the fan-out issued, and whether it has been accounted for.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -140,12 +144,65 @@ impl IssuedAttempts {
 ///   phase that issued it, and it says nothing about what a worker did with a request that
 ///   reached it. So an attempt the controller stopped offering stays outstanding here, which
 ///   is the honest record of what happened — the controller lost knowledge, not exposure.
-#[derive(Debug, Default)]
+///
+/// # Why it also knows who the obligation belongs to
+///
+/// A fan-out can end in two ways, and only one of them runs the line after the `await`. If the
+/// job's state task is cancelled mid-fan-out, the phase that would have handed the obligation
+/// over is gone before it can; what survives is the region rescue inside
+/// [`settle_under_admission`](crate::states::settle_under_admission), which holds the
+/// admission until the requests settle. The ledger is the one value that is live on *both*
+/// paths and carries the inventory on both, so it is also where the job's
+/// [`SettlementOwner`] is recorded — see [`Self::settlement_rescue`]. `None` for every caller
+/// in M11.T25, and for the landed M11.T08 path, whose rescue therefore behaves exactly as it
+/// did before.
+#[derive(Default)]
 pub(crate) struct AttemptLedger {
     attempts: Mutex<IssuedAttempts>,
+    /// The job's settlement owner, if this controller has one. Always `None` in M11.T25.
+    owner: Option<Arc<dyn SettlementOwner>>,
+}
+
+impl std::fmt::Debug for AttemptLedger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AttemptLedger")
+            .field("attempts", &self.snapshot())
+            .field("owned", &self.owner.is_some())
+            .finish()
+    }
 }
 
 impl AttemptLedger {
+    /// The ledger of a fan-out whose obligation belongs to `owner` if it is interrupted.
+    pub(crate) fn owned_by(owner: Option<Arc<dyn SettlementOwner>>) -> Self {
+        Self {
+            attempts: Mutex::new(IssuedAttempts::default()),
+            owner,
+        }
+    }
+
+    /// What a region rescue does with the authority it recovered, for this fan-out.
+    ///
+    /// `None` when the controller has no settlement owner: then there is nobody to hand the
+    /// obligation to, the rescue releases the admission once the requests have settled, and
+    /// that is the landed M11.T08 behaviour unchanged.
+    ///
+    /// Otherwise it is the same hand-over [`super::super::phases::StartFanOut::issue`]
+    /// performs, built at the only other moment the two halves of the obligation exist
+    /// together: the inventory is read from this ledger — which the request futures have gone
+    /// on writing to inside the rescued region, so it is what the workers actually answered —
+    /// and the authority is the admission the rescue is holding.
+    pub(crate) fn settlement_rescue(self: &Arc<Self>) -> Option<SettlementRescue> {
+        let owner = Arc::clone(self.owner.as_ref()?);
+        let ledger = Arc::clone(self);
+        Some(Box::new(move |admission| {
+            hand_over(
+                SettlementBundle::new(admission, ledger.snapshot()),
+                Some(owner.as_ref()),
+            );
+        }))
+    }
+
     /// Records that a request carrying `attempt_id` has been issued to `worker`.
     pub(crate) fn issued(&self, worker: WorkerId, attempt_id: &str) {
         self.attempts().issued(worker, attempt_id.to_string());
@@ -172,124 +229,6 @@ impl AttemptLedger {
     }
 }
 
-/// An interrupted fan-out's whole obligation: what it issued, and the authority that may not
-/// be released until those attempts settle.
-///
-/// The two travel together deliberately. Handing over the inventory without the
-/// [`Admission`] would leave a refusal publishable while the attempts were still live; handing
-/// over the authority without the inventory would leave the new owner unable to say what it
-/// was waiting for. M11.D39b requires them to move as one unit, and the only way to part with
-/// this value is [`Self::transfer_to`], which moves both.
-pub(crate) struct SettlementBundle {
-    admission: Admission,
-    issued: IssuedAttempts,
-}
-
-/// A proof that an obligation was handed over, and to how many attempts it applied.
-///
-/// Returned by [`SettlementBundle::transfer_to`] rather than by the owner, so that "the
-/// transfer happened" is something this module observes rather than something an
-/// implementation asserts about itself.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct SettlementReceipt {
-    outstanding: usize,
-}
-
-impl SettlementReceipt {
-    /// How many issued attempts the new owner became responsible for.
-    pub(crate) fn outstanding(&self) -> usize {
-        self.outstanding
-    }
-}
-
-/// The cancellation-resistant per-job owner an interrupted fan-out hands its obligation to.
-///
-/// **M11.T25 defines this and implements it nowhere**, which is the point rather than an
-/// omission: an owner is only safe once there is a durable record it can be recovered from
-/// after a controller restart, and that record — the M11.D39d fence — is M11.T26's. Until
-/// then [`PhaseContext::settlement_owner`] answers `None` and the fan-out settles in place,
-/// exactly as the landed M11.T08 path does.
-///
-/// An implementor takes the bundle by value: it receives the issued-attempt inventory and
-/// the lifecycle authority together, and there is no way to receive one without the other.
-pub(crate) trait SettlementOwner {
-    /// Takes over an interrupted fan-out's obligation.
-    ///
-    /// The implementation must not release the [`Admission`] inside the bundle until every
-    /// outstanding attempt has an authoritative outcome, an acknowledged fence or revoke that
-    /// makes its identifier permanently inapplicable, or an observed termination of the
-    /// worker generation it addressed. Dropping the bundle is never settlement.
-    fn take_over(&self, bundle: SettlementBundle);
-}
-
-/// What became of an interrupted fan-out's obligation.
-pub(crate) enum SettlementOutcome {
-    /// It was handed to an owner that outlives the phase. Unreachable in M11.T25, which
-    /// implements no [`SettlementOwner`].
-    Transferred(SettlementReceipt),
-    /// It stayed with the phase, which settled it before releasing anything — the landed
-    /// M11.T08 behaviour, and the only outcome M11.T25 has.
-    SettledInPlace(Admission, IssuedAttempts),
-}
-
-impl SettlementBundle {
-    /// The obligation of a fan-out that is being interrupted.
-    pub(crate) fn new(admission: Admission, issued: IssuedAttempts) -> Self {
-        Self { admission, issued }
-    }
-
-    /// What this bundle still owes.
-    pub(crate) fn issued(&self) -> &IssuedAttempts {
-        &self.issued
-    }
-
-    /// Hands the whole obligation to `owner`.
-    ///
-    /// Consuming `self` is what makes the hand-over exclusive: the phase that transferred can
-    /// no longer publish, reschedule or commit under the authority it gave away, because it
-    /// no longer has it.
-    pub(crate) fn transfer_to<O: SettlementOwner + ?Sized>(self, owner: &O) -> SettlementReceipt {
-        let outstanding = self.issued().outstanding_count();
-        owner.take_over(self);
-        SettlementReceipt { outstanding }
-    }
-
-    /// Releases the obligation back to the phase that raised it, for a controller with no
-    /// owner to transfer to.
-    ///
-    /// This is not a transfer and does not go through [`SettlementOwner`]: it is the
-    /// statement that nothing was handed over, and the caller is still the one that must
-    /// settle. M11.T25 always takes this branch.
-    pub(crate) fn keep(self) -> (Admission, IssuedAttempts) {
-        (self.admission, self.issued)
-    }
-}
-
-/// Hands an interrupted fan-out's obligation to whatever owner the controller has.
-///
-/// One function rather than a branch at each call site, so that "there is no owner, therefore
-/// the fan-out settles in place" is written once and is the same statement everywhere.
-pub(crate) fn hand_over(
-    bundle: SettlementBundle,
-    owner: Option<&dyn SettlementOwner>,
-) -> SettlementOutcome {
-    match owner {
-        Some(owner) => {
-            let receipt = bundle.transfer_to(owner);
-            info!(
-                outstanding = receipt.outstanding(),
-                "transferred an interrupted fan-out's issued attempts and its lifecycle \
-                 authority to the job's settlement owner"
-            );
-            SettlementOutcome::Transferred(receipt)
-        }
-        None => {
-            let (admission, issued) = bundle.keep();
-            SettlementOutcome::SettledInPlace(admission, issued)
-        }
-    }
-}
-
 /// The fan-out's half of the phase graph's access to the job.
 impl PhaseContext<'_, '_> {
     /// The job's settlement owner, if this controller has one.
@@ -297,7 +236,11 @@ impl PhaseContext<'_, '_> {
     /// Always `None` in M11.T25: see [`SettlementOwner`]. It is a method rather than a
     /// constant so that M11.T26 has one place to answer differently, and so that the
     /// always-`None` answer is visibly the seam rather than an oversight.
-    pub(crate) fn settlement_owner(&self) -> Option<&dyn SettlementOwner> {
+    ///
+    /// An owned handle rather than a borrow, because the owner has to be reachable from the
+    /// rescue that runs after the phase — and the whole `PhaseContext` — has been dropped.
+    /// A borrow would have made the seam work on every path except the one it is for.
+    pub(crate) fn settlement_owner(&self) -> Option<Arc<dyn SettlementOwner>> {
         None
     }
 
@@ -399,7 +342,11 @@ impl PhaseContext<'_, '_> {
             .collect();
         let connects = self.take_worker_connects();
 
-        let attempts = Arc::new(AttemptLedger::default());
+        // The owner is read here, while the phase still exists, precisely because the path
+        // that needs it is the one on which the phase does not: a cancelled state task drops
+        // this context, and the ledger — captured by the region — is what carries the answer
+        // into the rescue.
+        let attempts = Arc::new(AttemptLedger::owned_by(self.settlement_owner()));
         let job_id = self.job().config.id.clone();
         let pipeline_id = self.job().pipeline_info.pipeline_id.clone();
         let (admission, started) = super::start_execution_on_workers(

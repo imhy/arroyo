@@ -39,6 +39,7 @@ use std::time::{Duration, Instant};
 use anyhow::anyhow;
 use arroyo_rpc::LeaderContext;
 use arroyo_rpc::config::config;
+use arroyo_rpc::grpc::rpc::{JobFailure, JobState};
 use arroyo_rpc::worker_types::RunningMessage;
 use arroyo_types::{JobId, WorkerId};
 use arroyo_worker::job_controller::job_metrics::JobMetrics;
@@ -106,7 +107,7 @@ impl PhaseContext<'_, '_> {
         tokio::select! {
             v = self.ctx.rx.recv() => self.handle_task_wait_message(v).await,
             _ = wake.notified() => Ok(PhaseWait::Continue),
-            _ = tokio::time::sleep(timeout) => Err(self.task_startup_timeout().await),
+            _ = tokio::time::sleep(timeout) => self.task_startup_timeout().await,
         }
     }
 
@@ -228,34 +229,91 @@ impl PhaseContext<'_, '_> {
     ///
     /// In leader mode a timeout is often a job that failed on startup, and the failure is only
     /// readable from the leader; asking costs one RPC on a path that is already giving up.
-    async fn task_startup_timeout(&mut self) -> StateError {
-        if let Some((id, addr)) = self.leader_endpoint()
-            && let Ok(mut leader_manager) = LeaderManager::connect(
-                JobId(self.ctx.config.id.clone()),
-                self.ctx.pipeline_info.pipeline_id.clone(),
-                self.ctx.status.generation,
-                id,
-                addr,
-                config().controller.connect_timeout.as_deref().copied(),
-                self.ctx.execution_selector,
-            )
-            .await
-            && let Ok(status) = leader_manager.poll_leader_status().await
-        {
-            warn!(
-                message = "leader status at task startup timeout",
-                job_id = %self.ctx.config.id,
-                job_state = status.job_state,
-            );
+    ///
+    /// The answer decides the outcome, and it has to: a leader that reports the job failing is
+    /// giving the *cause*, of which the timeout is only the symptom. Reporting the symptom
+    /// discards the failure's error domain, its retry hint, and with the hint the difference
+    /// between a job that should be recovered and a job that must be failed — and it does so on
+    /// a shorter retry budget than the missing-payload case the landed body gives. So the
+    /// failure is handed to [`JobContext::handle_job_failure`](crate::states::JobContext::handle_job_failure),
+    /// the same function the landed `Scheduling::next` calls for the same status, which is what
+    /// makes the two routes' answers the same answer rather than two that happen to agree.
+    ///
+    /// The transition it can produce travels as [`PhaseWait::Leave`]: a job recovering from a
+    /// startup failure leaves `Scheduling` for `Recovering`, which is not something a
+    /// [`StateError`] can express and is why this returns a wait outcome rather than an error.
+    pub(crate) async fn task_startup_timeout(&mut self) -> Result<PhaseWait, StateError> {
+        match self.leader_startup_verdict().await {
+            LeaderVerdict::Failed(failure) => self
+                .ctx
+                .handle_job_failure(Scheduling {}, failure)
+                .await
+                .map(PhaseWait::Leave),
+            LeaderVerdict::FailedWithoutReason => Err(self.retryable(
+                "leader reported failing status without failure payload",
+                anyhow!("missing job failure"),
+                10,
+            )),
+            LeaderVerdict::NoFailure => Err(self.retryable(
+                "timed out while waiting for tasks to start",
+                anyhow!(
+                    "timed out after {:?} while waiting for worker startup",
+                    *config().pipeline.task_startup_time
+                ),
+                3,
+            )),
         }
-        self.retryable(
-            "timed out while waiting for tasks to start",
-            anyhow!(
-                "timed out after {:?} while waiting for worker startup",
-                *config().pipeline.task_startup_time
-            ),
-            3,
+    }
+
+    /// Asks the job's leader why its tasks never started.
+    ///
+    /// [`LeaderVerdict::NoFailure`] covers every way the question goes unanswered as well as a
+    /// leader that answers with a job that is not failing: an unreachable leader, a controller
+    /// that is not in leader mode at all, and a status whose `job_state` is not a value this
+    /// controller knows. All of them mean the same thing here — nothing better than the
+    /// timeout is known — and treating an unreadable status as a failure would fail jobs for a
+    /// leader the controller could not talk to.
+    async fn leader_startup_verdict(&mut self) -> LeaderVerdict {
+        let Some((id, addr)) = self.leader_endpoint() else {
+            return LeaderVerdict::NoFailure;
+        };
+        let connected = LeaderManager::connect(
+            JobId(self.ctx.config.id.clone()),
+            self.ctx.pipeline_info.pipeline_id.clone(),
+            self.ctx.status.generation,
+            id,
+            addr,
+            config().controller.connect_timeout.as_deref().copied(),
+            self.ctx.execution_selector,
         )
+        .await;
+        let Ok(mut leader_manager) = connected else {
+            return LeaderVerdict::NoFailure;
+        };
+        let Ok(status) = leader_manager.poll_leader_status().await else {
+            return LeaderVerdict::NoFailure;
+        };
+        warn!(
+            message = "leader status at task startup timeout",
+            job_id = %self.ctx.config.id,
+            job_state = status.job_state,
+        );
+        match JobState::try_from(status.job_state) {
+            Ok(JobState::JobFailing | JobState::JobFailed) => match status.job_failure {
+                Some(failure) => LeaderVerdict::Failed(failure),
+                None => LeaderVerdict::FailedWithoutReason,
+            },
+            Ok(_) => LeaderVerdict::NoFailure,
+            Err(e) => {
+                warn!(
+                    message = "leader returned invalid job state before task startup timeout",
+                    error = format!("{:?}", e),
+                    job_id = %self.ctx.config.id,
+                    pipeline_id = *self.ctx.pipeline_info.pipeline_id,
+                );
+                LeaderVerdict::NoFailure
+            }
+        }
     }
 
     /// The worker that runs this job's controller, in leader mode.
@@ -268,6 +326,21 @@ impl PhaseContext<'_, '_> {
             .min_by_key(|w| w.0.0)
             .map(|(id, status)| (*id, status.rpc_address.clone()))
     }
+}
+
+/// What the job's worker leader says about an execution whose tasks never started.
+///
+/// Three outcomes rather than two, because "the leader says the job failed" and "the leader
+/// says the job failed and here is why" lead to different retry budgets on the landed path,
+/// and this half must not quietly merge them.
+enum LeaderVerdict {
+    /// Nothing better than the timeout is known.
+    NoFailure,
+    /// The leader reports the job failing or failed, and this is the failure.
+    Failed(JobFailure),
+    /// The leader reports the job failing or failed and carried no failure to say why. The
+    /// status is worth another attempt: the payload may simply not have been written yet.
+    FailedWithoutReason,
 }
 
 /// The handover from a started execution to the state that runs it.

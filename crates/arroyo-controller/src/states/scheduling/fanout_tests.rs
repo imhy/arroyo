@@ -32,7 +32,7 @@ use arroyo_rpc::state_backend::StateBackendSelector;
 use arroyo_types::{MachineId, PipelineId, WorkerId};
 
 use super::ExecutionPlan;
-use super::fanout::{AttemptLedger, IssuedAttempts};
+use super::fanout::{AttemptLedger, IssuedAttempts, SettlementBundle, SettlementOwner};
 use crate::states::{Admission, RefusalGate};
 
 /// How long a row waits to establish that something has *not* happened.
@@ -474,4 +474,200 @@ async fn an_explicitly_refused_attempt_settles_and_its_sibling_is_unaffected() {
 
     drop(admission);
     assert!(gate.admit_publication().is_some());
+}
+
+/// A settlement owner that keeps whatever it is handed, so a row can ask what actually moved.
+///
+/// M11.T25 has no owner of its own — `PhaseContext::settlement_owner` answers `None` — so a
+/// double is the only way to observe the seam at all. What it does is what a real one must:
+/// it takes the bundle apart and *holds* the authority, rather than dropping it.
+#[derive(Default)]
+struct RecordingOwner {
+    /// The lifecycle authority, held exactly as a real owner would hold it.
+    held: Mutex<Option<Admission>>,
+    /// The inventory that arrived with it.
+    issued: Mutex<Option<IssuedAttempts>>,
+}
+
+impl SettlementOwner for RecordingOwner {
+    fn take_over(&self, bundle: SettlementBundle) {
+        let (admission, issued) = bundle.into_parts();
+        *self.issued.lock().unwrap() = Some(issued);
+        *self.held.lock().unwrap() = Some(admission);
+    }
+}
+
+/// Waits, bounded, for the detached region rescue to have handed the obligation over.
+///
+/// A bound rather than a wait: a row whose handover never happens fails with its own assertion
+/// instead of hanging the suite.
+async fn handed_over(owner: &Arc<RecordingOwner>) -> Option<IssuedAttempts> {
+    for _ in 0..MAX_TURNS {
+        if let Some(issued) = owner.issued.lock().unwrap().clone() {
+            return Some(issued);
+        }
+        tokio::time::sleep(TURN).await;
+    }
+    None
+}
+
+/// A fan-out whose phase is **cancelled** still hands its obligation to the job's settlement
+/// owner.
+///
+/// This is the path an owner exists for, and the one on which no line of the phase runs. When
+/// the controller's shutdown token fires the job's state task is dropped as a whole — see
+/// `ShutdownGuard::into_spawn_task` — so `StartFanOut::issue` never reaches its own
+/// `settlement_owner()` / `hand_over` block: the `await` it is suspended at simply never
+/// returns. What survives is the region rescue inside `settle_under_admission`, which holds the
+/// admission until the issued requests settle; before this fix it then *dropped* what it had
+/// rescued, so an owner received neither the inventory nor the authority on the only path it
+/// was built for.
+///
+/// The three assertions are the three halves of "the obligation moved as one unit", at the
+/// three moments they can be made:
+///
+/// * while the request is unsettled, nothing has been handed over and nothing is publishable;
+/// * once the worker answers, the owner has the inventory — with the identifier that worker was
+///   actually sent, read back from the worker itself;
+/// * and it has the authority too, which is why the gate is still closed until the owner lets
+///   it go.
+#[tokio::test]
+async fn a_cancelled_fan_out_hands_its_obligation_to_the_settlement_owner() {
+    let paused = Arc::new(Paused::default());
+    let (calls, slow) = worker(WorkerId(8), Answers::Pausing(paused.clone())).await;
+    let (gate, admission) = admitted().await;
+
+    let owner = Arc::new(RecordingOwner::default());
+    let attempts = Arc::new(AttemptLedger::owned_by(Some(
+        Arc::clone(&owner) as Arc<dyn SettlementOwner>
+    )));
+    let mut requests = Box::pin(fan_out(
+        admission,
+        HashMap::from([(WorkerId(8), slow)]),
+        Arc::clone(&attempts),
+    ));
+
+    // Drive it until the worker has been asked and has not answered.
+    let mut asked = false;
+    for _ in 0..MAX_TURNS {
+        tokio::select! {
+            _ = &mut requests => panic!("the fan-out cannot finish while the worker is paused"),
+            _ = tokio::time::sleep(TURN) => {}
+        }
+        if !calls.ids().is_empty() {
+            asked = true;
+            break;
+        }
+    }
+    assert!(
+        asked,
+        "the fixture's precondition: the request reached the worker"
+    );
+
+    // The job's state task is cancelled. Everything the phase would have done next goes with
+    // it, including the hand-over it performs on its own return path.
+    drop(requests);
+
+    tokio::time::sleep(NOTHING_HAPPENS_GRACE).await;
+    assert!(
+        owner.issued.lock().unwrap().is_none(),
+        "nothing is handed over while a request the fan-out issued is still unsettled: the \
+         rescue is holding the authority precisely so that nothing can be published behind it"
+    );
+    assert!(
+        gate.admit_publication().is_none(),
+        "and the job's publication lock is still held, by the rescue rather than by the phase"
+    );
+
+    // The worker answers. The rescue settles, and the obligation reaches the owner.
+    paused.released.notify_one();
+    let issued = handed_over(&owner).await.expect(
+        "a cancelled fan-out's inventory and its lifecycle authority must reach the job's \
+         settlement owner: the phase that would have handed them over no longer exists, so this \
+         is the only path left that can",
+    );
+
+    let mut expected = IssuedAttempts::default();
+    expected.issued(WorkerId(8), calls.first_id());
+    expected.settled(WorkerId(8));
+    assert_eq!(
+        issued, expected,
+        "what the owner receives is what the workers answered, under the identifier they were \
+         actually sent — the live ledger the rescued region went on writing to, not a summary \
+         composed before the cancellation"
+    );
+    assert!(
+        gate.admit_publication().is_none(),
+        "and the authority came with it: a refusal is no more publishable now than it was \
+         before, because the owner is the one holding the lock"
+    );
+
+    drop(owner.held.lock().unwrap().take());
+    assert!(
+        gate.admit_publication().is_some(),
+        "the control — the gate is closed only because the owner was holding the admission it \
+         was handed"
+    );
+}
+
+/// The same cancellation, for a controller with no settlement owner, releases the admission
+/// once the requests settle and hands nothing anywhere.
+///
+/// The control for the row above and the statement that M11.T25's own behaviour is unchanged:
+/// every ledger this half builds has no owner, so the rescue does exactly what it has always
+/// done. If this row ever stopped passing, the landed M11.T08 path would have acquired a
+/// behaviour it did not have.
+#[tokio::test]
+async fn a_cancelled_fan_out_without_an_owner_releases_its_admission_as_before() {
+    let paused = Arc::new(Paused::default());
+    let (calls, slow) = worker(WorkerId(9), Answers::Pausing(paused.clone())).await;
+    let (gate, admission) = admitted().await;
+
+    let attempts = Arc::new(AttemptLedger::default());
+    let mut requests = Box::pin(fan_out(
+        admission,
+        HashMap::from([(WorkerId(9), slow)]),
+        Arc::clone(&attempts),
+    ));
+    let mut asked = false;
+    for _ in 0..MAX_TURNS {
+        tokio::select! {
+            _ = &mut requests => panic!("the fan-out cannot finish while the worker is paused"),
+            _ = tokio::time::sleep(TURN) => {}
+        }
+        if !calls.ids().is_empty() {
+            asked = true;
+            break;
+        }
+    }
+    assert!(
+        asked,
+        "the fixture's precondition: the request reached the worker"
+    );
+
+    drop(requests);
+    tokio::time::sleep(NOTHING_HAPPENS_GRACE).await;
+    assert!(
+        gate.admit_publication().is_none(),
+        "the rescue holds the admission while the request it issued is unsettled"
+    );
+
+    paused.released.notify_one();
+    let mut released = false;
+    for _ in 0..MAX_TURNS {
+        if gate.admit_publication().is_some() {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(TURN).await;
+    }
+    assert!(
+        released,
+        "and releases it once the worker has answered — the landed M11.T08 rescue, unchanged"
+    );
+    assert_eq!(
+        attempts.snapshot().outstanding_count(),
+        0,
+        "with the attempt accounted for by the answer that arrived, not by the cancellation"
+    );
 }

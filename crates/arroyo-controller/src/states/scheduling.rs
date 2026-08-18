@@ -405,188 +405,196 @@ async fn start_execution_on_workers(
     worker_connects: HashMap<WorkerId, WorkerClient>,
     attempts: Arc<AttemptLedger>,
 ) -> (Admission, anyhow::Result<HashMap<WorkerId, WorkerClient>>) {
-    settle_under_admission(admission, move |admission| async move {
-        // The whole of this — issuing the requests as much as waiting for them — is one effect
-        // inside one region, and none of it may outlive the guard.
-        let started = admission
-            .effect("send every worker its StartExecution", async move {
-                let (leader_id, leader_addr) = plan.leader.unzip();
+    // Taken before the ledger is moved into the region. It is `None` for every caller in
+    // M11.T25 — including the landed body below, whose ledger has no owner — so the rescue
+    // releases the admission once the requests settle, exactly as it always has.
+    let rescue = attempts.settlement_rescue();
+    settle_under_admission(
+        admission,
+        move |admission| async move {
+            // The whole of this — issuing the requests as much as waiting for them — is one effect
+            // inside one region, and none of it may outlive the guard.
+            let started = admission
+                .effect("send every worker its StartExecution", async move {
+                    let (leader_id, leader_addr) = plan.leader.unzip();
 
-                let mut requests: FuturesUnordered<_> = worker_connects
-                    .into_iter()
-                    .map(|(id, mut c)| {
-                        let assignments = plan.assignments.clone();
-                        let job_id = job_id.clone();
-                        let pipeline_id = pipeline_id.clone();
-                        let program = plan.program.clone();
-                        // For the log lines below and nothing else, so a worker that somehow has
-                        // no status entry is still asked to start rather than panicking the
-                        // region — the one panic site the fan-out's path used to contain.
-                        let machine_id = machine_ids
-                            .get(&id)
-                            .cloned()
-                            .unwrap_or_else(|| MachineId(Arc::new(format!("unknown-{}", id.0))));
-                        let leader_addr = leader_addr.clone();
-                        let checkpoint_manifest_ref = plan.checkpoint_manifest_ref.clone();
-                        let state_backend = plan.state_backend;
-                        let start_execution_id = format!(
-                            "{:016x}{:016x}",
-                            rand::random::<u64>(),
-                            rand::random::<u64>()
-                        );
-                        // Recorded here, where the identifier is minted and before the first
-                        // request carrying it is sent, rather than when a request returns. An
-                        // inventory that under-reports could let a phase release its authority
-                        // while a request it had forgotten was still live; one that
-                        // over-reports only holds the obligation longer than it had to.
-                        attempts.issued(id, &start_execution_id);
-                        let attempts = Arc::clone(&attempts);
-                        let (restore_epoch, start_epoch, min_epoch, checkpoint_interval_micros) = (
-                            plan.restore_epoch,
-                            plan.start_epoch,
-                            plan.min_epoch,
-                            plan.checkpoint_interval_micros,
-                        );
-
-                        async move {
-                            info!(
-                                message = "starting execution on worker",
-                                job_id = %job_id,
-                                pipeline_id = *pipeline_id,
-                                worker_id = id.0,
-                                machine_id = *machine_id.0,
+                    let mut requests: FuturesUnordered<_> = worker_connects
+                        .into_iter()
+                        .map(|(id, mut c)| {
+                            let assignments = plan.assignments.clone();
+                            let job_id = job_id.clone();
+                            let pipeline_id = pipeline_id.clone();
+                            let program = plan.program.clone();
+                            // For the log lines below and nothing else, so a worker that somehow has
+                            // no status entry is still asked to start rather than panicking the
+                            // region — the one panic site the fan-out's path used to contain.
+                            let machine_id = machine_ids
+                                .get(&id)
+                                .cloned()
+                                .unwrap_or_else(|| MachineId(Arc::new(format!("unknown-{}", id.0))));
+                            let leader_addr = leader_addr.clone();
+                            let checkpoint_manifest_ref = plan.checkpoint_manifest_ref.clone();
+                            let state_backend = plan.state_backend;
+                            let start_execution_id = format!(
+                                "{:016x}{:016x}",
+                                rand::random::<u64>(),
+                                rand::random::<u64>()
+                            );
+                            // Recorded here, where the identifier is minted and before the first
+                            // request carrying it is sent, rather than when a request returns. An
+                            // inventory that under-reports could let a phase release its authority
+                            // while a request it had forgotten was still live; one that
+                            // over-reports only holds the obligation longer than it had to.
+                            attempts.issued(id, &start_execution_id);
+                            let attempts = Arc::clone(&attempts);
+                            let (restore_epoch, start_epoch, min_epoch, checkpoint_interval_micros) = (
+                                plan.restore_epoch,
+                                plan.start_epoch,
+                                plan.min_epoch,
+                                plan.checkpoint_interval_micros,
                             );
 
-                            let request = StartExecutionReq {
-                                    restore_epoch,
-                                    start_epoch,
-                                    min_epoch,
-                                    program: Some(program),
-                                    tasks: assignments,
-                                    job_controller_addr: leader_addr,
-                                    is_leader: leader_id.is_some_and(|l| l == id),
-                                    wait_for_leader: leader_id.is_some(),
-                                    checkpoint_interval_micros,
-                                    checkpoint_manifest_ref,
-                                    state_backend: state_backend.as_str().to_string(),
-                                    start_execution_id,
-                                };
-                            let mut unsettled = 0usize;
-                            loop {
-                                match c.start_execution(Request::new(request.clone())).await {
-                                    Ok(_) => {
-                                        attempts.settled(id);
-                                    debug!(
-                                        message = "worker entered initialization phase",
-                                        job_id = %job_id,
-                                        pipeline_id = *pipeline_id,
-                                        worker_id = id.0,
-                                        machine_id = *machine_id.0,
-                                    );
-                                        break Ok((id, c));
-                                    }
-                                    Err(e)
-                                        if matches!(
-                                            e.code(),
-                                            Code::Cancelled
-                                                | Code::Unknown
-                                                | Code::DeadlineExceeded
-                                                | Code::Unavailable
-                                                | Code::Aborted
-                                        ) =>
-                                    {
-                                        unsettled += 1;
-                                        if unsettled > START_EXECUTION_RECONCILE_ATTEMPTS {
-                                            // The terminal path. Not a deadline on the
-                                            // admission: what ends the attempt is the
-                                            // controller ceasing to offer it, and a peer that
-                                            // advertised the contract cannot be holding a
-                                            // parked handler for it.
-                                            //
-                                            // Deliberately *not* settled in the ledger. No
-                                            // worker answered this, so the honest record is
-                                            // that it is still unaccounted for; what the
-                                            // controller gave up is knowing the outcome, and
-                                            // an inventory that marked it settled would be
-                                            // reporting an answer nobody gave.
-                                            error!(
-                                                message = "StartExecution never settled; giving the attempt up so the job can be rescheduled",
+                            async move {
+                                info!(
+                                    message = "starting execution on worker",
+                                    job_id = %job_id,
+                                    pipeline_id = *pipeline_id,
+                                    worker_id = id.0,
+                                    machine_id = *machine_id.0,
+                                );
+
+                                let request = StartExecutionReq {
+                                        restore_epoch,
+                                        start_epoch,
+                                        min_epoch,
+                                        program: Some(program),
+                                        tasks: assignments,
+                                        job_controller_addr: leader_addr,
+                                        is_leader: leader_id.is_some_and(|l| l == id),
+                                        wait_for_leader: leader_id.is_some(),
+                                        checkpoint_interval_micros,
+                                        checkpoint_manifest_ref,
+                                        state_backend: state_backend.as_str().to_string(),
+                                        start_execution_id,
+                                    };
+                                let mut unsettled = 0usize;
+                                loop {
+                                    match c.start_execution(Request::new(request.clone())).await {
+                                        Ok(_) => {
+                                            attempts.settled(id);
+                                        debug!(
+                                            message = "worker entered initialization phase",
+                                            job_id = %job_id,
+                                            pipeline_id = *pipeline_id,
+                                            worker_id = id.0,
+                                            machine_id = *machine_id.0,
+                                        );
+                                            break Ok((id, c));
+                                        }
+                                        Err(e)
+                                            if matches!(
+                                                e.code(),
+                                                Code::Cancelled
+                                                    | Code::Unknown
+                                                    | Code::DeadlineExceeded
+                                                    | Code::Unavailable
+                                                    | Code::Aborted
+                                            ) =>
+                                        {
+                                            unsettled += 1;
+                                            if unsettled > START_EXECUTION_RECONCILE_ATTEMPTS {
+                                                // The terminal path. Not a deadline on the
+                                                // admission: what ends the attempt is the
+                                                // controller ceasing to offer it, and a peer that
+                                                // advertised the contract cannot be holding a
+                                                // parked handler for it.
+                                                //
+                                                // Deliberately *not* settled in the ledger. No
+                                                // worker answered this, so the honest record is
+                                                // that it is still unaccounted for; what the
+                                                // controller gave up is knowing the outcome, and
+                                                // an inventory that marked it settled would be
+                                                // reporting an answer nobody gave.
+                                                error!(
+                                                    message = "StartExecution never settled; giving the attempt up so the job can be rescheduled",
+                                                    job_id = %job_id,
+                                                    pipeline_id = *pipeline_id,
+                                                    worker_id = id.0,
+                                                    machine_id = *machine_id.0,
+                                                    start_execution_id = %request.start_execution_id,
+                                                    attempts = unsettled,
+                                                    error = format!("{:?}", e),
+                                                );
+                                                break Err(anyhow!(
+                                                    "worker {id:?} never settled StartExecution \
+                                                     {} after {unsettled} attempts: {e}",
+                                                    request.start_execution_id
+                                                ));
+                                            }
+                                            warn!(
+                                                message = "StartExecution is not settled; retrying the same id under admission",
                                                 job_id = %job_id,
                                                 pipeline_id = *pipeline_id,
                                                 worker_id = id.0,
                                                 machine_id = *machine_id.0,
                                                 start_execution_id = %request.start_execution_id,
-                                                attempts = unsettled,
+                                                attempt = unsettled,
                                                 error = format!("{:?}", e),
                                             );
-                                            break Err(anyhow!(
-                                                "worker {id:?} never settled StartExecution \
-                                                 {} after {unsettled} attempts: {e}",
-                                                request.start_execution_id
-                                            ));
+                                            tokio::time::sleep(START_EXECUTION_RECONCILE_DELAY).await;
                                         }
-                                        warn!(
-                                            message = "StartExecution is not settled; retrying the same id under admission",
+                                        Err(e) => {
+                                            // An explicit status other than the ambiguous set is
+                                            // the worker's own decision about this request, so the
+                                            // attempt is accounted for even though it failed.
+                                            attempts.settled(id);
+                                            error!(
+                                            message = "failed to start execution on worker",
                                             job_id = %job_id,
                                             pipeline_id = *pipeline_id,
                                             worker_id = id.0,
                                             machine_id = *machine_id.0,
-                                            start_execution_id = %request.start_execution_id,
-                                            attempt = unsettled,
                                             error = format!("{:?}", e),
                                         );
-                                        tokio::time::sleep(START_EXECUTION_RECONCILE_DELAY).await;
-                                    }
-                                    Err(e) => {
-                                        // An explicit status other than the ambiguous set is
-                                        // the worker's own decision about this request, so the
-                                        // attempt is accounted for even though it failed.
-                                        attempts.settled(id);
-                                        error!(
-                                        message = "failed to start execution on worker",
-                                        job_id = %job_id,
-                                        pipeline_id = *pipeline_id,
-                                        worker_id = id.0,
-                                        machine_id = *machine_id.0,
-                                        error = format!("{:?}", e),
-                                    );
-                                        break Err(anyhow!(
-                                            "failed to start execution on worker {id:?}: {e}"
-                                        ));
+                                            break Err(anyhow!(
+                                                "failed to start execution on worker {id:?}: {e}"
+                                            ));
+                                        }
                                     }
                                 }
                             }
-                        }
-                    })
-                    .collect();
+                        })
+                        .collect();
 
-                let mut started = HashMap::new();
-                let mut first_error: Option<anyhow::Error> = None;
-                // Every request, to an outcome. Leaving on the first error would drop the
-                // siblings' client futures, and a client future dropped is not a worker stopped:
-                // see this function's documentation. The loop is what makes "settled" a fact
-                // rather than a hope, and the admission is not handed back until it ends.
-                while let Some(outcome) = requests.next().await {
-                    match outcome {
-                        Ok((id, c)) => {
-                            started.insert(id, c);
-                        }
-                        Err(e) => {
-                            if first_error.is_none() {
-                                first_error = Some(e);
+                    let mut started = HashMap::new();
+                    let mut first_error: Option<anyhow::Error> = None;
+                    // Every request, to an outcome. Leaving on the first error would drop the
+                    // siblings' client futures, and a client future dropped is not a worker stopped:
+                    // see this function's documentation. The loop is what makes "settled" a fact
+                    // rather than a hope, and the admission is not handed back until it ends.
+                    while let Some(outcome) = requests.next().await {
+                        match outcome {
+                            Ok((id, c)) => {
+                                started.insert(id, c);
+                            }
+                            Err(e) => {
+                                if first_error.is_none() {
+                                    first_error = Some(e);
+                                }
                             }
                         }
                     }
-                }
-                match first_error {
-                    Some(e) => Err(e),
-                    None => Ok(started),
-                }
-            })
-            .await;
+                    match first_error {
+                        Some(e) => Err(e),
+                        None => Ok(started),
+                    }
+                })
+                .await;
 
-        (admission, started)
-    })
+            (admission, started)
+        },
+        rescue,
+    )
     .await
 }
 

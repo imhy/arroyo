@@ -105,7 +105,10 @@ struct RecordingOwner {
 
 impl SettlementOwner for RecordingOwner {
     fn take_over(&self, bundle: SettlementBundle) {
-        let (admission, issued) = bundle.keep();
+        // Taken apart rather than dropped: an owner that merely dropped what it was handed
+        // would release the job's publication lock without settling anything, which is what
+        // `SettlementBundle`'s own `Drop` exists to report.
+        let (admission, issued) = bundle.into_parts();
         *self.outstanding.lock().unwrap() = Some(issued.outstanding_count());
         *self.held.lock().unwrap() = Some(admission);
     }
@@ -203,8 +206,16 @@ fn phase_graph_production_sources() -> Vec<(&'static str, &'static str)> {
             production_half(include_str!("admission/execution.rs")),
         ),
         (
+            "scheduling/admission/observation.rs",
+            production_half(include_str!("admission/observation.rs")),
+        ),
+        (
             "scheduling/fanout.rs",
             production_half(include_str!("fanout.rs")),
+        ),
+        (
+            "scheduling/fanout/settlement.rs",
+            production_half(include_str!("fanout/settlement.rs")),
         ),
         (
             "scheduling/fencing.rs",

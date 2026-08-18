@@ -860,14 +860,37 @@ impl JobContext<'_> {
         &mut self,
         at: ConsumptionPoint,
     ) -> Result<ObservedIntent, StateError> {
+        Ok(self
+            .observe_lifecycle_decision(at)?
+            .unwrap_or(ObservedIntent::Continue))
+    }
+
+    /// The same read, keeping the one thing [`Self::observe_lifecycle_intent`] discards:
+    /// whether the writer decided anything at all.
+    ///
+    /// `None` is "the writer has said nothing new since the last look"; `Some` is a decision
+    /// that has been applied, and what the job's configuration says as a result. The two are
+    /// the same answer for a phase — a job that carries on carries on either way — and a
+    /// different one for a job that is *fencing*, whose standing reason for ending may be one
+    /// the writer has since superseded. Reporting a superseded reason fails a job for a
+    /// configuration that no longer exists, which is the same defect
+    /// [`RefusedConfig::into_current_error`] closes on the M11.T08 path.
+    ///
+    /// # Errors
+    ///
+    /// The fatal [`StateError`] of a refused configuration, exactly as above.
+    pub(crate) fn observe_lifecycle_decision(
+        &mut self,
+        at: ConsumptionPoint,
+    ) -> Result<Option<ObservedIntent>, StateError> {
         let Some(decision) = self
             .lifecycle_actor
             .as_mut()
             .and_then(|actor| actor.observe(at))
         else {
-            return Ok(ObservedIntent::Continue);
+            return Ok(None);
         };
-        decision.apply(self)
+        decision.apply(self).map(Some)
     }
 
     /// What an interruptible wait parks on so that a submitted intent ends it.
@@ -1619,6 +1642,18 @@ impl Admission {
 /// needs — and [`RefusalGate::admit_publication`] never waits, so contention with it defers a
 /// refusal to the next poll rather than blocking anything (round 6's rule).
 ///
+/// # Where the rescued authority goes
+///
+/// Holding the admission until the requests settle is only half of what a dropped region owes.
+/// The other half is *who ends up with it*: the phase that raised the region has gone with the
+/// task, so if this rescue simply dropped what it rescued, a controller that has a per-job
+/// settlement owner would be handed nothing on the one path where the phase cannot hand
+/// anything over itself. `rescue` is that seam. It is `None` for a caller with no owner —
+/// every caller through M11.T25, including the selected M11.T08 path, for which this behaves
+/// exactly as it did before the parameter existed — and otherwise it is given the settled
+/// [`Admission`] to pass to the job's owner together with the inventory of what was issued.
+/// See `scheduling::fanout::AttemptLedger::settlement_rescue`.
+///
 /// # What bounds the region
 ///
 /// Not the RPC deadline alone. The worker channels are built with `Endpoint::timeout` (90s in
@@ -1644,6 +1679,7 @@ impl Admission {
 pub(crate) async fn settle_under_admission<T, F>(
     admission: Admission,
     region: impl FnOnce(Admission) -> F,
+    rescue: Option<SettlementRescue>,
 ) -> (Admission, T)
 where
     F: std::future::Future<Output = (Admission, T)> + Send + 'static,
@@ -1651,9 +1687,18 @@ where
 {
     SettlingUnderAdmission {
         region: Some(Box::pin(region(admission))),
+        rescue,
     }
     .await
 }
+
+/// What a rescued region hands the job's lifecycle authority to, once its requests have
+/// settled and the phase that issued them is gone.
+///
+/// Owned and `'static` on purpose: the rescue runs in a detached task, so anything borrowed
+/// from the phase — which is what was dropped — could not be named here. That is the whole
+/// reason `PhaseContext::settlement_owner` answers with an `Arc` rather than a borrow.
+pub(crate) type SettlementRescue = Box<dyn FnOnce(Admission) + Send>;
 
 /// The owner [`settle_under_admission`] wraps a region in. Constructed only there.
 ///
@@ -1666,6 +1711,9 @@ struct SettlingUnderAdmission<T: Send + 'static> {
     region: Option<
         std::pin::Pin<Box<dyn std::future::Future<Output = (Admission, T)> + Send + 'static>>,
     >,
+    /// Where a rescued admission goes. `None` releases it, which is what every caller through
+    /// M11.T25 asks for.
+    rescue: Option<SettlementRescue>,
 }
 
 impl<T: Send + 'static> std::future::Future for SettlingUnderAdmission<T> {
@@ -1716,9 +1764,18 @@ impl<T: Send + 'static> Drop for SettlingUnderAdmission<T> {
              were still unsettled; holding the job's admission until they are, so that no \
              refusal can be published behind them"
         );
+        let rescue = self.rescue.take();
         runtime.spawn(async move {
-            // The admission is inside `region`, and is released only by this drop.
-            drop(region.await);
+            // The admission is inside `region`, so this is the first moment it exists as a
+            // value again — and the last moment anything can be done with it.
+            let (admission, _outcome) = region.await;
+            match rescue {
+                // The obligation reaches the job's settlement owner even here. This is the
+                // only path on which it can: the phase that issued the requests went with the
+                // state task, so nothing else is left that could hand its authority over.
+                Some(rescue) => rescue(admission),
+                None => drop(admission),
+            }
         });
     }
 }
@@ -2741,8 +2798,8 @@ mod tests {
     use super::{
         Admission, AppliedStatus, Failed, Failing, JobContext, LeaderRunning, RefusalGate, Running,
         RunningConfigUpdate, State, StateMachine, Transition, adopt_refreshed_config,
-        check_config_update, classify_running_config_update, execute_state,
-        handle_unhandled_message, lifecycle,
+        check_config_update, classify_running_config_update, controller_job_failure, errors,
+        execute_state, fatal, handle_unhandled_message, lifecycle,
     };
     use crate::schedulers::{Scheduler, SchedulerError, StartPipelineReq};
     use crate::states::scheduling::admission::PhaseContext;
@@ -2762,11 +2819,12 @@ mod tests {
         GetCheckpointDetailsReq, GetCheckpointDetailsResp, GetJobCheckpointsReq,
         GetJobCheckpointsResp, GetWorkerPhaseReq, GetWorkerPhaseResp, GlobalKeyedTableConfig,
         GlobalKeyedTableTaskCheckpointMetadata, HeartbeatNodeReq, JobControllerInitReq,
-        JobControllerInitResp, JobFinishedReq, JobFinishedResp, JobStatus as LeaderJobStatus,
-        JobStatusReq, JobStatusResp, LoadCompactedDataReq, LoadCompactedDataRes, MetricsReq,
-        MetricsResp, OperatorCheckpointMetadata, OperatorMetadata, RegisterNodeReq,
-        StartExecutionReq, StartExecutionResp, StopExecutionReq, StopExecutionResp, StopJobReq,
-        StopJobResp, TableCheckpointMetadata, TableConfig, TableEnum, WorkerFinishedReq,
+        JobControllerInitResp, JobFailure, JobFinishedReq, JobFinishedResp, JobState,
+        JobStatus as LeaderJobStatus, JobStatusReq, JobStatusResp, LoadCompactedDataReq,
+        LoadCompactedDataRes, MetricsReq, MetricsResp, OperatorCheckpointMetadata,
+        OperatorMetadata, RegisterNodeReq, StartExecutionReq, StartExecutionResp, StopExecutionReq,
+        StopExecutionResp, StopJobReq, StopJobResp, TableCheckpointMetadata, TableConfig,
+        TableEnum, WorkerFinishedReq,
     };
     use arroyo_rpc::state_backend::validated::Validated;
     use arroyo_rpc::state_backend::{StateBackendError, StateBackendSelector};
@@ -9135,6 +9193,9 @@ mod tests {
         generation: u64,
         /// What this leader reports it is running the job with, in the persisted spelling.
         state_backend: String,
+        /// What it reports about the job itself. Default — `JOB_UNKNOWN`, no failure — for
+        /// every row that only needs the handshake.
+        job_status: LeaderJobStatus,
         /// One per status poll, so a row can say the handshake happened rather than assume it.
         polls: Arc<AtomicU64>,
     }
@@ -9149,7 +9210,7 @@ mod tests {
             Ok(tonic::Response::new(JobStatusResp {
                 job_id: self.job_id.clone(),
                 generation: self.generation,
-                job_status: Some(LeaderJobStatus::default()),
+                job_status: Some(self.job_status.clone()),
                 state_backend: self.state_backend.clone(),
             }))
         }
@@ -9184,6 +9245,15 @@ mod tests {
 
     /// Serves a [`FakeLeader`] on a loopback port; returns its poll counter and its address.
     async fn fake_leader(generation: u64, state_backend: &str) -> (Arc<AtomicU64>, String) {
+        fake_leader_reporting(generation, state_backend, LeaderJobStatus::default()).await
+    }
+
+    /// The same, for a leader that has something to say about the job it is running.
+    async fn fake_leader_reporting(
+        generation: u64,
+        state_backend: &str,
+        job_status: LeaderJobStatus,
+    ) -> (Arc<AtomicU64>, String) {
         let polls = Arc::new(AtomicU64::new(0));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -9193,6 +9263,7 @@ mod tests {
                     job_id: "job_abc".to_string(),
                     generation,
                     state_backend: state_backend.to_string(),
+                    job_status,
                     polls: polls.clone(),
                 }))
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
@@ -9356,9 +9427,15 @@ mod tests {
         );
 
         // The handback, used for the one thing it exists for.
-        let reported = phase
+        let Err(reported) = phase
             .into_fencing(reason, IssuedAttempts::default())
-            .reconcile_and_report();
+            .reconcile_and_report()
+        else {
+            panic!(
+                "nothing asked this job to stop, so fencing ends it on the reason it was \
+                 interrupted with rather than on a transition"
+            )
+        };
         assert!(
             matches!(reported, StateError::RetryableError { .. }),
             "the reason survives token-free fencing unchanged: fencing is where an interrupted \
@@ -9371,5 +9448,367 @@ mod tests {
              next controller to start reads this column to find the job's leader"
         );
         assert!(ctx.leader_manager.is_none());
+    }
+    // ---------------------------------------------------------------------------------------
+    // Review round 2 — the three defects the M11.T25 substrate carried into review.
+    //
+    // None of these is reachable in production: `LifecycleMode::SELECTED` is `LegacyT08`, so no
+    // job has a `PhaseContext` at all. They are rows about what M11.T26 would activate.
+    // ---------------------------------------------------------------------------------------
+
+    /// A fatal reason for fencing has been superseded once the job's writer adopts a newer
+    /// configuration, and must not be what the job is failed for.
+    ///
+    /// The named contract rows `repaired_row_not_failed_by_stale_intent` and
+    /// `stop_wins_over_refusal` (D96 rows 9 and 7) live in `lifecycle/tests.rs`, and both are
+    /// about the *classifier* and the *actor*: which decision a polled row produces, and that a
+    /// superseded one is never decided twice. Neither reaches the fencing path, which is where
+    /// a scheduling attempt that has already been interrupted decides what to report — and that
+    /// is where the standing reason was being kept regardless of what the writer had since
+    /// said.
+    ///
+    /// A repaired row cannot undo the interruption, so the attempt still ends; what it removes
+    /// is the job being *failed* for a configuration it no longer has. The attempt becomes
+    /// retryable, and the next one runs under the repaired configuration.
+    #[tokio::test]
+    async fn a_repaired_configuration_stops_fencing_reporting_the_refusal_it_superseded() {
+        // The control first, so the two halves differ by one thing: the newer intent.
+        let mailbox = intent_mailbox();
+        let mut harness = Harness::new(3).with_actor(&mailbox);
+        let mut ctx = harness.ctx(
+            running_config(StateBackendSelector::Parquet),
+            StateBackendSelector::Parquet,
+        );
+        let phase = PhaseContext::new(&mut ctx);
+        let Err(reported) = phase
+            .into_fencing(refusal_reason(), IssuedAttempts::default())
+            .reconcile_and_report()
+        else {
+            panic!("a job nobody has asked to stop does not end by stopping")
+        };
+        assert!(
+            matches!(reported, StateError::FatalError { .. }),
+            "the control: with nothing newer said, the refusal this attempt was interrupted by \
+             is what it reports — {reported:?}"
+        );
+
+        // And now the same interruption, with the operator having repaired the row while the
+        // attempt was fencing.
+        let mailbox = intent_mailbox();
+        let mut harness = Harness::new(3).with_actor(&mailbox);
+        let mut ctx = harness.ctx(
+            running_config(StateBackendSelector::Parquet),
+            StateBackendSelector::Parquet,
+        );
+        let phase = PhaseContext::new(&mut ctx);
+        let mut repaired = running_config(StateBackendSelector::Parquet);
+        repaired.restart_nonce = 4;
+        mailbox.submit(LifecycleIntent::Adopt(Box::new(repaired)));
+
+        let Err(reported) = phase
+            .into_fencing(refusal_reason(), IssuedAttempts::default())
+            .reconcile_and_report()
+        else {
+            panic!("an adoption that does not ask the job to stop is not a stop")
+        };
+        assert!(
+            matches!(reported, StateError::RetryableError { .. }),
+            "a job may not be failed for a configuration its own writer has since replaced: the \
+             attempt ends, and the next one runs under the repaired row — {reported:?}"
+        );
+        assert_eq!(
+            ctx.config.restart_nonce, 4,
+            "and the newer configuration was actually published, which is what makes the \
+             standing reason stale rather than merely old"
+        );
+    }
+
+    /// A retryable reason for fencing is left exactly as it was when a newer configuration is
+    /// adopted.
+    ///
+    /// The other side of the rule, and the reason it is not "the newest decision always wins":
+    /// an adoption cannot repair what already went wrong. The workers still failed to start, the
+    /// job retries either way, and replacing the reason would cost the operator the message and
+    /// the retry budget that say what happened.
+    #[tokio::test]
+    async fn a_newer_configuration_does_not_rewrite_a_retryable_reason_for_fencing() {
+        let mailbox = intent_mailbox();
+        let mut harness = Harness::new(3).with_actor(&mailbox);
+        let mut ctx = harness.ctx(
+            running_config(StateBackendSelector::Parquet),
+            StateBackendSelector::Parquet,
+        );
+        let standing = ctx_retryable(&ctx);
+        let phase = PhaseContext::new(&mut ctx);
+        mailbox.submit(LifecycleIntent::Adopt(Box::new(running_config(
+            StateBackendSelector::Parquet,
+        ))));
+
+        let Err(reported) = phase
+            .into_fencing(standing, IssuedAttempts::default())
+            .reconcile_and_report()
+        else {
+            panic!("an adoption that does not ask the job to stop is not a stop")
+        };
+        let StateError::RetryableError {
+            message, retries, ..
+        } = &reported
+        else {
+            panic!("a retryable reason stays retryable: {reported:?}")
+        };
+        assert_eq!(
+            (message.as_str(), *retries),
+            ("failed to start the job's workers", 7),
+            "with its own message and its own budget: the workers still failed to start, and a \
+             newer configuration does not make that untrue"
+        );
+    }
+
+    /// A stop decided while the attempt is fencing ends it as a stop, not as the refusal the
+    /// stop was answering.
+    ///
+    /// `stop_wins_over_refusal` at the far end of the mechanism. The classifier already answers
+    /// "refused *and* stopping" as one case; what this covers is the attempt that had already
+    /// been interrupted by the refusal before the stop was decided. Reporting the refusal there
+    /// ends the job in `Failed`, which throws away the stop the operator asked for — and with a
+    /// `checkpoint` or `graceful` stop, the final checkpoint that stop exists for.
+    #[tokio::test]
+    async fn a_stop_decided_while_fencing_ends_the_attempt_as_a_stop() {
+        for stop_mode in [
+            StopMode::checkpoint,
+            StopMode::graceful,
+            StopMode::immediate,
+            StopMode::force,
+        ] {
+            let mailbox = intent_mailbox();
+            let mut harness = Harness::new(3).with_actor(&mailbox);
+            let mut ctx = harness.ctx(
+                running_config(StateBackendSelector::Parquet),
+                StateBackendSelector::Parquet,
+            );
+            let phase = PhaseContext::new(&mut ctx);
+            // The operator's answer to the refusal: stop this job.
+            mailbox.submit(LifecycleIntent::RefusedButStopping {
+                error: selector_changed(),
+                stop_mode,
+            });
+
+            let outcome = phase
+                .into_fencing(refusal_reason(), IssuedAttempts::default())
+                .reconcile_and_report();
+            assert_eq!(
+                advanced_to(&outcome),
+                Some("Stopping"),
+                "{stop_mode:?}: the job ends where a stop ends. Failing it for the refusal the \
+                 stop was answering would end it in `Failed` and discard the final checkpoint"
+            );
+        }
+    }
+
+    /// The fatal refusal a fencing attempt was interrupted by, exactly as
+    /// `LifecycleDecision::Refuse` builds one.
+    fn refusal_reason() -> StateError {
+        fatal(
+            "the job's persisted configuration was refused",
+            selector_changed().into(),
+        )
+    }
+
+    /// A retryable reason of the kind the preamble produces, built through the same helper the
+    /// phases use so its shape cannot drift from theirs.
+    fn ctx_retryable(ctx: &JobContext<'_>) -> StateError {
+        ctx.retryable(
+            Box::new(Scheduling {}),
+            "failed to start the job's workers",
+            anyhow::anyhow!("the scheduler refused"),
+            7,
+        )
+    }
+
+    /// A leader that reports the job failing answers the task-startup timeout, and the failure
+    /// it reports is what the job leaves on.
+    ///
+    /// The landed body extracts `job_failure` and calls `handle_job_failure`, which reads the
+    /// failure's error domain and its retry hint and decides between recovering the job and
+    /// failing it outright. The phase graph reproduced the RPC and threw the answer away: it
+    /// logged the state and returned a generic retryable timeout, on a budget of 3 rather than
+    /// the 10 the landed body gives even the case where the payload is missing.
+    ///
+    /// Parity is asserted rather than described. Both halves of this row are driven against the
+    /// same leader and the same payload, and the expected outcome is computed by calling the
+    /// very function the landed body calls — so the two routes cannot come to disagree without
+    /// this failing.
+    #[tokio::test]
+    async fn a_leader_reported_startup_failure_is_what_the_phase_graph_leaves_on() {
+        // A recoverable failure: the landed body transitions the job to `Recovering`.
+        let failure = controller_job_failure(
+            "operator blew up on startup",
+            arroyo_rpc::grpc::rpc::ErrorDomain::External,
+            arroyo_rpc::grpc::rpc::RetryHint::WithBackoff,
+        );
+        let (polls, address) = fake_leader_reporting(4, "parquet", failing_status(&failure)).await;
+
+        let mut harness = Harness::new(3);
+        harness.status.generation = 4;
+        let mut ctx = harness.ctx(
+            running_config(StateBackendSelector::Parquet),
+            StateBackendSelector::Parquet,
+        );
+
+        // What the landed `Scheduling::next` does with this exact status, computed here rather
+        // than asserted from memory.
+        let legacy = ctx.handle_job_failure(Scheduling {}, failure.clone()).await;
+        assert_eq!(
+            advanced_to(&legacy),
+            Some("Recovering"),
+            "the fixture's precondition: a `WithBackoff` failure recovers the job"
+        );
+
+        let mut phase = PhaseContext::new(&mut ctx);
+        phase.run_as_leader_on(WorkerId(7), address);
+        let outcome = phase.task_startup_timeout().await;
+
+        let Ok(super::scheduling::admission::PhaseWait::Leave(transition)) = outcome else {
+            panic!(
+                "a leader that says why the job never started is answering the timeout, and the \
+                 answer is a transition the timeout itself cannot express"
+            )
+        };
+        let Transition::Advance(holder) = transition else {
+            panic!("a failing job advances to the state that recovers it")
+        };
+        assert_eq!(
+            holder.state.name(),
+            "Recovering",
+            "the phase graph reaches the same state the landed body reaches for the same \
+             leader status, because it calls the same `handle_job_failure`"
+        );
+        assert!(
+            polls.load(Ordering::SeqCst) >= 1,
+            "and it is the leader's own answer that produced it"
+        );
+    }
+
+    /// The same, for a failure the job may not be retried for.
+    ///
+    /// The half that shows the retry *hint* survives and not merely the transition: a
+    /// `NoRetry` failure fails the job outright, with the domain the leader reported. The
+    /// discarded-answer path could only ever produce a retryable internal error, so the two
+    /// differ in the outcome as well as in the message.
+    #[tokio::test]
+    async fn a_leader_reported_unretryable_startup_failure_fails_the_job_in_its_own_domain() {
+        let failure = controller_job_failure(
+            "the pipeline's SQL cannot run",
+            arroyo_rpc::grpc::rpc::ErrorDomain::User,
+            arroyo_rpc::grpc::rpc::RetryHint::NoRetry,
+        );
+        let (_polls, address) = fake_leader_reporting(4, "parquet", failing_status(&failure)).await;
+
+        let mut harness = Harness::new(3);
+        harness.status.generation = 4;
+        let mut ctx = harness.ctx(
+            running_config(StateBackendSelector::Parquet),
+            StateBackendSelector::Parquet,
+        );
+        let mut phase = PhaseContext::new(&mut ctx);
+        phase.run_as_leader_on(WorkerId(7), address);
+
+        let Err(StateError::FatalError {
+            domain, message, ..
+        }) = phase.task_startup_timeout().await
+        else {
+            panic!("a failure the leader says must not be retried is not a retryable timeout")
+        };
+        assert_eq!(
+            (domain, message.as_str()),
+            (errors::ErrorDomain::User, "the pipeline's SQL cannot run"),
+            "the failure's own domain and its own message reach the job's status row; a generic \
+             timeout would have reported `internal` and hidden the cause"
+        );
+    }
+
+    /// A leader that reports failing without saying why is retried on the landed budget.
+    ///
+    /// The distinction the phase graph had lost entirely: the landed body gives this case 10
+    /// retries — the payload may simply not have been written yet — while an ordinary startup
+    /// timeout gets 3. Merging them makes a job that failed on startup give up sooner than the
+    /// landed path lets it.
+    #[tokio::test]
+    async fn a_leader_failing_without_a_payload_keeps_the_landed_retry_budget() {
+        let mut status = LeaderJobStatus {
+            job_state: JobState::JobFailed as i32,
+            ..Default::default()
+        };
+        status.job_failure = None;
+        let (_polls, address) = fake_leader_reporting(4, "parquet", status).await;
+
+        let mut harness = Harness::new(3);
+        harness.status.generation = 4;
+        let mut ctx = harness.ctx(
+            running_config(StateBackendSelector::Parquet),
+            StateBackendSelector::Parquet,
+        );
+        let mut phase = PhaseContext::new(&mut ctx);
+        phase.run_as_leader_on(WorkerId(7), address);
+
+        let Err(StateError::RetryableError {
+            message, retries, ..
+        }) = phase.task_startup_timeout().await
+        else {
+            panic!("a leader that says nothing useful leaves the attempt retryable")
+        };
+        assert_eq!(
+            (message.as_str(), retries),
+            ("leader reported failing status without failure payload", 10),
+            "the landed body's own message and its own budget"
+        );
+    }
+
+    /// A leader that is not failing leaves the timeout exactly as it was.
+    ///
+    /// The control for the three rows above, and the guarantee that nothing about a healthy —
+    /// or merely slow — leader has changed: the generic startup timeout, on its budget of 3, is
+    /// still what a job whose tasks did not report in gets.
+    #[tokio::test]
+    async fn a_leader_that_is_not_failing_still_reports_the_startup_timeout() {
+        let (_polls, address) = fake_leader_reporting(
+            4,
+            "parquet",
+            LeaderJobStatus {
+                job_state: JobState::JobInitializing as i32,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let mut harness = Harness::new(3);
+        harness.status.generation = 4;
+        let mut ctx = harness.ctx(
+            running_config(StateBackendSelector::Parquet),
+            StateBackendSelector::Parquet,
+        );
+        let mut phase = PhaseContext::new(&mut ctx);
+        phase.run_as_leader_on(WorkerId(7), address);
+
+        let Err(StateError::RetryableError {
+            message, retries, ..
+        }) = phase.task_startup_timeout().await
+        else {
+            panic!("a leader with nothing wrong to report leaves the timeout as a timeout")
+        };
+        assert_eq!(
+            (message.as_str(), retries),
+            ("timed out while waiting for tasks to start", 3),
+            "unchanged from the landed body, which reports the same thing for the same status"
+        );
+    }
+
+    /// A leader status that reports the job failing for `failure`.
+    fn failing_status(failure: &JobFailure) -> LeaderJobStatus {
+        LeaderJobStatus {
+            job_state: JobState::JobFailing as i32,
+            job_failure: Some(failure.clone()),
+            ..Default::default()
+        }
     }
 }

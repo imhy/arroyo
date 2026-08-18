@@ -221,6 +221,11 @@ impl<'a, 'ctx> StartFanOut<'a, 'ctx> {
     /// obligation — the inventory *and* the authority — is offered to the job's settlement
     /// owner as one unit; M11.T25 has no such owner, so it comes back and the admission is
     /// released only after the fan-out has settled in place.
+    ///
+    /// If this future is *dropped* instead — the job's state task cancelled mid-fan-out —
+    /// nothing below the `await` runs at all, and the same offer is made from the region rescue
+    /// that outlives it. See `super::fanout::AttemptLedger::settlement_rescue`: the seam is
+    /// reached on both paths, and the cancelled one is the path an owner exists for.
     pub(crate) async fn issue(self) -> Result<Self, Interrupted<'a, 'ctx>> {
         let Self {
             admission,
@@ -237,7 +242,7 @@ impl<'a, 'ctx> StartFanOut<'a, 'ctx> {
         };
 
         let owner = ctx.settlement_owner();
-        match hand_over(SettlementBundle::new(admission, issued), owner) {
+        match hand_over(SettlementBundle::new(admission, issued), owner.as_deref()) {
             SettlementOutcome::Transferred(receipt) => {
                 let outstanding = receipt.outstanding();
                 let mut interrupted = ctx.into_fencing(reason, IssuedAttempts::default());
@@ -392,7 +397,9 @@ pub(crate) async fn schedule(ctx: &mut JobContext<'_>) -> Result<Transition, Sta
     }
     match run(ctx).await {
         Ok(transition) => Ok(transition),
-        Err(interrupted) => Err(interrupted.reconcile_and_report()),
+        // An interruption is not always a failure: the job's writer may have answered it by
+        // asking the job to stop, and a stop ends where a stop ends.
+        Err(interrupted) => interrupted.reconcile_and_report(),
     }
 }
 
