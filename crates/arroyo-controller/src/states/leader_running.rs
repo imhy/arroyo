@@ -5,6 +5,7 @@ use crate::states::leader_finishing::LeaderFinishing;
 use crate::states::leader_rescaling::LeaderRescaling;
 use crate::states::leader_restarting::LeaderRestarting;
 use crate::states::leader_stop_if_desired_running;
+use crate::states::lifecycle::ConsumptionPoint;
 use crate::states::{RunningConfigUpdate, classify_running_config_update};
 use anyhow::anyhow;
 use arroyo_rpc::config::config;
@@ -67,7 +68,21 @@ impl State for LeaderRunning {
 
         let operator_parallelism = ctx.program.tasks_per_node();
 
+        // What the select below parks on so that a lifecycle intent submitted while the job is
+        // healthy ends the wait. Never ready on the landed M11.T08 mechanism — see
+        // `JobContext::lifecycle_wakeup`.
+        let wake = ctx.lifecycle_wakeup();
+
         loop {
+            // M11.D39a's second consumption point, for the same reason as in controller mode:
+            // a job whose leader is healthy has nothing else that would make this loop look.
+            if ctx
+                .observe_lifecycle_intent(ConsumptionPoint::InsideInterruptibleWait)?
+                .stops()
+            {
+                leader_stop_if_desired_running!(self, ctx.config, ctx);
+            }
+
             if ctx.leader_manager().last_heartbeat.elapsed()
                 > *pipeline_config.worker_heartbeat_timeout
             {
@@ -98,6 +113,9 @@ impl State for LeaderRunning {
             }
 
             tokio::select! {
+                // The loop reads the job's writer at the top of every turn, so ending the turn
+                // is the whole of what this arm has to do.
+                _ = wake.notified() => {}
                 msg = ctx.rx.recv() => {
                     match msg {
                         Some(JobMessage::ConfigUpdate(c)) => {

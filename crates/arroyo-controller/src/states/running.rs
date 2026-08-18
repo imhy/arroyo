@@ -7,6 +7,7 @@ use tracing::error;
 
 use crate::JobMessage;
 use crate::states::finishing::Finishing;
+use crate::states::lifecycle::ConsumptionPoint;
 use crate::states::recovering::Recovering;
 use crate::states::rescaling::Rescaling;
 use crate::states::restarting::Restarting;
@@ -38,7 +39,28 @@ impl State for Running {
         let mut log_interval = tokio::time::interval(Duration::from_secs(60));
         log_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
+        // What the select below parks on so that a lifecycle intent submitted while the job is
+        // healthy ends the wait. Never ready for a job on the landed M11.T08 mechanism, which
+        // is every production job through M11.T25: there the poll publishes into the channel
+        // the first arm already reads.
+        let wake = ctx.lifecycle_wakeup();
+
         loop {
+            // M11.D39a's second consumption point. `Running` is the state a healthy job spends
+            // its life in, and under the single-writer mechanism nothing is sent to the job's
+            // channel when the poll decides something — so without this read a stop or a
+            // refusal decided here would be observed at no point at all, for as long as the
+            // job kept running well.
+            if ctx
+                .observe_lifecycle_intent(ConsumptionPoint::InsideInterruptibleWait)?
+                .stops()
+            {
+                // Through the same macro the `ConfigUpdate` arm below uses, on the
+                // configuration the writer has just published into: a stop that arrives as an
+                // intent and a stop that arrives as a message reach the same state.
+                stop_if_desired_running!(self, ctx.config);
+            }
+
             let ttl_end: Option<Duration> = ctx.config.ttl.map(|t| {
                 let elapsed = Duration::from_micros(
                     (OffsetDateTime::now_utc() - ctx.status.start_time.unwrap())
@@ -49,6 +71,9 @@ impl State for Running {
             });
 
             tokio::select! {
+                // The loop reads the job's writer at the top of every turn, so ending the turn
+                // is the whole of what this arm has to do.
+                _ = wake.notified() => {}
                 msg = ctx.rx.recv() => {
                     match msg {
                         Some(JobMessage::ConfigUpdate(c)) => {

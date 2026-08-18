@@ -1306,7 +1306,18 @@ impl State for Scheduling {
             // interruptible stretches await. A no-op under `LifecycleMode::LegacyT08`,
             // which is what production runs: there the gate read at the next crossing is
             // the mechanism.
-            ctx.observe_lifecycle_intent(ConsumptionPoint::InsideInterruptibleWait)?;
+            //
+            // A consumed stop leaves through the same macro the message-borne one below
+            // uses. This body is not reachable under the other mode — `run_state_body`
+            // sends a job with a D39a writer to the phase graph — so the read can only
+            // ever be the no-op above; it is written this way so that no consumption
+            // point in the crate can answer "the job stops" and be read as "carry on".
+            if ctx
+                .observe_lifecycle_intent(ConsumptionPoint::InsideInterruptibleWait)?
+                .stops()
+            {
+                stop_if_desired_non_running!(self, &ctx.config);
+            }
 
             let timeout = pipeline_config
                 .worker_startup_time
@@ -1515,8 +1526,14 @@ impl State for Scheduling {
         let mut started_tasks = HashSet::new();
         while started_tasks.len() < ctx.program.task_count() {
             // The same consumption point, in the other interruptible wait, for the same
-            // reason: this loop also breaks on the message that makes its count.
-            ctx.observe_lifecycle_intent(ConsumptionPoint::InsideInterruptibleWait)?;
+            // reason: this loop also breaks on the message that makes its count, and for
+            // the same reason a stop it consumes leaves rather than being written down.
+            if ctx
+                .observe_lifecycle_intent(ConsumptionPoint::InsideInterruptibleWait)?
+                .stops()
+            {
+                stop_if_desired_non_running!(self, &ctx.config);
+            }
 
             let timeout = pipeline_config
                 .task_startup_time

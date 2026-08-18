@@ -229,9 +229,13 @@ impl<'a, 'ctx> Fencing<'a, 'ctx> {
     /// While a job fences, a further decision is not a further transition: there is nothing
     /// left to stop and nothing that may be published. So an intent read here is *coalesced*
     /// — recorded as the reason this attempt ends — rather than applied.
+    /// A stop decided here is deliberately *not* turned into a transition. There is nothing
+    /// left to leave for: the attempt has already ended, and this is the reason it ended being
+    /// recorded rather than a phase deciding what to do next. Only a refusal — which changes
+    /// what the job is reported as failing for — is folded in.
     pub(crate) fn coalesce_intent(&mut self, standing: &mut StateError) -> IntentCoalescing {
         match self.ctx.observe_intent_in_wait() {
-            Ok(()) => IntentCoalescing::Unchanged,
+            Ok(_) => IntentCoalescing::Unchanged,
             Err(newer) => {
                 *standing = newer;
                 IntentCoalescing::Coalesced

@@ -3,6 +3,7 @@ use super::{
     leader_stop_if_desired_running, scheduling::Scheduling,
 };
 use crate::JobMessage;
+use crate::states::lifecycle::ConsumptionPoint;
 use crate::states::recovering::Recovering;
 use crate::types::public::RestartMode;
 use arroyo_rpc::config::config;
@@ -40,7 +41,22 @@ impl State for LeaderRestarting {
 
                 let started = Instant::now();
 
+                // What the select below parks on so that a lifecycle intent submitted while the
+                // final checkpoint is being taken ends the wait. Never ready on the landed
+                // M11.T08 mechanism — see `JobContext::lifecycle_wakeup`.
+                let wake = ctx.lifecycle_wakeup();
+
                 loop {
+                    // M11.D39a's second consumption point. This restart ends in `Scheduling`,
+                    // which starts a replacement cluster, so a stop decided while the final
+                    // checkpoint is in flight has to be read here rather than after it.
+                    if ctx
+                        .observe_lifecycle_intent(ConsumptionPoint::InsideInterruptibleWait)?
+                        .stops()
+                    {
+                        leader_stop_if_desired_running!(self, ctx.config, ctx);
+                    }
+
                     let timeout = config()
                         .pipeline
                         .checkpoint
@@ -50,6 +66,9 @@ impl State for LeaderRestarting {
                         .unwrap_or(Duration::MAX);
 
                     tokio::select! {
+                        // The loop reads the job's writer at the top of every turn, so ending
+                        // the turn is the whole of what this arm has to do.
+                        _ = wake.notified() => {}
                         msg = ctx.rx.recv() => {
                             match msg {
                                 Some(JobMessage::ConfigUpdate(c)) => {

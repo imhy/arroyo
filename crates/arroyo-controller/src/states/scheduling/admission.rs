@@ -66,6 +66,27 @@ pub(crate) enum PhaseWait {
     Leave(Transition),
 }
 
+/// What crossing into a region of irreversible work produced.
+///
+/// A crossing has three outcomes, not two, and the third is the one M11.D39a's consumption
+/// points exist to make reachable: the job's single writer may have decided, since the last
+/// look, that the job *stops*. A stop is not a failure — nothing is wrong, and the job must
+/// end where a stop ends rather than where an error does — so it cannot be an `Err`; and it is
+/// emphatically not a success to be carried into the region, because the regions are the
+/// `StartExecution` fan-out and the publication of a restored checkpoint's commits.
+///
+/// So the admission itself is what a crossing has to *not* return when the job is stopping.
+/// Leaving carries no token, which is the structural half of the claim: there is no value in
+/// this enum from which a stopping job could perform an irreversible effect.
+pub(crate) enum Admitted {
+    /// The region was entered. Its authority is the job's publication lock, held until this
+    /// value is dropped.
+    Region(Admission),
+    /// The job's writer decided it stops. Nothing was admitted, and the region's first effect
+    /// has not run.
+    Leave(Transition),
+}
+
 /// Everything the phase graph is allowed to do to a job, and nothing else.
 ///
 /// # Why the borrow is owned rather than passed
@@ -157,20 +178,64 @@ impl<'a, 'ctx> PhaseContext<'a, 'ctx> {
     /// actor, so the first read is the operative one; taking the gate as well costs one
     /// uncontended lock and keeps the two mechanisms from diverging while both exist.
     ///
+    /// A writer that has decided the job stops leaves through [`Admitted::Leave`] instead, and
+    /// leaves *before* the admission is taken — not after. Taking it first and then noticing
+    /// would put the decision on the far side of the lock whose whole purpose is to fence the
+    /// region's effects, and the phase holding it would already be one method call from the
+    /// fan-out.
+    ///
     /// # Errors
     ///
     /// The fatal [`StateError`] of a refused configuration, from either mechanism.
-    pub(crate) async fn admit(&mut self) -> Result<Admission, StateError> {
-        self.ctx
-            .observe_lifecycle_intent(ConsumptionPoint::BeforeIrreversiblePhase)?;
-        self.ctx.admit_irreversible_scheduling().await
+    pub(crate) async fn admit(&mut self) -> Result<Admitted, StateError> {
+        if let PhaseWait::Leave(stop) = self.observe(ConsumptionPoint::BeforeIrreversiblePhase)? {
+            return Ok(Admitted::Leave(stop));
+        }
+        Ok(Admitted::Region(
+            self.ctx.admit_irreversible_scheduling().await?,
+        ))
     }
 
     /// Reads the job's single writer on a turn of a wait (M11.D39a's second consumption
     /// point).
-    pub(crate) fn observe_intent_in_wait(&mut self) -> Result<(), StateError> {
-        self.ctx
-            .observe_lifecycle_intent(ConsumptionPoint::InsideInterruptibleWait)
+    pub(crate) fn observe_intent_in_wait(&mut self) -> Result<PhaseWait, StateError> {
+        self.observe(ConsumptionPoint::InsideInterruptibleWait)
+    }
+
+    /// Reads the job's single writer immediately before a stretch of work that is not
+    /// irreversible in itself but *prepares* one (M11.D39a's first consumption point).
+    ///
+    /// [`AwaitingTasks::admit_commit_publish`](super::phases::AwaitingTasks::admit_commit_publish)
+    /// is the caller: the handover it runs first moves the restored checkpoint's commits into
+    /// the job controller, and a stop read on the far side of that move would be a stop read
+    /// after the thing it exists to prevent had been assembled.
+    pub(crate) fn observe_before_phase(&mut self) -> Result<PhaseWait, StateError> {
+        self.observe(ConsumptionPoint::BeforeIrreversiblePhase)
+    }
+
+    /// Reads the job's single writer, and says whether the job is now leaving `Scheduling`.
+    ///
+    /// The stop test is made against the job's *configuration* rather than against which
+    /// decision the writer reached, and unconditionally rather than only when something was
+    /// decided. Both are deliberate. Publication writes the stop into `ctx.config`, so the
+    /// configuration is where the answer is; and asking the same question
+    /// [`schedule`](super::phases::schedule) asks on entry — through the same
+    /// `stop_if_desired_non_running!` macro, so the two cannot disagree about what a stop mode
+    /// means — catches a stop that reached the configuration by any route, not only the one
+    /// this call just observed.
+    ///
+    /// Nothing on the selected M11.T08 path reaches here: a `PhaseContext` exists only for a
+    /// job whose lifecycle is M11.D39a's single writer.
+    ///
+    /// # Errors
+    ///
+    /// The fatal [`StateError`] of a refused configuration.
+    fn observe(&mut self, at: ConsumptionPoint) -> Result<PhaseWait, StateError> {
+        self.ctx.observe_lifecycle_intent(at)?;
+        Ok(match self.stop_if_desired() {
+            Some(stop) => PhaseWait::Leave(stop),
+            None => PhaseWait::Continue,
+        })
     }
 
     /// Starts the clock a wait's timeout is measured from.

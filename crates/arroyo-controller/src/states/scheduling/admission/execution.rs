@@ -17,6 +17,21 @@
 //! Both waits are `ctx.rx.recv` wrappers, and this is the only place in the phase graph that
 //! has any: [`super::super::phases`]'s token-free types are the only ones that expose a route
 //! to them.
+//!
+//! # Why each wait also selects on the job's intent mailbox
+//!
+//! Under M11.D39a the configuration poll *submits* rather than sends: it leaves a versioned
+//! intent and returns, and nothing is put in the job's channel. A wait that selected only on
+//! that channel would therefore not turn when a stop or a refusal was decided — it would turn
+//! when a worker registered, or when the startup budget ran out. Reading the mailbox at the
+//! top of each turn is necessary but not sufficient, because "the top of each turn" is only
+//! reached when something ended the previous one. So the mailbox's own wake is an arm of both
+//! selects, and the deadline for observing a decision becomes the submission rather than the
+//! timeout.
+//!
+//! For a job on the landed M11.T08 mechanism that arm is a future that never completes: there
+//! is no mailbox, the poll publishes into the job's channel and to the
+//! [`RefusalGate`](crate::states::RefusalGate), and this wait already selects on the channel.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -50,8 +65,14 @@ impl PhaseContext<'_, '_> {
     /// `StartExecutionReq` the fan-out sends stamps it into every one of them.
     pub(crate) async fn await_message_from_workers(&mut self) -> Result<PhaseWait, StateError> {
         let timeout = self.remaining(*config().pipeline.worker_startup_time);
+        // Taken before the select rather than inside it: the other arm borrows the job's
+        // context mutably, and this handle owns what it watches instead of borrowing it.
+        let wake = self.ctx.lifecycle_wakeup();
         tokio::select! {
             val = self.ctx.rx.recv() => self.handle_worker_wait_message(val).await,
+            // The loop reads the mailbox at the top of every turn, so ending the turn is the
+            // whole of what this arm has to do.
+            _ = wake.notified() => Ok(PhaseWait::Continue),
             _ = tokio::time::sleep(timeout) => Err(self.retryable(
                 "timed out while waiting for workers to start",
                 anyhow!(
@@ -81,8 +102,10 @@ impl PhaseContext<'_, '_> {
     /// One turn of the wait for the started execution's tasks to report in.
     pub(crate) async fn await_message_from_tasks(&mut self) -> Result<PhaseWait, StateError> {
         let timeout = self.remaining(*config().pipeline.task_startup_time);
+        let wake = self.ctx.lifecycle_wakeup();
         tokio::select! {
             v = self.ctx.rx.recv() => self.handle_task_wait_message(v).await,
+            _ = wake.notified() => Ok(PhaseWait::Continue),
             _ = tokio::time::sleep(timeout) => Err(self.task_startup_timeout().await),
         }
     }

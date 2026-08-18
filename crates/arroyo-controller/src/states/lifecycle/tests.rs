@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use arroyo_rpc::state_backend::{StateBackendError, StateBackendSelector};
 
 use super::actor::{ConsumptionPoint, LifecycleActor, LifecycleDecision};
-use super::intent::{IntentMailbox, IntentVersion, LifecycleIntent};
+use super::intent::{IntentMailbox, IntentVersion, IntentWakeup, LifecycleIntent};
 use super::mode::LifecycleMode;
 use crate::types::public::{RestartMode, StopMode};
 use crate::{JobConfig, PolledJob};
@@ -429,5 +429,120 @@ fn repaired_row_not_failed_by_stale_intent() {
         writer.observe(ConsumptionPoint::InsideInterruptibleWait),
         Some(LifecycleDecision::Adopt(repaired)),
         "and the repair is a new intent, so the writer that had already refused adopts it"
+    );
+}
+
+// -------------------------------------------------------------------------------------------
+// Review round 1 — the wake. Submitting an intent is not delivering it.
+//
+// Every consumption point is reached either at a state boundary or on a turn of a wait, and a
+// wait turns only when something wakes it. Under M11.D39a nothing is sent to the job's channel
+// when the poll decides something, so a job that is simply running well has nothing that would
+// make it look: the intent sits in the mailbox until a startup budget expires, or — in
+// `Running`, whose only other arms are its own progress tick and the channel — forever.
+//
+// A coarse bound, not a performance assertion: any of these that depended on a timeout rather
+// than on the wake would not finish inside it at all.
+// -------------------------------------------------------------------------------------------
+
+/// How long a row waits for a wake it expects. Generous, because what is being distinguished is
+/// "woken" from "not woken at all".
+const WAKE_BOUND: Duration = Duration::from_secs(10);
+/// How long a row waits to be sure a wake it does *not* expect has not happened.
+const QUIET: Duration = Duration::from_millis(100);
+
+/// A consumer already parked on the mailbox is released by the next submission.
+#[tokio::test]
+async fn a_submitted_intent_ends_a_wait_that_is_already_parked_on_it() {
+    let mailbox = new_mailbox();
+    let wake = IntentWakeup::watching(Arc::clone(&mailbox));
+
+    let poll = tokio::spawn({
+        let mailbox = Arc::clone(&mailbox);
+        async move {
+            // Long enough that the park below is entered first in any ordering that matters,
+            // and short enough that the row is not itself a timeout test.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            mailbox.submit(LifecycleIntent::Adopt(running_config()));
+        }
+    });
+
+    tokio::time::timeout(WAKE_BOUND, wake.notified())
+        .await
+        .expect(
+            "a submission has to end a wait that is parked on the mailbox. Nothing else would: \
+             under M11.D39a the poll puts nothing in the job's channel",
+        );
+    poll.await.unwrap();
+    assert!(
+        mailbox.newer_than(IntentVersion::NONE).is_some(),
+        "and what the wake was raised for is there to be read"
+    );
+}
+
+/// A submission that lands in the window between a consumer's read and its park still ends the
+/// park.
+///
+/// This is the ordering the wake primitive is chosen for, and it is not avoidable: the read has
+/// to happen before the wait, or the wait would be entered without the value it exists to
+/// notice. `notify_one` *stores* a permit when nobody is parked, so the park that follows the
+/// submission completes immediately; `notify_waiters` would have dropped it on the floor and the
+/// job would have waited out its startup budget with a stop sitting in its mailbox.
+#[tokio::test]
+async fn a_submission_that_lands_between_a_read_and_a_park_still_ends_the_park() {
+    let mailbox = new_mailbox();
+    let wake = IntentWakeup::watching(Arc::clone(&mailbox));
+
+    // The consumer's read: nothing yet.
+    assert!(mailbox.newer_than(IntentVersion::NONE).is_none());
+    // The poll, in the window.
+    mailbox.submit(LifecycleIntent::Adopt(running_config()));
+    // The consumer's park, after it.
+    tokio::time::timeout(QUIET, wake.notified())
+        .await
+        .expect("the permit a submission stores is what makes this window safe to have");
+}
+
+/// A row re-polled unchanged does not wake the job once per poll.
+///
+/// The same rule as the version stamp, for the same reason: a bad row is re-polled every 500ms
+/// forever, and a wake per poll would be a job woken every 500ms to find that nothing has
+/// changed since the last time it looked.
+#[tokio::test]
+async fn a_re_polled_row_does_not_wake_the_job_once_per_poll() {
+    let mailbox = new_mailbox();
+    let wake = IntentWakeup::watching(Arc::clone(&mailbox));
+
+    let refused = LifecycleIntent::classify(
+        StateBackendSelector::Parquet,
+        polled(running_config(), Some(selector_changed())),
+    );
+    let first = mailbox.submit(refused.clone());
+    tokio::time::timeout(QUIET, wake.notified())
+        .await
+        .expect("the first classification of the row is something new to look at");
+
+    for poll in 1..100 {
+        assert_eq!(mailbox.submit(refused.clone()), first, "poll {poll}");
+    }
+    assert!(
+        tokio::time::timeout(QUIET, wake.notified()).await.is_err(),
+        "and the ninety-nine polls after it are the same row, so there is nothing for a woken \
+         consumer to find"
+    );
+}
+
+/// A job whose lifecycle the configuration poll decides has nothing to wake on.
+///
+/// Not "a wake that fires and finds nothing" but a branch that is never ready: on the landed
+/// M11.T08 mechanism there is no mailbox at all, the poll publishes into the job's channel and
+/// to the refusal gate, and every wait already selects on that channel. This is what keeps the
+/// selected production path's behaviour identical.
+#[tokio::test]
+async fn a_job_on_the_landed_mechanism_has_nothing_to_wake_on() {
+    let wake = IntentWakeup::none();
+    assert!(
+        tokio::time::timeout(QUIET, wake.notified()).await.is_err(),
+        "there is no mailbox behind this handle, so it can never become ready"
     );
 }

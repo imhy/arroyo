@@ -11,7 +11,7 @@ use arroyo_rpc::state_backend::{
 };
 use tracing::{error, info};
 
-use super::intent::{IntentMailbox, IntentVersion, LifecycleIntent};
+use super::intent::{IntentMailbox, IntentVersion, IntentWakeup, LifecycleIntent};
 use crate::JobConfig;
 use crate::states::{JobContext, StateError, fatal};
 use crate::types::public::StopMode;
@@ -50,6 +50,65 @@ impl ConsumptionPoint {
     }
 }
 
+/// What observing the job's single writer leaves its caller to do.
+///
+/// # Why observation has three outcomes and not two
+///
+/// A decision is *published* by [`LifecycleDecision::apply`] and *acted on* by the caller,
+/// and the two are different steps because only the caller knows what leaving looks like from
+/// where it stands: `Scheduling` leaves for [`Stopping`](crate::states::stopping::Stopping),
+/// `Running` leaves for a checkpoint stop or an immediate one, a leader-mode state leaves for
+/// [`LeaderStopping`](crate::states::leader_stopping::LeaderStopping).
+///
+/// Publishing alone is not enough. A stop written into the job's configuration and then
+/// reported as `Ok(())` reads, at every call site, as permission to continue — and the phases
+/// that follow a consumption point are the fan-out that starts an execution and the
+/// publication of a restored checkpoint's commits, neither of which can be taken back. So a
+/// consumed stop is returned as a value the caller cannot spend without answering it, exactly
+/// as a consumed refusal is returned as an `Err` the caller cannot `?` past.
+///
+/// # The rule, in one place
+///
+/// [`Self::Stop`] means "the job's configuration now asks it to stop" — literally
+/// `stop_mode != StopMode::none`, which is the same field, read by the same rule, that every
+/// `stop_if_desired*` macro reads. The caller then invokes its own macro rather than
+/// reimplementing the mapping from stop mode to state, so a stop that arrives through the
+/// mailbox and a stop that arrives as a `ConfigUpdate` cannot come to mean different things.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ObservedIntent {
+    /// Nothing was decided, or what was decided leaves the job doing what it was doing.
+    ///
+    /// This is the *only* outcome under
+    /// [`LifecycleMode::LegacyT08`](super::LifecycleMode::LegacyT08), because a job on the
+    /// landed mechanism has no actor to decide anything — which is what makes every guard
+    /// built on [`Self::Stop`] unreachable in production and the selected path unchanged.
+    Continue,
+    /// The job's writer decided it stops, and has published the stop into the job's
+    /// configuration. The caller must leave for its own stop state before its next
+    /// irreversible effect.
+    Stop,
+}
+
+impl ObservedIntent {
+    /// What the job's configuration now says, as an outcome.
+    ///
+    /// Derived from the published configuration rather than from which decision produced it,
+    /// because a stop can arrive either way: [`LifecycleDecision::StopUnderRunningConfig`] is
+    /// a refused row keeping its stop, and [`LifecycleDecision::Adopt`] is an accepted row
+    /// that may itself be asking the job to stop. Reading the result closes both.
+    fn of(config: &JobConfig) -> Self {
+        match config.stop_mode {
+            StopMode::none => ObservedIntent::Continue,
+            _ => ObservedIntent::Stop,
+        }
+    }
+
+    /// Whether the caller must leave for its stop state.
+    pub(crate) fn stops(self) -> bool {
+        matches!(self, ObservedIntent::Stop)
+    }
+}
+
 /// What the job's single writer has decided to do about the poll's latest intent.
 ///
 /// A decision is separated from its application so that the decision itself is a value a
@@ -79,6 +138,11 @@ impl LifecycleDecision {
     /// baseline or a lifecycle status under [`LifecycleMode::FencedV2`](super::LifecycleMode::FencedV2),
     /// which is the whole of "decision and delivery have one owner".
     ///
+    /// Returning [`ObservedIntent`] rather than `()` is the other half of publication: what is
+    /// written here has to be *acted on* by whatever called the consumption point, and a stop
+    /// reported as an unremarkable success is a stop every caller reads as permission to carry
+    /// on into the next irreversible phase.
+    ///
     /// # Errors
     ///
     /// Returns a fatal [`StateError`] for [`Self::Refuse`], carrying the typed
@@ -86,18 +150,22 @@ impl LifecycleDecision {
     /// an interruptible wait, so the job fails from whatever state it is in — exactly as
     /// the M11.T08 path fails it through
     /// [`handle_unhandled_message`](crate::states::handle_unhandled_message).
-    pub(crate) fn apply(self, ctx: &mut JobContext<'_>) -> Result<(), StateError> {
+    pub(crate) fn apply(self, ctx: &mut JobContext<'_>) -> Result<ObservedIntent, StateError> {
         match self {
             LifecycleDecision::Adopt(config) => {
                 ctx.config = config;
-                Ok(())
+                // The adopted row may itself be the row that asks the job to stop, which is
+                // the ordinary way an operator stops a job whose configuration is fine. So
+                // the answer is read off what was just published, not off which arm reached
+                // it.
+                Ok(ObservedIntent::of(&ctx.config))
             }
             LifecycleDecision::StopUnderRunningConfig(stop_mode) => {
                 // Only the stop mode. The configuration this is written onto is the one the
                 // job's workers, table configs and checkpoints were built from, so the
                 // refused selector and the refused restart nonce are in neither.
                 ctx.config.stop_mode = stop_mode;
-                Ok(())
+                Ok(ObservedIntent::of(&ctx.config))
             }
             LifecycleDecision::Refuse(error) => {
                 error!(
@@ -185,6 +253,14 @@ impl LifecycleActor {
             decided: IntentVersion::NONE,
             mailbox,
         }
+    }
+
+    /// What an interruptible wait parks on so that a submission ends it.
+    ///
+    /// A handle rather than a borrow, because the waits select on it beside a mutable borrow
+    /// of the job's own context. See [`IntentWakeup`].
+    pub(crate) fn wakeup(&self) -> IntentWakeup {
+        IntentWakeup::watching(Arc::clone(&self.mailbox))
     }
 
     /// Reads the job's intent mailbox and decides, if there is anything new to decide.

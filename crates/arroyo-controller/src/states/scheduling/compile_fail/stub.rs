@@ -50,6 +50,11 @@ pub mod scheduling {
             Leave(Transition),
         }
 
+        pub enum Admitted {
+            Region(Admission),
+            Leave(Transition),
+        }
+
         pub struct PhaseContext<'a, 'ctx> {
             marker: std::marker::PhantomData<&'a mut JobContext<'ctx>>,
         }
@@ -61,10 +66,13 @@ pub mod scheduling {
             pub fn stop_if_desired(&self) -> Option<Transition> {
                 unimplemented!()
             }
-            pub async fn admit(&mut self) -> Result<Admission, StateError> {
+            pub async fn admit(&mut self) -> Result<Admitted, StateError> {
                 unimplemented!()
             }
-            pub fn observe_intent_in_wait(&mut self) -> Result<(), StateError> {
+            pub fn observe_intent_in_wait(&mut self) -> Result<PhaseWait, StateError> {
+                unimplemented!()
+            }
+            pub fn observe_before_phase(&mut self) -> Result<PhaseWait, StateError> {
                 unimplemented!()
             }
             pub fn begin_wait(&mut self) {}

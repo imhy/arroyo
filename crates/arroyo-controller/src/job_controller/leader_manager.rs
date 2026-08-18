@@ -1,5 +1,7 @@
+use crate::JobConfig;
 use crate::JobMessage;
 use crate::states::leader_stopping::{LeaderStopBehavior, LeaderStopping};
+use crate::states::lifecycle::ConsumptionPoint;
 use crate::states::recovering::Recovering;
 use crate::states::{
     JobContext, State, StateError, Transition, TransitionTo, check_config_update,
@@ -200,6 +202,25 @@ impl LeaderManager {
     }
 }
 
+/// The stop this wait can be overtaken by, if the job's configuration asks for one.
+///
+/// The states that share this wait are already ending the job — a checkpoint stop, a rescale's
+/// final checkpoint, a finish — so a `checkpoint` stop is what is already happening and a
+/// `none` is nothing. What overtakes them is an operator who has stopped being willing to wait:
+/// `graceful`, `immediate`, or `force`.
+///
+/// One rule with two readers: the configuration updates this wait consumes from the job's
+/// channel, and the lifecycle intents M11.D39a's single writer publishes into its
+/// configuration. Written once so the two cannot come to disagree about what a stop mode means.
+fn leader_stop_escalation(config: &JobConfig) -> Option<LeaderStopBehavior> {
+    match config.stop_mode {
+        SqlStopMode::force => Some(LeaderStopBehavior::StopWorkers),
+        SqlStopMode::immediate => Some(LeaderStopBehavior::StopJob(JobStopMode::JobStopImmediate)),
+        SqlStopMode::graceful => Some(LeaderStopBehavior::StopJob(JobStopMode::JobStopGraceful)),
+        SqlStopMode::none | SqlStopMode::checkpoint => None,
+    }
+}
+
 pub async fn handle_leader_stopping<'a, S, T>(
     state: S,
     ctx: &mut JobContext<'a>,
@@ -216,32 +237,35 @@ where
 {
     let started = Instant::now();
 
+    // What the select below parks on so that a lifecycle intent submitted while this waits ends
+    // the wait. Never ready on the landed M11.T08 mechanism — see
+    // `JobContext::lifecycle_wakeup`.
+    let wake = ctx.lifecycle_wakeup();
+
     loop {
+        // M11.D39a's second consumption point, in the wait three leader-mode states share.
+        // `LeaderRescaling` reaches `Scheduling` through it, which starts a replacement cluster,
+        // so the read is not merely for tidiness even though the other two are already ending.
+        if ctx
+            .observe_lifecycle_intent(ConsumptionPoint::InsideInterruptibleWait)?
+            .stops()
+            && let Some(stop_behavior) = leader_stop_escalation(&ctx.config)
+        {
+            return Ok(Transition::next(state, LeaderStopping { stop_behavior }));
+        }
+
         let timeout = timeout
             .map(|t| (started + t).saturating_duration_since(Instant::now()))
             .unwrap_or(Duration::MAX);
 
         tokio::select! {
+            // The loop reads the job's writer at the top of every turn, so ending the turn is
+            // the whole of what this arm has to do.
+            _ = wake.notified() => {}
             msg = ctx.rx.recv() => {
                 match msg {
                     Some(JobMessage::ConfigUpdate(c)) => {
-                        let next = match c.stop_mode {
-                            SqlStopMode::force => {
-                                Some(LeaderStopBehavior::StopWorkers)
-                            }
-                            SqlStopMode::immediate => {
-                                Some(LeaderStopBehavior::StopJob(JobStopMode::JobStopImmediate))
-                            }
-                            SqlStopMode::graceful => {
-                                Some(LeaderStopBehavior::StopJob(JobStopMode::JobStopGraceful))
-                            }
-                            SqlStopMode::none | SqlStopMode::checkpoint => {
-                                // do nothing
-                                None
-                            }
-                        };
-
-                        if let Some(stop_behavior) = next {
+                        if let Some(stop_behavior) = leader_stop_escalation(&c) {
                             return Ok(Transition::next(state, LeaderStopping {
                                 stop_behavior
                             }));

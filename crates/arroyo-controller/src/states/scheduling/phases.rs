@@ -41,7 +41,7 @@
 //! [`LifecycleMode::SELECTED`](crate::states::lifecycle::LifecycleMode::SELECTED) — and the
 //! landed `Scheduling::next` remains compiled, selected and unchanged.
 
-use super::admission::{PhaseContext, PhaseWait};
+use super::admission::{Admitted, PhaseContext, PhaseWait};
 use super::fanout::{IssuedAttempts, SettlementBundle, SettlementOutcome, hand_over};
 use super::fencing::Interrupted;
 use crate::states::{Admission, JobContext, StateError, Transition};
@@ -51,7 +51,14 @@ type PreambleStep<'a, 'ctx> = Result<Preamble<'a, 'ctx>, Interrupted<'a, 'ctx>>;
 
 /// Either the phase an attempt advanced to, or the transition by which it left `Scheduling`
 /// without reaching one.
-enum Advanced<P> {
+///
+/// Every crossing and every turn of a wait produces one of these, because both are points at
+/// which the job's single writer is read and what it decided may be *stop*. A stop is not an
+/// error and must not be reported as one — the job ends where a stop ends — so it travels as
+/// the transition it is, in the `Ok` half, and the phase it would otherwise have become is
+/// simply never constructed. Nothing in this enum carries an [`Admission`], which is the
+/// structural half of "a stopping job takes no further irreversible effect".
+pub(crate) enum Advanced<P> {
     To(P),
     Left(Transition),
 }
@@ -68,12 +75,14 @@ pub(crate) struct Preamble<'a, 'ctx> {
 }
 
 impl<'a, 'ctx> Preamble<'a, 'ctx> {
-    /// Crosses into the preamble, or fences because the job's configuration was refused.
+    /// Crosses into the preamble — or leaves for a stop the job's writer decided on, or fences
+    /// because its configuration was refused.
     pub(crate) async fn enter(
         mut ctx: PhaseContext<'a, 'ctx>,
-    ) -> Result<Self, Interrupted<'a, 'ctx>> {
+    ) -> Result<Advanced<Self>, Interrupted<'a, 'ctx>> {
         match ctx.admit().await {
-            Ok(admission) => Ok(Self { admission, ctx }),
+            Ok(Admitted::Region(admission)) => Ok(Advanced::To(Self { admission, ctx })),
+            Ok(Admitted::Leave(stop)) => Ok(Advanced::Left(stop)),
             Err(reason) => Err(ctx.into_fencing(reason, IssuedAttempts::default())),
         }
     }
@@ -139,7 +148,11 @@ pub(crate) struct AwaitingWorkers<'a, 'ctx> {
 
 impl<'a, 'ctx> AwaitingWorkers<'a, 'ctx> {
     /// Reads the job's single writer on this turn of the wait.
-    pub(crate) fn observe_intent(&mut self) -> Result<(), StateError> {
+    ///
+    /// [`PhaseWait::Leave`] is a stop it decided on, and it is the same value the message path
+    /// produces for a stop that arrived as a `ConfigUpdate` — so the loop that drives this wait
+    /// cannot treat one as decisive and the other as advisory.
+    pub(crate) fn observe_intent(&mut self) -> Result<PhaseWait, StateError> {
         self.ctx.observe_intent_in_wait()
     }
 
@@ -165,17 +178,20 @@ impl<'a, 'ctx> AwaitingWorkers<'a, 'ctx> {
     /// effect and awaits nothing, so it has no business holding the job's publication lock.
     pub(crate) async fn admit_fan_out(
         self,
-    ) -> Result<StartFanOut<'a, 'ctx>, Interrupted<'a, 'ctx>> {
+    ) -> Result<Advanced<StartFanOut<'a, 'ctx>>, Interrupted<'a, 'ctx>> {
         let Self { mut ctx } = self;
         if let Err(reason) = ctx.require_reconciling_workers() {
             return Err(ctx.into_fencing(reason, IssuedAttempts::default()));
         }
         match ctx.admit().await {
-            Ok(admission) => Ok(StartFanOut {
+            Ok(Admitted::Region(admission)) => Ok(Advanced::To(StartFanOut {
                 admission,
                 ctx,
                 issued: IssuedAttempts::default(),
-            }),
+            })),
+            // A stop decided here leaves without a token, so the fan-out below is not merely
+            // skipped: there is no value from which it could be performed.
+            Ok(Admitted::Leave(stop)) => Ok(Advanced::Left(stop)),
             Err(reason) => Err(ctx.into_fencing(reason, IssuedAttempts::default())),
         }
     }
@@ -256,7 +272,7 @@ pub(crate) struct AwaitingTasks<'a, 'ctx> {
 
 impl<'a, 'ctx> AwaitingTasks<'a, 'ctx> {
     /// Reads the job's single writer on this turn of the wait.
-    pub(crate) fn observe_intent(&mut self) -> Result<(), StateError> {
+    pub(crate) fn observe_intent(&mut self) -> Result<PhaseWait, StateError> {
         self.ctx.observe_intent_in_wait()
     }
 
@@ -278,18 +294,30 @@ impl<'a, 'ctx> AwaitingTasks<'a, 'ctx> {
     /// holds the lock at all.
     pub(crate) async fn admit_commit_publish(
         self,
-    ) -> Result<CommitOrRun<'a, 'ctx>, Interrupted<'a, 'ctx>> {
+    ) -> Result<Advanced<CommitOrRun<'a, 'ctx>>, Interrupted<'a, 'ctx>> {
         let Self { mut ctx, issued } = self;
+        // Before the handover, not after it. The wait above ends on the message that made its
+        // count, so this is the first look since; and the handover moves the restored
+        // checkpoint's commits into the job controller, which is the assembly of the very
+        // effect a stop has to prevent.
+        match ctx.observe_before_phase() {
+            Ok(PhaseWait::Continue) => {}
+            Ok(PhaseWait::Leave(stop)) => return Ok(Advanced::Left(stop)),
+            Err(reason) => return Err(ctx.into_fencing(reason, issued)),
+        }
         ctx.prepare_handover().await;
         if !ctx.needs_restored_commits() {
-            return Ok(CommitOrRun::Run(Running { ctx, issued }));
+            return Ok(Advanced::To(CommitOrRun::Run(Running { ctx, issued })));
         }
         match ctx.admit().await {
-            Ok(admission) => Ok(CommitOrRun::Publish(CommitPublish {
-                admission,
-                ctx,
-                issued,
-            })),
+            Ok(Admitted::Region(admission)) => {
+                Ok(Advanced::To(CommitOrRun::Publish(CommitPublish {
+                    admission,
+                    ctx,
+                    issued,
+                })))
+            }
+            Ok(Admitted::Leave(stop)) => Ok(Advanced::Left(stop)),
             Err(reason) => Err(ctx.into_fencing(reason, issued)),
         }
     }
@@ -370,7 +398,10 @@ pub(crate) async fn schedule(ctx: &mut JobContext<'_>) -> Result<Transition, Sta
 
 /// The graph itself, one phase per line.
 async fn run<'a, 'ctx>(ctx: PhaseContext<'a, 'ctx>) -> Result<Transition, Interrupted<'a, 'ctx>> {
-    let awaiting_workers = preamble(ctx).await?;
+    let awaiting_workers = match preamble(ctx).await? {
+        Advanced::To(phase) => phase,
+        Advanced::Left(transition) => return Ok(transition),
+    };
     let fan_out = match wait_for_workers(awaiting_workers).await? {
         Advanced::To(phase) => phase,
         Advanced::Left(transition) => return Ok(transition),
@@ -386,13 +417,16 @@ async fn run<'a, 'ctx>(ctx: PhaseContext<'a, 'ctx>) -> Result<Transition, Interr
 /// The first admitted region, effect by effect.
 async fn preamble<'a, 'ctx>(
     ctx: PhaseContext<'a, 'ctx>,
-) -> Result<AwaitingWorkers<'a, 'ctx>, Interrupted<'a, 'ctx>> {
-    let preamble = Preamble::enter(ctx).await?;
+) -> Result<Advanced<AwaitingWorkers<'a, 'ctx>>, Interrupted<'a, 'ctx>> {
+    let preamble = match Preamble::enter(ctx).await? {
+        Advanced::To(preamble) => preamble,
+        Advanced::Left(transition) => return Ok(Advanced::Left(transition)),
+    };
     let preamble = preamble.persist_generation().await?;
     let preamble = preamble.tear_down_existing_cluster().await?;
     let preamble = preamble.start_replacement_workers().await?;
     let preamble = preamble.prepare_recovery_checkpoint().await?;
-    Ok(preamble.release())
+    Ok(Advanced::To(preamble.release()))
 }
 
 /// The first interruptible wait, up to the crossing into the fan-out.
@@ -400,8 +434,10 @@ async fn wait_for_workers<'a, 'ctx>(
     mut awaiting: AwaitingWorkers<'a, 'ctx>,
 ) -> Result<Advanced<StartFanOut<'a, 'ctx>>, Interrupted<'a, 'ctx>> {
     loop {
-        if let Err(reason) = awaiting.observe_intent() {
-            return Err(awaiting.fence(reason));
+        match awaiting.observe_intent() {
+            Ok(PhaseWait::Continue) => {}
+            Ok(PhaseWait::Leave(transition)) => return Ok(Advanced::Left(transition)),
+            Err(reason) => return Err(awaiting.fence(reason)),
         }
         match awaiting.await_message().await {
             Ok(PhaseWait::Continue) => {}
@@ -415,7 +451,7 @@ async fn wait_for_workers<'a, 'ctx>(
     if let Err(reason) = awaiting.await_worker_channels().await {
         return Err(awaiting.fence(reason));
     }
-    awaiting.admit_fan_out().await.map(Advanced::To)
+    awaiting.admit_fan_out().await
 }
 
 /// The second interruptible wait, up to the crossing into the commit publication.
@@ -423,8 +459,10 @@ async fn wait_for_tasks<'a, 'ctx>(
     mut awaiting: AwaitingTasks<'a, 'ctx>,
 ) -> Result<Advanced<Running<'a, 'ctx>>, Interrupted<'a, 'ctx>> {
     while !awaiting.tasks_are_all_started() {
-        if let Err(reason) = awaiting.observe_intent() {
-            return Err(awaiting.fence(reason));
+        match awaiting.observe_intent() {
+            Ok(PhaseWait::Continue) => {}
+            Ok(PhaseWait::Leave(transition)) => return Ok(Advanced::Left(transition)),
+            Err(reason) => return Err(awaiting.fence(reason)),
         }
         match awaiting.await_message().await {
             Ok(PhaseWait::Continue) => {}
@@ -433,9 +471,10 @@ async fn wait_for_tasks<'a, 'ctx>(
         }
     }
     match awaiting.admit_commit_publish().await? {
-        CommitOrRun::Publish(publishing) => Ok(Advanced::To(
+        Advanced::To(CommitOrRun::Publish(publishing)) => Ok(Advanced::To(
             publishing.publish_restored_commits().await.release(),
         )),
-        CommitOrRun::Run(running) => Ok(Advanced::To(running)),
+        Advanced::To(CommitOrRun::Run(running)) => Ok(Advanced::To(running)),
+        Advanced::Left(transition) => Ok(Advanced::Left(transition)),
     }
 }

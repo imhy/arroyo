@@ -26,7 +26,9 @@ use self::leader_rescaling::LeaderRescaling;
 use self::leader_restarting::LeaderRestarting;
 use self::leader_running::LeaderRunning;
 use self::leader_stopping::LeaderStopping;
-use self::lifecycle::{ConsumptionPoint, JobLifecycle, LifecycleActor, LifecycleIntent};
+use self::lifecycle::{
+    ConsumptionPoint, IntentWakeup, JobLifecycle, LifecycleActor, LifecycleIntent, ObservedIntent,
+};
 use self::recovering::Recovering;
 use self::rescaling::Rescaling;
 use self::running::Running;
@@ -833,6 +835,22 @@ impl JobContext<'_> {
     /// enumerates everything those stretches are allowed to await. Consuming an intent is a
     /// lock and a comparison; nothing about it should ever become something to wait on.
     ///
+    /// # What the caller must do with the answer
+    ///
+    /// [`ObservedIntent::Stop`] is not advice. A stop the writer has decided on is published
+    /// into [`Self::config`] here, and the caller has to leave for its own stop state before
+    /// its next irreversible effect — the `StartExecution` fan-out and the publication of a
+    /// restored checkpoint's commits both sit immediately after a consumption point, and
+    /// neither can be withdrawn. Which state "leaving" means differs by caller, which is why
+    /// this returns the fact rather than a transition: every caller answers it with the same
+    /// `stop_if_desired*` macro the landed path uses, so a stop consumed from the mailbox and
+    /// a stop delivered as a [`JobMessage::ConfigUpdate`] cannot come to mean different
+    /// things.
+    ///
+    /// Under [`LifecycleMode::LegacyT08`](lifecycle::LifecycleMode::LegacyT08) — production
+    /// through M11.T25 — there is no actor, so the answer is always
+    /// [`ObservedIntent::Continue`] and every guard built on it is unreachable.
+    ///
     /// # Errors
     ///
     /// Returns the fatal [`StateError`] a refused configuration produces, from whatever
@@ -841,15 +859,36 @@ impl JobContext<'_> {
     pub(crate) fn observe_lifecycle_intent(
         &mut self,
         at: ConsumptionPoint,
-    ) -> Result<(), StateError> {
+    ) -> Result<ObservedIntent, StateError> {
         let Some(decision) = self
             .lifecycle_actor
             .as_mut()
             .and_then(|actor| actor.observe(at))
         else {
-            return Ok(());
+            return Ok(ObservedIntent::Continue);
         };
         decision.apply(self)
+    }
+
+    /// What an interruptible wait parks on so that a submitted intent ends it.
+    ///
+    /// Submission is not delivery. A wait turns only when something wakes it, and for a job
+    /// that is simply running well nothing does: the mailbox has no channel behind it and
+    /// [`Running`] has no reason to look at it again. So every wait selects on this beside
+    /// whatever it was already waiting for, and a stop or a refusal is observed on the turn it
+    /// causes rather than at the next timeout — or, for a healthy running job, never.
+    ///
+    /// Taken as an owned handle before the wait, because the other arms of the same `select!`
+    /// borrow this context mutably.
+    ///
+    /// Never completes for a job whose lifecycle the configuration poll decides, which is
+    /// every production job through M11.T25: there is no mailbox, the poll publishes to the
+    /// [`RefusalGate`] and the job's queue, and the wait already selects on that queue.
+    pub(crate) fn lifecycle_wakeup(&self) -> IntentWakeup {
+        match &self.lifecycle_actor {
+            Some(actor) => actor.wakeup(),
+            None => IntentWakeup::none(),
+        }
     }
 
     pub fn retryable(
@@ -1078,8 +1117,17 @@ async fn execute_state<'a>(
     // boundary is "before an irreversible phase". Under `LifecycleMode::LegacyT08` —
     // production through M11.T25 — there is no actor, this is a no-op, and the gate above
     // is the mechanism, unchanged.
-    let gated = gated
-        .and_then(|()| ctx.observe_lifecycle_intent(ConsumptionPoint::BeforeIrreversiblePhase));
+    //
+    // A stop decided here is *published* rather than acted on, and that is not a gap: the
+    // states that go on to do something irreversible — `Scheduling` in either of its bodies,
+    // `Running`, `LeaderRunning` — all open with their own `stop_if_desired*` on the very
+    // configuration this writes, and the states that loop instead read it on their first turn.
+    // `execute_state` holds a `Box<dyn State>` and could not name the transition anyway: what
+    // leaving means is the state's own, which is why it is the state that answers.
+    let gated = gated.and_then(|()| {
+        ctx.observe_lifecycle_intent(ConsumptionPoint::BeforeIrreversiblePhase)
+            .map(|_| ())
+    });
 
     // Which body a state runs is the job's lifecycle mechanism's to choose, and choosing it
     // here rather than inside each state is the same argument as the two reads above: a state
@@ -8465,6 +8513,336 @@ mod tests {
             run.harness.scheduler.stopped.lock().unwrap().as_slice(),
             Vec::<(String, Option<u64>)>::new(),
             "and the cluster the job is running on is left alone"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Review round 1 — a consumed stop leaves, and a submitted intent is observed.
+    //
+    // Two defects, one shape. Consuming an intent used to answer `Ok(())`, which every caller
+    // reads as permission to continue: a stop the job's writer had decided on mutated
+    // `ctx.config` and then let the phase graph walk into the `StartExecution` fan-out and the
+    // publication of a restored checkpoint's commits, both irreversible. And submitting an
+    // intent used to notify nothing at all, so a wait parked on the job's channel — which under
+    // M11.D39a carries nothing when the poll decides something — only looked again when its
+    // startup budget expired, ten minutes for workers and two for tasks.
+    //
+    // The rows below are end-to-end against the same real gRPC workers the landed body is run
+    // against, because what has to be asserted is what a worker was *sent*.
+    // ---------------------------------------------------------------------------------------
+
+    /// The configuration a poll carries once an operator has asked the job to stop.
+    fn config_requesting_a_stop() -> JobConfig {
+        let mut config = running_config(StateBackendSelector::Parquet);
+        config.stop_mode = StopMode::immediate;
+        config
+    }
+
+    /// How long a row waits for a decision it expects to be acted on.
+    ///
+    /// A liveness bound, not a performance assertion, and deliberately far below the budgets
+    /// that are the only other way out of these waits: ten minutes for worker startup and two
+    /// for task startup. A row that fell back on one of those would not finish inside this.
+    const DECIDED: Duration = Duration::from_secs(30);
+
+    /// An adopted configuration that asks the job to stop leaves `Scheduling` at its first
+    /// crossing, before the preamble's first effect.
+    ///
+    /// The shape this covers is the ordinary one: an operator stops a job whose configuration is
+    /// perfectly valid, so the intent is an `Adopt` and the stop is a field of what it carries.
+    /// Nothing in the decision itself says "stop" — only the configuration it publishes does —
+    /// which is why the answer is read off the published configuration rather than off which
+    /// arm of the writer produced it.
+    ///
+    /// Before the fix `LifecycleDecision::apply` wrote the stop into `ctx.config` and returned
+    /// `Ok(())`, and the crossing took its admission and scheduled the job anyway.
+    #[tokio::test]
+    async fn an_adopted_configuration_that_asks_the_job_to_stop_leaves_scheduling() {
+        let mailbox = intent_mailbox();
+        mailbox.submit(LifecycleIntent::Adopt(config_requesting_a_stop()));
+
+        let mut run = SchedulingRun::new("stop-before-preamble").await;
+        run.harness.install_actor(&mailbox);
+        let outcome = run.schedule_through_the_phase_graph().await;
+
+        assert_eq!(
+            advanced_to(&outcome),
+            Some("Stopping"),
+            "a job whose writer has decided it stops leaves for the state that stops it, \
+             through the same macro the landed body uses — not for `Running`, and not as an \
+             error"
+        );
+        assert_eq!(
+            run.calls.started(),
+            Vec::<String>::new(),
+            "and no worker is told to start executing a job that has been asked to stop"
+        );
+        assert_eq!(
+            run.calls.committed(),
+            Vec::<u64>::new(),
+            "nor is the restored checkpoint's two-phase commit finished against its sinks"
+        );
+        assert_eq!(
+            state_writes(&run.db),
+            Vec::<(String, u64)>::new(),
+            "and the crossing is before the preamble's first effect, so not even the \
+             scheduling generation was advanced"
+        );
+        assert_eq!(
+            run.harness.scheduler.started.lock().unwrap().as_slice(),
+            Vec::<(String, u64)>::new(),
+            "and no replacement cluster was started for a job that is stopping"
+        );
+    }
+
+    /// A refused row that keeps its stop leaves `Scheduling` rather than starting an execution.
+    ///
+    /// The other shape a stop arrives in: the row was refused for its state backend, and the
+    /// one thing that survives the refusal is the stop the same row asks for — because the
+    /// refusal's own remedy is "stop this job and create a new one under the other backend".
+    /// `StopUnderRunningConfig` writes only the stop mode, onto the configuration the job's
+    /// workers and checkpoints were built from.
+    ///
+    /// Before the fix that write was the whole of it, and the job was scheduled onto workers
+    /// under a configuration the controller had already decided to stop.
+    #[tokio::test]
+    async fn a_refused_row_keeping_its_stop_leaves_scheduling_rather_than_starting_an_execution() {
+        let mailbox = intent_mailbox();
+        mailbox.submit(LifecycleIntent::RefusedButStopping {
+            error: selector_changed(),
+            stop_mode: StopMode::immediate,
+        });
+
+        let mut run = SchedulingRun::new("refused-but-stopping").await;
+        run.harness.install_actor(&mailbox);
+        let outcome = run.schedule_through_the_phase_graph().await;
+
+        assert_eq!(
+            advanced_to(&outcome),
+            Some("Stopping"),
+            "the stop wins over the refusal, and winning means the job stops — in `Stopped`, \
+             with the final-checkpoint semantics its stop mode asked for, rather than in \
+             `Failed`"
+        );
+        assert_eq!(
+            run.calls.started(),
+            Vec::<String>::new(),
+            "and nothing was started under the configuration the row was refused for"
+        );
+        assert_eq!(
+            state_writes(&run.db),
+            Vec::<(String, u64)>::new(),
+            "nor was a generation persisted on the way to not starting it"
+        );
+    }
+
+    /// A stop decided while the job waits for its workers leaves before the `StartExecution`
+    /// fan-out.
+    ///
+    /// This is the wait half, and it needs both fixes to pass. The decision is submitted after
+    /// the preamble has asked for the cluster — so the job is inside `AwaitingWorkers`, with no
+    /// worker connect ever queued — and the only other way out of that wait is the ten-minute
+    /// worker-startup budget. So the mailbox's wake is what ends the turn, the read at the top
+    /// of the next turn is what sees the stop, and the transition it returns is what stops the
+    /// loop from going on to admit the fan-out.
+    ///
+    /// The sleep decides only *which* of the two reads catches it, not the outcome: without the
+    /// wake the wait never turns again, and without the transition the loop reads the stop,
+    /// writes it into the job's configuration and waits for workers anyway.
+    #[tokio::test]
+    async fn a_stop_decided_while_the_job_waits_for_workers_leaves_before_the_fan_out() {
+        let mailbox = intent_mailbox();
+        let mut run = SchedulingRun::new("stop-in-worker-wait").await;
+        run.harness.install_actor(&mailbox);
+
+        let barriers = run.barriers.clone();
+        let poll = async move {
+            // The last effect of the destructive preamble: from here the job is about to be
+            // waiting, and the sleep gives it time to actually park.
+            barriers.workers_started.notified().await;
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            mailbox.submit(LifecycleIntent::Adopt(config_requesting_a_stop()));
+        };
+        let scheduling = tokio::time::timeout(DECIDED, run.schedule_through_the_phase_graph());
+        let (outcome, ()) = tokio::join!(scheduling, poll);
+        let outcome = outcome.expect(
+            "the stop has to end the wait. The only other thing that would is the worker \
+             startup budget, which is ten minutes",
+        );
+
+        assert_eq!(
+            advanced_to(&outcome),
+            Some("Stopping"),
+            "the wait is left for the state that stops the job"
+        );
+        assert_eq!(
+            run.calls.started(),
+            Vec::<String>::new(),
+            "and the fan-out immediately after the wait never ran, so no worker was sent a \
+             `StartExecution` for a job the controller had decided to stop"
+        );
+        assert_eq!(
+            run.calls.committed(),
+            Vec::<u64>::new(),
+            "and nothing was committed either"
+        );
+        assert_eq!(
+            run.harness.scheduler.started.lock().unwrap().len(),
+            1,
+            "the control: the preamble did run, so this row really is about the wait after it \
+             and not about a job that never got that far"
+        );
+    }
+
+    /// A stop decided while the job waits for its tasks leaves before the restored checkpoint's
+    /// commits are published.
+    ///
+    /// The third admitted region is the one that is visible outside the cluster: it finishes a
+    /// two-phase commit against the job's sinks, and it cannot be withdrawn. The fixture's
+    /// restored checkpoint died in its committing phase, so a run that reaches that region
+    /// publishes — which is what `the_fenced_lifecycle_schedules_a_job_through_the_phase_graph`
+    /// asserts happens on the ordinary path, and what must not happen here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stop_decided_while_the_job_waits_for_tasks_leaves_before_the_restored_commits() {
+        let mailbox = intent_mailbox();
+        let mut run = SchedulingRun::new("stop-in-task-wait").await;
+        run.harness.install_actor(&mailbox);
+        // Enough to finish the first wait and the fan-out, and deliberately no `TaskStarted`:
+        // the second wait has nothing to end it but its own two-minute budget.
+        run.harness
+            .queue()
+            .send(worker_connect_from(WorkerId(7), &run.address(0)))
+            .await
+            .unwrap();
+
+        let barriers = run.barriers.clone();
+        let poll = async move {
+            // Raised inside the worker's own `StartExecution` handler, so the job is past the
+            // fan-out and into the wait for its tasks.
+            barriers.execution_started.notified().await;
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            mailbox.submit(LifecycleIntent::Adopt(config_requesting_a_stop()));
+        };
+        let scheduling = tokio::time::timeout(DECIDED, run.schedule_through_the_phase_graph());
+        let (outcome, ()) = tokio::join!(scheduling, poll);
+        let outcome = outcome.expect(
+            "the stop has to end the wait. The only other thing that would is the task startup \
+             budget, which is two minutes",
+        );
+
+        assert_eq!(
+            advanced_to(&outcome),
+            Some("Stopping"),
+            "the wait is left for the state that stops the job"
+        );
+        assert_eq!(
+            run.calls.committed(),
+            Vec::<u64>::new(),
+            "and the restored checkpoint's commits — externally visible, and unwithdrawable — \
+             were not published for a job the controller had decided to stop"
+        );
+        assert_eq!(
+            run.calls.started(),
+            ["parquet".to_string()],
+            "the control: the fan-out did run, so this row really is about the wait after it"
+        );
+    }
+
+    /// A healthy running job observes a stop its writer decided on.
+    ///
+    /// The sharp half of the delivery finding. `Running` is where a job that is working spends
+    /// its life, and under M11.D39a nothing is put in its channel when the poll decides
+    /// something — so before the fix a stop or a refusal left for a job that never had another
+    /// configuration update was observed at no point at all, for as long as the job kept
+    /// running well.
+    ///
+    /// Driven through the real `Running::next`, with nothing sent to the job's channel: the
+    /// mailbox is the only thing that could have carried this.
+    #[tokio::test]
+    async fn a_healthy_running_job_observes_a_stop_left_in_its_mailbox() {
+        let mailbox = intent_mailbox();
+        mailbox.submit(LifecycleIntent::Adopt(config_requesting_a_stop()));
+
+        let mut harness = Harness::new(3).with_actor(&mailbox);
+        let mut ctx = harness.ctx(
+            running_config(StateBackendSelector::Parquet),
+            StateBackendSelector::Parquet,
+        );
+        let outcome = tokio::time::timeout(DECIDED, Box::new(Running {}).next(&mut ctx))
+            .await
+            .expect("a running job has to read its mailbox; nothing else here ever would");
+
+        assert_eq!(
+            advanced_to(&outcome),
+            Some("Stopping"),
+            "and it acts on what it read, through the same macro its `ConfigUpdate` arm uses"
+        );
+        assert_eq!(
+            ctx.config.stop_mode,
+            StopMode::immediate,
+            "the decision was published into the job's configuration by the one thing allowed \
+             to publish it"
+        );
+    }
+
+    /// Every long-running wait a job can sit in reads its lifecycle mailbox, and can be woken by
+    /// it (M11.D39a's second consumption point).
+    ///
+    /// **A structural source pin, and the name says so.** The behavioural rows above drive the
+    /// two waits inside `Scheduling` and the one inside `Running`; the leader-mode waits cannot
+    /// be driven without a live worker leader to answer them, and a wait that quietly lost
+    /// either half would go unnoticed exactly where it is least testable.
+    ///
+    /// The intended reading of a failure here is "this wait can no longer be interrupted", not
+    /// "the test is stale". A wait that genuinely has nothing an intent could decide — `Stopping`
+    /// and `Finishing`, which are already ending the job and have no transition an intent could
+    /// produce — is deliberately absent rather than listed and excused.
+    #[test]
+    fn every_long_running_wait_reads_the_jobs_writer_and_can_be_woken_by_it() {
+        for (name, source) in [
+            ("running.rs", include_str!("running.rs")),
+            ("leader_running.rs", include_str!("leader_running.rs")),
+            ("restarting.rs", include_str!("restarting.rs")),
+            ("rescaling.rs", include_str!("rescaling.rs")),
+            (
+                "checkpoint_stopping.rs",
+                include_str!("checkpoint_stopping.rs"),
+            ),
+            ("leader_restarting.rs", include_str!("leader_restarting.rs")),
+            (
+                "leader_manager.rs",
+                include_str!("../job_controller/leader_manager.rs"),
+            ),
+        ] {
+            assert!(
+                source.contains("ConsumptionPoint::InsideInterruptibleWait"),
+                "{name}: every turn of a long-running wait must read the job's single writer. \
+                 Under M11.D39a nothing is sent to the job's channel when the poll decides \
+                 something, so a wait that does not read the mailbox does not learn"
+            );
+            assert!(
+                source.contains("ctx.lifecycle_wakeup()") && source.contains("wake.notified()"),
+                "{name}: and it must be woken by a submission, or the read at the top of the \
+                 turn is only reached when something else — a message, a timeout — ended the \
+                 previous one"
+            );
+        }
+
+        // The phase graph splits the two halves across its modules on purpose: the loop that
+        // reads lives with the typestate that can see it, and the `select!` that is woken lives
+        // with the context that owns the job's channel.
+        let phases = include_str!("scheduling/phases.rs");
+        assert_eq!(
+            phases.matches("awaiting.observe_intent()").count(),
+            2,
+            "both interruptible waits of the phase graph read the job's single writer"
+        );
+        assert_eq!(
+            include_str!("scheduling/admission/execution.rs")
+                .matches("wake.notified()")
+                .count(),
+            2,
+            "and both of their `select!`s can be woken by a submission"
         );
     }
 

@@ -32,8 +32,8 @@ use std::sync::Arc;
 
 use arroyo_rpc::state_backend::StateBackendSelector;
 
-pub(crate) use actor::{ConsumptionPoint, LifecycleActor};
-pub(crate) use intent::{IntentMailbox, LifecycleIntent};
+pub(crate) use actor::{ConsumptionPoint, LifecycleActor, ObservedIntent};
+pub(crate) use intent::{IntentMailbox, IntentWakeup, LifecycleIntent};
 pub(crate) use mode::LifecycleMode;
 
 /// One job's lifecycle mechanism, as its state machine holds it.

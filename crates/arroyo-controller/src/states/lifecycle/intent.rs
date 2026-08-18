@@ -11,6 +11,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use tokio::sync::Notify;
+
 use arroyo_rpc::state_backend::{
     StateBackendError, StateBackendSelector, validate_unchanged_job_selector,
 };
@@ -189,6 +191,23 @@ pub(crate) struct IntentMailbox {
     /// Read outside the lock by [`Self::published`], which is why it is an atomic rather
     /// than a field of the slot.
     published: AtomicU64,
+    /// Raised whenever [`Self::submit`] stamps a *new* version.
+    ///
+    /// Submitting a value is not delivering it. Every consumption point in the job's state
+    /// task is reached either at a state boundary or on a turn of a wait, and a wait turns
+    /// only when something wakes it — a worker message, a startup timeout, a progress tick.
+    /// Without this, an intent left for a job that is simply running well is waited on by
+    /// nothing at all: the poll thread stores it and the job's writer has no reason to look
+    /// again. So the poll raises this, and every interruptible wait selects on it alongside
+    /// whatever else it was waiting for.
+    ///
+    /// [`Notify::notify_one`] rather than `notify_waiters`, deliberately: it *stores* a
+    /// permit when nobody is parked, so a submission that lands in the window between a
+    /// consumer's read and its park is delivered by the park rather than lost in it. That
+    /// window is unavoidable — the read has to happen before the wait, or the wait would be
+    /// entered without the value it exists to notice — so the primitive has to be one that
+    /// survives it.
+    wake: Notify,
 }
 
 impl IntentMailbox {
@@ -198,6 +217,7 @@ impl IntentMailbox {
             job_id,
             slot: Mutex::new(None),
             published: AtomicU64::new(IntentVersion::NONE.0),
+            wake: Notify::new(),
         }
     }
 
@@ -210,29 +230,52 @@ impl IntentMailbox {
     /// second time. The returned version is therefore also the answer to "how many distinct
     /// things has the poll said about this job", which is the quantity that must stay
     /// bounded however many times the row is polled.
+    ///
+    /// A submission that stamps a new version also *wakes* the job's writer — see
+    /// [`wake`](Self::wake). The wake is raised outside the lock, so the critical section
+    /// stays exactly what the type documentation claims it is: an equality comparison and a
+    /// move. A coalesced re-submission raises nothing, because there is nothing new for a
+    /// woken consumer to find and a wake per poll would be a wake per 500ms forever.
     pub(crate) fn submit(&self, intent: LifecycleIntent) -> IntentVersion {
-        let mut slot = self.slot.lock().unwrap();
+        let version = {
+            let mut slot = self.slot.lock().unwrap();
 
-        if let Some(held) = slot.as_ref()
-            && held.intent == intent
-        {
-            // The row has not changed since the last poll. Re-stamping it would supersede
-            // an intent the writer has already decided on and make it decide again — which
-            // for a refused row means failing the job once per 500ms poll.
-            return held.version;
-        }
+            if let Some(held) = slot.as_ref()
+                && held.intent == intent
+            {
+                // The row has not changed since the last poll. Re-stamping it would
+                // supersede an intent the writer has already decided on and make it decide
+                // again — which for a refused row means failing the job once per 500ms poll.
+                return held.version;
+            }
 
-        let version = IntentVersion(self.published.fetch_add(1, Ordering::SeqCst) + 1);
-        debug!(
-            job_id = %self.job_id,
-            version = version.as_u64(),
-            intent = ?intent,
-            "the job's configuration poll left a lifecycle intent for its state task"
-        );
-        // Replaces rather than appends. Whatever the previous poll said is dropped here,
-        // which is the coalescing this type exists for.
-        *slot = Some(VersionedIntent { version, intent });
+            let version = IntentVersion(self.published.fetch_add(1, Ordering::SeqCst) + 1);
+            debug!(
+                job_id = %self.job_id,
+                version = version.as_u64(),
+                intent = ?intent,
+                "the job's configuration poll left a lifecycle intent for its state task"
+            );
+            // Replaces rather than appends. Whatever the previous poll said is dropped here,
+            // which is the coalescing this type exists for.
+            *slot = Some(VersionedIntent { version, intent });
+            version
+        };
+        self.wake.notify_one();
         version
+    }
+
+    /// Completes when the poll has submitted something at a version it had not used before.
+    ///
+    /// A permit stored by a submission that found nobody parked completes this immediately,
+    /// which is the whole point: what a consumption point must not do is miss an intent
+    /// submitted in the instant between its read and its park.
+    ///
+    /// A spurious completion — a permit left by an intent the caller has already decided on
+    /// — costs one more turn of the caller's loop and nothing else, because deciding is what
+    /// [`LifecycleActor::observe`](super::LifecycleActor::observe) does, not this.
+    async fn notified(&self) {
+        self.wake.notified().await;
     }
 
     /// The intent the job stands under, if the caller has not already decided on it.
@@ -246,5 +289,48 @@ impl IntentMailbox {
         let slot = self.slot.lock().unwrap();
         let held = slot.as_ref()?;
         (held.version > decided).then(|| held.clone())
+    }
+}
+
+/// The thing an interruptible wait parks on so that a submitted intent ends it.
+///
+/// Owned rather than borrowed, because the waits that select on it hold the job's context
+/// mutably for the other arm of the same `select!`: a handle that borrowed the context could
+/// not sit beside `ctx.rx.recv()`.
+///
+/// # Why the `LegacyT08` arm is a future that never completes
+///
+/// A job on the landed mechanism has no mailbox at all — the poll thread publishes to the
+/// [`RefusalGate`](crate::states::RefusalGate) and to the job's message queue, and every wait
+/// already selects on that queue. So there is nothing to wake *for*, and the honest way to say
+/// so is an arm that is never ready rather than one that fires and finds nothing. The selected
+/// production path therefore behaves exactly as it did: the branch is polled once per turn,
+/// returns `Pending`, and is never woken.
+pub(crate) struct IntentWakeup(Option<Arc<IntentMailbox>>);
+
+impl IntentWakeup {
+    /// The handle for a job whose lifecycle transitions the configuration poll decides.
+    ///
+    /// There is no mailbox to wake from, so this never completes.
+    pub(crate) fn none() -> Self {
+        Self(None)
+    }
+
+    /// The handle for a job whose lifecycle transitions its own state task decides.
+    pub(crate) fn watching(mailbox: Arc<IntentMailbox>) -> Self {
+        Self(Some(mailbox))
+    }
+
+    /// Completes when the job's poll has left something new, and never otherwise.
+    ///
+    /// Safe to create and drop once per turn of a wait: the permit a submission stores lives
+    /// on the mailbox rather than on this future, so a turn that ended for another reason does
+    /// not consume it — and a turn that *did* consume it is a turn whose loop reads the mailbox
+    /// before it parks again.
+    pub(crate) async fn notified(&self) {
+        match &self.0 {
+            Some(mailbox) => mailbox.notified().await,
+            None => std::future::pending().await,
+        }
     }
 }
