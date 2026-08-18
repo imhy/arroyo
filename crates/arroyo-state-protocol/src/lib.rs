@@ -9,6 +9,7 @@ pub mod resolve;
 pub mod state;
 pub mod store;
 pub mod types;
+pub mod validated;
 pub mod workflow;
 
 use crate::types::{CheckpointRef, Epoch, Generation};
@@ -93,7 +94,7 @@ impl ProtocolPaths {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gc::cleanup_leader_checkpoints;
+    use crate::gc::{CheckpointOwner, cleanup_leader_checkpoints, delete_classified_history};
     use crate::resolve::{
         EpochClaimOutcome, ParentCheckpointStatus, ResolveDecision, ResolveFailure,
         resolve_candidate,
@@ -107,6 +108,7 @@ mod tests {
     use crate::types::{
         CommittedMarker, CurrentGeneration, EpochRecord, GenerationManifest, ProtocolError,
     };
+    use crate::validated::CheckpointHistory;
     use crate::workflow::{
         CheckpointPublication, ClaimEpochRecordRequest, CommitAuthorization, CommitPermit,
         CommittedMarkerOutcome, GenerationInitialization, GenerationRecovery, GenerationResolution,
@@ -119,6 +121,7 @@ mod tests {
         GlobalKeyedTableTaskCheckpointMetadata, OperatorCheckpointMetadata, OperatorMetadata,
         ParquetTimeFile, TableCheckpointMetadata, TableConfig, TableEnum,
     };
+    use arroyo_rpc::state_backend::validated::Validated;
     use arroyo_rpc::state_backend::{StateBackendError, StateBackendSelector};
     use arroyo_types::{JobId, PipelineId, from_micros};
     use prost::Message;
@@ -1023,6 +1026,118 @@ mod tests {
         );
         assert!(store.deleted_objects().is_empty());
         assert!(exists(&store, &old_file).await);
+    }
+
+    /// D96 row 2 (round 1): leader GC's first delete is reachable only through a token for
+    /// the *whole* reachable manifest set, so nothing the traversal named can go before
+    /// every link of the chain has been accounted for.
+    ///
+    /// [`cleanup_leader_checkpoints`] is now classify-then-`delete_classified_history`, and
+    /// the deletion takes nothing but the token — so the three cases below are the complete
+    /// set of ways into it. The chain that agrees deletes; a chain one of whose links was
+    /// written by another backend does not; and — the part that makes the second case a
+    /// claim about the *set* rather than about whichever links happened to be recorded — a
+    /// plan that would delete a checkpoint the traversal never reached does not either.
+    #[tokio::test]
+    async fn gc_requires_validated_manifest_set() {
+        let store = MemoryProtocolStore::default();
+        let paths = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J"));
+        let old_file = data_ref(&paths, 1);
+        let kept_file = data_ref(&paths, 2);
+
+        store.put_bytes(&old_file, b"1".to_vec()).await.unwrap();
+        store.put_bytes(&kept_file, b"2".to_vec()).await.unwrap();
+        write_gc_checkpoint(
+            &store,
+            &paths,
+            1,
+            None,
+            vec![global_operator(vec![old_file.clone()])],
+        )
+        .await;
+        write_gc_checkpoint(
+            &store,
+            &paths,
+            2,
+            Some(1),
+            vec![global_operator(vec![kept_file.clone()])],
+        )
+        .await;
+
+        let owner = |epoch: u64| CheckpointOwner {
+            generation: Generation(1),
+            epoch: Epoch(epoch),
+        };
+        // A classified history as the traversal records one: the links it read, newest
+        // first, and the plan it derived from them.
+        let history = |reached: Vec<(u64, OperatorCheckpointMetadata)>, deleting: Vec<u64>| {
+            let mut history = CheckpointHistory::default();
+            for (epoch, operator) in reached {
+                let mut manifest = checkpoint_for_generation(Generation(1), epoch, None, false);
+                manifest.operators = vec![operator];
+                history.reached(owner(epoch), &manifest);
+            }
+            history.classified(
+                deleting.into_iter().map(owner).collect(),
+                vec![old_file.clone()],
+            );
+            history
+        };
+
+        let agreeing = global_operator(vec![]);
+        let foreign = operator_with_selector(global_operator(vec![]), "stateengine");
+
+        // A link this job did not write: no token, and the deletion has no other argument.
+        let err = Validated::validate(
+            history(vec![(2, agreeing.clone()), (1, foreign)], vec![1]),
+            StateBackendSelector::Parquet,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::StateBackend(StateBackendError::CheckpointMismatch { .. })
+            ),
+            "{err:?}"
+        );
+
+        // A plan naming a checkpoint the traversal never read: nothing validated the
+        // manifest that named its files, so it cannot be collected either.
+        let err = Validated::validate(
+            history(vec![(2, agreeing.clone())], vec![1]),
+            StateBackendSelector::Parquet,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::Protocol(ProtocolError::CheckpointGcUnreached {
+                    generation: Generation(1),
+                    epoch: Epoch(1),
+                })
+            ),
+            "{err:?}"
+        );
+
+        assert!(
+            store.deleted_objects().is_empty(),
+            "a refused history still deleted something"
+        );
+        assert!(exists(&store, &old_file).await);
+
+        // The whole chain agrees: this is the one shape that yields the token, and the
+        // deletion it authorizes is the ordinary one.
+        let validated = Validated::validate(
+            history(vec![(2, agreeing.clone()), (1, agreeing)], vec![1]),
+            StateBackendSelector::Parquet,
+        )
+        .expect("a whole, agreeing history is exactly what a token is for");
+        delete_classified_history(&store, &paths, &validated)
+            .await
+            .unwrap();
+
+        assert!(!exists(&store, &old_file).await);
+        assert!(exists(&store, &kept_file).await);
     }
 
     #[tokio::test]

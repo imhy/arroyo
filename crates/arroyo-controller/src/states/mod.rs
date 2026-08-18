@@ -26,6 +26,7 @@ use self::leader_rescaling::LeaderRescaling;
 use self::leader_restarting::LeaderRestarting;
 use self::leader_running::LeaderRunning;
 use self::leader_stopping::LeaderStopping;
+use self::lifecycle::{ConsumptionPoint, JobLifecycle, LifecycleActor, LifecycleIntent};
 use self::recovering::Recovering;
 use self::rescaling::Rescaling;
 use self::running::Running;
@@ -64,6 +65,7 @@ pub(crate) mod leader_rescaling;
 pub(crate) mod leader_restarting;
 pub(crate) mod leader_running;
 pub(crate) mod leader_stopping;
+pub(crate) mod lifecycle;
 pub(crate) mod recovering;
 pub(crate) mod rescaling;
 pub(crate) mod restarting;
@@ -656,6 +658,16 @@ pub struct JobContext<'a> {
     /// state's behalf precisely because a state that had to remember to consult it would be
     /// a state that could forget — which is the shape of the bug this exists for.
     pub(crate) refusal_gate: RefusalGate,
+    /// This job's D39a single writer, or `None` under
+    /// [`LifecycleMode::LegacyT08`](lifecycle::LifecycleMode::LegacyT08) — which is what
+    /// production runs through M11.T25, so in production this is always `None` and
+    /// [`refusal_gate`](Self::refusal_gate) above is the mechanism.
+    ///
+    /// Not `pub`, for the same reason the gate is not: no state reaches for it. It is read
+    /// by [`Self::observe_lifecycle_intent`], which the state boundary and the
+    /// interruptible waits call, so a state that had to remember to consult it cannot
+    /// forget to.
+    pub(crate) lifecycle_actor: Option<LifecycleActor>,
     pub retries_attempted: usize,
     pub job_controller: Option<JobController>,
     pub leader_manager: Option<LeaderManager>,
@@ -794,6 +806,50 @@ impl JobContext<'_> {
             self.handle(JobMessage::ConfigRefused(refusal))?;
         }
         Ok(admission)
+    }
+
+    /// Whether this job's lifecycle transitions are decided by the M11.D39a single writer.
+    ///
+    /// The existence of an actor *is* that fact: `JobLifecycle::actor` returns `None` for the
+    /// landed M11.T08 mechanism, so there is nothing to consult and nothing that could
+    /// disagree with the selection. Asked here rather than by matching on a mode so that the
+    /// mode itself stays named in exactly one production place —
+    /// `no_production_path_selects_the_fenced_v2_lifecycle` counts those, and a second one
+    /// would be a second thing that could choose differently.
+    pub(crate) fn runs_fenced_lifecycle(&self) -> bool {
+        self.lifecycle_actor.is_some()
+    }
+
+    /// Reads the job's lifecycle intent and publishes whatever it decides, if this job runs
+    /// the D39a path.
+    ///
+    /// A no-op under [`LifecycleMode::LegacyT08`](lifecycle::LifecycleMode::LegacyT08) —
+    /// production through M11.T25 — where there is no actor and the cross-task
+    /// [`RefusalGate`] is the mechanism.
+    ///
+    /// It is a plain `fn` and not `async`, which is not an accident: the interruptible
+    /// waits call it on every turn, and the source-level pin
+    /// `the_source_of_scheduling_next_keeps_every_irreversible_effect_inside_an_admitted_region`
+    /// enumerates everything those stretches are allowed to await. Consuming an intent is a
+    /// lock and a comparison; nothing about it should ever become something to wait on.
+    ///
+    /// # Errors
+    ///
+    /// Returns the fatal [`StateError`] a refused configuration produces, from whatever
+    /// state the job is in — the same outcome the T08 path reaches through
+    /// [`handle_unhandled_message`].
+    pub(crate) fn observe_lifecycle_intent(
+        &mut self,
+        at: ConsumptionPoint,
+    ) -> Result<(), StateError> {
+        let Some(decision) = self
+            .lifecycle_actor
+            .as_mut()
+            .and_then(|actor| actor.observe(at))
+        else {
+            return Ok(());
+        };
+        decision.apply(self)
     }
 
     pub fn retryable(
@@ -1016,8 +1072,22 @@ async fn execute_state<'a>(
         None => Ok(()),
     };
 
+    // The same boundary is D39a's first consumption point, for exactly the reason above:
+    // `Compiling` never receives, and `Scheduling` does its generation write, worker
+    // teardown, worker start and checkpoint recovery before its first `recv`, so a state
+    // boundary is "before an irreversible phase". Under `LifecycleMode::LegacyT08` —
+    // production through M11.T25 — there is no actor, this is a no-op, and the gate above
+    // is the mechanism, unchanged.
+    let gated = gated
+        .and_then(|()| ctx.observe_lifecycle_intent(ConsumptionPoint::BeforeIrreversiblePhase));
+
+    // Which body a state runs is the job's lifecycle mechanism's to choose, and choosing it
+    // here rather than inside each state is the same argument as the two reads above: a state
+    // that had to remember to ask would be a state that could forget. Production takes the
+    // legacy branch for every state of every job — `runs_fenced_lifecycle` is false unless the
+    // job was built with the D39a single writer, which no production construction site does.
     let outcome = match gated {
-        Ok(()) => state.next(&mut ctx).await,
+        Ok(()) => scheduling::run_state_body(state, &mut ctx).await,
         Err(refused) => Err(refused),
     };
 
@@ -1191,6 +1261,11 @@ async fn run_to_completion(
     execution_selector: StateBackendSelector,
     cluster_id: Arc<String>,
     refusal_gate: RefusalGate,
+    // The job's D39a single writer, or `None` under `LifecycleMode::LegacyT08`. Built by
+    // `StateMachine::start` from the job's own `JobLifecycle`, so a task and its actor have
+    // the same lifetime: the watermark of what has been decided belongs to the task that
+    // decided it.
+    lifecycle_actor: Option<LifecycleActor>,
     pipeline_info: Arc<PipelineInfo>,
     mut program: LogicalProgram,
     mut status: JobStatus,
@@ -1241,6 +1316,7 @@ async fn run_to_completion(
         scheduler,
         rx: &mut rx,
         refusal_gate,
+        lifecycle_actor,
         retries_attempted: 0,
         job_controller: None,
         leader_manager,
@@ -1258,13 +1334,20 @@ async fn run_to_completion(
             (None, _) => break,
         }
 
-        let refreshed = job_config_and_status.read().unwrap().0.clone();
-        if let Some(adopted) = adopt_refreshed_config(
-            refreshed,
-            execution_selector,
-            &ctx.pipeline_info.pipeline_id,
-        ) {
-            ctx.config = adopted;
+        // D39a: under `FencedV2` this task is the only writer of the job's configuration.
+        // The shared cell is the *other* writer's — the configuration poll's — and under
+        // that mode the poll deliberately never writes it, so refreshing from it here would
+        // undo whatever the actor has just published. Under `LegacyT08`, which is what
+        // production runs, the refresh is exactly as M11.T08 landed it.
+        if ctx.lifecycle_actor.is_none() {
+            let refreshed = job_config_and_status.read().unwrap().0.clone();
+            if let Some(adopted) = adopt_refreshed_config(
+                refreshed,
+                execution_selector,
+                &ctx.pipeline_info.pipeline_id,
+            ) {
+                ctx.config = adopted;
+            }
         }
     }
 }
@@ -1756,6 +1839,16 @@ pub struct StateMachine {
     /// is consulted before every state body, so a refusal that is known when a state is
     /// about to run stops it, whether or not that state ever receives. See [`RefusalGate`].
     refusal_gate: RefusalGate,
+    /// Which mechanism decides this job's lifecycle transitions (M11.T25f).
+    ///
+    /// Fixed when the state machine is created, from
+    /// [`LifecycleMode::SELECTED`](lifecycle::LifecycleMode::SELECTED), so a job cannot
+    /// change hands halfway through its own lifecycle. Production is
+    /// [`JobLifecycle::LegacyT08`] for the whole of M11.T25 and every field above stays
+    /// exactly as M11.T08 landed it; the alternative is reachable only by constructing a
+    /// state machine with [`JobLifecycle::for_mode`] directly, which nothing outside a test
+    /// module does.
+    lifecycle: JobLifecycle,
     pub(crate) state: Arc<RwLock<String>>,
     metrics: Arc<tokio::sync::RwLock<HashMap<Arc<String>, JobMetrics>>>,
     db: DatabaseSource,
@@ -1785,6 +1878,14 @@ impl StateMachine {
         shutdown_guard: ShutdownGuard,
         metrics: Arc<tokio::sync::RwLock<HashMap<Arc<String>, JobMetrics>>>,
     ) -> Self {
+        let job_id = Arc::clone(&status.id);
+        // The one production site at which a job's lifecycle mechanism is chosen. It is
+        // `LifecycleMode::SELECTED`, which is derived exhaustively from the enum and is
+        // `LegacyT08` for the whole of M11.T25, so no production job runs the D39a path.
+        // `no_production_path_selects_the_fenced_v2_lifecycle` pins that this is the only
+        // such site and what it passes.
+        let lifecycle = JobLifecycle::for_mode(lifecycle::LifecycleMode::SELECTED, job_id);
+
         let PolledJob {
             execution_selector,
             config,
@@ -1799,11 +1900,17 @@ impl StateMachine {
             refusal: None,
             refusal_version: Arc::new(AtomicU64::new(0)),
             refusal_gate: RefusalGate::default(),
+            lifecycle,
             state: Arc::new(RwLock::new(status.state.clone())),
             metrics,
             db,
             scheduler,
         };
+
+        // Which of the two mechanisms this job runs under, decided once, above, and read
+        // here rather than at each of the three sites below — so the poll cannot record
+        // through one mechanism and act through the other.
+        let fenced = this.lifecycle.intents().map(Arc::clone);
 
         // Recorded *before* the adoption starts the job's state task, and separately from
         // acting on it below.
@@ -1815,7 +1922,23 @@ impl StateMachine {
         // `recv`. So a refusal recorded after the start could not stop any of it. Recording
         // it here publishes it to [`RefusalGate`], which the task consults before its first
         // state body.
-        if let Some(error) = &refusal {
+        //
+        // D39a says the same thing with one owner instead of two: under `FencedV2` the poll
+        // decides nothing at all, and its whole contribution is the classified intent left
+        // here — before the state task exists — for that task's actor to read at its first
+        // consumption point. The ordering requirement is identical, and
+        // `both_paths_that_start_a_job_are_written_to_record_the_refusal_first` pins it for
+        // the selected mechanism.
+        if let Some(intents) = &fenced {
+            intents.submit(LifecycleIntent::classify(
+                execution_selector,
+                PolledJob {
+                    execution_selector,
+                    config: this.config.read().unwrap().0.clone(),
+                    refusal: refusal.clone(),
+                },
+            ));
+        } else if let Some(error) = &refusal {
             let refused = this.config.read().unwrap().0.clone();
             this.note_refused_row(error.clone(), &refused);
         }
@@ -1823,7 +1946,11 @@ impl StateMachine {
         this.start(status.clone(), shutdown_guard.clone_temporary())
             .await;
 
-        if let Some(error) = refusal {
+        // Under `FencedV2` there is nothing left for this thread to do: applying the row is
+        // the state task's, and it has the intent.
+        if let Some(error) = refusal
+            && fenced.is_none()
+        {
             let refused = this.config.read().unwrap().0.clone();
             this.apply_refused_row(error, &refused, status, &shutdown_guard)
                 .await;
@@ -1942,6 +2069,13 @@ impl StateMachine {
                 // refusal already published when this task is created gates its very first
                 // state, and one raised later reaches it at the next state boundary.
                 let refusal_gate = self.refusal_gate.clone();
+                // The task's D39a single writer, or `None` under `LegacyT08` — which is
+                // production through M11.T25. One actor per task rather than per job: it
+                // starts having decided nothing, so it reads whatever the poll left,
+                // including an intent submitted while this job had no state task at all.
+                let lifecycle_actor = self
+                    .lifecycle
+                    .actor(Arc::clone(&status.id), self.execution_selector);
                 let db = self.db.clone();
                 let scheduler = self.scheduler.clone();
                 let metrics = self.metrics.clone();
@@ -1990,6 +2124,7 @@ impl StateMachine {
                                 execution_selector,
                                 cluster_id,
                                 refusal_gate,
+                                lifecycle_actor,
                                 pipeline_info,
                                 program,
                                 status,
@@ -2051,6 +2186,31 @@ impl StateMachine {
         shutdown_guard: &ShutdownGuard,
     ) {
         *self.state.write().unwrap() = status.state.clone();
+
+        // D39a: under `FencedV2` this thread is not a decider. It validates and classifies
+        // the polled row and leaves one versioned intent; the job's own state task — the
+        // single writer — consumes it and publishes the transition. Nothing below runs, so
+        // no in-memory execution baseline is replaced and no lifecycle status is written
+        // from the poll thread, which is the whole of "classify before adopting".
+        //
+        // The job's *task* is still supervised from here, because a job with no task has no
+        // writer at all: an intent left while the program could not be loaded stays in the
+        // mailbox, and is decided by the actor of whichever poll finally gets a task up.
+        // `restart_if_needed` starts the job only if it should be running or has never
+        // applied a configuration, and it starts it under `Self::execution_selector` and
+        // the shared configuration a refused row was never allowed into — so this cannot
+        // restart the job under a value that is being refused.
+        //
+        // The state mirror above is not a lifecycle publication: it is this controller's
+        // cached view of what the database already says, read by the API, and it is
+        // deliberately still refreshed on both paths.
+        if let Some(intents) = self.lifecycle.intents().map(Arc::clone) {
+            intents.submit(LifecycleIntent::classify(self.execution_selector, polled));
+            let applied = self.config.read().unwrap().1;
+            self.restart_if_needed(applied, status, shutdown_guard)
+                .await;
+            return;
+        }
 
         let PolledJob {
             config, refusal, ..
@@ -2523,13 +2683,22 @@ impl StateMachine {
 
 #[cfg(test)]
 mod tests {
+    use super::lifecycle::classification::{
+        SelectorClassification, UndecidableSelector, classify_selector,
+    };
+    use super::lifecycle::intent::{IntentVersion, VersionedIntent};
+    use super::lifecycle::{
+        ConsumptionPoint, JobLifecycle, LifecycleActor, LifecycleIntent, LifecycleMode,
+    };
     use super::{
         Admission, AppliedStatus, Failed, Failing, JobContext, LeaderRunning, RefusalGate, Running,
         RunningConfigUpdate, State, StateMachine, Transition, adopt_refreshed_config,
         check_config_update, classify_running_config_update, execute_state,
-        handle_unhandled_message,
+        handle_unhandled_message, lifecycle,
     };
     use crate::schedulers::{Scheduler, SchedulerError, StartPipelineReq};
+    use crate::states::scheduling::admission::PhaseContext;
+    use crate::states::scheduling::fanout::IssuedAttempts;
     use crate::states::scheduling::{START_EXECUTION_RECONCILE_ATTEMPTS, Scheduling};
     use crate::types::public::{RestartMode, StopMode};
     use crate::{
@@ -2538,18 +2707,23 @@ mod tests {
     };
     use arroyo_datastream::logical::{LogicalNode, LogicalProgram, OperatorName};
     use arroyo_rpc::grpc::api::ArrowProgram;
+    use arroyo_rpc::grpc::rpc::job_status_grpc_server::{JobStatusGrpc, JobStatusGrpcServer};
     use arroyo_rpc::grpc::rpc::worker_grpc_server::{WorkerGrpc, WorkerGrpcServer};
     use arroyo_rpc::grpc::rpc::{
         CheckpointMetadata, CheckpointReq, CheckpointResp, CommitReq, CommitResp,
-        GetWorkerPhaseReq, GetWorkerPhaseResp, GlobalKeyedTableConfig,
+        GetCheckpointDetailsReq, GetCheckpointDetailsResp, GetJobCheckpointsReq,
+        GetJobCheckpointsResp, GetWorkerPhaseReq, GetWorkerPhaseResp, GlobalKeyedTableConfig,
         GlobalKeyedTableTaskCheckpointMetadata, HeartbeatNodeReq, JobControllerInitReq,
-        JobControllerInitResp, JobFinishedReq, JobFinishedResp, LoadCompactedDataReq,
-        LoadCompactedDataRes, MetricsReq, MetricsResp, OperatorCheckpointMetadata,
-        OperatorMetadata, RegisterNodeReq, StartExecutionReq, StartExecutionResp, StopExecutionReq,
-        StopExecutionResp, TableCheckpointMetadata, TableConfig, TableEnum, WorkerFinishedReq,
+        JobControllerInitResp, JobFinishedReq, JobFinishedResp, JobStatus as LeaderJobStatus,
+        JobStatusReq, JobStatusResp, LoadCompactedDataReq, LoadCompactedDataRes, MetricsReq,
+        MetricsResp, OperatorCheckpointMetadata, OperatorMetadata, RegisterNodeReq,
+        StartExecutionReq, StartExecutionResp, StopExecutionReq, StopExecutionResp, StopJobReq,
+        StopJobResp, TableCheckpointMetadata, TableConfig, TableEnum, WorkerFinishedReq,
     };
+    use arroyo_rpc::state_backend::validated::Validated;
     use arroyo_rpc::state_backend::{StateBackendError, StateBackendSelector};
     use arroyo_server_common::shutdown::{Shutdown, SignalBehavior};
+    use arroyo_state::validated::CheckpointMetadataWrite;
     use arroyo_state::{BackingStore, StateBackend, StorageProviderFor};
     use arroyo_types::{MachineId, PipelineId, WorkerId};
     use cornucopia_async::DatabaseSource;
@@ -2929,6 +3103,10 @@ mod tests {
         /// same gate the state runs under and can ask, afterwards, whether the job's
         /// scheduling admission was left free.
         refusal_gate: RefusalGate,
+        /// The D39a actor the context runs with, for the tests of the `FencedV2` path.
+        /// `None` — the production selection — for every other test in this module, whose
+        /// contexts therefore behave exactly as they did before M11.T25a.
+        lifecycle_actor: Option<LifecycleActor>,
     }
 
     impl Harness {
@@ -2943,6 +3121,7 @@ mod tests {
                 db: unused_db(),
                 state_url: None,
                 refusal_gate: RefusalGate::default(),
+                lifecycle_actor: None,
             }
         }
 
@@ -2966,6 +3145,39 @@ mod tests {
         fn with_scheduler(mut self, scheduler: RecordingScheduler) -> Self {
             self.scheduler = Arc::new(scheduler);
             self
+        }
+
+        /// A harness whose context carries the D39a single writer for `job_abc`.
+        ///
+        /// The actor is built from a mailbox the test also holds, so the test can play the
+        /// configuration poll — `submit` — and then ask what the job's writer decided.
+        fn with_actor(mut self, mailbox: &Arc<lifecycle::IntentMailbox>) -> Self {
+            self.install_actor(mailbox);
+            self
+        }
+
+        /// A harness whose lifecycle mechanism is derived the way a production job's is.
+        ///
+        /// Every other fixture leaves [`Self::lifecycle_actor`] at its `None` default, which
+        /// is the same answer arrived at by assertion. This one *derives* it: it asks
+        /// `JobLifecycle::for_mode(LifecycleMode::SELECTED, ..)` for the job's actor and
+        /// installs whatever comes back, so a change that made production's mechanism the
+        /// D39a single writer would arrive here as an actor rather than as nothing — and the
+        /// row that uses this would see the phase graph run instead of the landed body.
+        fn install_production_lifecycle(&mut self) {
+            let job_id = Arc::new("job_abc".to_string());
+            self.lifecycle_actor =
+                JobLifecycle::for_mode(lifecycle::LifecycleMode::SELECTED, Arc::clone(&job_id))
+                    .actor(job_id, StateBackendSelector::Parquet);
+        }
+
+        /// The same, for a harness a fixture has already built.
+        fn install_actor(&mut self, mailbox: &Arc<lifecycle::IntentMailbox>) {
+            self.lifecycle_actor = Some(LifecycleActor::new(
+                Arc::new("job_abc".to_string()),
+                StateBackendSelector::Parquet,
+                Arc::clone(mailbox),
+            ));
         }
 
         /// The job's own queue, for a test that has to put messages in it in a known order.
@@ -2993,6 +3205,7 @@ mod tests {
                 scheduler: self.scheduler.clone(),
                 rx: &mut self.rx,
                 refusal_gate: self.refusal_gate.clone(),
+                lifecycle_actor: self.lifecycle_actor.take(),
                 retries_attempted: 0,
                 job_controller: None,
                 leader_manager: None,
@@ -3022,6 +3235,32 @@ mod tests {
         tx: Option<Sender<JobMessage>>,
         db: DatabaseSource,
     ) -> StateMachine {
+        state_machine_in_mode(
+            LifecycleMode::SELECTED,
+            config,
+            execution_selector,
+            tx,
+            db,
+            Arc::new(RecordingScheduler::default()),
+        )
+    }
+
+    /// The same, in a named lifecycle mode and with a scheduler the caller can inspect.
+    ///
+    /// Every test that predates M11.T25a goes through [`state_machine_with`] and therefore
+    /// runs `LifecycleMode::SELECTED`, which is what production runs. The `FencedV2` rows
+    /// name the mode here, which is the only way to reach that path: no production
+    /// construction site takes anything but `SELECTED` — see
+    /// [`no_production_path_selects_the_fenced_v2_lifecycle`].
+    fn state_machine_in_mode(
+        mode: LifecycleMode,
+        config: JobConfig,
+        execution_selector: StateBackendSelector,
+        tx: Option<Sender<JobMessage>>,
+        db: DatabaseSource,
+        scheduler: Arc<RecordingScheduler>,
+    ) -> StateMachine {
+        let job_id = Arc::clone(&config.id);
         StateMachine {
             tx,
             config: Arc::new(RwLock::new((config, AppliedStatus::Applied))),
@@ -3030,11 +3269,27 @@ mod tests {
             refusal: None,
             refusal_version: Arc::new(AtomicU64::new(0)),
             refusal_gate: RefusalGate::default(),
+            lifecycle: JobLifecycle::for_mode(mode, job_id),
             state: Arc::new(RwLock::new("Running".to_string())),
             metrics: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             db,
-            scheduler: Arc::new(RecordingScheduler::default()),
+            scheduler,
         }
+    }
+
+    /// The job's intent mailbox, for a test that plays the configuration poll and then asks
+    /// what the job's single writer decided.
+    fn mailbox_of(sm: &StateMachine) -> Arc<lifecycle::IntentMailbox> {
+        Arc::clone(
+            sm.lifecycle
+                .intents()
+                .expect("this state machine runs the FencedV2 lifecycle"),
+        )
+    }
+
+    /// What the job's configuration poll currently stands behind, if anything.
+    fn standing_intent(mailbox: &Arc<lifecycle::IntentMailbox>) -> Option<VersionedIntent> {
+        mailbox.newer_than(IntentVersion::NONE)
     }
 
     /// The error a queued [`JobMessage::ConfigRefused`] would fail the job with, or `None`
@@ -5471,16 +5726,26 @@ mod tests {
         .await
         .unwrap();
 
+        // The write takes a token, so the fixture states which operators it stands behind
+        // the same way the worker that took the checkpoint does — with the set it just
+        // wrote.
         StateBackend::write_checkpoint_metadata(
             &dir.role(),
-            CheckpointMetadata {
-                job_id: "job_abc".to_string(),
-                epoch: RESTORED_EPOCH,
-                min_epoch: 0,
-                start_time: 0,
-                finish_time: 0,
-                operator_ids: vec![OPERATOR_ID.to_string()],
-            },
+            Validated::validate(
+                CheckpointMetadataWrite::for_completed_checkpoint(
+                    CheckpointMetadata {
+                        job_id: "job_abc".to_string(),
+                        epoch: RESTORED_EPOCH,
+                        min_epoch: 0,
+                        start_time: 0,
+                        finish_time: 0,
+                        operator_ids: vec![OPERATOR_ID.to_string()],
+                    },
+                    vec![OPERATOR_ID.to_string()],
+                ),
+                (),
+            )
+            .unwrap(),
         )
         .await
         .unwrap();
@@ -5562,6 +5827,61 @@ mod tests {
             );
             Box::new(Scheduling {}).next(&mut ctx).await
         }
+
+        /// The same run, entered exactly as [`execute_state`] enters it, for a job whose
+        /// lifecycle mechanism was derived the way production derives one.
+        ///
+        /// The assertion inside is the point of the fixture rather than a precondition of it:
+        /// `run_state_body`'s only question is `runs_fenced_lifecycle()`, and this is where a
+        /// harness that has been given production's own `JobLifecycle` answers it.
+        async fn schedule_through_the_production_route(
+            &mut self,
+        ) -> Result<Transition, StateError> {
+            let mut ctx = self.harness.ctx(
+                running_config(StateBackendSelector::Parquet),
+                StateBackendSelector::Parquet,
+            );
+            assert!(
+                !ctx.runs_fenced_lifecycle(),
+                "a job built from `LifecycleMode::SELECTED` has no D39a writer, so the seam \
+                 must send it to the landed `Scheduling::next`"
+            );
+            super::scheduling::run_state_body(Box::new(Scheduling {}), &mut ctx).await
+        }
+
+        /// The same run, through the M11.D39b phase graph, entered exactly as
+        /// [`execute_state`] enters it.
+        ///
+        /// The harness must have been given a lifecycle actor first: that is what makes the
+        /// job's mechanism the D39a single writer, and it is the only thing that decides which
+        /// body runs.
+        async fn schedule_through_the_phase_graph(&mut self) -> Result<Transition, StateError> {
+            let mut ctx = self.harness.ctx(
+                running_config(StateBackendSelector::Parquet),
+                StateBackendSelector::Parquet,
+            );
+            assert!(
+                ctx.runs_fenced_lifecycle(),
+                "this fixture is about the phase graph, and without an actor it would silently \
+                 run the landed body instead"
+            );
+            super::scheduling::run_state_body(Box::new(Scheduling {}), &mut ctx).await
+        }
+    }
+
+    /// The name of the state a transition advances to.
+    fn advanced_to(outcome: &Result<Transition, StateError>) -> Option<&'static str> {
+        match outcome {
+            Ok(Transition::Advance(holder)) => Some(holder.state.name()),
+            _ => None,
+        }
+    }
+
+    /// A job's intent mailbox, for a fixture that drives the D39a path without a state machine.
+    fn intent_mailbox() -> Arc<lifecycle::IntentMailbox> {
+        Arc::new(lifecycle::IntentMailbox::new(Arc::new(
+            "job_abc".to_string(),
+        )))
     }
 
     /// Publishes `refusal` to `gate` at the first instant a publication is possible, exactly as
@@ -7296,5 +7616,1382 @@ mod tests {
             adopt_refreshed_config(refreshed, StateBackendSelector::Parquet, "pipeline_1")
                 .expect("an unchanged selector must still be adopted");
         assert_eq!(adopted.restart_nonce, 99);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // M11.T25a / M11.T25f — the D39a single writer, and the seam that leaves it unselected.
+    //
+    // The rows below need a whole `StateMachine`: a job with no state task, a program that
+    // will not load, a database that records every status write. The rows that are about the
+    // intent and the decision alone live beside their modules, in `states/lifecycle/tests.rs`.
+    // ---------------------------------------------------------------------------------------
+
+    /// No production path can select the D39a lifecycle (M11.T25f, DoD M11.T25l).
+    ///
+    /// **A structural source pin, and the name says so.** Its companion
+    /// `production_selects_only_the_legacy_t08_lifecycle` proves that the *selection* names
+    /// `LegacyT08` exhaustively over the enum; what no test of that selection can notice is
+    /// a second construction site that never consults it. `JobLifecycle::for_mode` takes the
+    /// mode as an argument — which is what lets a test build the new path directly — so the
+    /// claim "production is `LegacyT08`" is a claim about call sites, and this is where they
+    /// are counted.
+    ///
+    /// The intended reading of a failure here is not "the test is stale" but "say why a
+    /// second production path is choosing a lifecycle mechanism". M11.T26 is the owner that
+    /// changes the answer, together with the durable fence and worker protocol that make the
+    /// new path's settlement claim true.
+    #[test]
+    fn no_production_path_selects_the_fenced_v2_lifecycle() {
+        /// Everything in a file before its test module, so a mention inside a test does not
+        /// count as a production one.
+        fn production_half(source: &'static str) -> &'static str {
+            match source.find("\n#[cfg(test)]") {
+                Some(at) => &source[..at],
+                None => source,
+            }
+        }
+
+        let states = production_half(include_str!("mod.rs"));
+        let scheduling = production_half(include_str!("scheduling.rs"));
+
+        assert_eq!(
+            states.matches("JobLifecycle::for_mode(").count(),
+            1,
+            "a job's lifecycle mechanism is chosen in exactly one production place. A second \
+             one is a second thing that could choose differently"
+        );
+        assert!(
+            states.contains("JobLifecycle::for_mode(lifecycle::LifecycleMode::SELECTED"),
+            "and it passes the selection rather than a literal, so it inherits the exhaustive \
+             `LegacyT08` result that `production_selects_only_the_legacy_t08_lifecycle` pins"
+        );
+
+        for (file, source) in [
+            ("states/mod.rs", states),
+            ("states/scheduling.rs", scheduling),
+        ] {
+            assert_eq!(
+                source.matches("LifecycleMode::FencedV2").count(),
+                0,
+                "{file}: the D39a mode is never named on a production path outside the module \
+                 that defines it — naming it is how it would come to be selected"
+            );
+        }
+
+        assert_eq!(
+            include_str!("lifecycle/mod.rs")
+                .matches("LifecycleMode::FencedV2")
+                .count(),
+            1,
+            "the only production code that names the D39a mode is `JobLifecycle::for_mode`'s \
+             own match arm, which is what makes the mode a seam rather than a switch"
+        );
+        assert!(
+            include_str!("lifecycle/mode.rs").contains("LifecycleMode::FencedV2 => false,"),
+            "and the selection's exhaustive answer for it is `false`: M11.T25 builds the \
+             substrate and M11.T26 activates it"
+        );
+    }
+
+    /// D96 row 6 (R3): a polled configuration is classified before it becomes anybody's
+    /// baseline.
+    ///
+    /// The finding is that the configuration was adopted as the execution baseline and
+    /// *then* classified, which is an order that cannot be repaired afterwards: whatever
+    /// re-read the baseline in between has already run.
+    ///
+    /// Under D39a the poll thread has no baseline to replace. It classifies, leaves one
+    /// intent, and stops; the job's own state task is the only thing that adopts anything,
+    /// and it adopts the classification's *result* rather than the row. So the two halves
+    /// below assert the same property from both sides: a refused row is adopted nowhere, and
+    /// an accepted row is adopted only by the writer, only after classification.
+    #[tokio::test]
+    async fn classify_then_adopt_execution_config() {
+        // The row an operator has edited to name another backend, which the poll has already
+        // resolved against the job's execution record and refused.
+        let current = running_config(StateBackendSelector::Parquet);
+        let (tx, mut rx) = channel(16);
+        let mut sm = state_machine_in_mode(
+            LifecycleMode::FencedV2,
+            current.clone(),
+            StateBackendSelector::Parquet,
+            Some(tx),
+            unused_db(),
+            Arc::new(RecordingScheduler::default()),
+        );
+        let mailbox = mailbox_of(&sm);
+
+        let mut refused = running_config(StateBackendSelector::Parquet);
+        refused.restart_nonce = 99;
+        sm.update(
+            polled(
+                StateBackendSelector::Parquet,
+                refused,
+                Some(selector_changed()),
+            ),
+            job_status(current.restart_nonce),
+            &shutdown_guard(),
+        )
+        .await;
+
+        assert_eq!(
+            sm.config.read().unwrap().0,
+            current,
+            "the poll replaced no baseline at all: under D39a it is not a writer, so there \
+             is no window in which a row that turns out to be refused has already been adopted"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "and it published nothing to the job either — a decision is the state task's"
+        );
+        assert!(
+            sm.refusal.is_none()
+                && sm.refusal_version.load(Ordering::SeqCst) == 0
+                && sm.refusal_gate.clone().take().is_none(),
+            "and the M11.T08 cross-task machinery is untouched: the two mechanisms are \
+             alternatives, not layers"
+        );
+        assert_eq!(
+            standing_intent(&mailbox).map(VersionedIntent::into_intent),
+            Some(LifecycleIntent::Refused(selector_changed())),
+            "what the poll left is the classification, and nothing of the refused row \
+             travels with it"
+        );
+
+        // The job's single writer, at its first consumption point.
+        let mut harness = Harness::new(current.restart_nonce).with_actor(&mailbox);
+        let mut ctx = harness.ctx(current.clone(), StateBackendSelector::Parquet);
+        let refused_by_the_writer = ctx
+            .observe_lifecycle_intent(ConsumptionPoint::BeforeIrreversiblePhase)
+            .expect_err("the writer must fail the job its configuration was refused for");
+        assert_eq!(selector_error(&refused_by_the_writer), &selector_changed());
+        assert_eq!(
+            ctx.config, current,
+            "and the refused row is still adopted nowhere, including by the writer that \
+             read it"
+        );
+
+        // The control, and the half that makes the assertions above about classification
+        // rather than about a harness in which nothing is ever adopted.
+        let (tx, _rx) = channel(16);
+        let mut sm = state_machine_in_mode(
+            LifecycleMode::FencedV2,
+            current.clone(),
+            StateBackendSelector::Parquet,
+            Some(tx),
+            unused_db(),
+            Arc::new(RecordingScheduler::default()),
+        );
+        let mailbox = mailbox_of(&sm);
+
+        let mut accepted = running_config(StateBackendSelector::Parquet);
+        accepted.checkpoint_interval = Duration::from_secs(45);
+        sm.update(
+            polled(StateBackendSelector::Parquet, accepted.clone(), None),
+            job_status(current.restart_nonce),
+            &shutdown_guard(),
+        )
+        .await;
+
+        assert_eq!(
+            sm.config.read().unwrap().0,
+            current,
+            "even an accepted row is not adopted by the poll: adoption is a lifecycle \
+             decision, and D39a gives every decision one owner"
+        );
+        assert_eq!(
+            standing_intent(&mailbox).map(VersionedIntent::into_intent),
+            Some(LifecycleIntent::Adopt(accepted.clone())),
+        );
+
+        let mut harness = Harness::new(current.restart_nonce).with_actor(&mailbox);
+        let mut ctx = harness.ctx(current.clone(), StateBackendSelector::Parquet);
+        ctx.observe_lifecycle_intent(ConsumptionPoint::BeforeIrreversiblePhase)
+            .expect("an accepted row is adopted, not refused");
+        assert_eq!(
+            ctx.config, accepted,
+            "and the writer is what adopts it, at a point strictly after the classification \
+             that let it through"
+        );
+    }
+
+    /// D96 row 10 (R5): a refused row's stop survives a job that has no state task to
+    /// execute it.
+    ///
+    /// The finding is that the stop disappeared. A cold controller cannot load the job's
+    /// program — a transient `get_program` or database failure — so there is no state task,
+    /// and the stop the refused row asks for has nowhere to go; recording it as issued made
+    /// every later poll short-circuit on "already stopping" while nothing ever stopped the
+    /// job.
+    ///
+    /// Under D39a there is nothing to record and nothing to short-circuit on. The poll
+    /// classifies and leaves an intent, which simply stands in the job's mailbox until a
+    /// writer exists; the writer that finally comes up reads it and stops the job. The job
+    /// therefore ends in `Stopped`, with the final-checkpoint semantics the stop asked for,
+    /// rather than in `Failed` — and it reaches neither by rescheduling anything on the way.
+    #[tokio::test]
+    async fn inactive_refused_row_honors_stop() {
+        for stop_mode in [
+            StopMode::checkpoint,
+            StopMode::graceful,
+            StopMode::immediate,
+            StopMode::force,
+        ] {
+            let db = sqlite_startable_job("Running", 2);
+            program_loadable(&db, false);
+            // Held for the whole test: the task that finally comes up has to run, not just
+            // exist.
+            let shutdown = LiveShutdown::new();
+            let scheduler = Arc::new(RecordingScheduler::default());
+
+            let current = running_config(StateBackendSelector::Parquet);
+            let mut sm = state_machine_in_mode(
+                LifecycleMode::FencedV2,
+                current.clone(),
+                StateBackendSelector::Parquet,
+                None,
+                db.clone(),
+                scheduler.clone(),
+            );
+            let mailbox = mailbox_of(&sm);
+
+            let mut refused = running_config(StateBackendSelector::Parquet);
+            refused.stop_mode = stop_mode;
+            let refused_poll = || {
+                polled(
+                    StateBackendSelector::Parquet,
+                    refused.clone(),
+                    Some(selector_changed()),
+                )
+            };
+
+            for poll in 0..3 {
+                sm.update(
+                    refused_poll(),
+                    job_status(current.restart_nonce),
+                    shutdown.guard(),
+                )
+                .await;
+
+                assert!(
+                    sm.done(),
+                    "{stop_mode:?} poll {poll}: the program still cannot be loaded, so there \
+                     is no writer to execute the stop"
+                );
+                assert_eq!(
+                    sm.config.read().unwrap().0.stop_mode,
+                    StopMode::none,
+                    "{stop_mode:?} poll {poll}: and the poll records nothing, so it cannot \
+                     short-circuit a later one on a stop nobody executed"
+                );
+                let standing = standing_intent(&mailbox).unwrap_or_else(|| {
+                    panic!(
+                        "{stop_mode:?} poll {poll}: the stop must not be lost with the \
+                                refusal — a job with no state task is exactly the case in \
+                                which it used to disappear"
+                    )
+                });
+                assert_eq!(
+                    standing.version().as_u64(),
+                    1,
+                    "{stop_mode:?} poll {poll}: the same row polled again is the same intent, \
+                     so the job stands where it stood"
+                );
+                assert_eq!(
+                    standing.into_intent(),
+                    LifecycleIntent::RefusedButStopping {
+                        error: selector_changed(),
+                        stop_mode,
+                    },
+                    "{stop_mode:?} poll {poll}: and what stands is the stop, carried through \
+                     the refusal rather than discarded with it"
+                );
+            }
+
+            // The dependency recovers, so the retry finally brings a writer up.
+            program_loadable(&db, true);
+            sm.update(
+                refused_poll(),
+                job_status(current.restart_nonce),
+                shutdown.guard(),
+            )
+            .await;
+            assert!(
+                !sm.done(),
+                "{stop_mode:?}: once the program loads the job must finally be adopted — a \
+                 stop nothing could execute is not a reason to stop trying to reach it"
+            );
+
+            let writes = drive_to_completion(&sm, &db).await;
+            assert!(
+                writes.iter().all(|(state, generation)| state != "Failing"
+                    && state != "Failed"
+                    && *generation == 1),
+                "{stop_mode:?}: the row asked for a stop, so the job stops. Failing it would \
+                 destroy exactly the final checkpoint the stop exists for, and rescheduling \
+                 it would run the refused configuration; wrote {writes:?}"
+            );
+            assert!(
+                writes.ends_with(&[("Stopping".to_string(), 1), ("Stopped".to_string(), 1)]),
+                "{stop_mode:?}: and it ends stopped; wrote {writes:?}"
+            );
+            assert!(
+                scheduler
+                    .stopped
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|(job, generation)| job == "job_abc" && *generation == Some(1)),
+                "{stop_mode:?}: every teardown is scoped to the generation the job already \
+                 had — never `Scheduling`'s destructive `stop_workers(_, None, _)`; asked \
+                 for {:?}",
+                scheduler.stopped.lock().unwrap()
+            );
+            assert_eq!(
+                scheduler.started.lock().unwrap().as_slice(),
+                [],
+                "{stop_mode:?}: and no replacement workers for a configuration that must be \
+                 adopted nowhere"
+            );
+        }
+    }
+
+    /// D96 row 11 (R6): a job whose program will not load keeps its refusal across every
+    /// retry.
+    ///
+    /// The finding is a cold adoption that orphaned itself. `start` cannot load the program,
+    /// leaves the job with no state task, and explicitly promises to retry — but the refused
+    /// row's branch recorded the refusal as delivered to a queue that did not exist, so every
+    /// later poll short-circuited on "already sent". Program loading was never retried, the
+    /// job was never adopted, and its workers kept running with nothing administering them
+    /// even after the dependency recovered.
+    ///
+    /// Under D39a "delivered" is not a thing the poll can get wrong, because the poll does
+    /// not deliver: the classification stands in the job's mailbox, at one version, until a
+    /// writer reads it. So the retry is the ordinary one, the refusal is still there when it
+    /// succeeds, and the job is failed by the refusal it was restarted to receive — having
+    /// rescheduled nothing on the way.
+    ///
+    /// `StateMachine::new` is deliberately not the entry point here: it is the one
+    /// production site that chooses a lifecycle mechanism, and it chooses
+    /// `LifecycleMode::SELECTED`. The retry loop this row is about is `update`'s, which is
+    /// where the poll reaches a job it has already picked up.
+    #[tokio::test]
+    async fn program_load_failure_retries_keeping_refusal() {
+        let db = sqlite_startable_job("Running", 2);
+        program_loadable(&db, false);
+        let shutdown = LiveShutdown::new();
+        let scheduler = Arc::new(RecordingScheduler::default());
+
+        let current = running_config(StateBackendSelector::Parquet);
+        let mut sm = state_machine_in_mode(
+            LifecycleMode::FencedV2,
+            current.clone(),
+            StateBackendSelector::Parquet,
+            None,
+            db.clone(),
+            scheduler.clone(),
+        );
+        let mailbox = mailbox_of(&sm);
+
+        // The shape the stop branch never sees: refused, and asking for no stop.
+        let refused = running_config(StateBackendSelector::Parquet);
+        assert_eq!(refused.stop_mode, StopMode::none);
+        let refused_poll = || {
+            polled(
+                StateBackendSelector::Parquet,
+                refused.clone(),
+                Some(selector_changed()),
+            )
+        };
+
+        for poll in 0..3 {
+            sm.update(
+                refused_poll(),
+                job_status(current.restart_nonce),
+                shutdown.guard(),
+            )
+            .await;
+
+            assert!(
+                sm.done(),
+                "poll {poll}: the program still cannot be loaded, so there is no writer"
+            );
+            assert_eq!(
+                recorded_status(&db).1,
+                None,
+                "poll {poll}: and no execution has begun, so none is recorded"
+            );
+            let standing = standing_intent(&mailbox).unwrap_or_else(|| {
+                panic!(
+                    "poll {poll}: the refusal must survive a job with no writer, which is \
+                         the whole of the retry this row is about"
+                )
+            });
+            assert_eq!(
+                standing.version().as_u64(),
+                1,
+                "poll {poll}: the row has not changed, so nothing about the job's standing \
+                 intent has either — this is the coalescing that makes a retry free"
+            );
+            assert_eq!(
+                standing.into_intent(),
+                LifecycleIntent::Refused(selector_changed()),
+                "poll {poll}: and it is still the refusal, not something a failed start \
+                 consumed"
+            );
+        }
+
+        // The dependency recovers. The row is unchanged and still refused, so the only thing
+        // that can adopt the job now is the retry `start` promised.
+        program_loadable(&db, true);
+        sm.update(
+            refused_poll(),
+            job_status(current.restart_nonce),
+            shutdown.guard(),
+        )
+        .await;
+
+        assert!(
+            !sm.done(),
+            "once the program loads, the still-live job must finally be adopted: a refusal \
+             it cannot be told about is not a reason to stop trying to reach it"
+        );
+        assert_eq!(
+            recorded_status(&db).1,
+            Some("parquet".to_string()),
+            "and the execution that has now begun is recorded under the job's own immutable \
+             selector, never the refused row's"
+        );
+
+        let writes = drive_to_completion(&sm, &db).await;
+        assert!(
+            writes
+                .iter()
+                .all(|(state, generation)| state != "Scheduling" && *generation == 1),
+            "the job is adopted so the refusal can be applied to it, not so the refused row \
+             can reschedule it; wrote {writes:?}"
+        );
+        assert!(
+            writes.ends_with(&[("Failing".to_string(), 1), ("Failed".to_string(), 1)]),
+            "and the adoption ends in the failure the refusal asked for; wrote {writes:?}"
+        );
+        assert_eq!(
+            recorded_failure(&db).as_deref(),
+            Some("the job's persisted configuration was refused"),
+            "failed by the refusal itself, through the job's single writer"
+        );
+        assert_eq!(
+            scheduler.started.lock().unwrap().as_slice(),
+            [],
+            "no replacement workers for a configuration that must be adopted nowhere"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // M11.T25e — selector immutability and fail-closed classification (design M11.D39f).
+    // ---------------------------------------------------------------------------------------
+
+    /// D96 row 5 (R2): a configuration update carrying a different state backend is refused
+    /// before it replaces any execution baseline and before any status write.
+    ///
+    /// The claim is an *ordering* one, and the reason it has to be is that the two possible
+    /// orders are not equally repairable. A configuration adopted as the execution baseline
+    /// and classified afterwards cannot be un-adopted: whatever re-read that baseline in
+    /// between — a state that reschedules, a status write that persists the job's execution
+    /// record — has already run under the value being refused. Refusing by *not mutating* is
+    /// the only version of the rule that survives the fatal path it ends in.
+    ///
+    /// So the assertions below are about what did not move, not about an error coming back.
+    /// After a poll carrying a different selector:
+    ///
+    /// * the state machine's shared configuration is exactly what it was, so nothing
+    ///   downstream of it can read the refused row;
+    /// * the job's durable status row is untouched and the trigger recorded **no status
+    ///   write at all** — in particular the execution record was never re-stamped, which is
+    ///   the write that would have made the refused value the job's authority;
+    /// * nothing was published: not to the job's queue, and not to M11.T08's cross-task
+    ///   refusal machinery, which is a different mechanism and not a second layer of this one;
+    /// * and what stands is a *typed* [`StateBackendError::JobSelectorChanged`] naming both
+    ///   backends, rather than a string an operator has to interpret.
+    ///
+    /// Then the job's single writer reads it and fails the job — still adopting nothing, so
+    /// the refused row is a baseline nowhere, including in the task that was told about it.
+    ///
+    /// # Both shapes the boundary can be handed
+    ///
+    /// The loop runs the same row twice. Once as [`crate::classify_polled_row`] really hands
+    /// it on — resolved against the job's execution record, so the configuration already
+    /// carries the job's own selector and the refusal travels beside it — and once as if that
+    /// resolution had not happened at all, with the row's own foreign selector still on the
+    /// configuration and no refusal attached. The second shape is the defence in depth: the
+    /// lifecycle boundary validates against the job's immutable
+    /// [`StateMachine::execution_selector`] rather than trusting what it was handed, so the
+    /// refusal does not depend on one earlier caller having got it right.
+    ///
+    /// # The control
+    ///
+    /// The final section polls the *identical* edit with the job's own selector on it. It is
+    /// adopted, and the writer's configuration changes — which is what makes everything above
+    /// a statement about the selector rather than about a harness in which nothing is ever
+    /// adopted anyway.
+    #[tokio::test]
+    async fn selector_change_refused_before_execution_adoption() {
+        // The rule itself, in the one place it now lives (M11.D39f). A job's selector is
+        // fixed at its first execution: the recorded value wins, the row's differing value
+        // becomes a typed refusal rather than a change, and an unrecognized persisted value
+        // is never guessed at.
+        let unknown = StateBackendError::UnknownValue {
+            label: "job \"job_abc\" execution".to_string(),
+            value: "rocksdb".to_string(),
+        };
+        for (recorded, requested, expected, why) in [
+            (
+                Ok(Some(StateBackendSelector::Parquet)),
+                Ok(StateBackendSelector::StateEngine),
+                SelectorClassification::Fixed {
+                    execution_selector: StateBackendSelector::Parquet,
+                    refusal: Some(selector_changed()),
+                },
+                "an execution on record is the job's authority, so the row's differing value \
+                 is refused and the job goes on being administered under its own backend",
+            ),
+            (
+                Ok(None),
+                Ok(StateBackendSelector::StateEngine),
+                SelectorClassification::Fixed {
+                    execution_selector: StateBackendSelector::StateEngine,
+                    refusal: None,
+                },
+                "and a job with no execution takes the row's value: starting is the one \
+                 moment a job chooses its backend",
+            ),
+            (
+                Err(unknown.clone()),
+                Ok(StateBackendSelector::Parquet),
+                SelectorClassification::Undecidable(UndecidableSelector::ExecutionRecord(
+                    unknown.clone(),
+                )),
+                "a recorded value nobody recognizes leaves the controller unable to say what \
+                 the job is running with, and picking one would pick it for a live execution",
+            ),
+            (
+                Ok(None),
+                Err(unknown.clone()),
+                SelectorClassification::Undecidable(UndecidableSelector::FirstDeclaration(
+                    unknown.clone(),
+                )),
+                "a declaration that cannot be interpreted is never downgraded to a default, \
+                 so the job simply never starts",
+            ),
+            (
+                Ok(Some(StateBackendSelector::Parquet)),
+                Err(unknown.clone()),
+                SelectorClassification::Fixed {
+                    execution_selector: StateBackendSelector::Parquet,
+                    refusal: Some(unknown.clone()),
+                },
+                "but an uninterpretable row on a job that *has* an execution is a refusal \
+                 rather than a skip — there is a selector to go on running under",
+            ),
+        ] {
+            assert_eq!(
+                classify_selector("job_abc", recorded, requested),
+                expected,
+                "{why}"
+            );
+        }
+
+        let current = running_config(StateBackendSelector::Parquet);
+
+        for (shape, row_selector, refusal_from_the_poll) in [
+            (
+                "resolved by the poll",
+                StateBackendSelector::Parquet,
+                Some(selector_changed()),
+            ),
+            (
+                "not resolved by the poll",
+                StateBackendSelector::StateEngine,
+                None,
+            ),
+        ] {
+            // A real database, so a status write would leave a record. Nothing here should
+            // produce one: the job already has a state task, so the poll's own supervision
+            // has nothing to start, and under D39a the poll publishes nothing itself.
+            let db = sqlite_startable_job("Running", 2);
+            let (tx, mut rx) = channel(16);
+            let mut sm = state_machine_in_mode(
+                LifecycleMode::FencedV2,
+                current.clone(),
+                StateBackendSelector::Parquet,
+                Some(tx),
+                db.clone(),
+                Arc::new(RecordingScheduler::default()),
+            );
+            let mailbox = mailbox_of(&sm);
+
+            // The row an operator has edited. A real edit moves more than one column, so the
+            // restart nonce and the checkpoint interval move too: adoption anywhere would be
+            // visible, and "nothing was mutated" is then a claim with something to catch.
+            let mut edited = running_config(row_selector);
+            edited.restart_nonce = 99;
+            edited.checkpoint_interval = Duration::from_secs(45);
+
+            sm.update(
+                polled(StateBackendSelector::Parquet, edited, refusal_from_the_poll),
+                job_status(current.restart_nonce),
+                &shutdown_guard(),
+            )
+            .await;
+
+            assert_eq!(
+                sm.config.read().unwrap().0,
+                current,
+                "{shape}: the execution baseline is untouched — not the selector, not the \
+                 restart nonce, not the checkpoint interval. A refusal that had already \
+                 replaced it could not take it back"
+            );
+            assert!(
+                state_writes(&db).is_empty(),
+                "{shape}: and no lifecycle status was written; wrote {:?}",
+                state_writes(&db)
+            );
+            assert_eq!(
+                recorded_status(&db),
+                ("Running".to_string(), None),
+                "{shape}: in particular the job's durable execution record was never \
+                 re-stamped, which is the write that would have made the refused value the \
+                 job's own authority"
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "{shape}: nothing was published to the job either — under D39a a decision \
+                 belongs to the job's state task"
+            );
+            assert!(
+                sm.refusal.is_none()
+                    && sm.refusal_version.load(Ordering::SeqCst) == 0
+                    && sm.refusal_gate.clone().take().is_none(),
+                "{shape}: and M11.T08's cross-task machinery is untouched: the two \
+                 mechanisms are alternatives, not layers"
+            );
+            assert_eq!(
+                standing_intent(&mailbox).map(VersionedIntent::into_intent),
+                Some(LifecycleIntent::Refused(selector_changed())),
+                "{shape}: what stands is the typed refusal, naming the backend the job runs \
+                 with and the one the row asked for — and nothing of the refused row travels \
+                 with it"
+            );
+
+            // The job's single writer, at its first consumption point.
+            let mut harness = Harness::new(current.restart_nonce).with_actor(&mailbox);
+            let mut ctx = harness.ctx(current.clone(), StateBackendSelector::Parquet);
+            let Err(refused_by_the_writer) =
+                ctx.observe_lifecycle_intent(ConsumptionPoint::BeforeIrreversiblePhase)
+            else {
+                panic!("{shape}: the writer must fail a job whose configuration was refused")
+            };
+            assert_eq!(
+                selector_error(&refused_by_the_writer),
+                &selector_changed(),
+                "{shape}: with the typed error the classification produced, carried through \
+                 rather than rewritten"
+            );
+            assert_eq!(
+                ctx.config, current,
+                "{shape}: and the refused row is adopted nowhere, including by the writer \
+                 that was told about it"
+            );
+        }
+
+        // The control. The same edit, with the job's own selector on it, is adopted — so the
+        // sections above are about the selector and not about a state machine that never
+        // adopts anything.
+        let db = sqlite_startable_job("Running", 2);
+        let (tx, _rx) = channel(16);
+        let mut sm = state_machine_in_mode(
+            LifecycleMode::FencedV2,
+            current.clone(),
+            StateBackendSelector::Parquet,
+            Some(tx),
+            db.clone(),
+            Arc::new(RecordingScheduler::default()),
+        );
+        let mailbox = mailbox_of(&sm);
+
+        let mut unchanged_selector = running_config(StateBackendSelector::Parquet);
+        unchanged_selector.restart_nonce = 99;
+        unchanged_selector.checkpoint_interval = Duration::from_secs(45);
+
+        sm.update(
+            polled(
+                StateBackendSelector::Parquet,
+                unchanged_selector.clone(),
+                None,
+            ),
+            job_status(current.restart_nonce),
+            &shutdown_guard(),
+        )
+        .await;
+
+        assert_eq!(
+            standing_intent(&mailbox).map(VersionedIntent::into_intent),
+            Some(LifecycleIntent::Adopt(unchanged_selector.clone())),
+            "an edit that leaves the selector alone is classified as an adoption"
+        );
+
+        let mut harness = Harness::new(current.restart_nonce).with_actor(&mailbox);
+        let mut ctx = harness.ctx(current.clone(), StateBackendSelector::Parquet);
+        ctx.observe_lifecycle_intent(ConsumptionPoint::BeforeIrreversiblePhase)
+            .expect("an unchanged selector is adopted, not refused");
+        assert_eq!(
+            ctx.config, unchanged_selector,
+            "and the writer adopts it, at a point strictly after the classification that let \
+             it through: the same edit, differing only in the selector, does move the job"
+        );
+    }
+    // ---------------------------------------------------------------------------------------
+    // M11.T25b — the D39b phase graph, run against the same workers the landed body is run
+    // against. The rows that need no job at all — the issued-attempt inventory, the fence
+    // target set, the transfer interface, and the two source pins over `Fencing` — live beside
+    // their modules in `states/scheduling/phase_tests.rs`, and the two compile restrictions are
+    // in `states/scheduling/compile_fail.rs`.
+    // ---------------------------------------------------------------------------------------
+
+    /// A job whose lifecycle is the D39a single writer schedules through the phase graph, and
+    /// reaches the same place, by the same effects, as the landed body.
+    ///
+    /// The two halves run the identical fixture — one restored checkpoint in its committing
+    /// phase, one worker, one operator — so every difference between them is the body that ran.
+    /// What is compared is what the *worker* saw and what the job's status row records, because
+    /// those are the things a job's owner can observe: the `StartExecution` it was sent and the
+    /// selector stamped into it, the commits replayed into its sinks, and the generation
+    /// persisted before any of it.
+    #[tokio::test]
+    async fn the_fenced_lifecycle_schedules_a_job_through_the_phase_graph() {
+        async fn prime(run: &SchedulingRun) {
+            let queue = run.harness.queue();
+            queue
+                .send(worker_connect_from(WorkerId(7), &run.address(0)))
+                .await
+                .unwrap();
+            queue.send(task_started()).await.unwrap();
+        }
+
+        let mut legacy = SchedulingRun::new("phase-parity-legacy").await;
+        prime(&legacy).await;
+        let legacy_outcome = legacy.schedule().await;
+
+        let mailbox = intent_mailbox();
+        let mut fenced = SchedulingRun::new("phase-parity-fenced").await;
+        fenced.harness.install_actor(&mailbox);
+        prime(&fenced).await;
+        let fenced_outcome = fenced.schedule_through_the_phase_graph().await;
+
+        assert_eq!(
+            advanced_to(&legacy_outcome),
+            Some("Running"),
+            "the control: the landed body schedules this fixture into a running execution"
+        );
+        assert_eq!(
+            advanced_to(&fenced_outcome),
+            Some("Running"),
+            "and so does the phase graph"
+        );
+        assert_eq!(
+            fenced.calls.started(),
+            legacy.calls.started(),
+            "the worker is sent the same `StartExecution`, stamped with the same selector"
+        );
+        assert_eq!(
+            fenced.calls.committed(),
+            legacy.calls.committed(),
+            "and the restored checkpoint's commits are published exactly as before — the third \
+             admitted region does the same externally visible thing"
+        );
+        assert_eq!(
+            state_writes(&fenced.db),
+            state_writes(&legacy.db),
+            "and the job's status row records the same scheduling generation, written in the \
+             same preamble"
+        );
+    }
+
+    /// A decision the job's writer has already taken stops the phase graph before its preamble,
+    /// and the attempt ends in token-free fencing.
+    ///
+    /// The intent is standing before the graph is entered, which is the case the first crossing
+    /// exists for: `Preamble::enter` reads the job's writer and takes the admission, in that
+    /// order, so a refusal that was decided while the job was elsewhere stops it before the
+    /// generation is persisted rather than after. Nothing reaches a worker and nothing is
+    /// written, which is the difference between refusing and failing partway.
+    #[tokio::test]
+    async fn the_phase_graph_fences_a_refused_job_before_its_preamble() {
+        let mailbox = intent_mailbox();
+        mailbox.submit(LifecycleIntent::Refused(selector_changed()));
+
+        let mut run = SchedulingRun::new("phase-fencing").await;
+        run.harness.install_actor(&mailbox);
+        let outcome = run.schedule_through_the_phase_graph().await;
+
+        let Err(err) = outcome else {
+            panic!("a refused job must not be scheduled into an execution");
+        };
+        assert!(
+            matches!(
+                selector_error(&err),
+                StateBackendError::JobSelectorChanged { .. }
+            ),
+            "and it fails for the refusal itself, reported out of token-free fencing: {err:?}"
+        );
+        assert_eq!(
+            run.calls.started(),
+            Vec::<String>::new(),
+            "no worker is told to start executing a configuration the job's writer has refused"
+        );
+        assert_eq!(
+            run.calls.committed(),
+            Vec::<u64>::new(),
+            "and nothing is committed either"
+        );
+        assert_eq!(
+            state_writes(&run.db),
+            Vec::<(String, u64)>::new(),
+            "nor is a generation persisted: the crossing is before the preamble's first effect, \
+             not after it"
+        );
+        assert_eq!(
+            run.harness.scheduler.stopped.lock().unwrap().as_slice(),
+            Vec::<(String, Option<u64>)>::new(),
+            "and the cluster the job is running on is left alone"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // M11.T25f — legacy-path parity. What these rows are for, and what they deliberately are
+    // not.
+    //
+    // DoD M11.T25l is one claim in two halves: production selects `LegacyT08`, and the guards
+    // M11.T08 landed under it are still there and still doing their work. The first half is
+    // already pinned twice — `production_selects_only_the_legacy_t08_lifecycle` quantifies the
+    // selection over the whole enum, and `no_production_path_selects_the_fenced_v2_lifecycle`
+    // counts the production construction sites — and neither is restated here.
+    //
+    // What was left unpinned is the *middle* of the chain those two do not meet in: a mode is
+    // selected, and then a job is built from it, and then a body is chosen for that job. M11.T25b
+    // added the last link — `run_state_body`, a fork taken on every state of every job — and its
+    // question is not "which mode?" but "does this context have a D39a writer?". The rows below
+    // are about that: what a job built from the selection actually has, which body it therefore
+    // runs, and that the landed guards are still present and still called on the way there.
+    //
+    // Deliberately not restated, because a pin that only repeats another adds a place to
+    // update rather than a thing that can fail:
+    //
+    // * the admitted regions of `Scheduling::next` and its inventory of irreversible effects —
+    //   `the_source_of_scheduling_next_keeps_every_irreversible_effect_inside_an_admitted_region`;
+    // * `settle_under_admission` owning the `StartExecution` fan-out, structurally in that same
+    //   pin and behaviourally in `dropping_the_scheduling_task_keeps_the_admission_until_its_blocked_request_settles`,
+    //   `a_cancelled_fan_out_holds_its_admission_until_the_request_it_issued_settles` and
+    //   `a_sibling_failure_cannot_release_the_admission_while_a_blocked_worker_is_unsettled`,
+    //   all of which drive `Scheduling::next` itself;
+    // * the `reconciles_start_execution` capability gate, in
+    //   `a_worker_predating_the_reconciliation_contract_is_never_sent_a_start_execution` and
+    //   `a_controller_replacement_leaves_no_legacy_start_execution_handler_behind_its_gate`,
+    //   which drive the same body against a worker that never advertised it.
+    // ---------------------------------------------------------------------------------------
+
+    /// A job built the way production builds one runs the landed `Scheduling` body, and reaches
+    /// the same place by the same effects (M11.T25f, DoD M11.T25l).
+    ///
+    /// The chain M11.T25 has to keep true has four links, and the two pins named above cover
+    /// only the first two:
+    ///
+    /// 1. the production construction site passes `LifecycleMode::SELECTED`;
+    /// 2. `SELECTED` is `LegacyT08`;
+    /// 3. **a `JobLifecycle` built from `LegacyT08` has no mailbox and no actor**;
+    /// 4. **a context with no actor runs `Scheduling::next`, not the phase graph.**
+    ///
+    /// Links 3 and 4 are what this asserts, and they are the ones M11.T25 introduced: before
+    /// this todo there was no second body for a state to run and no seam to choose between
+    /// them. Link 3 is checked on the real `JobLifecycle::for_mode` rather than on a literal,
+    /// so a future arm that handed `LegacyT08` a mailbox "for symmetry" fails here; link 4 is
+    /// checked by running the fixture through the seam with production's own lifecycle
+    /// installed, which is the only thing `run_state_body` consults.
+    ///
+    /// The parity half is then the ordinary one: the same fixture — one restored checkpoint in
+    /// its committing phase, one worker, one operator — run once through the seam and once by
+    /// calling `Scheduling::next` directly, compared on what a job's owner can observe. The
+    /// landed body is unchanged by M11.T25 down to its source text, so "the same body ran" and
+    /// "nothing about the job's lifecycle changed" are the same statement.
+    #[tokio::test]
+    async fn the_production_route_runs_the_landed_scheduling_body() {
+        // Link 3, on the production constructor itself.
+        let job_id = Arc::new("job_abc".to_string());
+        let production =
+            JobLifecycle::for_mode(lifecycle::LifecycleMode::SELECTED, Arc::clone(&job_id));
+        assert!(
+            production.intents().is_none(),
+            "a job on the selected mechanism has no intent mailbox, so the configuration poll \
+             has nowhere to leave a decision and keeps deciding for itself exactly as M11.T08 \
+             landed it"
+        );
+        assert!(
+            production
+                .actor(Arc::clone(&job_id), StateBackendSelector::Parquet)
+                .is_none(),
+            "and its state task has no single writer, which is the fact the seam reads: the \
+             D39a machinery is absent from a production job rather than present and bypassed"
+        );
+
+        async fn prime(run: &SchedulingRun) {
+            let queue = run.harness.queue();
+            queue
+                .send(worker_connect_from(WorkerId(7), &run.address(0)))
+                .await
+                .unwrap();
+            queue.send(task_started()).await.unwrap();
+        }
+
+        // The control: the landed body, called the way every round-1-to-16 row calls it.
+        let mut landed = SchedulingRun::new("route-parity-landed").await;
+        prime(&landed).await;
+        let landed_outcome = landed.schedule().await;
+
+        // And link 4: the same fixture, entered through the seam `execute_state` enters, by a
+        // job whose lifecycle came out of `LifecycleMode::SELECTED`.
+        let mut production_route = SchedulingRun::new("route-parity-production").await;
+        production_route.harness.install_production_lifecycle();
+        prime(&production_route).await;
+        let production_outcome = production_route
+            .schedule_through_the_production_route()
+            .await;
+
+        assert_eq!(
+            advanced_to(&landed_outcome),
+            Some("Running"),
+            "the control: `Scheduling::next` schedules this fixture into a running execution"
+        );
+        assert_eq!(
+            advanced_to(&production_outcome),
+            advanced_to(&landed_outcome),
+            "and a job that reached the same body through the seam leaves `Scheduling` for the \
+             same state"
+        );
+        assert_eq!(
+            production_route.calls.started(),
+            landed.calls.started(),
+            "the worker is sent the same `StartExecution`, stamped with the same selector"
+        );
+        assert_eq!(
+            production_route.calls.committed(),
+            landed.calls.committed(),
+            "the restored checkpoint's commits are published identically — the third \
+             irreversible region does the same externally visible thing"
+        );
+        assert_eq!(
+            state_writes(&production_route.db),
+            state_writes(&landed.db),
+            "and the job's status row records the same scheduling generation, written in the \
+             same preamble"
+        );
+    }
+
+    /// Every guard M11.T08 landed on the production route is still there, and still on it
+    /// (M11.T25f, DoD M11.T25l).
+    ///
+    /// **A structural source pin, and the name says so.** Two things no behavioural row can
+    /// notice:
+    ///
+    /// * **The gate's inventory, and that every member of it is still reached from production.**
+    ///   `RefusalGate` is six methods that only make sense together — take the admission
+    ///   without waiting, take it and read what was published, publish under it, withdraw,
+    ///   apply once, and stop applying — so the set is pinned in the same idiom as
+    ///   `the_source_of_fencing_exposes_no_admission_and_no_irreversible_effect`: adding or
+    ///   removing one is a decision, and this is where it has to be made. The *caller* half is
+    ///   the part no other mechanism covers at all: `#[warn(dead_code)]` is silenced by a test
+    ///   that calls the method, and every one of these has such a test, so a guard that quietly
+    ///   lost its production call site would compile with no warning and keep passing its own
+    ///   unit row while guarding nothing. M11.T26 is the owner allowed to remove them, in the
+    ///   change that activates the durable fence; the intended reading of a failure here is
+    ///   "T26 has arrived", not "the test is stale".
+    /// * **Where the body is chosen.** M11.T25b moved the state body's call site: `execute_state`
+    ///   used to call `state.next(ctx)` and now calls `scheduling::run_state_body`. That fork is
+    ///   the only new thing between a job and its landed behaviour, and it cannot be reached
+    ///   behaviourally — the two bodies are built to be observably identical, which is what
+    ///   `the_fenced_lifecycle_schedules_a_job_through_the_phase_graph` asserts, so no run can
+    ///   tell you which one it took. What it is guarded by, and that the gate is still read
+    ///   *before* it, are therefore pinned here. A seam installed ahead of the gate would be a
+    ///   state body that runs before the refusal it is under is applied — the exact defect
+    ///   rounds 7 to 9 kept finding, reintroduced one level up.
+    #[test]
+    fn the_production_route_retains_every_t08_guard() {
+        /// Everything in a file before its test module, so a mention inside a test does not
+        /// count as a production one.
+        fn production_half(source: &'static str) -> &'static str {
+            match source.find("\n#[cfg(test)]") {
+                Some(at) => &source[..at],
+                None => source,
+            }
+        }
+        let states = production_half(include_str!("mod.rs"));
+
+        // The gate quartet, plus the two per-task methods that make "applied once" true.
+        let impl_at = states
+            .find("impl RefusalGate {")
+            .expect("the refusal gate's impl has been renamed");
+        let body =
+            &states[impl_at..impl_at + states[impl_at..].find("\n}\n").expect("unterminated impl")];
+        let mut methods: Vec<&str> = body
+            .match_indices("    fn ")
+            .chain(body.match_indices("    async fn "))
+            .map(|(i, m)| {
+                let rest = &body[i + m.len()..];
+                &rest[..rest.find('(').expect("a method has arguments")]
+            })
+            .collect();
+        methods.sort_unstable();
+        assert_eq!(
+            methods,
+            [
+                "admit_publication",
+                "admit_scheduling",
+                "disarm",
+                "publish",
+                "take",
+                "withdraw",
+            ],
+            "these six are the landed M11.T08 interlock, and M11.T25 keeps every one of them \
+             selected. Removing one is M11.T26's to do, in the change that makes the durable \
+             fence the mechanism instead"
+        );
+
+        // And none of them is merely compiled: each is still reached from a production path.
+        for method in methods {
+            let calls = states.matches(&format!("refusal_gate.{method}(")).count();
+            assert!(
+                calls > 0,
+                "`RefusalGate::{method}` has no production caller left. A guard nothing calls \
+                 guards nothing, and its removal would then look like tidying"
+            );
+        }
+
+        // Where a state's body is chosen, and what stands before that choice.
+        let execute = states
+            .find("async fn execute_state<'a>(")
+            .expect("`execute_state` has been renamed");
+        let execute = &states[execute
+            ..execute
+                + states[execute..]
+                    .find("\n}\n")
+                    .expect("unterminated function")];
+        let read_gate = execute
+            .find("refusal_gate.take()")
+            .expect("`execute_state` must read the gate on every state's behalf");
+        let run_body = execute
+            .find("scheduling::run_state_body(")
+            .expect("`execute_state` runs a state's body through the M11.T25b seam");
+        assert!(
+            read_gate < run_body,
+            "the gate is read before the body runs, not after it: a refusal the job is already \
+             under has to stop `Compiling`, which never receives, and `Scheduling`, which \
+             persists a generation and tears the job's cluster down before its first `recv`"
+        );
+        assert_eq!(
+            execute.matches("run_state_body(").count(),
+            1,
+            "and there is one place a state body is entered from. A second would be a second \
+             thing that could choose a body without reading the gate first"
+        );
+
+        // The seam itself: which job takes the new branch, and what every other job gets.
+        //
+        // Cut here rather than with `scheduling_body`, whose "first `\n    }\n`" rule ends a
+        // function at the close of its first indented block — which for this one is the
+        // `return` arm, leaving the fallthrough this row exists to read outside the slice.
+        let scheduling = scheduling_source_without_comments();
+        let seam_at = scheduling
+            .find("pub(crate) async fn run_state_body(")
+            .expect("`run_state_body` has been renamed");
+        let seam = &scheduling[seam_at
+            ..seam_at
+                + scheduling[seam_at..]
+                    .find("\n}\n")
+                    .expect("unterminated function")];
+        assert_eq!(
+            seam.matches("phases::schedule(").count(),
+            1,
+            "the M11.D39b phase graph is entered from exactly one place"
+        );
+        assert!(
+            seam.contains("ctx.runs_fenced_lifecycle()"),
+            "and only for a job that has a D39a single writer, which is what \
+             `the_production_route_runs_the_landed_scheduling_body` shows a production job \
+             does not have"
+        );
+        assert!(
+            seam.contains("state.next(ctx).await"),
+            "every other state of every other job runs its own landed body, unchanged. If this \
+             fell through to anything else, `LegacyT08` would no longer mean M11.T08's path"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // M11.T25f — the leader-mode tail of the M11.D39b phase graph.
+    //
+    // M11.T25b reproduced this tail from the landed body but disclosed it as uncovered: the
+    // `SchedulingRun` fixture runs controller mode, because which mode a scheduling attempt is
+    // in comes from the process-wide `config().job_controller` and every test in this binary
+    // reads that same cell. The rows below cover it without touching the cell — see
+    // `PhaseContext::run_as_leader_on` for why that matters at `--test-threads` 16 — by driving
+    // the tail directly against a real worker leader on a real socket.
+    // ---------------------------------------------------------------------------------------
+
+    /// A worker leader, as far as [`LeaderManager`] can tell.
+    ///
+    /// Only `GetJobStatus` is ever called: connecting polls once, and that poll is the whole
+    /// handshake. The other three are the rest of the service and answer as a leader that has
+    /// been asked something it has no business being asked at this point in a job's life.
+    struct FakeLeader {
+        job_id: String,
+        generation: u64,
+        /// What this leader reports it is running the job with, in the persisted spelling.
+        state_backend: String,
+        /// One per status poll, so a row can say the handshake happened rather than assume it.
+        polls: Arc<AtomicU64>,
+    }
+
+    #[tonic::async_trait]
+    impl JobStatusGrpc for FakeLeader {
+        async fn get_job_status(
+            &self,
+            _: tonic::Request<JobStatusReq>,
+        ) -> Result<tonic::Response<JobStatusResp>, tonic::Status> {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            Ok(tonic::Response::new(JobStatusResp {
+                job_id: self.job_id.clone(),
+                generation: self.generation,
+                job_status: Some(LeaderJobStatus::default()),
+                state_backend: self.state_backend.clone(),
+            }))
+        }
+
+        async fn stop_job(
+            &self,
+            _: tonic::Request<StopJobReq>,
+        ) -> Result<tonic::Response<StopJobResp>, tonic::Status> {
+            Err(tonic::Status::unimplemented(
+                "this leader is only ever asked for its status",
+            ))
+        }
+
+        async fn get_job_checkpoints(
+            &self,
+            _: tonic::Request<GetJobCheckpointsReq>,
+        ) -> Result<tonic::Response<GetJobCheckpointsResp>, tonic::Status> {
+            Err(tonic::Status::unimplemented(
+                "this leader is only ever asked for its status",
+            ))
+        }
+
+        async fn get_checkpoint_details(
+            &self,
+            _: tonic::Request<GetCheckpointDetailsReq>,
+        ) -> Result<tonic::Response<GetCheckpointDetailsResp>, tonic::Status> {
+            Err(tonic::Status::unimplemented(
+                "this leader is only ever asked for its status",
+            ))
+        }
+    }
+
+    /// Serves a [`FakeLeader`] on a loopback port; returns its poll counter and its address.
+    async fn fake_leader(generation: u64, state_backend: &str) -> (Arc<AtomicU64>, String) {
+        let polls = Arc::new(AtomicU64::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(JobStatusGrpcServer::new(FakeLeader {
+                    job_id: "job_abc".to_string(),
+                    generation,
+                    state_backend: state_backend.to_string(),
+                    polls: polls.clone(),
+                }))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+        (polls, format!("http://{addr}"))
+    }
+
+    /// The leader-mode tail attaches to the job's leader and records where it is
+    /// (M11.T25b's disclosed gap, closed).
+    ///
+    /// A job whose controller runs on a worker never gets a `JobController` of its own: the
+    /// controller connects to the leader, writes down which worker it is and at which
+    /// generation, and hands the job to `LeaderRunning`. That record is the only thing a
+    /// restarted controller has to find the leader again with — `run_to_completion` reconnects
+    /// from `status.state_context.leader` before the job's first state — so writing it, and
+    /// writing it only once the leader has agreed about the backend, is the whole of this tail.
+    ///
+    /// Two of the three assertions are leader-specific by construction: `epochs` reads
+    /// `ignore_state_before_epoch` as an epoch threshold in controller mode and must ignore it
+    /// in leader mode, where the same column carries a generation number, and the same context
+    /// is checked both ways here so the difference is the mode and nothing else.
+    #[tokio::test]
+    async fn the_phase_graph_hands_a_leader_mode_execution_to_its_worker_leader() {
+        const GENERATION: u64 = 2;
+        let (polls, address) = fake_leader(GENERATION, "parquet").await;
+
+        // The column the two modes read differently, set to something a controller-mode
+        // execution would have started from epoch 4 with.
+        let mut config = running_config(StateBackendSelector::Parquet);
+        config.ignore_state_before_epoch = Some(5);
+
+        let mut harness = Harness::new(3);
+        harness.status.generation = GENERATION;
+        let mut ctx = harness.ctx(config, StateBackendSelector::Parquet);
+
+        let control = PhaseContext::new(&mut ctx);
+        assert!(
+            !control.leader_mode(),
+            "the control half of this row needs the process's own configuration to be the \
+             ordinary controller-mode one, which is what `PhaseContext::new` reads"
+        );
+        assert_eq!(
+            control.epochs(),
+            (4, 4),
+            "the control: in controller mode `ignore_state_before_epoch` is an epoch threshold"
+        );
+        drop(control);
+
+        let mut phase = PhaseContext::new(&mut ctx);
+        phase.run_as_leader_on(WorkerId(7), address.clone());
+        assert!(phase.leader_mode());
+        assert_eq!(
+            phase.epochs(),
+            (0, 0),
+            "and in leader mode the same column is a generation number, which must not be read \
+             as an epoch: a job whose controller runs on a worker would otherwise start from a \
+             checkpoint epoch nobody asked for"
+        );
+
+        phase.prepare_handover().await;
+        assert!(
+            !phase.needs_restored_commits(),
+            "a leader-mode generation registers its recovery checkpoint through the leader and \
+             carries no commit replay of its own"
+        );
+
+        let transition = match phase.into_transition().await {
+            Ok(transition) => transition,
+            Err((_, reason)) => panic!("the leader answered, so the job must leave: {reason:?}"),
+        };
+        let Transition::Advance(holder) = transition else {
+            panic!("a started execution advances rather than stopping");
+        };
+        assert!(
+            format!("{:?}", holder.state).starts_with("LeaderRunning"),
+            "the job is handed to the state that administers it through its leader, not to the \
+             one that administers it directly — both of which report the name `Running` in the \
+             status row, which is why this asks the type: {:?}",
+            holder.state
+        );
+
+        assert!(
+            polls.load(Ordering::SeqCst) >= 1,
+            "and it was attached to only after the leader had answered once: `connect` polls \
+             before it returns a manager, which is what validates the backend the leader says \
+             it is running"
+        );
+        assert!(
+            ctx.leader_manager.is_some(),
+            "the manager is installed on the job's context, so the states after this one poll \
+             the same leader rather than reconnecting to whatever the row now says"
+        );
+        assert!(
+            ctx.job_controller.is_none(),
+            "and no job controller is carried into the state that runs it: in leader mode the \
+             leader owns the job's checkpointing, which is what the landed body says by \
+             clearing the field in its own `Some((id, addr))` arm"
+        );
+        assert_eq!(
+            ctx.status.tasks,
+            Some(ctx.program.task_count() as i32),
+            "the task count is recorded in both modes, exactly as the landed body records it \
+             before its own `match leader_info`"
+        );
+        let leader = ctx
+            .status
+            .state_context
+            .leader
+            .as_ref()
+            .expect("the durable record of where this job's leader is");
+        assert_eq!(leader.worker_id, WorkerId(7));
+        assert_eq!(leader.rpc_address, address);
+        assert_eq!(
+            leader.generation, GENERATION,
+            "recorded at the generation this scheduling attempt started, which is what a \
+             reconnecting controller checks the leader against"
+        );
+    }
+
+    /// A leader that reports a different backend is not attached to, and the phase is handed
+    /// back able to fence (M11.T25b's disclosed gap, second half).
+    ///
+    /// This is the failure arm of the same tail, and it is where the handback contract earns
+    /// its keep: `into_transition` returns the `PhaseContext` *with* the error rather than
+    /// dropping it, because a phase that cannot leave `Scheduling` still has to be able to
+    /// enter token-free `Fencing`, and fencing needs the context the phase was holding.
+    ///
+    /// Nothing durable may be written on the way out. A `LeaderContext` recorded for a leader
+    /// the controller refused to attach to would be read back on the next controller start as
+    /// the place to reconnect to.
+    #[tokio::test]
+    async fn a_leader_that_disagrees_about_the_backend_is_not_attached_to() {
+        let (polls, address) = fake_leader(2, "stateengine").await;
+
+        let mut harness = Harness::new(3);
+        harness.status.generation = 2;
+        let mut ctx = harness.ctx(
+            running_config(StateBackendSelector::Parquet),
+            StateBackendSelector::Parquet,
+        );
+
+        let mut phase = PhaseContext::new(&mut ctx);
+        phase.run_as_leader_on(WorkerId(7), address);
+        phase.prepare_handover().await;
+
+        let Err((phase, reason)) = phase.into_transition().await else {
+            panic!(
+                "a controller administering this job under parquet must not attach to a leader \
+                 running it under something else"
+            );
+        };
+        assert!(
+            matches!(reason, StateError::RetryableError { .. }),
+            "the disagreement is reported as retryable: the row may be repaired, or this may be \
+             a leader that is about to be replaced — {reason:?}"
+        );
+        assert!(
+            polls.load(Ordering::SeqCst) >= 1,
+            "and it is the leader's own answer that produced it, not a guess from persisted \
+             state"
+        );
+
+        // The handback, used for the one thing it exists for.
+        let reported = phase
+            .into_fencing(reason, IssuedAttempts::default())
+            .reconcile_and_report();
+        assert!(
+            matches!(reported, StateError::RetryableError { .. }),
+            "the reason survives token-free fencing unchanged: fencing is where an interrupted \
+             phase releases its authority, not where the reason is rewritten — {reported:?}"
+        );
+
+        assert!(
+            ctx.status.state_context.leader.is_none(),
+            "and nothing was recorded about a leader this controller never attached to: the \
+             next controller to start reads this column to find the job's leader"
+        );
+        assert!(ctx.leader_manager.is_none());
     }
 }

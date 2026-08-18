@@ -9,9 +9,11 @@ use async_trait::async_trait;
 use bincode::config::Configuration;
 use bincode::{Decode, Encode};
 
+use crate::validated::CheckpointMetadataWrite;
 use arroyo_rpc::config::config;
 use arroyo_rpc::df::ArroyoSchema;
 use arroyo_rpc::state_backend::StateBackendSelector;
+use arroyo_rpc::state_backend::validated::Validated;
 use arroyo_storage::StorageProvider;
 pub use arroyo_storage::StorageProviderFor;
 use prost::Message;
@@ -27,6 +29,7 @@ mod metrics;
 pub mod parquet;
 pub(crate) mod schemas;
 pub mod tables;
+pub mod validated;
 
 pub const BINCODE_CONFIG: Configuration = bincode::config::standard();
 pub const FULL_KEY_RANGE: RangeInclusive<u64> = 0..=u64::MAX;
@@ -169,9 +172,16 @@ pub trait BackingStore {
     ) -> Result<(), StateError>;
 
     /// writes the checkpoint metadata to the backing store
+    ///
+    /// Takes a [`Validated<CheckpointMetadataWrite>`] rather than the metadata (design item
+    /// M11.D39c). This write is what makes a checkpoint the one a restart reads, so it may
+    /// not name an operator that no whole-checkpoint check covered — which is exactly what a
+    /// `ready` checkpoint used to do, reaching this call with no operator preflighted at
+    /// all. The token is the only spelling of the argument, so a new caller cannot repeat
+    /// that by forgetting to check first.
     async fn write_checkpoint_metadata(
         role: &StorageProviderFor,
-        metadata: CheckpointMetadata,
+        metadata: Validated<CheckpointMetadataWrite>,
     ) -> Result<(), StateError>;
 
     /// cleans up a checkpoint by deleting data that is no longer needed

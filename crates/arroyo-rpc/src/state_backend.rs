@@ -21,6 +21,14 @@
 //! a build that had no backend but parquet. That is what makes an existing deployment's
 //! checkpoints restorable, and what makes them refuse to restore into a stateengine job.
 
+//!
+//! On top of *that* — because "checked before the operation" is a claim about a whole
+//! object and not about the item that happened to be checked — [`validated`] carries the
+//! result of a whole-object check as a token that the destructive and publishing operations
+//! take instead of the raw object (design item M11.D39c).
+
+pub mod validated;
+
 pub use arroyo_types::state_backend::*;
 
 use crate::grpc::rpc::{CheckpointManifest, OperatorCheckpointMetadata, TableConfig};

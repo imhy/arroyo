@@ -1,6 +1,11 @@
 use crate::tables::expiring_time_key_map::ExpiringTimeKeyTable;
 use crate::tables::global_keyed_map::GlobalKeyedTable;
 use crate::tables::{CompactionConfig, ErasedTable};
+use crate::validated::{
+    CheckpointCleanup, CheckpointMetadataWrite, CleanupScope, OperatorCleanup,
+    RestorableCheckpoint, RestoringProgram, ValidatedOperatorCleanup, ValidatedTable,
+    check_program_coverage,
+};
 use crate::{BackingStore, StorageProviderFor, get_storage_provider};
 use arroyo_rpc::errors::StateError;
 use arroyo_rpc::grpc::rpc::{
@@ -12,13 +17,14 @@ use futures::stream::FuturesUnordered;
 
 use arroyo_rpc::config::config;
 use arroyo_rpc::grpc::rpc;
-use arroyo_rpc::state_backend::{StateBackendSelector, validate_restored_operator_metadata};
+use arroyo_rpc::state_backend::StateBackendSelector;
+use arroyo_rpc::state_backend::validated::Validated;
 use prost::Message;
 use std::collections::{HashMap, HashSet};
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::time::SystemTime;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 pub const FULL_KEY_RANGE: RangeInclusive<u64> = 0..=u64::MAX;
 pub const GENERATIONS_TO_COMPACT: u32 = 1; // only compact generation 0 files
@@ -97,8 +103,9 @@ impl BackingStore for ParquetBackend {
 
     async fn write_checkpoint_metadata(
         role: &StorageProviderFor,
-        metadata: CheckpointMetadata,
+        metadata: Validated<CheckpointMetadataWrite>,
     ) -> Result<(), StateError> {
+        let metadata = metadata.into_inner().into_metadata();
         debug!("writing checkpoint {:?}", metadata);
         let storage_client = get_storage_provider(role).await?;
         let path = metadata_path(&base_path(&metadata.job_id, metadata.epoch));
@@ -121,47 +128,90 @@ impl BackingStore for ParquetBackend {
             job_id = metadata.job_id
         );
 
-        // Classify first, delete second. Every operator and every epoch this cleanup touches
-        // is loaded and checked against `job` before the first delete, so a mismatch found in
-        // the last operator's oldest epoch cannot follow files the first operator has already
-        // removed. Each metadata object is still read exactly once — planning keeps the file
-        // set it derived — and operators are still planned concurrently.
-        let mut planning: FuturesUnordered<_> = metadata
+        // Collect first, check second, delete third. Every operator and every epoch this
+        // cleanup touches is read before the first delete and then checked against `job` as
+        // one object, so a mismatch found in the last operator's oldest epoch cannot follow
+        // files the first operator has already removed. Each metadata object is still read
+        // exactly once and operators are still collected concurrently; what the check costs
+        // is holding one cleanup's metadata — the operators of the epoch being kept plus the
+        // few epochs being dropped — rather than one operator's at a time.
+        //
+        // The classification below runs off the token, so `files_to_keep` cannot decide
+        // which of this job's files survive on the strength of an object nothing checked.
+        let mut collecting: FuturesUnordered<_> = metadata
             .operator_ids
             .iter()
-            .map(|operator_id| {
-                Self::plan_operator_cleanup(
-                    role,
-                    job,
-                    metadata.job_id.clone(),
-                    operator_id.clone(),
-                    old_min_epoch,
-                    min_epoch,
-                )
+            .enumerate()
+            .map(|(position, operator_id)| {
+                let job_id = metadata.job_id.clone();
+                let operator_id = operator_id.clone();
+                async move {
+                    let operator = Self::collect_operator_cleanup(
+                        role,
+                        job_id,
+                        operator_id,
+                        old_min_epoch,
+                        min_epoch,
+                    )
+                    .await?;
+                    Ok::<_, StateError>((position, operator))
+                }
             })
             .collect();
 
-        let mut plans = Vec::with_capacity(metadata.operator_ids.len());
-        while let Some(plan) = planning.next().await {
-            plans.push(plan?);
+        let mut collected = Vec::with_capacity(metadata.operator_ids.len());
+        while let Some(operator) = collecting.next().await {
+            collected.push(operator?);
         }
-        drop(planning);
+        drop(collecting);
+        // Back into the checkpoint's own order, which is the order the check compares
+        // against and the order the deletions below run in.
+        collected.sort_by_key(|(position, _)| *position);
+
+        let cleanup = Validated::validate(
+            CheckpointCleanup::new(
+                metadata.job_id.clone(),
+                old_min_epoch,
+                min_epoch,
+                collected
+                    .into_iter()
+                    .map(|(_, operator)| operator)
+                    .collect(),
+            ),
+            CleanupScope {
+                job,
+                operator_ids: &metadata.operator_ids,
+            },
+        )?;
+
+        let mut plans = Vec::with_capacity(metadata.operator_ids.len());
+        for operator in CheckpointCleanup::operators(&cleanup) {
+            plans.push(OperatorCleanupPlan {
+                operator_id: operator.operator_id().to_string(),
+                files_to_delete: Self::files_no_longer_referenced(&operator)?,
+            });
+        }
 
         let storage_client = get_storage_provider(role).await?;
 
+        // Every path below is derived from the token rather than from the arguments, so the
+        // job and the epoch range that are deleted from are literally the ones the check
+        // covered.
+        let deleting_from = cleanup.get();
         let mut deleting: FuturesUnordered<_> = plans
             .into_iter()
             .map(|plan| {
                 let storage_client = Arc::clone(&storage_client);
-                let job_id = metadata.job_id.clone();
                 async move {
                     for file in plan.files_to_delete {
                         storage_client.delete_if_present(file).await?;
                     }
 
-                    for epoch_to_remove in old_min_epoch..min_epoch {
+                    for epoch_to_remove in
+                        deleting_from.old_min_epoch()..deleting_from.new_min_epoch()
+                    {
                         let path = metadata_path(&operator_path(
-                            &job_id,
+                            deleting_from.job_id(),
                             epoch_to_remove,
                             &plan.operator_id,
                         ));
@@ -178,30 +228,39 @@ impl BackingStore for ParquetBackend {
             let operator_id = result?;
             debug!(
                 message = "Finished cleaning operator",
-                job_id = metadata.job_id,
+                job_id = deleting_from.job_id(),
                 operator_id,
                 min_epoch
             );
         }
         drop(deleting);
 
-        for epoch_to_remove in old_min_epoch..min_epoch {
+        for epoch_to_remove in deleting_from.old_min_epoch()..deleting_from.new_min_epoch() {
             storage_client
-                .delete_if_present(metadata_path(&base_path(&metadata.job_id, epoch_to_remove)))
+                .delete_if_present(metadata_path(&base_path(
+                    deleting_from.job_id(),
+                    epoch_to_remove,
+                )))
                 .await?;
         }
         metadata.min_epoch = min_epoch;
-        Self::write_checkpoint_metadata(role, metadata).await?;
+        Self::write_checkpoint_metadata(
+            role,
+            Validated::validate(
+                CheckpointMetadataWrite::after_cleanup(metadata, &cleanup),
+                (),
+            )?,
+        )
+        .await?;
         Ok(())
     }
 }
 
 /// One operator's fully classified cleanup.
 ///
-/// Produced by [`ParquetBackend::plan_operator_cleanup`] for every operator of a checkpoint
-/// before any of them is executed, so the decision to delete is made with the whole checkpoint
-/// in hand. It carries the derived file set rather than the metadata it came from: the metadata
-/// is read once, during planning, and dropped there.
+/// Derived from a [`Validated<CheckpointCleanup>`] for every operator of a checkpoint before
+/// any of them is executed, so the decision to delete is made with the whole checkpoint in
+/// hand. It carries the derived file set rather than the metadata it came from.
 struct OperatorCleanupPlan {
     operator_id: String,
     files_to_delete: HashSet<String>,
@@ -226,13 +285,18 @@ impl ParquetBackend {
         operator_id: &str,
         epoch: u32,
     ) -> Result<HashMap<String, TableCheckpointMetadata>, StateError> {
-        let operator_checkpoint_metadata =
-            Self::load_operator_metadata(role, &job_id, operator_id, epoch)
-                .await?
-                .expect("expect operator metadata to still be present");
-        validate_restored_operator_metadata(job, &operator_checkpoint_metadata)?;
+        // One operator is still a whole object: it goes through the same load-check-act path
+        // as a whole checkpoint, with itself as the entire set being compacted, so there is
+        // no second route to `compact_validated_checkpoint`.
+        let compacted =
+            Self::compact_checkpoint(role, job, job_id, vec![operator_id.to_string()], epoch)
+                .await?;
 
-        Self::compact_loaded_operator(role, operator_checkpoint_metadata).await
+        Ok(compacted
+            .into_iter()
+            .next()
+            .map(|(_, tables)| tables)
+            .unwrap_or_default())
     }
 
     /// Loads and validates every operator's metadata for one checkpoint, without touching
@@ -248,7 +312,10 @@ impl ParquetBackend {
     /// Operators are loaded concurrently and returned in `operator_ids` order, so the
     /// caller reuses these objects instead of reading them again — restoring a checkpoint
     /// with this preflight costs the same reads it did without one, as long as the caller
-    /// consumes what it is given.
+    /// consumes what it is given. They come back inside a
+    /// [`Validated<RestorableCheckpoint>`], which is what the metadata rewrite that follows
+    /// a restore takes: the preflight and the rewrite are joined by the type rather than by
+    /// the caller remembering to run them in that order (design item M11.D39c).
     ///
     /// `restoring` is the set of operators the job's workers will actually construct,
     /// derived from the *current* program rather than from the checkpoint. The two are
@@ -281,40 +348,22 @@ impl ParquetBackend {
         job: StateBackendSelector,
         restoring: &HashSet<&str>,
         metadata: &CheckpointMetadata,
-    ) -> Result<Vec<(String, OperatorCheckpointMetadata)>, StateError> {
-        let incomplete = |detail: String| StateError::IncompleteCheckpoint {
-            epoch: metadata.epoch,
-            detail,
-        };
-
+    ) -> Result<Validated<RestorableCheckpoint>, StateError> {
         // Set arithmetic first: it needs no reads, and a checkpoint that cannot cover this
-        // job's operators must be refused before even the preflight's own reads happen.
-        let listed: HashSet<&str> = metadata.operator_ids.iter().map(String::as_str).collect();
-
-        let mut missing: Vec<&str> = restoring.difference(&listed).copied().collect();
-        if !missing.is_empty() {
-            missing.sort_unstable();
-            return Err(incomplete(format!(
-                "the job's program contains operator(s) {} that the checkpoint does not \
-                 list, and every operator a worker builds loads its own metadata",
-                missing.join(", ")
-            )));
-        }
-
-        let mut extra: Vec<&str> = listed.difference(restoring).copied().collect();
-        if !extra.is_empty() {
-            extra.sort_unstable();
-            return Err(incomplete(format!(
-                "the checkpoint lists operator(s) {} that the job's program does not \
-                 contain",
-                extra.join(", ")
-            )));
-        }
+        // job's operators must be refused before even the preflight's own reads happen. The
+        // token's own check runs it again over what was actually loaded, which is the copy
+        // every operation below depends on.
+        check_program_coverage(
+            metadata.epoch,
+            metadata.operator_ids.iter().map(String::as_str),
+            restoring,
+        )?;
 
         let mut loading: FuturesUnordered<_> = metadata
             .operator_ids
             .iter()
-            .map(|operator_id| async move {
+            .enumerate()
+            .map(|(position, operator_id)| async move {
                 let loaded = Self::load_operator_metadata(
                     role,
                     &metadata.job_id,
@@ -322,55 +371,37 @@ impl ParquetBackend {
                     metadata.epoch,
                 )
                 .await?
-                .ok_or_else(|| {
-                    incomplete(format!(
+                .ok_or_else(|| StateError::IncompleteCheckpoint {
+                    epoch: metadata.epoch,
+                    detail: format!(
                         "operator {operator_id} has no checkpoint metadata object, but the \
                          worker that builds it requires one"
-                    ))
+                    ),
                 })?;
-                // ...and that object must carry an operator header naming this operator.
-                // `TableManager::load` reads the restored watermark straight out of it
-                // and panics if it is absent, so tolerating a headerless object here only
-                // moves the failure into a worker, past the metadata rewrite.
-                match loaded.operator_metadata.as_ref() {
-                    Some(header) if header.operator_id == *operator_id => {}
-                    Some(header) => {
-                        return Err(incomplete(format!(
-                            "the checkpoint metadata object for operator {operator_id} is \
-                             headed \"{}\" instead",
-                            header.operator_id
-                        )));
-                    }
-                    None => {
-                        return Err(incomplete(format!(
-                            "the checkpoint metadata object for operator {operator_id} has \
-                             no operator header, which the worker that builds it requires"
-                        )));
-                    }
-                }
-                validate_restored_operator_metadata(job, &loaded)?;
-                Ok::<_, StateError>((operator_id.clone(), loaded))
+                Ok::<_, StateError>((position, operator_id.clone(), loaded))
             })
             .collect();
 
-        let mut validated = HashMap::with_capacity(metadata.operator_ids.len());
-        while let Some(loaded) = loading.next().await {
-            let (operator_id, loaded) = loaded?;
-            validated.insert(operator_id, loaded);
+        let mut loaded = Vec::with_capacity(metadata.operator_ids.len());
+        while let Some(operator) = loading.next().await {
+            loaded.push(operator?);
         }
         drop(loading);
+        loaded.sort_by_key(|(position, _, _)| *position);
 
-        Ok(metadata
-            .operator_ids
-            .iter()
-            .filter_map(|operator_id| {
-                // `remove` rather than `get`: a checkpoint that lists the same operator
-                // twice yields it once, which is also what the loading pass produced.
-                validated
-                    .remove(operator_id)
-                    .map(|loaded| (operator_id.clone(), loaded))
-            })
-            .collect())
+        // An operator that had no object never reaches here, so "every listed operator has
+        // one" is a property of having built the value at all. What is left to check — the
+        // headers, the exact coverage, and every table config — is the token's job.
+        Validated::validate(
+            RestorableCheckpoint::new(
+                metadata.epoch,
+                loaded
+                    .into_iter()
+                    .map(|(_, operator_id, loaded)| (operator_id, loaded))
+                    .collect(),
+            ),
+            RestoringProgram { job, restoring },
+        )
     }
 
     /// Compacts a whole checkpoint, one operator at a time, after the whole checkpoint has
@@ -401,31 +432,67 @@ impl ParquetBackend {
     ) -> Result<Vec<(String, HashMap<String, TableCheckpointMetadata>)>, StateError> {
         let mut loading: FuturesUnordered<_> = operator_ids
             .iter()
-            .map(|operator_id| {
+            .enumerate()
+            .map(|(position, operator_id)| {
                 let job_id = Arc::clone(&job_id);
                 async move {
                     let metadata = Self::load_operator_metadata(role, &job_id, operator_id, epoch)
                         .await?
                         .expect("expect operator metadata to still be present");
-                    validate_restored_operator_metadata(job, &metadata)?;
-                    Ok::<_, StateError>((operator_id.clone(), metadata))
+                    Ok::<_, StateError>((position, operator_id.clone(), metadata))
                 }
             })
             .collect();
 
-        let mut validated = HashMap::with_capacity(operator_ids.len());
-        while let Some(loaded) = loading.next().await {
-            let (operator_id, metadata) = loaded?;
-            validated.insert(operator_id, metadata);
+        let mut loaded = Vec::with_capacity(operator_ids.len());
+        while let Some(operator) = loading.next().await {
+            loaded.push(operator?);
         }
         drop(loading);
+        loaded.sort_by_key(|(position, _, _)| *position);
 
-        let mut compacted = Vec::with_capacity(operator_ids.len());
-        for operator_id in operator_ids {
-            let Some(metadata) = validated.remove(&operator_id) else {
-                // Only reachable if the caller passed the same operator twice.
-                continue;
-            };
+        let compacting: HashSet<&str> = operator_ids.iter().map(String::as_str).collect();
+        let checkpoint = Validated::validate(
+            RestorableCheckpoint::new(
+                epoch,
+                loaded
+                    .into_iter()
+                    .map(|(_, operator_id, metadata)| (operator_id, metadata))
+                    .collect(),
+            ),
+            RestoringProgram {
+                job,
+                restoring: &compacting,
+            },
+        )?;
+
+        Self::compact_validated_checkpoint(role, checkpoint).await
+    }
+
+    /// Compacts every operator of a checkpoint that has already been checked as a whole.
+    ///
+    /// This is the destructive half of compaction, and it takes only the token: there is no
+    /// spelling of this call that names an operator nothing vouched for (design item
+    /// M11.D39c). It consumes the token rather than borrowing it, because the metadata the
+    /// check ran over is the metadata that is compacted — re-reading it would pay twice for
+    /// the same bytes and would let a different object be rewritten than the one that was
+    /// checked.
+    ///
+    /// Results come back in the order the token holds its operators, which is the order the
+    /// caller asked for, so the caller can publish them to workers in that order.
+    ///
+    /// # Errors
+    ///
+    /// Returns the storage and table failures compaction can produce; a selector
+    /// disagreement cannot reach here, because it is what stops the token existing.
+    pub async fn compact_validated_checkpoint(
+        role: &StorageProviderFor,
+        checkpoint: Validated<RestorableCheckpoint>,
+    ) -> Result<Vec<(String, HashMap<String, TableCheckpointMetadata>)>, StateError> {
+        let operators = checkpoint.into_inner().into_operators();
+
+        let mut compacted = Vec::with_capacity(operators.len());
+        for (operator_id, metadata) in operators {
             compacted.push((
                 operator_id,
                 Self::compact_loaded_operator(role, metadata).await?,
@@ -438,7 +505,9 @@ impl ParquetBackend {
     /// Compacts one operator's already-loaded, already-validated checkpoint metadata.
     ///
     /// Takes the metadata by value rather than re-reading it, so the whole-checkpoint
-    /// preflight in [`ParquetBackend::compact_checkpoint`] costs no extra reads.
+    /// preflight in [`ParquetBackend::compact_checkpoint`] costs no extra reads. Private,
+    /// and reachable only from [`ParquetBackend::compact_validated_checkpoint`], which is
+    /// what makes "already validated" true rather than hoped for.
     async fn compact_loaded_operator(
         role: &StorageProviderFor,
         operator_checkpoint_metadata: OperatorCheckpointMetadata,
@@ -494,105 +563,89 @@ impl ParquetBackend {
         Ok(result)
     }
 
-    /// Classify the files no longer referenced by the new min epoch, without deleting them
+    /// Reads one operator's share of a cleanup: the epoch being kept and every epoch being
+    /// dropped, without checking or deleting anything.
     ///
-    /// `job` is the state backend the job selected. Both the epoch being kept and every
-    /// epoch being dropped are checked against it, because the dropped epochs may predate a
-    /// restart: a job that was previously run on another backend must not have that
-    /// backend's files deleted by this one's file layout.
-    ///
-    /// Nothing is deleted here. [`ParquetBackend::cleanup_checkpoint`] plans every operator
-    /// first and only then executes the plans, so a mismatch in *any* operator or epoch is
-    /// found while the checkpoint is still whole. Each epoch's metadata is read once and the
-    /// derived paths are kept, so classifying costs no extra reads over deleting inline.
+    /// Every epoch is read, including ones whose object is already gone — recorded as
+    /// absent rather than skipped — because the check that follows is a claim about the
+    /// whole range and cannot tell "collected and absent" from "never collected" otherwise.
+    /// The dropped epochs may predate a restart onto another backend, which is why they are
+    /// part of the object being checked at all: a job must never have another backend's
+    /// files deleted by this one's file layout.
     ///
     /// # Errors
     ///
-    /// Returns [`StateError::StateBackendError`] if any of those epochs' table configs
-    /// disagree with `job`, alongside the storage failures reading metadata can produce.
-    async fn plan_operator_cleanup(
+    /// Returns the storage failures reading metadata can produce. Nothing is checked here,
+    /// so no selector disagreement is reported; that is
+    /// [`CheckpointCleanup`]'s whole-object check.
+    async fn collect_operator_cleanup(
         role: &StorageProviderFor,
-        job: StateBackendSelector,
         job_id: String,
         operator_id: String,
         old_min_epoch: u32,
         new_min_epoch: u32,
-    ) -> Result<OperatorCleanupPlan, StateError> {
-        let operator_metadata =
-            Self::load_operator_metadata(role, &job_id, &operator_id, new_min_epoch)
-                .await?
-                .expect("expect new_min_epoch metadata to still be present");
-        validate_restored_operator_metadata(job, &operator_metadata)?;
+    ) -> Result<OperatorCleanup, StateError> {
+        let retained = Self::load_operator_metadata(role, &job_id, &operator_id, new_min_epoch)
+            .await?
+            .expect("expect new_min_epoch metadata to still be present");
 
-        let paths_to_keep: HashSet<String> = operator_metadata
-            .table_checkpoint_metadata
-            .iter()
-            .flat_map(|(table_name, metadata)| {
-                let table_config = operator_metadata
-                    .table_configs
-                    .get(table_name)
-                    .unwrap()
-                    .clone();
+        let mut dropped = Vec::with_capacity(new_min_epoch.saturating_sub(old_min_epoch) as usize);
+        for epoch_to_remove in old_min_epoch..new_min_epoch {
+            dropped.push((
+                epoch_to_remove,
+                Self::load_operator_metadata(role, &job_id, &operator_id, epoch_to_remove).await?,
+            ));
+        }
 
-                match table_config.table_type() {
-                    rpc::TableEnum::MissingTableType => todo!("should handle error"),
-                    rpc::TableEnum::GlobalKeyValue => {
-                        GlobalKeyedTable::files_to_keep(table_config, metadata.clone()).unwrap()
-                    }
-                    rpc::TableEnum::ExpiringKeyedTimeTable => {
-                        ExpiringTimeKeyTable::files_to_keep(table_config, metadata.clone()).unwrap()
-                    }
-                }
-            })
-            .collect();
+        Ok(OperatorCleanup::new(operator_id, retained, dropped))
+    }
+
+    /// The files one operator's dropped epochs reference and its retained epoch does not.
+    ///
+    /// Reachable only from a [`ValidatedOperatorCleanup`], which in turn comes only from a
+    /// checked [`CheckpointCleanup`] — so the set of files a job is about to lose is never
+    /// derived from an object nothing vouched for (design item M11.D39c).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateError::Other`] if a table has checkpoint metadata but no table config,
+    /// or a config that states no table type: either leaves nothing that can say which files
+    /// the table references, and treating that as "references nothing" would delete files the
+    /// retained epoch still needs.
+    fn files_no_longer_referenced(
+        operator: &ValidatedOperatorCleanup<'_>,
+    ) -> Result<HashSet<String>, StateError> {
+        let mut paths_to_keep = HashSet::new();
+        for table in operator.retained_tables()? {
+            paths_to_keep.extend(Self::table_files_to_keep(table)?);
+        }
 
         let mut files_to_delete = HashSet::new();
-
-        for epoch_to_remove in old_min_epoch..new_min_epoch {
-            let Some(operator_metadata) =
-                Self::load_operator_metadata(role, &job_id, &operator_id, epoch_to_remove).await?
-            else {
-                continue;
-            };
-            validate_restored_operator_metadata(job, &operator_metadata)?;
-
-            // delete any files that are not in the new min epoch
-            let mut files = HashSet::new();
-            for (table_name, metadata) in operator_metadata.table_checkpoint_metadata.iter() {
-                let table_config = operator_metadata
-                    .table_configs
-                    .get(table_name)
-                    .ok_or_else(|| StateError::Other {
-                        table: table_name.clone(),
-                        error: format!("missing table config for operator {operator_id}, table {table_name}, metadata is {metadata:?}, operator_metadata is {operator_metadata:?}")
-                    })?
-                    .clone();
-
-                files.extend(match table_config.table_type() {
-                    rpc::TableEnum::MissingTableType => {
-                        warn!("found table without table type: {:?}", table_name);
-                        HashSet::new()
-                    }
-                    rpc::TableEnum::GlobalKeyValue => {
-                        GlobalKeyedTable::files_to_keep(table_config, metadata.clone())?
-                    }
-                    rpc::TableEnum::ExpiringKeyedTimeTable => {
-                        ExpiringTimeKeyTable::files_to_keep(table_config, metadata.clone())?
-                    }
-                });
-            }
-
-            for file in files {
+        for table in operator.dropped_tables()? {
+            for file in Self::table_files_to_keep(table)? {
                 if !paths_to_keep.contains(&file) {
                     files_to_delete.insert(file);
                 }
             }
         }
 
-        Ok(OperatorCleanupPlan {
-            operator_id,
-            files_to_delete,
-        })
+        Ok(files_to_delete)
+    }
+
+    /// Dispatches one validated table to the table type that knows how to read its files.
+    fn table_files_to_keep(table: ValidatedTable<'_>) -> Result<HashSet<String>, StateError> {
+        match table.config().table_type() {
+            rpc::TableEnum::MissingTableType => Err(StateError::Other {
+                table: table.name().to_string(),
+                error: format!(
+                    "the table config for {} states no table type, so the files it \
+                     references cannot be determined",
+                    table.name()
+                ),
+            }),
+            rpc::TableEnum::GlobalKeyValue => GlobalKeyedTable::files_to_keep(table),
+            rpc::TableEnum::ExpiringKeyedTimeTable => ExpiringTimeKeyTable::files_to_keep(table),
+        }
     }
 }
 
@@ -624,6 +677,10 @@ impl ParquetStats {
 #[cfg(test)]
 mod tests {
     use super::{HashSet, ParquetBackend, base_path, metadata_path, operator_path};
+    use crate::validated::{
+        CheckpointCleanup, CheckpointMetadataWrite, CleanupScope, OperatorCleanup,
+        RestorableCheckpoint, RestoringProgram,
+    };
     use crate::{BackingStore, StorageProviderFor, get_storage_provider};
     use arroyo_rpc::errors::StateError;
     use arroyo_rpc::grpc::rpc::{
@@ -631,6 +688,7 @@ mod tests {
         OperatorCheckpointMetadata, OperatorMetadata, TableCheckpointMetadata, TableConfig,
         TableEnum,
     };
+    use arroyo_rpc::state_backend::validated::Validated;
     use arroyo_rpc::state_backend::{StateBackendError, StateBackendSelector};
     use arroyo_storage::StorageProvider;
     use prost::Message;
@@ -1004,7 +1062,7 @@ mod tests {
         write_epoch(&store, "node_1", 1, "").await;
         write_epoch(&store, "node_2", 1, "").await;
 
-        let operators = ParquetBackend::load_checkpoint_operators(
+        let preflight = ParquetBackend::load_checkpoint_operators(
             &store.role,
             StateBackendSelector::Parquet,
             &restoring(&["node_1", "node_2"]),
@@ -1013,6 +1071,7 @@ mod tests {
         .await
         .unwrap();
 
+        let operators = preflight.get().operators();
         let ids: Vec<&str> = operators.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(ids, vec!["node_1", "node_2"]);
         assert_eq!(operators[0].1.table_configs["g"].state_backend, "");
@@ -1171,5 +1230,301 @@ mod tests {
         // Global keyed tables never produce compacted metadata; what matters here is that the
         // whole checkpoint was accepted rather than refused.
         assert!(compacted.iter().all(|(_, tables)| tables.is_empty()));
+    }
+
+    /// One operator's collected epochs, all agreeing with the job, as a whole cleanup
+    /// records them.
+    fn agreeing_operator(operator_id: &str, dropped: &[u32]) -> OperatorCleanup {
+        OperatorCleanup::new(
+            operator_id.to_string(),
+            operator_metadata(operator_id, 1, "parquet", &[]),
+            dropped
+                .iter()
+                .map(|epoch| {
+                    (
+                        *epoch,
+                        Some(operator_metadata(operator_id, *epoch, "parquet", &[])),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    /// D96 row 1 (round 1): a cleanup's first delete is reachable only through a token for
+    /// the *whole* checkpoint, so no operator's files can go before every operator and every
+    /// epoch has been accounted for.
+    ///
+    /// Two halves. The behavioural half puts the disagreement in the last operator's oldest
+    /// dropped epoch, with both operators reading the same number of objects before they
+    /// diverge — the interleaving PR-#157 round 1 lost, and the one an "equalize the work"
+    /// setup is needed to expose at all. Nothing may be deleted and the checkpoint's
+    /// `min_epoch` may not be advanced.
+    ///
+    /// The token half is what makes that structural rather than remembered: a cleanup that
+    /// left an epoch of the range uncollected, or an operator of the checkpoint uncollected,
+    /// cannot be checked either — so a caller cannot earn the argument the deletion needs by
+    /// collecting less than the whole thing and then deleting all of it.
+    #[tokio::test]
+    async fn cleanup_requires_validated_whole_checkpoint() {
+        let store = LocalCheckpointStore::new("cleanup-token");
+        let agreeing_dropped = write_epoch(&store, "node_1", 0, "parquet").await;
+        let agreeing_kept = write_epoch(&store, "node_1", 1, "parquet").await;
+        let mismatching_dropped = write_epoch(&store, "node_2", 0, "stateengine").await;
+        write_epoch(&store, "node_2", 1, "parquet").await;
+
+        let err = ParquetBackend::cleanup_checkpoint(
+            &store.role,
+            StateBackendSelector::Parquet,
+            checkpoint_metadata(&["node_1", "node_2"], 1),
+            0,
+            1,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                StateError::StateBackendError(StateBackendError::CheckpointMismatch { .. })
+            ),
+            "expected a typed selector rejection, got {err:?}"
+        );
+        assert!(
+            store.exists(&agreeing_dropped).await,
+            "the agreeing operator's dropped file went before the whole checkpoint was checked"
+        );
+        assert!(store.exists(&agreeing_kept).await);
+        assert!(store.exists(&mismatching_dropped).await);
+        assert!(
+            store
+                .exists(&metadata_path(&operator_path(JOB_ID, 0, "node_1")))
+                .await,
+            "the agreeing operator's dropped metadata was deleted"
+        );
+        assert!(
+            !store.exists(&metadata_path(&base_path(JOB_ID, 1))).await,
+            "the checkpoint's min_epoch was rewritten"
+        );
+
+        // The token half. `operator_ids` is the checkpoint's own list, which is what the
+        // collected cleanup has to match.
+        let operator_ids = vec!["node_1".to_string(), "node_2".to_string()];
+        let scope = CleanupScope {
+            job: StateBackendSelector::Parquet,
+            operator_ids: &operator_ids,
+        };
+
+        Validated::validate(
+            CheckpointCleanup::new(
+                JOB_ID.to_string(),
+                0,
+                1,
+                vec![
+                    agreeing_operator("node_1", &[0]),
+                    agreeing_operator("node_2", &[0]),
+                ],
+            ),
+            scope,
+        )
+        .expect("a whole, agreeing cleanup is exactly what a token is for");
+
+        let missing_epoch = Validated::validate(
+            CheckpointCleanup::new(
+                JOB_ID.to_string(),
+                0,
+                1,
+                vec![
+                    // node_1's dropped epoch 0 was never collected, so nothing has looked at
+                    // the object whose files this cleanup would delete.
+                    agreeing_operator("node_1", &[]),
+                    agreeing_operator("node_2", &[0]),
+                ],
+            ),
+            scope,
+        )
+        .unwrap_err();
+        assert!(
+            missing_epoch.to_string().contains("node_1"),
+            "{missing_epoch}"
+        );
+
+        let missing_operator = Validated::validate(
+            CheckpointCleanup::new(
+                JOB_ID.to_string(),
+                0,
+                1,
+                vec![agreeing_operator("node_1", &[0])],
+            ),
+            scope,
+        )
+        .unwrap_err();
+        assert!(
+            missing_operator.to_string().contains("node_2"),
+            "{missing_operator}"
+        );
+    }
+
+    /// D96 row 3 (round 1): the destructive half of compaction takes only a token for the
+    /// whole job, so no operator is rewritten before every operator has been checked.
+    ///
+    /// The behavioural half gives both operators the same work to do before they diverge:
+    /// `node_1` agrees with the job but its table states no table type, which compaction
+    /// raises only once it is *compacting* that operator, and `node_2` disagrees. The
+    /// control at the end is what makes that evidence rather than coincidence — with
+    /// `node_2` agreeing, the same call does reach `node_1` and does report its missing
+    /// table type.
+    ///
+    /// The token half pins the coverage claim that a per-operator check cannot make: a set
+    /// that is missing one of the job's operators is refused, so `compact_validated_checkpoint`
+    /// has no argument for a partial job.
+    #[tokio::test]
+    async fn compaction_after_whole_job_validation() {
+        let store = LocalCheckpointStore::new("compaction-token");
+
+        let untyped = |operator_id: &str| {
+            let mut untyped = operator_metadata(operator_id, 1, "parquet", &[]);
+            untyped
+                .table_checkpoint_metadata
+                .get_mut("g")
+                .unwrap()
+                .table_type = TableEnum::MissingTableType as i32;
+            untyped
+        };
+        ParquetBackend::write_operator_checkpoint_metadata(&store.role, untyped("node_1"))
+            .await
+            .unwrap();
+        ParquetBackend::write_operator_checkpoint_metadata(
+            &store.role,
+            operator_metadata("node_2", 1, "stateengine", &[]),
+        )
+        .await
+        .unwrap();
+
+        let err = ParquetBackend::compact_checkpoint(
+            &store.role,
+            StateBackendSelector::Parquet,
+            Arc::new(JOB_ID.to_string()),
+            vec!["node_1".to_string(), "node_2".to_string()],
+            1,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                StateError::StateBackendError(StateBackendError::CheckpointMismatch { .. })
+            ),
+            "expected node_2's selector to be refused before node_1 was compacted, got {err:?}"
+        );
+
+        // The control: with node_2 agreeing, the whole job passes the check and node_1 is
+        // reached — which is what proves the run above stopped before compaction, rather
+        // than node_1 simply never being compactable.
+        ParquetBackend::write_operator_checkpoint_metadata(
+            &store.role,
+            operator_metadata("node_2", 1, "parquet", &[]),
+        )
+        .await
+        .unwrap();
+        let reached = ParquetBackend::compact_checkpoint(
+            &store.role,
+            StateBackendSelector::Parquet,
+            Arc::new(JOB_ID.to_string()),
+            vec!["node_1".to_string(), "node_2".to_string()],
+            1,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(reached, StateError::Other { .. }),
+            "expected node_1's missing table type once the whole job passed, got {reached:?}"
+        );
+
+        // The token half: a set that is not the whole job cannot be checked at all.
+        let partial = Validated::validate(
+            RestorableCheckpoint::new(
+                1,
+                vec![(
+                    "node_1".to_string(),
+                    operator_metadata("node_1", 1, "parquet", &[]),
+                )],
+            ),
+            RestoringProgram {
+                job: StateBackendSelector::Parquet,
+                restoring: &restoring(&["node_1", "node_2"]),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(partial, StateError::IncompleteCheckpoint { epoch: 1, .. }),
+            "{partial:?}"
+        );
+        assert!(partial.to_string().contains("node_2"), "{partial}");
+    }
+
+    /// D96 row 4 (round 2): rewriting a checkpoint's top-level metadata takes only a token,
+    /// and the token ties the operators the metadata names to the ones a whole-checkpoint
+    /// preflight actually covered.
+    ///
+    /// This is the shape of the finding: a `ready` checkpoint reached this write with no
+    /// operator preflighted at all, because the preflight was something the caller ran on
+    /// the way past rather than something the write required. There is now no spelling of
+    /// the write that takes the metadata on its own, and the only token a restore can build
+    /// is derived from the preflight's own result.
+    #[tokio::test]
+    async fn metadata_write_requires_validated_operators() {
+        let store = LocalCheckpointStore::new("metadata-write-token");
+        write_epoch(&store, "node_1", 1, "").await;
+        write_epoch(&store, "node_2", 1, "").await;
+
+        let metadata = checkpoint_metadata(&["node_1", "node_2"], 1);
+        let preflight = ParquetBackend::load_checkpoint_operators(
+            &store.role,
+            StateBackendSelector::Parquet,
+            &restoring(&["node_1", "node_2"]),
+            &metadata,
+        )
+        .await
+        .unwrap();
+
+        // Metadata naming an operator the preflight did not cover is not writable...
+        let extra = Validated::validate(
+            CheckpointMetadataWrite::after_restore_preflight(
+                checkpoint_metadata(&["node_1", "node_2", "node_3"], 1),
+                &preflight,
+            ),
+            (),
+        )
+        .unwrap_err();
+        assert!(extra.to_string().contains("node_3"), "{extra}");
+
+        // ...and neither is metadata that quietly drops one the preflight did cover, which
+        // is what a checkpoint whose restore skipped an operator would produce.
+        let dropped = Validated::validate(
+            CheckpointMetadataWrite::after_restore_preflight(
+                checkpoint_metadata(&["node_1"], 1),
+                &preflight,
+            ),
+            (),
+        )
+        .unwrap_err();
+        assert!(dropped.to_string().contains("node_2"), "{dropped}");
+
+        assert!(
+            !store.exists(&metadata_path(&base_path(JOB_ID, 1))).await,
+            "a refused write still reached storage"
+        );
+
+        // The write the preflight does entitle goes through.
+        let write = Validated::validate(
+            CheckpointMetadataWrite::after_restore_preflight(metadata, &preflight),
+            (),
+        )
+        .unwrap();
+        ParquetBackend::write_checkpoint_metadata(&store.role, write)
+            .await
+            .unwrap();
+        assert!(store.exists(&metadata_path(&base_path(JOB_ID, 1))).await);
     }
 }

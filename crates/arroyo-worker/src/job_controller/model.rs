@@ -18,6 +18,7 @@ use arroyo_rpc::grpc::rpc::{
 use arroyo_rpc::identity::WorkerClient;
 use arroyo_rpc::public_ids::{IdTypes, generate_id};
 use arroyo_rpc::state_backend::StateBackendSelector;
+use arroyo_rpc::state_backend::validated::Validated;
 use arroyo_state::parquet::ParquetBackend;
 use arroyo_state::{BackingStore, StateBackend, StorageProviderFor, get_storage_provider};
 use arroyo_state_protocol::ProtocolPaths;
@@ -475,7 +476,11 @@ impl RunningJobModel {
                     JobCheckpointEventType::WritingMetadata,
                 );
 
-                let metadata = checkpointing.build_metadata();
+                // Leader mode publishes a manifest through the protocol rather than the
+                // legacy top-level metadata object, so it takes the metadata back out
+                // rather than carrying the write token: the publication that commits this
+                // generation is gated by the protocol's own whole-manifest check.
+                let metadata = checkpointing.build_metadata().into_metadata();
 
                 let manifest = CheckpointManifest {
                     pipeline_id,
@@ -678,7 +683,7 @@ impl RunningJobModel {
             CheckpointingOrCommittingState::Checkpointing(mut checkpointing) => {
                 let metadata_span = self.start_or_get_span(JobCheckpointEventType::WritingMetadata);
 
-                let metadata = checkpointing.build_metadata();
+                let metadata = Validated::validate(checkpointing.build_metadata(), ())?;
 
                 StateBackend::write_checkpoint_metadata(&storage_role, metadata).await?;
 

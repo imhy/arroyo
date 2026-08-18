@@ -1,10 +1,12 @@
 use crate::ProtocolPaths;
 use crate::store::{ProtocolStore, StoreError, read_protobuf};
 use crate::types::{CheckpointRef, Epoch, Generation, ProtocolError};
+use crate::validated::{CheckpointHistory, validate_history};
 use arroyo_rpc::grpc::rpc::{
     CheckpointManifest, ExpiringKeyedTimeTableCheckpointMetadata,
     GlobalKeyedTableTaskCheckpointMetadata, TableCheckpointMetadata, TableEnum,
 };
+use arroyo_rpc::state_backend::validated::Validated;
 use arroyo_rpc::state_backend::{StateBackendSelector, validate_restored_manifest};
 use futures::{TryStreamExt, stream};
 use prost::Message;
@@ -20,14 +22,6 @@ pub(crate) struct CheckpointOwner {
     pub epoch: Epoch,
 }
 
-/// A fully classified GC operation. Classification must complete before any deletion begins.
-struct CleanupPlan {
-    /// Checkpoints below the retention boundary, ordered newest to oldest by traversal order.
-    old_checkpoints: Vec<CheckpointOwner>,
-    /// Deduplicated files referenced only by old checkpoints.
-    data_files: Vec<CheckpointRef>,
-}
-
 /// Deletes the leader-mode checkpoint history below `new_min_epoch`.
 ///
 /// `job` is the state backend the job selected, handed in by the caller rather than read from
@@ -35,6 +29,13 @@ struct CleanupPlan {
 /// validated against it while the history is classified, which is strictly before the first
 /// delete: the reachable chain is the only thing that names the files this function removes, and
 /// a chain some other backend wrote must not have its files named by this one's traversal.
+///
+/// Classification and deletion are two functions with a
+/// [`Validated<CheckpointHistory>`] between them (design item M11.D39c). The traversal checks
+/// each manifest as it reads it, which is what keeps its own parent links and file names from
+/// being taken out of bytes nobody vouched for; the token is the separate claim about the
+/// *whole* chain, and [`delete_classified_history`] takes nothing else — so a caller cannot
+/// arrive at the deletion with a chain that was only partly classified.
 ///
 /// # Errors
 ///
@@ -51,10 +52,35 @@ pub async fn cleanup_leader_checkpoints<S>(
 where
     S: ProtocolStore + ?Sized,
 {
-    let cleanup = classify_checkpoint_history(store, job, head, new_min_epoch).await?;
+    let cleanup = validate_history(
+        classify_checkpoint_history(store, job, head, new_min_epoch).await?,
+        job,
+    )?;
+
+    delete_classified_history(store, paths, &cleanup).await
+}
+
+/// Deletes everything a checked history classified as collectable.
+///
+/// Takes only the token: this is the irreversible half, and there is no spelling of it that
+/// names a checkpoint chain nothing validated.
+///
+/// # Errors
+///
+/// Returns the storage failures deleting can produce. Deletions run in an order that cannot
+/// strand a still-reachable checkpoint if one of them fails part way.
+pub async fn delete_classified_history<S>(
+    store: &S,
+    paths: &ProtocolPaths,
+    cleanup: &Validated<CheckpointHistory>,
+) -> Result<(), StoreError>
+where
+    S: ProtocolStore + ?Sized,
+{
+    let cleanup = cleanup.get();
 
     let data_directories: HashSet<_> = cleanup
-        .data_files
+        .data_files()
         .iter()
         .filter_map(|f| Path::new(f.as_str()).parent().and_then(|p| p.to_str()))
         .map(|f| f.to_string())
@@ -65,8 +91,8 @@ where
         .map(|directory| directory.to_string())
         .collect();
 
-    let mut objects = cleanup.data_files;
-    for checkpoint in &cleanup.old_checkpoints {
+    let mut objects = cleanup.data_files().to_vec();
+    for checkpoint in cleanup.old_checkpoints() {
         objects.push(paths.committed_marker(checkpoint.generation, checkpoint.epoch));
         objects.push(paths.epoch_record(checkpoint.epoch));
     }
@@ -86,7 +112,7 @@ where
 
     // Traversal records checkpoints newest-to-oldest. Delete manifests in reverse so a failed
     // cleanup cannot create a gap that makes still-reachable older checkpoints undiscoverable.
-    for c in cleanup.old_checkpoints.iter().rev() {
+    for c in cleanup.old_checkpoints().iter().rev() {
         debug!(
             generation = c.generation.0,
             epoch = c.epoch.0,
@@ -123,17 +149,23 @@ where
 ///
 /// Each manifest is checked against `job` at the point it is read, before its files are added to
 /// either set — so the selector check costs no extra reads, and a disagreement anywhere in the
-/// chain aborts classification with an empty plan rather than a partial one.
+/// chain aborts classification with an empty plan rather than a partial one. That per-object
+/// check is the untrusted-bytes guard: the parent link that continues the traversal and the file
+/// refs that become delete candidates both come out of the manifest, so who wrote it has to be
+/// known before any of that is interpreted. The claim about the *chain* is separate, and is what
+/// [`CheckpointHistory`]'s own check makes; the reduced evidence collected here is what lets it
+/// be made without buffering the file lists a second time.
 async fn classify_checkpoint_history<S>(
     store: &S,
     job: StateBackendSelector,
     current: CheckpointRef,
     new_min_epoch: Epoch,
-) -> Result<CleanupPlan, StoreError>
+) -> Result<CheckpointHistory, StoreError>
 where
     S: ProtocolStore + ?Sized,
 {
     let mut head = true;
+    let mut history = CheckpointHistory::default();
     let mut old_checkpoints = vec![];
     let mut candidate_files = HashSet::new();
     let mut protected_files = HashSet::new();
@@ -189,6 +221,8 @@ where
             protected_files.extend(files);
         }
 
+        history.reached(owner, &manifest);
+
         next = manifest
             .parent_checkpoint_ref
             .map(CheckpointRef::new)
@@ -197,10 +231,8 @@ where
 
     candidate_files.retain(|file| !protected_files.contains(file));
 
-    Ok(CleanupPlan {
-        old_checkpoints,
-        data_files: candidate_files.into_iter().collect(),
-    })
+    history.classified(old_checkpoints, candidate_files.into_iter().collect());
+    Ok(history)
 }
 
 fn checkpoint_data_files(

@@ -21,9 +21,7 @@ use arroyo_rpc::grpc::rpc::{
     WorkerInitializationCompleteResp,
 };
 use arroyo_rpc::public_ids::{IdTypes, generate_id};
-use arroyo_rpc::state_backend::{
-    StateBackendError, StateBackendSelector, validate_unchanged_job_selector,
-};
+use arroyo_rpc::state_backend::{StateBackendError, StateBackendSelector};
 use arroyo_rpc::worker_types::{RunningMessage, TaskFailedEvent};
 use arroyo_rpc::{StateContext, config, errors};
 use arroyo_server_common::shutdown::ShutdownGuard;
@@ -33,6 +31,9 @@ use arroyo_worker::job_controller::job_metrics::JobMetrics;
 use cornucopia_async::DatabaseSource;
 use lazy_static::lazy_static;
 use prometheus::{IntGaugeVec, register_int_gauge_vec};
+use states::lifecycle::classification::{
+    SelectorClassification, classify_selector, decode_execution_record,
+};
 use states::{Created, State, StateMachine};
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -49,7 +50,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::codec::CompressionEncoding;
 use tonic::{Request, Response, Status};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 //pub mod compiler;
 pub mod job_controller;
@@ -201,43 +202,32 @@ pub(crate) struct PolledJob {
 /// returning the error from the polling loop would stop every other job on the cluster
 /// from being polled because one row is bad, so it is reported per row on each poll, which
 /// is also what makes the condition visible until an operator fixes it.
+///
+/// The rules themselves are [`classify_selector`]'s, in the job lifecycle boundary rather
+/// than here (M11.T25e, design M11.D39f). This function reads the two values they decide
+/// between and applies their answer to the row; what an answer *means* is written once, in
+/// the one place the job's own single writer can reach it too.
 fn classify_polled_row(
     row: queries::controller_queries::Job,
     status: &JobStatus,
 ) -> Option<PolledJob> {
     let job_id = row.id.clone();
 
-    // Persisted, and therefore untrusted: a recorded value nobody recognizes is refused,
-    // never guessed at, because guessing is what would pick a backend for a live job.
-    let recorded = match status.recorded_execution_selector() {
-        Ok(recorded) => recorded,
-        Err(e) => {
-            error!(job_id = %job_id, error = %e,
-                "refusing job whose recorded execution state backend is unusable");
+    let (execution_selector, refusal) = match classify_selector(
+        &job_id,
+        status.recorded_execution_selector(),
+        StateBackendSelector::normalize(&row.state_backend, &format!("job {job_id}")),
+    ) {
+        SelectorClassification::Fixed {
+            execution_selector,
+            refusal,
+        } => (execution_selector, refusal),
+        // Fail closed for this job, fail open for the poll: the condition is reported and
+        // the next row is read, so one unusable job cannot stop the cluster being polled.
+        SelectorClassification::Undecidable(undecidable) => {
+            undecidable.log(&job_id);
             return None;
         }
-    };
-
-    let requested = StateBackendSelector::normalize(&row.state_backend, &format!("job {job_id}"));
-
-    let (execution_selector, refusal) = match (recorded, requested) {
-        // No execution on record: this row is the job's declaration, and starting is the
-        // only moment a job chooses its backend.
-        (None, Ok(requested)) => (requested, None),
-        // ...and a declaration that cannot be interpreted is never downgraded to a
-        // default, so the job simply never starts. There is no execution to administer
-        // and nothing to fail.
-        (None, Err(e)) => {
-            error!(job_id = %job_id, error = %e, "refusing job with an unusable config");
-            return None;
-        }
-        // An execution exists, so it is the authority. The job goes on being administered
-        // under the backend it is running with, and the row's value is refused.
-        (Some(recorded), Ok(requested)) => (
-            recorded,
-            validate_unchanged_job_selector(&job_id, recorded, requested).err(),
-        ),
-        (Some(recorded), Err(e)) => (recorded, Some(e)),
     };
 
     let mut config = JobConfig::from_row(row, execution_selector);
@@ -259,41 +249,20 @@ fn classify_polled_row(
     })
 }
 
-/// Decodes the controller's own durable record of a job's execution.
-///
-/// `job_statuses.state_context` is persisted state, and therefore untrusted input. A blob
-/// that cannot be decoded is *not* turned into "this job has no execution": for a job that
-/// does have one, that would erase its only selector authority, and the editable
-/// configuration row would be adopted in its place — the very substitution
-/// [`classify_polled_row`] exists to prevent.
-///
-/// `None` therefore means *skip this job*. It is reported on every poll, so the condition
-/// stays visible until an operator repairs the row, and it is scoped to the one job: the
-/// rest of the cluster goes on being polled.
-fn decode_state_context(job_id: &str, raw: &serde_json::Value) -> Option<StateContext> {
-    match serde_json::from_value::<StateContext>(raw.clone()) {
-        Ok(state_context) => Some(state_context),
-        Err(e) => {
-            error!(job_id = %job_id, original =? raw, error =? e,
-                "skipping job whose execution record cannot be decoded");
-            None
-        }
-    }
-}
-
 /// Turns one polled row into the job's status and the configuration the state machine
 /// should act on, or `None` if the update thread must move on without touching this job.
 ///
 /// This is the whole of the per-row decision, in one place the tests can drive: decode the
 /// execution record, build the status from it, then resolve the row against it. Every
 /// `None` here is fail-closed for the job and fail-open for the cluster — the poll loop
-/// skips to the next row rather than erroring out.
+/// skips to the next row rather than erroring out. Both halves of that — the decode and the
+/// resolution — are [`crate::states::lifecycle::classification`]'s rules (M11.D39f).
 fn classify_polled_job(row: queries::controller_queries::Job) -> Option<(PolledJob, JobStatus)> {
     let id = Arc::new(row.id.clone());
 
     // Everything the status needs is read before the config consumes the row, so a
     // rejected row can skip just this job.
-    let state_context = decode_state_context(&id, &row.state_context)?;
+    let state_context = decode_execution_record(&id, &row.state_context)?;
 
     let status = JobStatus {
         id: id.clone(),
@@ -1198,7 +1167,7 @@ mod tests {
             ignore_state_before_epoch: None,
             // Exactly what the V29/V7 migration's `DEFAULT '{"version": 1}'` puts in the
             // column for a job whose status has never been written, which is the shape
-            // `decode_state_context` has to accept.
+            // `decode_execution_record` has to accept.
             state_context: serde_json::json!({ "version": 1 }),
             env_vars: serde_json::json!({}),
             scheduler_config: serde_json::json!({}),

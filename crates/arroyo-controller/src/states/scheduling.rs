@@ -14,7 +14,7 @@ use tracing::{debug, error, info, warn};
 
 use super::{
     Admission, JobContext, State, Transition, check_config_update, leader_running::LeaderRunning,
-    running::Running, settle_under_admission,
+    lifecycle::ConsumptionPoint, running::Running, settle_under_admission,
 };
 use crate::job_controller::checkpoint_store::DbCheckpointMetadataStore;
 use crate::job_controller::leader_manager::LeaderManager;
@@ -31,6 +31,7 @@ use arroyo_datastream::logical::LogicalProgram;
 use arroyo_rpc::config::{JobControllerMode, config};
 use arroyo_rpc::errors::StateError as StateStoreError;
 use arroyo_rpc::grpc::api;
+use arroyo_rpc::state_backend::validated::Validated;
 use arroyo_rpc::state_backend::{
     StateBackendError, StateBackendSelector, validate_restored_checkpoint,
 };
@@ -39,6 +40,7 @@ use arroyo_rpc::{LeaderContext, grpc_channel_builder};
 use arroyo_state::{
     BackingStore, StateBackend, StorageProviderFor, get_storage_provider,
     tables::{ErasedTable, global_keyed_map::GlobalKeyedTable},
+    validated::CheckpointMetadataWrite,
 };
 use arroyo_state_protocol::types::Generation;
 use arroyo_state_protocol::workflow::{
@@ -47,6 +49,13 @@ use arroyo_state_protocol::workflow::{
 };
 use arroyo_worker::job_controller::committing_state::{CheckpointIdOrRef, CommittingState};
 use arroyo_worker::job_controller::job_metrics::JobMetrics;
+
+pub(crate) mod admission;
+pub(crate) mod fanout;
+pub(crate) mod fencing;
+pub(crate) mod phases;
+
+use self::fanout::AttemptLedger;
 
 /// How many times the fan-out re-offers an unsettled `start_execution_id` to a worker before
 /// it gives the attempt up, on top of the first request.
@@ -88,6 +97,40 @@ enum WorkerState {
 
 #[derive(Debug)]
 pub struct Scheduling {}
+
+impl Scheduling {
+    /// The name this state is known by, in logs, in the job's status row, and — because
+    /// [`State`] is object-safe and a `Box<dyn State>` cannot be downcast — in the one place
+    /// that has to recognise it: [`run_state_body`].
+    pub(crate) const NAME: &'static str = "Scheduling";
+}
+
+/// Runs one state's body, through the M11.D39b phase graph for a `Scheduling` whose job runs
+/// the M11.D39a single-writer lifecycle.
+///
+/// This is the whole of the seam. It exists here, called once from
+/// [`execute_state`](crate::states::execute_state), rather than inside
+/// [`Scheduling::next`], because `next` is pinned by
+/// `the_source_of_scheduling_next_keeps_every_irreversible_effect_inside_an_admitted_region`
+/// down to the set of things its interruptible stretches may await — and the landed body must
+/// keep passing that pin unchanged, which is exactly what M11.T25 promises about it.
+///
+/// **No production job takes the first branch.** A job's lifecycle mechanism is fixed when its
+/// state machine is created, from
+/// [`LifecycleMode::SELECTED`](crate::states::lifecycle::LifecycleMode::SELECTED), and that is
+/// `LegacyT08` for the whole of M11.T25; a job on the legacy mechanism has no lifecycle actor,
+/// so [`JobContext::runs_fenced_lifecycle`](crate::states::JobContext::runs_fenced_lifecycle)
+/// is `false` and every state — `Scheduling` included — runs the same body it ran before this
+/// module existed.
+pub(crate) async fn run_state_body(
+    state: Box<dyn State>,
+    ctx: &mut JobContext<'_>,
+) -> Result<Transition, StateError> {
+    if state.name() == Scheduling::NAME && ctx.runs_fenced_lifecycle() {
+        return phases::schedule(ctx).await;
+    }
+    state.next(ctx).await
+}
 
 fn slots_for_job(job: &LogicalProgram) -> usize {
     job.graph
@@ -335,6 +378,20 @@ struct ExecutionPlan {
 /// `Endpoint::timeout`; state-task cancellation still hands the whole settling region to
 /// [`settle_under_admission`].
 ///
+/// # What it records while it runs
+///
+/// `attempts` is the fan-out's own inventory (M11.D39b). Every request records the stable
+/// `start_execution_id` it was minted with before it is sent, and records its own outcome as
+/// that outcome arrives, so a holder of the ledger can ask what is outstanding at any moment
+/// rather than only after the last request is in. Both halves of that are per attempt: an
+/// answered request is accounted for while its siblings are still in flight, and an attempt
+/// the terminal path above gives up is not accounted for at all, because giving up is not an
+/// answer. The ledger is one record per target worker — a replayed identifier is the same
+/// attempt — so it costs nothing that grows with the reconcile budget.
+///
+/// It is a record, not a control: nothing in this function consults it, and marking an attempt
+/// settled neither ends a request nor releases the admission.
+///
 /// # Errors
 ///
 /// Returns the first failing worker's error, after every request has settled. The caller turns
@@ -346,6 +403,7 @@ async fn start_execution_on_workers(
     plan: ExecutionPlan,
     machine_ids: HashMap<WorkerId, MachineId>,
     worker_connects: HashMap<WorkerId, WorkerClient>,
+    attempts: Arc<AttemptLedger>,
 ) -> (Admission, anyhow::Result<HashMap<WorkerId, WorkerClient>>) {
     settle_under_admission(admission, move |admission| async move {
         // The whole of this — issuing the requests as much as waiting for them — is one effect
@@ -376,6 +434,13 @@ async fn start_execution_on_workers(
                             rand::random::<u64>(),
                             rand::random::<u64>()
                         );
+                        // Recorded here, where the identifier is minted and before the first
+                        // request carrying it is sent, rather than when a request returns. An
+                        // inventory that under-reports could let a phase release its authority
+                        // while a request it had forgotten was still live; one that
+                        // over-reports only holds the obligation longer than it had to.
+                        attempts.issued(id, &start_execution_id);
+                        let attempts = Arc::clone(&attempts);
                         let (restore_epoch, start_epoch, min_epoch, checkpoint_interval_micros) = (
                             plan.restore_epoch,
                             plan.start_epoch,
@@ -410,6 +475,7 @@ async fn start_execution_on_workers(
                             loop {
                                 match c.start_execution(Request::new(request.clone())).await {
                                     Ok(_) => {
+                                        attempts.settled(id);
                                     debug!(
                                         message = "worker entered initialization phase",
                                         job_id = %job_id,
@@ -436,6 +502,13 @@ async fn start_execution_on_workers(
                                             // controller ceasing to offer it, and a peer that
                                             // advertised the contract cannot be holding a
                                             // parked handler for it.
+                                            //
+                                            // Deliberately *not* settled in the ledger. No
+                                            // worker answered this, so the honest record is
+                                            // that it is still unaccounted for; what the
+                                            // controller gave up is knowing the outcome, and
+                                            // an inventory that marked it settled would be
+                                            // reporting an answer nobody gave.
                                             error!(
                                                 message = "StartExecution never settled; giving the attempt up so the job can be rescheduled",
                                                 job_id = %job_id,
@@ -465,6 +538,10 @@ async fn start_execution_on_workers(
                                         tokio::time::sleep(START_EXECUTION_RECONCILE_DELAY).await;
                                     }
                                     Err(e) => {
+                                        // An explicit status other than the ambiguous set is
+                                        // the worker's own decision about this request, so the
+                                        // attempt is accounted for even though it failed.
+                                        attempts.settled(id);
                                         error!(
                                         message = "failed to start execution on worker",
                                         job_id = %job_id,
@@ -776,7 +853,7 @@ async fn prepare_restored_checkpoint(
     // checked is the workers' own, not the checkpoint's list, so an operator the
     // checkpoint omits cannot slip past unread and then fail in a worker.
     let expected: HashSet<&str> = restoring.keys().map(String::as_str).collect();
-    let operators =
+    let preflight =
         StateBackend::load_checkpoint_operators(storage_role, job, &expected, &metadata)
             .await
             .map_err(|err| match err {
@@ -810,7 +887,7 @@ async fn prepare_restored_checkpoint(
         // Exactly the operators the preflight covered, which is exactly the set the
         // workers will build: the coverage check above is what makes those three the same
         // set, so nothing is committed for an operator that was not validated.
-        for (operator_id, operator_metadata) in &operators {
+        for (operator_id, operator_metadata) in preflight.get().operators() {
             for (table_name, table_metadata) in &operator_metadata.table_checkpoint_metadata {
                 let config = operator_metadata
                     .table_configs
@@ -861,7 +938,22 @@ async fn prepare_restored_checkpoint(
         ));
     }
 
-    StateBackend::write_checkpoint_metadata(storage_role, metadata)
+    // The rewrite takes the preflight's token, not the metadata on its own: this is the
+    // write that makes the checkpoint the one a restart reads, and step 2 is what entitles
+    // it. Skipping the preflight for a `ready` checkpoint — which is what this path used to
+    // do — is no longer expressible.
+    let write = Validated::validate(
+        CheckpointMetadataWrite::after_restore_preflight(metadata, &preflight),
+        (),
+    )
+    .map_err(|err| RestorePreparationError::Fatal {
+        message: "cannot rewrite a checkpoint's metadata for operators that were not \
+                  validated"
+            .to_string(),
+        source: err.into(),
+    })?;
+
+    StateBackend::write_checkpoint_metadata(storage_role, write)
         .await
         .map_err(retryable(format!(
             "Failed to write checkpoint metadata for epoch {epoch}"
@@ -1078,7 +1170,7 @@ impl Scheduling {
 #[async_trait::async_trait]
 impl State for Scheduling {
     fn name(&self) -> &'static str {
-        "Scheduling"
+        Self::NAME
     }
 
     async fn next(mut self: Box<Self>, ctx: &mut JobContext) -> Result<Transition, StateError> {
@@ -1206,6 +1298,16 @@ impl State for Scheduling {
 
         let start = Instant::now();
         loop {
+            // D39a's second consumption point, on every turn of an interruptible wait.
+            // This loop breaks on the message that makes its count rather than on the last
+            // message in the queue, so a decision published while it waited can be sitting
+            // behind those messages, unread; reading the job's intent here does not depend
+            // on the channel at all. Not `async`, so it adds nothing to what the pinned
+            // interruptible stretches await. A no-op under `LifecycleMode::LegacyT08`,
+            // which is what production runs: there the gate read at the next crossing is
+            // the mechanism.
+            ctx.observe_lifecycle_intent(ConsumptionPoint::InsideInterruptibleWait)?;
+
             let timeout = pipeline_config
                 .worker_startup_time
                 .min(
@@ -1377,6 +1479,12 @@ impl State for Scheduling {
             .iter()
             .map(|(id, status)| (*id, status.machine_id.clone()))
             .collect();
+        // The fan-out's own inventory of what it issues, bounded by the number of target
+        // workers. The landed path does not consult it: acting on an attempt that never
+        // settled needs the M11.D39b phase graph, which no production job runs, so this is
+        // created here and dropped with the region. It is the fan-out that keeps the record,
+        // rather than either caller, so both routes are recording the same thing.
+        let attempts = Arc::new(AttemptLedger::default());
         let admission = ctx.admit_irreversible_scheduling().await?;
         let (admission, started) = start_execution_on_workers(
             admission,
@@ -1385,6 +1493,7 @@ impl State for Scheduling {
             plan,
             machine_ids,
             worker_connects,
+            attempts,
         )
         .await;
         drop(admission);
@@ -1405,6 +1514,10 @@ impl State for Scheduling {
         let start = Instant::now();
         let mut started_tasks = HashSet::new();
         while started_tasks.len() < ctx.program.task_count() {
+            // The same consumption point, in the other interruptible wait, for the same
+            // reason: this loop also breaks on the message that makes its count.
+            ctx.observe_lifecycle_intent(ConsumptionPoint::InsideInterruptibleWait)?;
+
             let timeout = pipeline_config
                 .task_startup_time
                 .min(ctx.config.ttl.unwrap_or(*pipeline_config.task_startup_time))
@@ -1623,6 +1736,17 @@ impl State for Scheduling {
     }
 }
 
+// The M11.T25b modules' own tests. Declared *here*, below everything this file's production
+// half contains, because `states/mod.rs`'s two source pins read that half as "everything before
+// the first `#[cfg(test)]`" — a test module declared at the top of the file would truncate it
+// to nothing and make both pins vacuous.
+#[cfg(test)]
+mod compile_fail;
+#[cfg(test)]
+mod fanout_tests;
+#[cfg(test)]
+mod phase_tests;
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1634,6 +1758,8 @@ mod tests {
         OperatorCheckpointMetadata, OperatorMetadata, TableCheckpointMetadata, TableConfig,
         TableEnum,
     };
+    use arroyo_rpc::state_backend::validated::Validated;
+    use arroyo_state::validated::CheckpointMetadataWrite;
     use arroyo_state::{BackingStore, StateBackend, StorageProviderFor};
     use prost::Message;
     use std::collections::HashMap;
@@ -1765,24 +1891,43 @@ mod tests {
             .unwrap();
         }
 
+        write_checkpoint_listing(
+            &store,
+            &operators
+                .iter()
+                .map(|(operator_id, _, _)| operator_id.to_string())
+                .collect::<Vec<_>>(),
+        )
+        .await;
+
+        store
+    }
+
+    /// Writes the checkpoint's top-level metadata listing `operator_ids`.
+    ///
+    /// The write takes a token, so the fixture states which operators it stands behind the
+    /// same way the worker that took the checkpoint does — with the set it just wrote.
+    async fn write_checkpoint_listing(store: &LocalCheckpointStore, operator_ids: &[String]) {
         StateBackend::write_checkpoint_metadata(
             &store.role,
-            CheckpointMetadata {
-                job_id: JOB_ID.to_string(),
-                epoch: EPOCH,
-                min_epoch: STORED_MIN_EPOCH,
-                start_time: 0,
-                finish_time: 0,
-                operator_ids: operators
-                    .iter()
-                    .map(|(operator_id, _, _)| operator_id.to_string())
-                    .collect(),
-            },
+            Validated::validate(
+                CheckpointMetadataWrite::for_completed_checkpoint(
+                    CheckpointMetadata {
+                        job_id: JOB_ID.to_string(),
+                        epoch: EPOCH,
+                        min_epoch: STORED_MIN_EPOCH,
+                        start_time: 0,
+                        finish_time: 0,
+                        operator_ids: operator_ids.to_vec(),
+                    },
+                    operator_ids.to_vec(),
+                ),
+                (),
+            )
+            .unwrap(),
         )
         .await
         .unwrap();
-
-        store
     }
 
     fn checkpoint_info(needs_commits: bool) -> CheckpointInfo {
@@ -2017,19 +2162,7 @@ mod tests {
         )
         .await;
         // relist the checkpoint with an operator that has no object of its own
-        StateBackend::write_checkpoint_metadata(
-            &store.role,
-            CheckpointMetadata {
-                job_id: JOB_ID.to_string(),
-                epoch: EPOCH,
-                min_epoch: STORED_MIN_EPOCH,
-                start_time: 0,
-                finish_time: 0,
-                operator_ids: vec!["node_1".to_string(), "node_2".to_string()],
-            },
-        )
-        .await
-        .unwrap();
+        write_checkpoint_listing(&store, &["node_1".to_string(), "node_2".to_string()]).await;
 
         let Err(err) = prepare_restored_checkpoint(
             &store.role,

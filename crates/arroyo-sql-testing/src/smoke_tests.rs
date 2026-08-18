@@ -21,6 +21,7 @@ use arroyo_rpc::grpc::rpc::{
     StopMode, TaskCheckpointCompletedReq, TaskCheckpointEventReq, WorkerContext,
 };
 use arroyo_rpc::state_backend::StateBackendSelector;
+use arroyo_rpc::state_backend::validated::Validated;
 use arroyo_rpc::{CompactionResult, ControlMessage, ControlResp};
 use arroyo_state::{BackingStore, StateBackend, StorageProviderFor};
 use arroyo_state_protocol::types::Epoch;
@@ -197,7 +198,7 @@ async fn checkpoint(ctx: &mut SmokeTestContext<'_>, epoch: u32) {
         }
     }
 
-    let checkpoint_metadata = checkpoint_state.build_metadata();
+    let checkpoint_metadata = Validated::validate(checkpoint_state.build_metadata(), ()).unwrap();
     StateBackend::write_checkpoint_metadata(&StorageProviderFor::Worker, checkpoint_metadata)
         .await
         .unwrap();

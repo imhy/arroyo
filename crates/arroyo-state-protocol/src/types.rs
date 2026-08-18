@@ -49,6 +49,16 @@ pub enum ProtocolError {
         head_epoch: Epoch,
         new_min_epoch: Epoch,
     },
+    /// A garbage-collection plan would delete a checkpoint the reachable-history traversal
+    /// never read, so nothing validated the manifest that named its files.
+    #[error(
+        "checkpoint GC would delete generation {generation}, epoch {epoch}, which the \
+         reachable history traversal never reached"
+    )]
+    CheckpointGcUnreached {
+        generation: Generation,
+        epoch: Epoch,
+    },
 }
 
 /// Monotonic identifier for a worker cluster generation of a job.

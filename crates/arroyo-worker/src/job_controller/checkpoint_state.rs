@@ -13,6 +13,7 @@ use arroyo_rpc::{TaskEventSpans, get_event_spans, grpc, log_trace_event};
 use arroyo_state::tables::ErasedTable;
 use arroyo_state::tables::expiring_time_key_map::ExpiringTimeKeyTable;
 use arroyo_state::tables::global_keyed_map::GlobalKeyedTable;
+use arroyo_state::validated::CheckpointMetadataWrite;
 use arroyo_state_protocol::types::Epoch;
 use arroyo_types::{from_micros, to_micros};
 use std::collections::{HashMap, HashSet};
@@ -443,7 +444,15 @@ impl CheckpointState {
         self.operators == self.operators_checkpointed
     }
 
-    pub fn build_metadata(&mut self) -> CheckpointMetadata {
+    /// Builds this checkpoint's top-level metadata, paired with the operators that are
+    /// entitled to appear in it.
+    ///
+    /// Returns a [`CheckpointMetadataWrite`] rather than the metadata because the write it
+    /// feeds takes only a checked one (design item M11.D39c). The two halves are produced
+    /// together, here, where the set of operators that reported completion — each having had
+    /// its subtask table configs checked as it did — is known; a caller that had to supply
+    /// them separately could supply a different set from the one the metadata names.
+    pub fn build_metadata(&mut self) -> CheckpointMetadataWrite {
         let finish_time = SystemTime::now();
 
         for (op, details) in &self.operator_details {
@@ -484,18 +493,23 @@ impl CheckpointState {
             Default::default(),
         );
 
-        CheckpointMetadata {
-            job_id: self.job_id.to_string(),
-            epoch: *self.epoch as u32,
-            min_epoch: *self.min_epoch as u32,
-            start_time: to_micros(self.start_time),
-            finish_time: to_micros(finish_time),
-            operator_ids: self
-                .operator_state
-                .keys()
-                .map(|key| key.to_string())
-                .collect(),
-        }
+        let completed_operators: Vec<String> = self
+            .operator_state
+            .keys()
+            .map(|key| key.to_string())
+            .collect();
+
+        CheckpointMetadataWrite::for_completed_checkpoint(
+            CheckpointMetadata {
+                job_id: self.job_id.to_string(),
+                epoch: *self.epoch as u32,
+                min_epoch: *self.min_epoch as u32,
+                start_time: to_micros(self.start_time),
+                finish_time: to_micros(finish_time),
+                operator_ids: completed_operators.clone(),
+            },
+            completed_operators,
+        )
     }
 
     pub fn needs_commit(&self) -> bool {
