@@ -118,7 +118,11 @@ impl ObservedIntent {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum LifecycleDecision {
     /// Run under this configuration from now on.
-    Adopt(JobConfig),
+    ///
+    /// Boxed for the same reason as [`LifecycleIntent::Adopt`](super::LifecycleIntent::Adopt),
+    /// which this decision is derived from: the configuration is by far the largest thing
+    /// any variant carries, and the refusal a failing job produces should not be sized for it.
+    Adopt(Box<JobConfig>),
     /// Stop the job, under the configuration it is already running with.
     ///
     /// Carries a stop mode and nothing else, which is what makes "a refused row keeps its
@@ -153,7 +157,7 @@ impl LifecycleDecision {
     pub(crate) fn apply(self, ctx: &mut JobContext<'_>) -> Result<ObservedIntent, StateError> {
         match self {
             LifecycleDecision::Adopt(config) => {
-                ctx.config = config;
+                ctx.config = *config;
                 // The adopted row may itself be the row that asks the job to stop, which is
                 // the ordinary way an operator stops a job whose configuration is fine. So
                 // the answer is read off what was just published, not off which arm reached

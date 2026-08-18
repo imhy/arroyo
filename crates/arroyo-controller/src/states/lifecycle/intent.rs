@@ -56,7 +56,13 @@ impl IntentVersion {
 pub(crate) enum LifecycleIntent {
     /// The row was accepted. This configuration becomes the job's baseline — but only
     /// when the job's own state task adopts it, never on the poll thread.
-    Adopt(JobConfig),
+    ///
+    /// Boxed because a `JobConfig` is ~304 bytes and the other two variants are a typed
+    /// error and a stop mode. Unboxed, every value of this type — including the refusals,
+    /// which is what a job in trouble produces — would be sized for the accepted row it is
+    /// not. The indirection is paid once per *distinct* polled row, which
+    /// [`IntentMailbox::submit`]'s coalescing already makes the rare case.
+    Adopt(Box<JobConfig>),
     /// The row's `state_backend` was refused *and* the same row asks the job to stop.
     ///
     /// The stop wins. Refusing the selector must not also discard the row's lifecycle
@@ -105,7 +111,7 @@ impl LifecycleIntent {
         });
 
         match refusal {
-            None => LifecycleIntent::Adopt(config),
+            None => LifecycleIntent::Adopt(Box::new(config)),
             // Checked before the plain refusal below, which is the whole of "a stop wins
             // over a refusal": the two are not independent decisions taken in some order,
             // they are one classification with the stop as its outcome.

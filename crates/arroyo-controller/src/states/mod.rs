@@ -7849,7 +7849,7 @@ mod tests {
         );
         assert_eq!(
             standing_intent(&mailbox).map(VersionedIntent::into_intent),
-            Some(LifecycleIntent::Adopt(accepted.clone())),
+            Some(LifecycleIntent::Adopt(Box::new(accepted.clone()))),
         );
 
         let mut harness = Harness::new(current.restart_nonce).with_actor(&mailbox);
@@ -8385,7 +8385,7 @@ mod tests {
 
         assert_eq!(
             standing_intent(&mailbox).map(VersionedIntent::into_intent),
-            Some(LifecycleIntent::Adopt(unchanged_selector.clone())),
+            Some(LifecycleIntent::Adopt(Box::new(unchanged_selector.clone()))),
             "an edit that leaves the selector alone is classified as an adoption"
         );
 
@@ -8559,7 +8559,7 @@ mod tests {
     #[tokio::test]
     async fn an_adopted_configuration_that_asks_the_job_to_stop_leaves_scheduling() {
         let mailbox = intent_mailbox();
-        mailbox.submit(LifecycleIntent::Adopt(config_requesting_a_stop()));
+        mailbox.submit(LifecycleIntent::Adopt(Box::new(config_requesting_a_stop())));
 
         let mut run = SchedulingRun::new("stop-before-preamble").await;
         run.harness.install_actor(&mailbox);
@@ -8661,7 +8661,7 @@ mod tests {
             // waiting, and the sleep gives it time to actually park.
             barriers.workers_started.notified().await;
             tokio::time::sleep(Duration::from_millis(250)).await;
-            mailbox.submit(LifecycleIntent::Adopt(config_requesting_a_stop()));
+            mailbox.submit(LifecycleIntent::Adopt(Box::new(config_requesting_a_stop())));
         };
         let scheduling = tokio::time::timeout(DECIDED, run.schedule_through_the_phase_graph());
         let (outcome, ()) = tokio::join!(scheduling, poll);
@@ -8721,7 +8721,7 @@ mod tests {
             // fan-out and into the wait for its tasks.
             barriers.execution_started.notified().await;
             tokio::time::sleep(Duration::from_millis(250)).await;
-            mailbox.submit(LifecycleIntent::Adopt(config_requesting_a_stop()));
+            mailbox.submit(LifecycleIntent::Adopt(Box::new(config_requesting_a_stop())));
         };
         let scheduling = tokio::time::timeout(DECIDED, run.schedule_through_the_phase_graph());
         let (outcome, ()) = tokio::join!(scheduling, poll);
@@ -8761,7 +8761,7 @@ mod tests {
     #[tokio::test]
     async fn a_healthy_running_job_observes_a_stop_left_in_its_mailbox() {
         let mailbox = intent_mailbox();
-        mailbox.submit(LifecycleIntent::Adopt(config_requesting_a_stop()));
+        mailbox.submit(LifecycleIntent::Adopt(Box::new(config_requesting_a_stop())));
 
         let mut harness = Harness::new(3).with_actor(&mailbox);
         let mut ctx = harness.ctx(

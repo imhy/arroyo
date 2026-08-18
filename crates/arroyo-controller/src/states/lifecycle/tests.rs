@@ -386,7 +386,7 @@ fn repaired_row_not_failed_by_stale_intent() {
     let mut writer = actor_for(&mailbox);
     assert_eq!(
         writer.observe(ConsumptionPoint::BeforeIrreversiblePhase),
-        Some(LifecycleDecision::Adopt(repaired.clone())),
+        Some(LifecycleDecision::Adopt(Box::new(repaired.clone()))),
         "the writer reads the job's standing intent, which is the repair: the refusal it \
          superseded was never a message anybody had to remember to discard"
     );
@@ -427,7 +427,7 @@ fn repaired_row_not_failed_by_stale_intent() {
     ));
     assert_eq!(
         writer.observe(ConsumptionPoint::InsideInterruptibleWait),
-        Some(LifecycleDecision::Adopt(repaired)),
+        Some(LifecycleDecision::Adopt(Box::new(repaired))),
         "and the repair is a new intent, so the writer that had already refused adopts it"
     );
 }
@@ -463,7 +463,7 @@ async fn a_submitted_intent_ends_a_wait_that_is_already_parked_on_it() {
             // Long enough that the park below is entered first in any ordering that matters,
             // and short enough that the row is not itself a timeout test.
             tokio::time::sleep(Duration::from_millis(50)).await;
-            mailbox.submit(LifecycleIntent::Adopt(running_config()));
+            mailbox.submit(LifecycleIntent::Adopt(Box::new(running_config())));
         }
     });
 
@@ -496,7 +496,7 @@ async fn a_submission_that_lands_between_a_read_and_a_park_still_ends_the_park()
     // The consumer's read: nothing yet.
     assert!(mailbox.newer_than(IntentVersion::NONE).is_none());
     // The poll, in the window.
-    mailbox.submit(LifecycleIntent::Adopt(running_config()));
+    mailbox.submit(LifecycleIntent::Adopt(Box::new(running_config())));
     // The consumer's park, after it.
     tokio::time::timeout(QUIET, wake.notified())
         .await
