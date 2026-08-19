@@ -1,22 +1,24 @@
 use crate::job_controller::checkpoint_state::CheckpointState;
 use crate::job_controller::committing_state::{CheckpointIdOrRef, CommittingState};
-use crate::job_controller::{
-    CHECKPOINTS_TO_KEEP, COMPACT_EVERY, RetireWorkerLeader, RunningMessage, TaskFailedEvent,
-};
+use crate::job_controller::job_metrics::{JobMetrics, get_metric_name};
+use crate::job_controller::{RetireWorkerLeader, RunningMessage, TaskFailedEvent};
 use anyhow::bail;
 use arroyo_datastream::logical::LogicalProgram;
 use arroyo_rpc::api_types::checkpoints::{JobCheckpointEventType, JobCheckpointSpan};
+use arroyo_rpc::api_types::metrics::MetricName;
 use arroyo_rpc::checkpoints::{
     CheckpointMetadataStore, CheckpointStatus, CreateCheckpointReq, FinishCheckpointReq,
     UpdateCheckpointReq,
 };
 use arroyo_rpc::config::config;
 use arroyo_rpc::grpc::rpc::{
-    CheckpointManifest, CheckpointReq, CommitReq, JobFinishedReq, LoadCompactedDataReq,
-    OperatorCheckpointMetadata, TaskCheckpointEventType,
+    CheckpointManifest, CheckpointReq, CommitReq, JobFinishedReq, LabelPair, LoadCompactedDataReq,
+    MetricsReq, OperatorCheckpointMetadata, TaskCheckpointEventType,
 };
 use arroyo_rpc::identity::WorkerClient;
 use arroyo_rpc::public_ids::{IdTypes, generate_id};
+use arroyo_rpc::state_backend::StateBackendSelector;
+use arroyo_rpc::state_backend::validated::Validated;
 use arroyo_state::parquet::ParquetBackend;
 use arroyo_state::{BackingStore, StateBackend, StorageProviderFor, get_storage_provider};
 use arroyo_state_protocol::ProtocolPaths;
@@ -28,6 +30,7 @@ use arroyo_state_protocol::workflow::{
 use arroyo_types::{JobId, PipelineId, WorkerId, to_micros};
 use futures::future::try_join_all;
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::task::JoinHandle;
@@ -37,12 +40,12 @@ use tracing::{debug, error, info, warn};
 pub struct RunningJobModel {
     pub pipeline_id: PipelineId,
     pub job_id: JobId,
-    pub generation: u64,
+    pub generation: Generation,
     pub state: JobState,
     pub program: Arc<LogicalProgram>,
     pub checkpoint_state: Option<CheckpointingOrCommittingState>,
-    pub epoch: u32,
-    pub min_epoch: u32,
+    pub epoch: Epoch,
+    pub min_epoch: Epoch,
     pub last_checkpoint: Instant,
     pub workers: HashMap<WorkerId, WorkerStatus>,
     pub tasks: HashMap<(u32, u32), TaskStatus>,
@@ -54,6 +57,12 @@ pub struct RunningJobModel {
     pub generation_manifest: Option<GenerationManifest>,
 
     pub finished_operators: Vec<OperatorCheckpointMetadata>,
+
+    /// The state backend this job selected, taken from the job's config on the controller
+    /// and from the leader's `StartExecutionReq` in worker-leader mode. Every checkpoint
+    /// this model creates, merges, or compacts is validated against it; nothing here
+    /// consults a process-global backend.
+    pub state_backend: StateBackendSelector,
 
     pub worker_leader_mode: bool,
 
@@ -74,6 +83,8 @@ pub struct RunningJobModel {
 
     // checkpoint-wide events
     pub checkpoint_spans: Vec<JobCheckpointSpan>,
+
+    pub job_metrics: Option<JobMetrics>,
 }
 
 impl std::fmt::Debug for RunningJobModel {
@@ -139,9 +150,9 @@ impl RunningJobModel {
         store: &dyn CheckpointMetadataStore,
     ) -> anyhow::Result<()> {
         info!(
-            message = "Finishing committing",
-            epoch = self.epoch,
+            epoch = *self.epoch,
             job_id = *self.job_id,
+            "Finishing committing"
         );
 
         store
@@ -164,11 +175,11 @@ impl RunningJobModel {
         match msg {
             RunningMessage::TaskCheckpointEvent(c) => {
                 if let Some(checkpoint_state) = &mut self.checkpoint_state {
-                    if c.epoch != self.epoch {
+                    if c.epoch != *self.epoch {
                         warn!(
                             message = "Received checkpoint event for wrong epoch",
                             epoch = c.epoch,
-                            expected = self.epoch,
+                            expected = *self.epoch,
                             job_id = *self.job_id,
                         );
                     } else {
@@ -199,11 +210,11 @@ impl RunningJobModel {
             }
             RunningMessage::TaskCheckpointFinished(c) => {
                 if let Some(checkpoint_state) = &mut self.checkpoint_state {
-                    if c.epoch != self.epoch {
+                    if c.epoch != *self.epoch {
                         warn!(
                             message = "Received checkpoint finished for wrong epoch",
                             epoch = c.epoch,
-                            expected = self.epoch,
+                            expected = *self.epoch,
                             job_id = *self.job_id,
                         );
                     } else {
@@ -326,12 +337,12 @@ impl RunningJobModel {
         store: &dyn CheckpointMetadataStore,
         then_stop: bool,
     ) -> anyhow::Result<()> {
-        self.epoch += 1;
+        self.epoch = self.epoch.next();
 
         info!(
             message = "Starting checkpointing",
             job_id = *self.job_id,
-            epoch = self.epoch,
+            epoch = *self.epoch,
             then_stop
         );
 
@@ -341,9 +352,9 @@ impl RunningJobModel {
 
         let checkpoints = self.workers.values_mut().map(|worker| {
             worker.connect.checkpoint(Request::new(CheckpointReq {
-                epoch: self.epoch,
+                epoch: *self.epoch,
                 timestamp: to_micros(SystemTime::now()),
-                min_epoch: self.min_epoch,
+                min_epoch: *self.min_epoch,
                 then_stop,
                 is_commit: false,
             }))
@@ -356,9 +367,10 @@ impl RunningJobModel {
         store
             .create_checkpoint(CreateCheckpointReq {
                 checkpoint_id: checkpoint_id.clone(),
-                epoch: self.epoch,
-                min_epoch: self.min_epoch,
+                epoch: *self.epoch,
+                min_epoch: *self.min_epoch,
                 start_time: SystemTime::now(),
+                is_stopping: then_stop,
             })
             .await?;
 
@@ -368,6 +380,7 @@ impl RunningJobModel {
             self.epoch,
             self.min_epoch,
             self.program.clone(),
+            self.state_backend,
         );
 
         self.checkpoint_state = Some(CheckpointingOrCommittingState::Checkpointing(state));
@@ -390,36 +403,50 @@ impl RunningJobModel {
         info!(
             message = "Compacting state",
             job_id = *self.job_id,
-            epoch = self.epoch,
+            epoch = *self.epoch,
         );
 
         let storage_role = self.storage_role.clone();
         let mut worker_clients: Vec<WorkerClient> =
             self.workers.values().map(|w| w.connect.clone()).collect();
-        for node in self.program.graph.node_weights() {
-            for (op, _) in node.operator_chain.iter() {
-                let compacted_tables = ParquetBackend::compact_operator(
-                    // compact the operator's state and notify the workers to load the new files
-                    &storage_role,
-                    self.job_id.0.clone(),
-                    &op.operator_id,
-                    self.epoch,
-                )
-                .await?;
 
-                if compacted_tables.is_empty() {
-                    continue;
-                }
+        let operator_ids: Vec<String> = self
+            .program
+            .graph
+            .node_weights()
+            .flat_map(|node| {
+                node.operator_chain
+                    .iter()
+                    .map(|(op, _)| op.operator_id.clone())
+            })
+            .collect();
 
-                // TODO: these should be put on separate tokio tasks.
-                for worker_client in &mut worker_clients {
-                    worker_client
-                        .load_compacted_data(LoadCompactedDataReq {
-                            operator_id: op.operator_id.clone(),
-                            compacted_metadata: compacted_tables.clone(),
-                        })
-                        .await?;
-                }
+        // The whole checkpoint is validated against the job's selector before its first
+        // operator is compacted, and no worker is told about compacted data until every
+        // operator has passed: a mismatch in the last operator must not leave earlier
+        // operators rewritten and workers already pointed at the rewritten files.
+        let compacted = ParquetBackend::compact_checkpoint(
+            &storage_role,
+            self.state_backend,
+            self.job_id.0.clone(),
+            operator_ids,
+            *self.epoch as u32,
+        )
+        .await?;
+
+        for (operator_id, compacted_tables) in compacted {
+            if compacted_tables.is_empty() {
+                continue;
+            }
+
+            // TODO: these should be put on separate tokio tasks.
+            for worker_client in &mut worker_clients {
+                worker_client
+                    .load_compacted_data(LoadCompactedDataReq {
+                        operator_id: operator_id.clone(),
+                        compacted_metadata: compacted_tables.clone(),
+                    })
+                    .await?;
             }
         }
         self.start_or_get_span(JobCheckpointEventType::Compacting)
@@ -428,7 +455,7 @@ impl RunningJobModel {
         info!(
             message = "Finished compaction",
             job_id = *self.job_id,
-            epoch = self.epoch,
+            epoch = *self.epoch,
         );
         Ok(())
     }
@@ -449,12 +476,16 @@ impl RunningJobModel {
                     JobCheckpointEventType::WritingMetadata,
                 );
 
-                let metadata = checkpointing.build_metadata();
+                // Leader mode publishes a manifest through the protocol rather than the
+                // legacy top-level metadata object, so it takes the metadata back out
+                // rather than carrying the write token: the publication that commits this
+                // generation is gated by the protocol's own whole-manifest check.
+                let metadata = checkpointing.build_metadata().into_metadata();
 
                 let manifest = CheckpointManifest {
                     pipeline_id,
                     job_id: metadata.job_id,
-                    generation,
+                    generation: *generation,
                     epoch: metadata.epoch as u64,
                     min_epoch: metadata.min_epoch as u64,
                     start_time: metadata.start_time,
@@ -469,7 +500,7 @@ impl RunningJobModel {
 
                 let checkpoint_ref = self
                     .protocol_paths
-                    .checkpoint_manifest(Generation(generation), Epoch(metadata.epoch as u64));
+                    .checkpoint_manifest(generation, Epoch(metadata.epoch as u64));
 
                 let publish_req = PublishCheckpointRequest {
                     generation_manifest: self
@@ -503,7 +534,7 @@ impl RunningJobModel {
                         info!(
                             message = "Finished checkpointing",
                             job_id = *self.job_id,
-                            epoch = self.epoch,
+                            epoch = *self.epoch,
                             duration
                         );
                         self.update_checkpoint_in_db(
@@ -549,8 +580,8 @@ impl RunningJobModel {
                 info!(
                     message = "Committing checkpoint",
                     job_id = *self.job_id,
-                    epoch = self.epoch,
-                    generation = self.generation,
+                    epoch = *self.epoch,
+                    generation = *self.generation,
                     checkpoint_ref = checkpoint_ref.as_str(),
                 );
 
@@ -571,7 +602,7 @@ impl RunningJobModel {
                             worker
                                 .connect
                                 .commit(Request::new(CommitReq {
-                                    epoch: self.epoch,
+                                    epoch: *self.epoch,
                                     // TODO: this is pretty expensive
                                     committing_data: committing_data.clone(),
                                 }))
@@ -622,8 +653,7 @@ impl RunningJobModel {
 
                 let commit_permit = committing.commit_permit();
 
-                complete_commit(storage.as_ref(), commit_permit, Generation(self.generation))
-                    .await?;
+                complete_commit(storage.as_ref(), commit_permit, self.generation).await?;
 
                 self.finish_committing(committing.checkpoint_id(), store)
                     .await?;
@@ -633,8 +663,8 @@ impl RunningJobModel {
                 info!(
                     message = "Finished committing checkpointing",
                     job_id = *self.job_id,
-                    epoch = self.epoch,
-                    generation = self.generation,
+                    epoch = *self.epoch,
+                    generation = *self.generation,
                 );
                 store.notify_checkpoint_complete();
             }
@@ -653,7 +683,7 @@ impl RunningJobModel {
             CheckpointingOrCommittingState::Checkpointing(mut checkpointing) => {
                 let metadata_span = self.start_or_get_span(JobCheckpointEventType::WritingMetadata);
 
-                let metadata = checkpointing.build_metadata();
+                let metadata = Validated::validate(checkpointing.build_metadata(), ())?;
 
                 StateBackend::write_checkpoint_metadata(&storage_role, metadata).await?;
 
@@ -677,7 +707,7 @@ impl RunningJobModel {
                     info!(
                         message = "Finished checkpointing",
                         job_id = *self.job_id,
-                        epoch = self.epoch,
+                        epoch = *self.epoch,
                         duration
                     );
                     store.notify_checkpoint_complete();
@@ -694,7 +724,7 @@ impl RunningJobModel {
                     info!(
                         message = "Committing checkpoint",
                         job_id = *self.job_id,
-                        epoch = self.epoch,
+                        epoch = *self.epoch,
                     );
 
                     self.start_or_get_span(JobCheckpointEventType::Committing);
@@ -705,7 +735,7 @@ impl RunningJobModel {
                         worker
                             .connect
                             .commit(Request::new(CommitReq {
-                                epoch: self.epoch,
+                                epoch: *self.epoch,
                                 committing_data: committing.committing_data().clone(),
                             }))
                             .await?;
@@ -727,7 +757,7 @@ impl RunningJobModel {
                 info!(
                     message = "Finished committing checkpointing",
                     job_id = *self.job_id,
-                    epoch = self.epoch,
+                    epoch = *self.epoch,
                 );
                 store.notify_checkpoint_complete();
             }
@@ -750,14 +780,83 @@ impl RunningJobModel {
         Ok(())
     }
 
-    pub fn cleanup_needed(&self) -> Option<u32> {
-        if self.epoch - self.min_epoch > CHECKPOINTS_TO_KEEP
-            && self.epoch.is_multiple_of(COMPACT_EVERY)
+    pub async fn update_metrics(&mut self) {
+        let Some(job_metrics) = self.job_metrics.clone() else {
+            return;
+        };
+
+        if self.metric_update_task.is_some()
+            && !self.metric_update_task.as_ref().unwrap().is_finished()
         {
-            Some(self.epoch - CHECKPOINTS_TO_KEEP)
-        } else {
-            None
+            return;
         }
+
+        let workers: Vec<_> = self
+            .workers
+            .iter()
+            .filter(|(_, w)| w.state == WorkerState::Running)
+            .map(|(id, w)| (*id, w.connect.clone()))
+            .collect();
+        let program = self.program.clone();
+        let operator_indices: Arc<HashMap<_, _>> = Arc::new(
+            program
+                .graph
+                .node_indices()
+                .map(|idx| (program.graph[idx].node_id, idx.index() as u32))
+                .collect(),
+        );
+
+        self.metric_update_task = Some(tokio::spawn(async move {
+            let mut metrics: HashMap<(u32, u32), HashMap<MetricName, u64>> = HashMap::new();
+
+            for (id, mut connect) in workers {
+                let Ok(e) = connect.get_metrics(MetricsReq {}).await else {
+                    warn!("Failed to collect metrics from worker {:?}", id);
+                    return;
+                };
+
+                fn find_label<'a>(labels: &'a [LabelPair], name: &'static str) -> Option<&'a str> {
+                    Some(
+                        labels
+                            .iter()
+                            .find(|t| t.name.as_ref().map(|t| t == name).unwrap_or(false))?
+                            .value
+                            .as_ref()?
+                            .as_str(),
+                    )
+                }
+
+                e.into_inner()
+                    .metrics
+                    .into_iter()
+                    .filter_map(|f| Some((get_metric_name(&f.name?)?, f.metric)))
+                    .flat_map(|(metric, values)| {
+                        let operator_indices = operator_indices.clone();
+                        values.into_iter().filter_map(move |m| {
+                            let subtask_idx =
+                                u32::from_str(find_label(&m.label, "subtask_idx")?).ok()?;
+                            let operator_idx = *operator_indices
+                                .get(&u32::from_str(find_label(&m.label, "node_id")?).ok()?)?;
+                            let value = m
+                                .counter
+                                .map(|c| c.value)
+                                .or_else(|| m.gauge.map(|g| g.value))??
+                                as u64;
+                            Some(((operator_idx, subtask_idx), (metric, value)))
+                        })
+                    })
+                    .for_each(|(subtask_idx, (metric, value))| {
+                        metrics
+                            .entry(subtask_idx)
+                            .or_default()
+                            .insert(metric, value);
+                    });
+            }
+
+            for ((operator_idx, subtask_idx), values) in metrics {
+                job_metrics.update(operator_idx, subtask_idx, &values);
+            }
+        }));
     }
 
     pub fn worker_timedout(&self) -> bool {

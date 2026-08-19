@@ -1,5 +1,6 @@
 use crate::grpc::rpc;
 use arrow_schema::ArrowError;
+use arroyo_types::state_backend::StateBackendError;
 use datafusion::error::DataFusionError;
 use datafusion::parquet::errors::ParquetError;
 use serde::{Deserialize, Serialize};
@@ -317,6 +318,28 @@ pub enum StateError {
     BincodeEncodeError(#[from] bincode::error::EncodeError),
     #[error("protobuf decode error: {0}")]
     ProtoDecodeError(#[from] prost::DecodeError),
+    /// A state-backend selector was rejected before any state was created or read. The
+    /// inner error is carried through unchanged so the failure that reaches the
+    /// controller still names the offending table and the values that disagreed.
+    #[error(transparent)]
+    StateBackendError(#[from] StateBackendError),
+    /// A checkpoint does not cover the operators the job would restore into it: an
+    /// operator of the job's program is missing from the checkpoint's operator list, the
+    /// checkpoint lists an operator the program does not contain, or a listed operator
+    /// has no metadata object in storage.
+    ///
+    /// Like [`Self::StateBackendError`] this is raised by the restore preflight, before
+    /// anything is rewritten, and is not recoverable: the same checkpoint is read again on
+    /// every attempt. Workers require an operator's metadata object for every operator
+    /// they construct, so a checkpoint that does not cover them cannot be restored however
+    /// many times it is tried.
+    #[error("checkpoint for epoch {epoch} cannot be restored by this job: {detail}")]
+    IncompleteCheckpoint {
+        /// The checkpoint that could not be restored.
+        epoch: u32,
+        /// What was missing, naming the operators involved.
+        detail: String,
+    },
 }
 
 #[derive(Debug, Clone)]

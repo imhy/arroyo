@@ -20,8 +20,11 @@ use arroyo_rpc::config;
 use arroyo_rpc::grpc::rpc::{
     StopMode, TaskCheckpointCompletedReq, TaskCheckpointEventReq, WorkerContext,
 };
+use arroyo_rpc::state_backend::StateBackendSelector;
+use arroyo_rpc::state_backend::validated::Validated;
 use arroyo_rpc::{CompactionResult, ControlMessage, ControlResp};
 use arroyo_state::{BackingStore, StateBackend, StorageProviderFor};
+use arroyo_state_protocol::types::Epoch;
 use arroyo_types::{CheckpointBarrier, to_micros};
 use arroyo_udf_host::LocalUdf;
 use arroyo_worker::engine::Engine;
@@ -123,9 +126,10 @@ async fn checkpoint(ctx: &mut SmokeTestContext<'_>, epoch: u32) {
     let mut checkpoint_state = CheckpointState::new(
         ctx.job_id.clone(),
         checkpoint_id.to_string(),
-        epoch,
-        0,
+        Epoch(epoch as u64),
+        Epoch(0),
         ctx.program.clone(),
+        StateBackendSelector::DEFAULT,
     );
 
     // trigger a checkpoint, pass the messages to the CheckpointState
@@ -194,7 +198,7 @@ async fn checkpoint(ctx: &mut SmokeTestContext<'_>, epoch: u32) {
         }
     }
 
-    let checkpoint_metadata = checkpoint_state.build_metadata();
+    let checkpoint_metadata = Validated::validate(checkpoint_state.build_metadata(), ()).unwrap();
     StateBackend::write_checkpoint_metadata(&StorageProviderFor::Worker, checkpoint_metadata)
         .await
         .unwrap();
@@ -213,6 +217,7 @@ async fn compact(
     for (operator, _) in tasks_per_operator {
         if let Ok(compacted) = ParquetBackend::compact_operator(
             &StorageProviderFor::Worker,
+            StateBackendSelector::DEFAULT,
             job_id.clone(),
             &operator,
             epoch,
@@ -420,7 +425,15 @@ async fn run_pipeline_and_assert_outputs(
     let (control_tx, mut control_rx) = channel(128);
     run_completely(
         job_id,
-        Program::local_from_logical(job_id.to_string(), &graph, udfs, None, control_tx).await,
+        Program::local_from_logical(
+            job_id.to_string(),
+            &graph,
+            udfs,
+            None,
+            StateBackendSelector::DEFAULT,
+            control_tx,
+        )
+        .await,
         output_location.clone(),
         golden_output_location.clone(),
         primary_keys,
@@ -439,7 +452,15 @@ async fn run_pipeline_and_assert_outputs(
     println!("Run and checkpoint");
     run_and_checkpoint(
         Arc::new(job_id.to_string()),
-        Program::local_from_logical(job_id.to_string(), &graph, udfs, None, control_tx).await,
+        Program::local_from_logical(
+            job_id.to_string(),
+            &graph,
+            udfs,
+            None,
+            StateBackendSelector::DEFAULT,
+            control_tx,
+        )
+        .await,
         Arc::new(LogicalProgram::new(
             graph.clone(),
             ProgramConfig {
@@ -462,7 +483,15 @@ async fn run_pipeline_and_assert_outputs(
     println!("Finish from checkpoint");
     finish_from_checkpoint(
         job_id,
-        Program::local_from_logical(job_id.to_string(), &graph, udfs, Some(3), control_tx).await,
+        Program::local_from_logical(
+            job_id.to_string(),
+            &graph,
+            udfs,
+            Some(3),
+            StateBackendSelector::DEFAULT,
+            control_tx,
+        )
+        .await,
         &mut control_rx,
     )
     .await;

@@ -33,6 +33,7 @@ export type SubtaskCheckpointGroup = schemas['SubtaskCheckpointGroup'];
 export type GlobalUdf = schemas['GlobalUdf'];
 export type PipelineLocalUdf = schemas['Udf'];
 export type UdfValidationResult = schemas['UdfValidationResult'];
+export type SqlDiagnostic = schemas['SqlDiagnostic'];
 
 const base = window.__ARROYO_BASENAME.replace(/\/$/, '') || '';
 const BASE_URL = `${base}/api`;
@@ -524,7 +525,7 @@ export const usePipeline = (pipelineId?: string, refresh: boolean = false) => {
       params: { path: { id: pipelineId } },
       body: { ignore_state: ignoreState ?? false },
     });
-    await mutate();
+    await Promise.all([mutate(), globalMutate(pipelineJobsKey(pipelineId))]);
   };
 
   const deletePipeline = async () => {

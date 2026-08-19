@@ -161,7 +161,8 @@ impl MqttTopicTester {
             ))),
             mqtt.tables(),
         )
-        .await;
+        .await
+        .unwrap();
 
         let chain_info = Arc::new(ChainInfo {
             job_id: ctx.task_info.job_id.clone(),

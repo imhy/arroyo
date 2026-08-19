@@ -252,7 +252,8 @@ impl Scheduler for KubernetesScheduler {
         }
 
         info!(
-            job_id = *req.job_id,
+            job_id = %req.job_id,
+            pipeline_id = *req.pipeline_id,
             message = "starting workers on k8s",
             replicas = pods.len(),
             task_slots = req.slots
@@ -260,7 +261,8 @@ impl Scheduler for KubernetesScheduler {
 
         for pod in pods {
             info!(
-                job_id = *req.job_id,
+                job_id = %req.job_id,
+                pipeline_id = *req.pipeline_id,
                 message = "starting worker",
                 pod = pod.metadata.name
             );
@@ -370,6 +372,7 @@ mod test {
             program: LogicalProgram::default(),
             wasm_path: "file:///wasm".to_string(),
             pipeline_id: PipelineId("pipe-123".to_string().into()),
+            organization_id: "org-123".to_string(),
             job_id: JobId("job123".to_string().into()),
             hash: "12123123h".to_string(),
             generation: 1,

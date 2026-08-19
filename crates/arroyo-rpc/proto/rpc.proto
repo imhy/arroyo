@@ -26,6 +26,20 @@ message RegisterWorkerReq {
   string data_address = 5;
   WorkerResources resources = 6;
   uint64 slots = 8;
+  // Set by a worker that implements the StartExecution reconciliation contract, all three
+  // clauses of which the controller relies on and none of which it can observe:
+  //
+  //   1. a repeated non-empty `start_execution_id` is acknowledged idempotently, so a lost
+  //      response can be resolved by replaying the same attempt;
+  //   2. a contended execution phase returns `Aborted` having applied nothing, rather than
+  //      parking the handler inside one synchronous poll where no reset can reach it;
+  //   3. no authoritative answer about the worker's phase uses `Unavailable`, so that code
+  //      means "transport" and nothing else.
+  //
+  // False is the proto3 default and is therefore exactly what a worker predating this field
+  // reports. The controller does not issue StartExecution to such a worker at all: see
+  // `Scheduling::next` in arroyo-controller, which fails the scheduling attempt instead.
+  bool reconciles_start_execution = 9;
 }
 
 message RegisterWorkerResp {
@@ -58,7 +72,7 @@ message TaskCheckpointEventReq {
   uint64 time = 2;
   string operator_id = 8;
   uint32 subtask_idx = 5;
-  uint32 epoch = 6;
+  uint64 epoch = 6;
   TaskCheckpointEventType event_type = 7;
 }
 
@@ -69,7 +83,7 @@ message TaskCheckpointCompletedReq {
   WorkerContext worker_context = 1;
   uint64  time = 2;
   string operator_id = 4;
-  uint32 epoch = 5;
+  uint64 epoch = 5;
   SubtaskCheckpointMetadata metadata = 6;
   bool needs_commit = 7;
 }
@@ -254,7 +268,7 @@ message JobStatusReq {
 }
 
 message CheckpointStatus {
-  uint32 epoch = 1;
+  uint64 epoch = 1;
   uint64 started_at = 2;
   optional uint64 finished_at = 3;
   uint64 size_bytes = 4;
@@ -268,11 +282,12 @@ message JobCheckpointEventSpan {
 }
 
 message JobCheckpointMetadata {
-  uint32 epoch = 1;
+  uint64 epoch = 1;
   string state_backend = 2;
   uint64 start_time = 3;
   optional uint64 finish_time = 4;
   repeated JobCheckpointEventSpan event_spans = 5;
+  bool is_stopping = 6;
 }
 
 enum JobState {
@@ -308,6 +323,12 @@ message JobStatusResp {
   string job_id = 1;
   uint64 generation = 2;
   JobStatus job_status = 3;
+  // the state backend the leader is actually running this job with, i.e. the value it
+  // received in its own StartExecutionReq ("parquet" or "stateengine"). Empty means
+  // "parquet", which is what a leader predating this field reports and is also the only
+  // backend such a leader can be running. A controller that has been restarted checks
+  // this against the selector it recovered before it administers the job.
+  string state_backend = 4;
 }
 
 message GetJobCheckpointsReq {
@@ -445,6 +466,11 @@ message TableConfig {
   TableEnum table_type = 1;
   bytes config = 2;
   uint32 state_version = 3;
+  // the state backend this table's state lives in ("parquet" or "stateengine"); empty
+  // means "parquet", which is what a config written before this field existed decodes
+  // as. Operators never set this: the job's selector is stamped in centrally when the
+  // operator's context is built.
+  string state_backend = 4;
 }
 
 message TableCheckpointMetadata {
@@ -491,14 +517,22 @@ message StartExecutionReq {
   uint64 checkpoint_interval_micros = 9;
   // for leader mode, this gives the path to load the restore checkpoint manifest from
   optional string checkpoint_manifest_ref = 10;
+  // the state backend the job selected ("parquet" or "stateengine"); empty means
+  // "parquet", which is also what a request from a controller predating this field
+  // decodes as
+  string state_backend = 11;
+  // Identifies one controller attempt. Workers must treat a repeated non-empty ID as an
+  // idempotent retry, so a client-side timeout can be reconciled without starting twice or
+  // releasing the controller's admission while the first handler may still be running.
+  string start_execution_id = 12;
 }
 
 message StartExecutionResp {
 }
 
 message CheckpointReq {
-  uint32 epoch = 1;
-  uint32 min_epoch = 2;
+  uint64 epoch = 1;
+  uint64 min_epoch = 2;
   uint64 timestamp = 3;
   // if set, tasks will finish after completing the checkpoint
   bool then_stop = 4;
@@ -510,7 +544,7 @@ message CheckpointResp {
 }
 
 message CommitReq {
-  uint32 epoch = 1;
+  uint64 epoch = 1;
   map<string, OperatorCommitData> committing_data = 2;
 }
 

@@ -12,8 +12,12 @@ use crate::types::{
     GenerationManifest, ProtocolError, checkpoint_parent_checkpoint_ref,
     validate_epoch_record_matches_checkpoint,
 };
+use crate::validated::{GenerationPublication, PublishingJob};
 use arroyo_rpc::grpc::rpc::CheckpointManifest;
-use arroyo_types::{JobId, PipelineId, to_micros};
+use arroyo_rpc::state_backend::StateBackendSelector;
+use arroyo_rpc::state_backend::validated::Validated;
+use arroyo_types::{JobId, PipelineId};
+use std::collections::HashSet;
 use std::time::SystemTime;
 
 /// Request to claim canonical ownership of a checkpoint's epoch.
@@ -71,6 +75,21 @@ pub struct InitializeGenerationRequest {
     pub job_id: JobId,
     pub generation: Generation,
     pub updated_at: SystemTime,
+    /// The state backend the job selects. The recovery checkpoint this initialization
+    /// would restore from is checked against it before the generation is published, so a
+    /// job cannot advance persistent protocol state towards a checkpoint it is not
+    /// allowed to read.
+    pub state_backend: StateBackendSelector,
+    /// Every operator id the job's workers will construct, i.e. the key set of
+    /// `LogicalProgram::tasks_per_operator` for the *current* program.
+    ///
+    /// The recovery checkpoint's manifest has to describe exactly these, one valid entry
+    /// each, before the generation is published: each of these operators looks itself up
+    /// in that manifest as it builds its state, so a manifest that omits one, describes
+    /// one the program does not contain, or describes one twice fails in a worker — after
+    /// the protocol state has already advanced. This is the same source of truth the
+    /// legacy restore preflight uses.
+    pub program_operators: HashSet<String>,
 }
 
 /// Checkpoint, if any, that a newly initialized generation should restore from.
@@ -87,12 +106,23 @@ pub enum GenerationRecovery {
 }
 
 /// Result of [`initialize_generation`].
+///
+/// Not `Eq`: it carries a [`CheckpointManifest`], whose generated `PartialEq` is all
+/// prost provides.
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum GenerationInitialization {
     Initialized {
         generation_manifest: GenerationManifest,
         recovery: GenerationRecovery,
+        /// The recovery checkpoint's manifest, already read and already validated against
+        /// the job's selector, or `None` when there is nothing to recover from.
+        ///
+        /// It is returned rather than left for the caller to fetch because it had to be
+        /// read here anyway, before publication: re-reading it afterwards would pay twice
+        /// for the same bytes and would let the caller act on a different object than the
+        /// one that was validated.
+        recovery_checkpoint: Option<CheckpointManifest>,
     },
     StaleGeneration {
         current_generation: Generation,
@@ -220,6 +250,35 @@ pub enum CommitAuthorization {
 ///
 /// If `update_current_generation` is set, this method will write the current generation
 /// file. If not set, it will read the current generation and enforce conformance.
+///
+/// # Recovery-checkpoint validation and write ordering
+///
+/// Publishing a generation is what commits this job to a recovery checkpoint: the current
+/// generation file names the generation, and the generation manifest records its link to
+/// the checkpoint it will restore from. Both are persistent protocol state, so the
+/// recovery checkpoint has to be resolved, read, and checked *before* either of them is
+/// written — validating afterwards would report the problem only once the job had already
+/// advanced.
+///
+/// Two things are checked, and both are whole-set claims about the manifest rather than
+/// per-entry ones:
+///
+/// 1. It must describe exactly `request.program_operators`, one entry each, carrying an
+///    operator header. Every one of those operators looks itself up in this manifest as it
+///    builds its state; an entry the manifest merely happens to contain proves nothing.
+/// 2. Every table config in it must agree with `request.state_backend`.
+///
+/// The resolved manifest is returned in
+/// [`GenerationInitialization::Initialized::recovery_checkpoint`] so callers use the same
+/// object that was validated rather than reading it again.
+///
+/// # Errors
+///
+/// Returns [`StoreError::IncompleteManifest`] if the recovery checkpoint does not describe
+/// exactly the operators the job's workers will build, or [`StoreError::StateBackend`] if
+/// it was written by a different backend than the job selects or names an unknown one. In
+/// either case nothing has been written: the previous generation and its manifest are
+/// untouched, and the checkpoint remains restorable by a job it does fit.
 pub async fn initialize_generation<S>(
     store: &S,
     request: InitializeGenerationRequest,
@@ -243,14 +302,6 @@ where
                 ProtocolError::NonMonotonicGenerationUpdate,
             ));
         }
-
-        let current_generation = CurrentGeneration::new(
-            request.pipeline_id.clone(),
-            request.job_id.clone(),
-            request.generation,
-            SystemTime::now(),
-        );
-        put_json(store, &paths.current_generation(), &current_generation).await?;
     } else if let Some(cur) = &current_generation
         && cur.generation != request.generation
     {
@@ -259,6 +310,8 @@ where
         });
     }
 
+    // Resolve, read and validate before publishing anything. The search and the read are
+    // the reads this function would have done anyway; only their position has moved.
     let recovery = find_recovery_checkpoint(store, &paths, request.generation).await?;
     let base_checkpoint_ref = match &recovery {
         RecoverySearch::Found(recovery) => match recovery {
@@ -268,6 +321,52 @@ where
                 Some(checkpoint_ref.clone())
             }
         },
+        RecoverySearch::StopOrphaned { .. } | RecoverySearch::Failed(_) => None,
+    };
+
+    let recovery_checkpoint = match &base_checkpoint_ref {
+        Some(checkpoint_ref) => Some(
+            read_protobuf::<_, CheckpointManifest>(store, checkpoint_ref)
+                .await?
+                .ok_or_else(|| {
+                    StoreError::Protocol(ProtocolError::MissingCheckpointManifest {
+                        checkpoint_ref: checkpoint_ref.clone(),
+                    })
+                })?,
+        ),
+        None => None,
+    };
+
+    // Whole-object check, before either publication. Both writes below take the token and
+    // nothing else, so neither can be reached with a manifest that was not read or that this
+    // job's workers cannot restore.
+    let restoring: HashSet<&str> = request
+        .program_operators
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let publication = Validated::validate(
+        GenerationPublication::new(
+            request.pipeline_id.clone(),
+            request.job_id.clone(),
+            request.generation,
+            request.updated_at,
+            base_checkpoint_ref,
+            recovery_checkpoint,
+        ),
+        PublishingJob {
+            state_backend: request.state_backend,
+            program_operators: &restoring,
+        },
+    )?;
+
+    if update_current_generation {
+        publish_current_generation(store, &paths, &publication).await?;
+    }
+
+    // Reported only after the current generation has been claimed, as before: an orphaned
+    // or unresolvable history is a state this generation still owns.
+    match &recovery {
         RecoverySearch::StopOrphaned { canonical_ref } => {
             return Ok(GenerationInitialization::StopOrphaned {
                 canonical_ref: canonical_ref.clone(),
@@ -276,22 +375,10 @@ where
         RecoverySearch::Failed(failure) => {
             return Ok(GenerationInitialization::Failed(failure.clone()));
         }
-    };
+        RecoverySearch::Found(_) => {}
+    }
 
-    let generation_manifest = GenerationManifest::new(
-        request.pipeline_id,
-        request.job_id,
-        request.generation,
-        base_checkpoint_ref,
-        to_micros(request.updated_at),
-    );
-
-    put_json(
-        store,
-        &paths.generation_manifest(request.generation),
-        &generation_manifest,
-    )
-    .await?;
+    let generation_manifest = publish_generation_manifest(store, &paths, &publication).await?;
 
     let RecoverySearch::Found(recovery) = recovery else {
         unreachable!("handled non-found recovery results above")
@@ -300,7 +387,52 @@ where
     Ok(GenerationInitialization::Initialized {
         generation_manifest,
         recovery,
+        recovery_checkpoint: publication.into_inner().into_recovery_checkpoint(),
     })
+}
+
+/// Writes the current-generation fence.
+///
+/// Takes only the [`Validated<GenerationPublication>`]: this is the first of the two objects
+/// that commit the job to a recovery checkpoint, so it may not be written for a checkpoint
+/// nothing checked (design item M11.D39c).
+async fn publish_current_generation<S>(
+    store: &S,
+    paths: &ProtocolPaths,
+    publication: &Validated<GenerationPublication>,
+) -> Result<(), StoreError>
+where
+    S: ProtocolStore + ?Sized,
+{
+    put_json(
+        store,
+        &paths.current_generation(),
+        &publication.get().current_generation(SystemTime::now()),
+    )
+    .await
+}
+
+/// Writes the generation manifest and returns what was written.
+///
+/// Takes only the [`Validated<GenerationPublication>`], for the same reason as
+/// [`publish_current_generation`]: this object records the link to the checkpoint the
+/// generation will restore from, which is the commitment the check exists to gate.
+async fn publish_generation_manifest<S>(
+    store: &S,
+    paths: &ProtocolPaths,
+    publication: &Validated<GenerationPublication>,
+) -> Result<GenerationManifest, StoreError>
+where
+    S: ProtocolStore + ?Sized,
+{
+    let generation_manifest = publication.get().generation_manifest();
+    put_json(
+        store,
+        &paths.generation_manifest(publication.get().generation()),
+        &generation_manifest,
+    )
+    .await?;
+    Ok(generation_manifest)
 }
 
 async fn find_recovery_checkpoint<S>(

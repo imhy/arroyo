@@ -356,6 +356,30 @@ pub struct ApiConfig {
 
     #[serde(default)]
     pub auth_mode: ApiAuthMode,
+
+    #[serde(default)]
+    pub cors: CorsConfig,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct CorsConfig {
+    #[serde(default)]
+    pub origin_policy: CorsOriginPolicy,
+
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
+
+    #[serde(default)]
+    pub allow_credentials: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, Copy, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CorsOriginPolicy {
+    #[default]
+    Any,
+    AllowList,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -376,6 +400,13 @@ pub struct ControllerConfig {
 
     /// Poll interval for leader status
     pub leader_poll_interval: HumanReadableDuration,
+
+    /// Timeout for connecting to gRPC services
+    #[serde(default)]
+    pub connect_timeout: Option<HumanReadableDuration>,
+
+    /// Metric system configurations
+    pub metrics: MetricsConfig,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -497,6 +528,9 @@ pub struct AdminConfig {
 
     #[serde(default)]
     pub auth_mode: ApiAuthMode,
+
+    #[serde(default)]
+    pub allow_unauthenticated_metrics: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -695,6 +729,13 @@ impl Default for SqliteConfig {
                 .unwrap_or_else(|| PathBuf::from_str("config.sqlite").unwrap()),
         }
     }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct MetricsConfig {
+    /// Whether to enable pipeline metric collection and storage
+    pub enabled: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, Eq, PartialEq, Clone)]
@@ -1061,6 +1102,11 @@ mod tests {
             jail.set_env("ARROYO__ADMIN__HTTP_PORT", 9111);
             let config: Config = load_config(&[]).extract().unwrap();
             assert_eq!(config.admin.http_port, 9111);
+            assert!(!config.admin.allow_unauthenticated_metrics);
+
+            jail.set_env("ARROYO__ADMIN__ALLOW_UNAUTHENTICATED_METRICS", true);
+            let config: Config = load_config(&[]).extract().unwrap();
+            assert!(config.admin.allow_unauthenticated_metrics);
 
             Ok(())
         });

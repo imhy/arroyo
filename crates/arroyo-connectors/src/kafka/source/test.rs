@@ -2,6 +2,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 
 use arroyo_state::tables::ErasedTable;
 use arroyo_state::tables::global_keyed_map::GlobalKeyedTable;
+use arroyo_state::validated::CheckpointMetadataWrite;
 use arroyo_state::{BackingStore, StateBackend, StorageProviderFor};
 use rand::random;
 
@@ -16,6 +17,7 @@ use arroyo_operator::operator::SourceOperator;
 use arroyo_rpc::df::ArroyoSchema;
 use arroyo_rpc::formats::{Format, RawStringFormat};
 use arroyo_rpc::grpc::rpc::{CheckpointMetadata, OperatorCheckpointMetadata, OperatorMetadata};
+use arroyo_rpc::state_backend::validated::Validated;
 use arroyo_rpc::{
     CheckpointCompleted, ControlMessage, ControlResp, MetadataField, MetadataOrManifest,
 };
@@ -136,7 +138,8 @@ impl KafkaTopicTester {
             out_schema,
             kafka.tables(),
         )
-        .await;
+        .await
+        .unwrap();
 
         let chain_info = Arc::new(ChainInfo {
             job_id: ctx.task_info.job_id.clone(),
@@ -257,7 +260,7 @@ impl KafkaSourceWithReads {
                 .expect("should be a valid message");
 
             if let ControlResp::CheckpointCompleted(checkpoint) = control_response {
-                assert_eq!(expected_epoch, checkpoint.checkpoint_epoch);
+                assert_eq!(expected_epoch as u64, checkpoint.checkpoint_epoch);
                 return checkpoint;
             }
         }
@@ -334,16 +337,25 @@ async fn test_kafka() {
     .await
     .unwrap();
 
+    // The write takes a token, so this fixture states which operators it stands behind the
+    // same way the worker that took the checkpoint does — with the set it just wrote.
     StateBackend::write_checkpoint_metadata(
         &StorageProviderFor::Worker,
-        CheckpointMetadata {
-            job_id: task_info.job_id.clone(),
-            epoch: 1,
-            min_epoch: 1,
-            start_time: 0,
-            finish_time: 0,
-            operator_ids: vec![task_info.operator_id.clone()],
-        },
+        Validated::validate(
+            CheckpointMetadataWrite::for_completed_checkpoint(
+                CheckpointMetadata {
+                    job_id: task_info.job_id.clone(),
+                    epoch: 1,
+                    min_epoch: 1,
+                    start_time: 0,
+                    finish_time: 0,
+                    operator_ids: vec![task_info.operator_id.clone()],
+                },
+                vec![task_info.operator_id.clone()],
+            ),
+            (),
+        )
+        .unwrap(),
     )
     .await
     .unwrap();
@@ -445,7 +457,8 @@ async fn test_kafka_with_metadata_fields() {
         ))),
         kafka.tables(),
     )
-    .await;
+    .await
+    .unwrap();
 
     let chain_info = Arc::new(ChainInfo {
         job_id: ctx.task_info.job_id.clone(),

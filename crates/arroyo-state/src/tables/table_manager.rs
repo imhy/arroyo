@@ -31,6 +31,7 @@ use crate::{CheckpointMessage, TableData};
 use arroyo_rpc::MetadataOrManifest;
 use arroyo_rpc::errors::{DataflowResult, StateError};
 use arroyo_rpc::grpc::rpc::OperatorCheckpointMetadata;
+use arroyo_rpc::state_backend::validate_restored_operator_metadata;
 use tracing::{debug, error, info, warn};
 
 #[allow(unused)]
@@ -181,7 +182,7 @@ impl BackendFlusher {
         };
         self.control_tx
             .send(ControlResp::CheckpointCompleted(CheckpointCompleted {
-                checkpoint_epoch: cp.epoch,
+                checkpoint_epoch: cp.epoch as u64,
                 operator_idx: self.task_info.operator_idx,
                 operator_id: self.task_info.operator_id.clone(),
                 subtask_metadata,
@@ -262,6 +263,22 @@ async fn load_operator_metadata(
 }
 
 impl TableManager {
+    /// Builds this subtask's state, restoring it from `restore_from` when there is one.
+    ///
+    /// A restored checkpoint's table configs record the backend that wrote them. They are
+    /// checked against the job's selector — carried explicitly on `task_info` — before a
+    /// single table is constructed and before the writer that will produce the next
+    /// checkpoint is started, so a job can never read another backend's state or extend a
+    /// checkpoint lineage it does not own. This is the read-back side of the selector: an
+    /// empty value in a restored config means the checkpoint predates the field and was
+    /// therefore written by parquet, which is why it restores into a parquet job and is
+    /// refused by a stateengine one.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`arroyo_rpc::state_backend::StateBackendError`] the restored configs
+    /// raised, alongside the pre-existing failures of loading and constructing state.
+    /// Callers that need the selector failure typed can downcast it.
     pub async fn load(
         task_info: Arc<TaskInfo>,
         table_configs: HashMap<String, TableConfig>,
@@ -271,6 +288,8 @@ impl TableManager {
         let (watermark, checkpoint_metadata) = if let Some(metadata) = restore_from {
             let operator_metadata =
                 load_operator_metadata(metadata, &task_info.operator_id).await?;
+            validate_restored_operator_metadata(task_info.state_backend, &operator_metadata)?;
+
             let watermark = operator_metadata
                 .operator_metadata
                 .as_ref()

@@ -95,7 +95,8 @@ impl MqttTopicTester {
             None,
             HashMap::new(),
         )
-        .await;
+        .await
+        .unwrap();
 
         mqtt.on_start(&mut ctx).await.unwrap();
 

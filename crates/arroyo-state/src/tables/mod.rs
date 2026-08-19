@@ -1,3 +1,4 @@
+use crate::validated::ValidatedTable;
 use crate::{CheckpointMessage, DataOperation, TableData};
 use arroyo_rpc::errors::StateError;
 use arroyo_rpc::grpc::rpc::{
@@ -261,10 +262,17 @@ pub trait ErasedTable: Send + Sync + 'static {
         })
     }
 
-    fn files_to_keep(
-        config: TableConfig,
-        checkpoint: TableCheckpointMetadata,
-    ) -> Result<HashSet<String>, StateError>
+    /// The files this table's checkpoint metadata references.
+    ///
+    /// Takes a [`ValidatedTable`] rather than a config and a metadata (design item
+    /// M11.D39c). This is the classification a checkpoint cleanup subtracts to decide which
+    /// of a job's files it may delete, so it must not be reachable from a pair of objects
+    /// that no whole-checkpoint check covered: a foreign backend's metadata read through
+    /// this backend's file layout names the wrong files, and the deletion that follows is
+    /// not recoverable. A [`ValidatedTable`] has no public constructor and is only ever
+    /// borrowed out of a token, which is what makes that unreachable rather than merely
+    /// discouraged.
+    fn files_to_keep(table: ValidatedTable<'_>) -> Result<HashSet<String>, StateError>
     where
         Self: Sized;
 
@@ -405,16 +413,13 @@ impl<T: Table + Sized + 'static> ErasedTable for T {
         self
     }
 
-    fn files_to_keep(
-        config: TableConfig,
-        checkpoint: TableCheckpointMetadata,
-    ) -> Result<HashSet<String>, StateError>
+    fn files_to_keep(table: ValidatedTable<'_>) -> Result<HashSet<String>, StateError>
     where
         Self: Sized,
     {
         T::files_to_keep(
-            Self::checked_proto_decode(T::table_type(), config.config)?,
-            Self::checked_proto_decode(T::table_type(), checkpoint.data)?,
+            Self::checked_proto_decode(T::table_type(), table.config().config.clone())?,
+            Self::checked_proto_decode(T::table_type(), table.checkpoint().data.clone())?,
         )
     }
     fn committing_data(

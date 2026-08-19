@@ -24,7 +24,8 @@ SELECT
     ignore_state_before_epoch,
     state_context,
     env_vars,
-    scheduler_config
+    scheduler_config,
+    state_backend
 FROM job_configs c
 INNER JOIN job_statuses s ON c.id = s.id;
 
@@ -58,8 +59,8 @@ WHERE job_id = :job_id AND epoch < :epoch;
 
 --! create_checkpoint
 INSERT INTO checkpoints
-(pub_id, organization_id, job_id, state_backend, epoch, min_epoch, start_time)
-VALUES (:pub_id, :organization_id, :job_id, :state_backend, :epoch, :min_epoch, :start_time);
+(pub_id, organization_id, job_id, state_backend, epoch, min_epoch, start_time, is_stopping)
+VALUES (:pub_id, :organization_id, :job_id, :state_backend, :epoch, :min_epoch, :start_time, :is_stopping);
 
 --! update_checkpoint (finish_time?)
 UPDATE checkpoints
@@ -91,7 +92,7 @@ SET
 WHERE job_id = :job_id AND epoch >= :epoch;
 
 --! last_successful_checkpoint
-SELECT pub_id, epoch, min_epoch, state = 'committing' as needs_commits
+SELECT pub_id, epoch, min_epoch, state_backend, state = 'committing' as needs_commits
 FROM checkpoints
 WHERE job_id = :job_id AND (state = 'ready' or state = 'committing')
 ORDER BY epoch DESC

@@ -142,7 +142,7 @@ async fn start_and_monitor(
         if let Some(checkpoint) = checkpoints
             .data
             .iter()
-            .find(|c| c.epoch == checkpoints_to_wait as i32)
+            .find(|c| c.epoch == checkpoints_to_wait as i64)
             && checkpoint.finish_time.is_some()
         {
             // get details
@@ -223,7 +223,7 @@ async fn basic_pipeline() {
         .unwrap()
         .into_inner();
 
-    assert_eq!(valid.errors, Vec::<String>::new());
+    assert!(valid.errors.is_empty());
     assert!(valid.graph.is_some());
 
     let (pipeline_id, job_id, _) = start_and_monitor(test_id, &query, &[], 10).await.unwrap();

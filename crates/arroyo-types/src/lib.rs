@@ -1,3 +1,6 @@
+pub mod state_backend;
+
+use crate::state_backend::StateBackendSelector;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow_array::RecordBatch;
 use bincode::{Decode, Encode};
@@ -397,6 +400,10 @@ pub struct TaskInfo {
     pub parallelism: u32,
     pub key_range: RangeInclusive<u64>,
     pub checkpoint_file_path_layout: CheckpointFilePathLayout,
+    /// The state backend the job selected, handed down from the job config through the
+    /// worker's `StartExecutionReq`. Task initialization is the only carrier: no operator
+    /// reads an ambient or process-global selector.
+    pub state_backend: StateBackendSelector,
 }
 
 impl Display for TaskInfo {
@@ -448,6 +455,7 @@ impl TaskInfo {
             parallelism: 1,
             key_range: 0..=u64::MAX,
             checkpoint_file_path_layout: CheckpointFilePathLayout::Legacy,
+            state_backend: StateBackendSelector::DEFAULT,
         }
     }
 }
@@ -462,6 +470,7 @@ pub fn get_test_task_info() -> TaskInfo {
         parallelism: 1,
         key_range: 0..=u64::MAX,
         checkpoint_file_path_layout: CheckpointFilePathLayout::Legacy,
+        state_backend: StateBackendSelector::DEFAULT,
     }
 }
 

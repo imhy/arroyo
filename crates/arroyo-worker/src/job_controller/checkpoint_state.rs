@@ -8,10 +8,13 @@ use arroyo_rpc::grpc::rpc::{
     TaskCheckpointCompletedReq, TaskCheckpointEventReq,
 };
 use arroyo_rpc::grpc::{api, rpc};
+use arroyo_rpc::state_backend::{StateBackendSelector, validate_subtask_table_configs};
 use arroyo_rpc::{TaskEventSpans, get_event_spans, grpc, log_trace_event};
 use arroyo_state::tables::ErasedTable;
 use arroyo_state::tables::expiring_time_key_map::ExpiringTimeKeyTable;
 use arroyo_state::tables::global_keyed_map::GlobalKeyedTable;
+use arroyo_state::validated::CheckpointMetadataWrite;
+use arroyo_state_protocol::types::Epoch;
 use arroyo_types::{from_micros, to_micros};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -24,8 +27,11 @@ pub type CommitData = HashMap<String, HashMap<String, HashMap<u32, Vec<u8>>>>;
 pub struct CheckpointState {
     job_id: Arc<String>,
     pub checkpoint_id: String,
-    epoch: u32,
-    min_epoch: u32,
+    epoch: Epoch,
+    min_epoch: Epoch,
+    /// The selector of the job this checkpoint belongs to. Every subtask's table configs
+    /// must agree with it before they are merged into an operator's checkpoint metadata.
+    state_backend: StateBackendSelector,
     start_time: SystemTime,
     operators: usize,
     operators_checkpointed: usize,
@@ -145,18 +151,25 @@ impl TableState {
 }
 
 impl CheckpointState {
+    /// Starts accumulating one checkpoint of `program`.
+    ///
+    /// `state_backend` is the selector of the job being checkpointed, handed in by the
+    /// caller — the job controller that owns this state — rather than read from anywhere
+    /// ambient. Every subtask's table configs are checked against it as they arrive.
     pub fn new(
         job_id: Arc<String>,
         checkpoint_id: String,
-        epoch: u32,
-        min_epoch: u32,
+        epoch: Epoch,
+        min_epoch: Epoch,
         program: Arc<LogicalProgram>,
+        state_backend: StateBackendSelector,
     ) -> Self {
         Self {
             job_id,
             checkpoint_id,
             epoch,
             min_epoch,
+            state_backend,
             bytes: 0,
             start_time: SystemTime::now(),
             operators: program.tasks_per_operator().len(),
@@ -177,7 +190,7 @@ impl CheckpointState {
         operator_names: &HashMap<String, String>,
         operator_id: Option<&str>,
         subtask_idx: Option<u64>,
-        epoch: u32,
+        epoch: Epoch,
         size: u64,
         total_time: Duration,
         spans: TaskEventSpans,
@@ -266,6 +279,19 @@ impl CheckpointState {
         Ok(())
     }
 
+    /// Records one subtask's finished checkpoint, returning the operator's merged
+    /// checkpoint metadata once every subtask of that operator has reported.
+    ///
+    /// The subtask's table configs are checked against the job's selector first, before
+    /// any of its bytes, watermarks, or table state are folded into this checkpoint.
+    /// Merging a subtask that selects a different backend would produce a checkpoint that
+    /// is partly one backend's and partly another's, which nothing could later restore.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the request carries no metadata, if the operator is not part of this
+    /// checkpoint, or — carrying an [`arroyo_rpc::state_backend::StateBackendError`] the
+    /// caller can downcast — if the subtask's table configs disagree with the job.
     pub fn checkpoint_finished(
         &mut self,
         c: TaskCheckpointCompletedReq,
@@ -276,12 +302,19 @@ impl CheckpointState {
             .as_ref()
             .ok_or_else(|| anyhow!("missing metadata for operator {}", c.operator_id))?;
 
+        validate_subtask_table_configs(
+            self.state_backend,
+            &c.operator_id,
+            metadata.subtask_index,
+            &metadata.table_configs,
+        )?;
+
         debug!(
             message = "Checkpoint finished",
             checkpoint_id = self.checkpoint_id,
             job_id = *self.job_id,
-            epoch = self.epoch,
-            min_epoch = self.min_epoch,
+            epoch = *self.epoch,
+            min_epoch = *self.min_epoch,
             operator_id = %c.operator_id,
             subtask_index = metadata.subtask_index,
             time = c.time);
@@ -394,7 +427,7 @@ impl CheckpointState {
                 operator_metadata: Some(OperatorMetadata {
                     job_id: self.job_id.to_string(),
                     operator_id: c.operator_id,
-                    epoch: self.epoch,
+                    epoch: *self.epoch as u32,
                     min_watermark,
                     max_watermark,
                     parallelism: operator_state.subtasks_checkpointed as u64,
@@ -411,7 +444,15 @@ impl CheckpointState {
         self.operators == self.operators_checkpointed
     }
 
-    pub fn build_metadata(&mut self) -> CheckpointMetadata {
+    /// Builds this checkpoint's top-level metadata, paired with the operators that are
+    /// entitled to appear in it.
+    ///
+    /// Returns a [`CheckpointMetadataWrite`] rather than the metadata because the write it
+    /// feeds takes only a checked one (design item M11.D39c). The two halves are produced
+    /// together, here, where the set of operators that reported completion — each having had
+    /// its subtask table configs checked as it did — is known; a caller that had to supply
+    /// them separately could supply a different set from the one the metadata names.
+    pub fn build_metadata(&mut self) -> CheckpointMetadataWrite {
         let finish_time = SystemTime::now();
 
         for (op, details) in &self.operator_details {
@@ -452,18 +493,23 @@ impl CheckpointState {
             Default::default(),
         );
 
-        CheckpointMetadata {
-            job_id: self.job_id.to_string(),
-            epoch: self.epoch,
-            min_epoch: self.min_epoch,
-            start_time: to_micros(self.start_time),
-            finish_time: to_micros(finish_time),
-            operator_ids: self
-                .operator_state
-                .keys()
-                .map(|key| key.to_string())
-                .collect(),
-        }
+        let completed_operators: Vec<String> = self
+            .operator_state
+            .keys()
+            .map(|key| key.to_string())
+            .collect();
+
+        CheckpointMetadataWrite::for_completed_checkpoint(
+            CheckpointMetadata {
+                job_id: self.job_id.to_string(),
+                epoch: *self.epoch as u32,
+                min_epoch: *self.min_epoch as u32,
+                start_time: to_micros(self.start_time),
+                finish_time: to_micros(finish_time),
+                operator_ids: completed_operators.clone(),
+            },
+            completed_operators,
+        )
     }
 
     pub fn needs_commit(&self) -> bool {
@@ -472,5 +518,128 @@ impl CheckpointState {
 
     pub fn into_commit(self, checkpoint_id: CheckpointIdOrRef) -> CommittingState {
         CommittingState::new(checkpoint_id, self.subtasks_to_commit, self.commit_data)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CheckpointState;
+    use arroyo_datastream::logical::LogicalProgram;
+    use arroyo_rpc::grpc::rpc::{
+        SubtaskCheckpointMetadata, TableConfig, TableEnum, TaskCheckpointCompletedReq,
+    };
+    use arroyo_rpc::state_backend::{StateBackendError, StateBackendSelector};
+    use arroyo_state_protocol::types::Epoch;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    /// A checkpoint of a program with no operators. Every subtask report is therefore
+    /// "unexpected" once it reaches the merge — which is exactly what makes the merge
+    /// observable: reaching it produces that failure and leaves the subtask's bytes and
+    /// details behind, while being stopped before it produces neither.
+    fn checkpoint_state(job: StateBackendSelector) -> CheckpointState {
+        CheckpointState::new(
+            Arc::new("job_1".to_string()),
+            "chk_1".to_string(),
+            Epoch(4),
+            Epoch(0),
+            Arc::new(LogicalProgram::default()),
+            job,
+        )
+    }
+
+    /// One subtask's finished checkpoint, carrying a single table that states
+    /// `state_backend`.
+    fn subtask_completed(state_backend: &str) -> TaskCheckpointCompletedReq {
+        TaskCheckpointCompletedReq {
+            operator_id: "node_3".to_string(),
+            epoch: 4,
+            metadata: Some(SubtaskCheckpointMetadata {
+                subtask_index: 1,
+                bytes: 128,
+                table_configs: HashMap::from([(
+                    "w:window".to_string(),
+                    TableConfig {
+                        table_type: TableEnum::GlobalKeyValue as i32,
+                        config: vec![],
+                        state_version: 0,
+                        state_backend: state_backend.to_string(),
+                    },
+                )]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// The merge guard, pinned by the difference between two otherwise identical reports.
+    ///
+    /// The agreeing one gets past the selector check and into the merge, which records
+    /// the subtask's bytes and detail before failing for its own reason. The disagreeing
+    /// one fails typed and leaves both untouched: nothing of a foreign backend's subtask
+    /// is folded into this job's checkpoint. Move the check after the merge and the
+    /// second half of this test fails.
+    #[test]
+    fn a_subtask_from_another_backend_is_refused_before_it_is_merged() {
+        let mut merged = checkpoint_state(StateBackendSelector::StateEngine);
+        let err = merged
+            .checkpoint_finished(subtask_completed("stateengine"))
+            .unwrap_err();
+        assert!(err.downcast_ref::<StateBackendError>().is_none(), "{err:?}");
+        assert_eq!(merged.bytes, 128);
+        assert!(merged.operator_details.contains_key("node_3"));
+
+        let mut refused = checkpoint_state(StateBackendSelector::StateEngine);
+        let err = refused
+            .checkpoint_finished(subtask_completed("parquet"))
+            .unwrap_err();
+
+        let typed = err
+            .downcast_ref::<StateBackendError>()
+            .unwrap_or_else(|| panic!("a disagreeing subtask must fail typed, got {err:?}"));
+        assert!(
+            matches!(typed, StateBackendError::TableMismatch { .. }),
+            "{typed:?}"
+        );
+        let message = typed.to_string();
+        assert!(message.contains("w:window"), "{message}");
+        assert!(message.contains("node_3"), "{message}");
+        assert!(message.contains("subtask 1"), "{message}");
+
+        assert_eq!(refused.bytes, 0);
+        assert!(refused.operator_details.is_empty());
+    }
+
+    /// The compatibility guarantee at the merge: a subtask running a build that predates
+    /// the field sends empty table configs, which mean parquet, and a parquet job merges
+    /// them exactly as before.
+    #[test]
+    fn a_subtask_predating_the_selector_merges_into_a_parquet_job() {
+        let mut merged = checkpoint_state(StateBackendSelector::Parquet);
+        let err = merged
+            .checkpoint_finished(subtask_completed(""))
+            .unwrap_err();
+
+        assert!(err.downcast_ref::<StateBackendError>().is_none(), "{err:?}");
+        assert_eq!(merged.bytes, 128);
+    }
+
+    /// A table config nobody recognizes stops the merge rather than being merged under
+    /// the job's own selector.
+    #[test]
+    fn a_subtask_with_an_unknown_selector_is_refused() {
+        let mut refused = checkpoint_state(StateBackendSelector::Parquet);
+        let err = refused
+            .checkpoint_finished(subtask_completed("rocksdb"))
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err.downcast_ref::<StateBackendError>(),
+                Some(StateBackendError::UnknownValue { value, .. }) if value == "rocksdb"
+            ),
+            "{err:?}"
+        );
+        assert_eq!(refused.bytes, 0);
     }
 }

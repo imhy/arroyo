@@ -4,10 +4,12 @@
 //! passes the observed facts into pure decision functions, and then executes the
 //! returned decision.
 
+pub mod gc;
 pub mod resolve;
 pub mod state;
 pub mod store;
 pub mod types;
+pub mod validated;
 pub mod workflow;
 
 use crate::types::{CheckpointRef, Epoch, Generation};
@@ -92,6 +94,7 @@ impl ProtocolPaths {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gc::{CheckpointOwner, cleanup_leader_checkpoints, delete_classified_history};
     use crate::resolve::{
         EpochClaimOutcome, ParentCheckpointStatus, ResolveDecision, ResolveFailure,
         resolve_candidate,
@@ -99,12 +102,13 @@ mod tests {
     use crate::state::{CheckpointState, derive_checkpoint_state};
     use crate::store::tests::MemoryProtocolStore;
     use crate::store::{
-        CreateResult, StoreError, create_json_if_not_exist, put_json, put_protobuf, read_json,
-        read_protobuf,
+        CreateResult, ProtocolStore, StoreError, create_json_if_not_exist, put_json, put_protobuf,
+        read_json, read_protobuf,
     };
     use crate::types::{
         CommittedMarker, CurrentGeneration, EpochRecord, GenerationManifest, ProtocolError,
     };
+    use crate::validated::CheckpointHistory;
     use crate::workflow::{
         CheckpointPublication, ClaimEpochRecordRequest, CommitAuthorization, CommitPermit,
         CommittedMarkerOutcome, GenerationInitialization, GenerationRecovery, GenerationResolution,
@@ -112,8 +116,16 @@ mod tests {
         initialize_generation, mark_committed, prepare_commit, publish_checkpoint,
         resolve_generation_manifest,
     };
-    use arroyo_rpc::grpc::rpc::CheckpointManifest;
+    use arroyo_rpc::grpc::rpc::{
+        CheckpointManifest, ExpiringKeyedTimeTableCheckpointMetadata,
+        GlobalKeyedTableTaskCheckpointMetadata, OperatorCheckpointMetadata, OperatorMetadata,
+        ParquetTimeFile, TableCheckpointMetadata, TableConfig, TableEnum,
+    };
+    use arroyo_rpc::state_backend::validated::Validated;
+    use arroyo_rpc::state_backend::{StateBackendError, StateBackendSelector};
     use arroyo_types::{JobId, PipelineId, from_micros};
+    use prost::Message;
+    use std::collections::HashSet;
     use std::time::SystemTime;
 
     fn checkpoint_ref(path: &str) -> CheckpointRef {
@@ -245,6 +257,889 @@ mod tests {
         .unwrap();
     }
 
+    fn data_ref(paths: &ProtocolPaths, epoch: u64) -> CheckpointRef {
+        checkpoint_ref(&format!(
+            "{}/operator-op/table-table-000",
+            paths.checkpoint_dir(Generation(1), Epoch(epoch))
+        ))
+    }
+
+    fn global_operator(files: Vec<CheckpointRef>) -> OperatorCheckpointMetadata {
+        OperatorCheckpointMetadata {
+            operator_metadata: Some(OperatorMetadata {
+                job_id: "J".to_string(),
+                operator_id: "op".to_string(),
+                epoch: 0,
+                min_watermark: None,
+                max_watermark: None,
+                parallelism: 1,
+            }),
+            start_time: 0,
+            finish_time: 0,
+            table_checkpoint_metadata: [(
+                "table".to_string(),
+                TableCheckpointMetadata {
+                    table_type: TableEnum::GlobalKeyValue.into(),
+                    data: GlobalKeyedTableTaskCheckpointMetadata {
+                        files: files.into_iter().map(|file| file.to_string()).collect(),
+                        commit_data_by_subtask: Default::default(),
+                    }
+                    .encode_to_vec(),
+                },
+            )]
+            .into(),
+            table_configs: Default::default(),
+        }
+    }
+
+    /// A manifest entry headed for `operator_id`, as the checkpoint writer heads them.
+    fn named_operator(operator_id: &str) -> OperatorCheckpointMetadata {
+        let mut operator = global_operator(vec![]);
+        operator.operator_metadata.as_mut().unwrap().operator_id = operator_id.to_string();
+        operator
+    }
+
+    fn expiring_operator(
+        operator_id: &str,
+        files: Vec<CheckpointRef>,
+    ) -> OperatorCheckpointMetadata {
+        OperatorCheckpointMetadata {
+            operator_metadata: Some(OperatorMetadata {
+                job_id: "J".to_string(),
+                operator_id: operator_id.to_string(),
+                epoch: 0,
+                min_watermark: None,
+                max_watermark: None,
+                parallelism: 1,
+            }),
+            start_time: 0,
+            finish_time: 0,
+            table_checkpoint_metadata: [(
+                "expiring-table".to_string(),
+                TableCheckpointMetadata {
+                    table_type: TableEnum::ExpiringKeyedTimeTable.into(),
+                    data: ExpiringKeyedTimeTableCheckpointMetadata {
+                        files: files
+                            .into_iter()
+                            .map(|file| ParquetTimeFile {
+                                file: file.to_string(),
+                                ..Default::default()
+                            })
+                            .collect(),
+                    }
+                    .encode_to_vec(),
+                },
+            )]
+            .into(),
+            table_configs: Default::default(),
+        }
+    }
+
+    async fn write_gc_checkpoint(
+        store: &MemoryProtocolStore,
+        paths: &ProtocolPaths,
+        epoch: u64,
+        parent_epoch: Option<u64>,
+        operators: Vec<OperatorCheckpointMetadata>,
+    ) {
+        let checkpoint_ref = paths.checkpoint_manifest(Generation(1), Epoch(epoch));
+        let parent_checkpoint_ref =
+            parent_epoch.map(|epoch| paths.checkpoint_manifest(Generation(1), Epoch(epoch)));
+        let mut checkpoint =
+            checkpoint_for_generation(Generation(1), epoch, parent_checkpoint_ref, false);
+        checkpoint.operators = operators;
+        write_canonical_checkpoint(store, paths, &checkpoint_ref, &checkpoint).await;
+        put_json(
+            store,
+            &paths.committed_marker(Generation(1), Epoch(epoch)),
+            &committed_marker(checkpoint_ref, epoch),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn exists(store: &MemoryProtocolStore, path: &CheckpointRef) -> bool {
+        store.read_bytes(path).await.unwrap().is_some()
+    }
+
+    #[tokio::test]
+    async fn cleanup_deletes_only_checkpoints_below_new_min_epoch() {
+        let store = MemoryProtocolStore::default();
+        let paths = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J"));
+        let file1 = data_ref(&paths, 1);
+        let file2 = data_ref(&paths, 2);
+        let file3 = data_ref(&paths, 3);
+        let checkpoint1_ref = paths.checkpoint_manifest(Generation(1), Epoch(1));
+        let checkpoint2_ref = paths.checkpoint_manifest(Generation(1), Epoch(2));
+        let checkpoint3_ref = paths.checkpoint_manifest(Generation(1), Epoch(3));
+
+        store.put_bytes(&file1, b"1".to_vec()).await.unwrap();
+        store.put_bytes(&file2, b"2".to_vec()).await.unwrap();
+        store.put_bytes(&file3, b"3".to_vec()).await.unwrap();
+        write_gc_checkpoint(
+            &store,
+            &paths,
+            1,
+            None,
+            vec![global_operator(vec![file1.clone()])],
+        )
+        .await;
+        write_gc_checkpoint(
+            &store,
+            &paths,
+            2,
+            Some(1),
+            vec![global_operator(vec![file2.clone()])],
+        )
+        .await;
+        write_gc_checkpoint(
+            &store,
+            &paths,
+            3,
+            Some(2),
+            vec![global_operator(vec![file3.clone()])],
+        )
+        .await;
+
+        cleanup_leader_checkpoints(
+            &store,
+            &paths,
+            StateBackendSelector::Parquet,
+            checkpoint3_ref.clone(),
+            Epoch(2),
+        )
+        .await
+        .unwrap();
+
+        assert!(!exists(&store, &file1).await);
+        assert!(!exists(&store, &paths.epoch_record(Epoch(1))).await);
+        assert!(!exists(&store, &paths.committed_marker(Generation(1), Epoch(1))).await);
+        assert!(
+            read_protobuf::<_, CheckpointManifest>(&store, &checkpoint1_ref)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        assert!(exists(&store, &file2).await);
+        assert!(exists(&store, &file3).await);
+        assert!(
+            read_protobuf::<_, CheckpointManifest>(&store, &checkpoint2_ref)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            read_protobuf::<_, CheckpointManifest>(&store, &checkpoint3_ref)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_preserves_expiring_files_referenced_by_retained_checkpoint() {
+        let store = MemoryProtocolStore::default();
+        let paths = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J"));
+        let shared_file = checkpoint_ref(&format!(
+            "{}/operator-expiring-op/table-expiring-shared",
+            paths.checkpoint_dir(Generation(1), Epoch(1))
+        ));
+        let expired_file = checkpoint_ref(&format!(
+            "{}/operator-expiring-op/table-expiring-expired",
+            paths.checkpoint_dir(Generation(1), Epoch(1))
+        ));
+        let checkpoint2_ref = paths.checkpoint_manifest(Generation(1), Epoch(2));
+
+        store
+            .put_bytes(&shared_file, b"shared".to_vec())
+            .await
+            .unwrap();
+        store
+            .put_bytes(&expired_file, b"expired".to_vec())
+            .await
+            .unwrap();
+        write_gc_checkpoint(
+            &store,
+            &paths,
+            1,
+            None,
+            vec![expiring_operator(
+                "expiring-op",
+                vec![shared_file.clone(), expired_file.clone()],
+            )],
+        )
+        .await;
+        write_gc_checkpoint(
+            &store,
+            &paths,
+            2,
+            Some(1),
+            vec![expiring_operator("expiring-op", vec![shared_file.clone()])],
+        )
+        .await;
+
+        cleanup_leader_checkpoints(
+            &store,
+            &paths,
+            StateBackendSelector::Parquet,
+            checkpoint2_ref.clone(),
+            Epoch(2),
+        )
+        .await
+        .unwrap();
+
+        assert!(exists(&store, &shared_file).await);
+        assert!(!exists(&store, &expired_file).await);
+
+        let deleted_count = store.deleted_objects().len();
+        cleanup_leader_checkpoints(
+            &store,
+            &paths,
+            StateBackendSelector::Parquet,
+            checkpoint2_ref,
+            Epoch(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(deleted_count, store.deleted_objects().len());
+        assert!(exists(&store, &shared_file).await);
+    }
+
+    #[tokio::test]
+    async fn cleanup_retries_checkpoint_directory_when_carried_file_expires() {
+        let store = MemoryProtocolStore::default();
+        let paths = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J"));
+        let checkpoint1_dir = paths.checkpoint_dir(Generation(1), Epoch(1));
+        let carried_file = checkpoint_ref(&format!(
+            "{checkpoint1_dir}/operator-expiring-op/table-expiring-carried"
+        ));
+
+        store
+            .put_bytes(&carried_file, b"carried".to_vec())
+            .await
+            .unwrap();
+        write_gc_checkpoint(
+            &store,
+            &paths,
+            1,
+            None,
+            vec![expiring_operator("expiring-op", vec![carried_file.clone()])],
+        )
+        .await;
+        write_gc_checkpoint(
+            &store,
+            &paths,
+            2,
+            Some(1),
+            vec![expiring_operator("expiring-op", vec![carried_file.clone()])],
+        )
+        .await;
+
+        cleanup_leader_checkpoints(
+            &store,
+            &paths,
+            StateBackendSelector::Parquet,
+            paths.checkpoint_manifest(Generation(1), Epoch(2)),
+            Epoch(2),
+        )
+        .await
+        .unwrap();
+
+        assert!(exists(&store, &carried_file).await);
+        assert_eq!(
+            1,
+            store
+                .deleted_directories()
+                .iter()
+                .filter(|directory| *directory == checkpoint1_dir.as_str())
+                .count()
+        );
+
+        write_gc_checkpoint(
+            &store,
+            &paths,
+            3,
+            Some(2),
+            vec![expiring_operator("expiring-op", vec![])],
+        )
+        .await;
+        cleanup_leader_checkpoints(
+            &store,
+            &paths,
+            StateBackendSelector::Parquet,
+            paths.checkpoint_manifest(Generation(1), Epoch(3)),
+            Epoch(3),
+        )
+        .await
+        .unwrap();
+
+        assert!(!exists(&store, &carried_file).await);
+        assert_eq!(
+            2,
+            store
+                .deleted_directories()
+                .iter()
+                .filter(|directory| *directory == checkpoint1_dir.as_str())
+                .count(),
+            "the old checkpoint directory should be retried when its carried file expires"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_classifies_mixed_global_and_expiring_metadata() {
+        let store = MemoryProtocolStore::default();
+        let paths = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J"));
+        let global_old = checkpoint_ref(&format!(
+            "{}/operator-op/table-global-old",
+            paths.checkpoint_dir(Generation(1), Epoch(1))
+        ));
+        let global_retained = data_ref(&paths, 2);
+        let expiring_old = checkpoint_ref(&format!(
+            "{}/operator-expiring-op/table-expiring-old",
+            paths.checkpoint_dir(Generation(1), Epoch(1))
+        ));
+        let expiring_shared = checkpoint_ref(&format!(
+            "{}/operator-expiring-op/table-expiring-shared",
+            paths.checkpoint_dir(Generation(1), Epoch(1))
+        ));
+
+        for file in [
+            &global_old,
+            &global_retained,
+            &expiring_old,
+            &expiring_shared,
+        ] {
+            store.put_bytes(file, b"data".to_vec()).await.unwrap();
+        }
+        write_gc_checkpoint(
+            &store,
+            &paths,
+            1,
+            None,
+            vec![
+                global_operator(vec![global_old.clone()]),
+                expiring_operator(
+                    "expiring-op",
+                    vec![expiring_old.clone(), expiring_shared.clone()],
+                ),
+            ],
+        )
+        .await;
+        write_gc_checkpoint(
+            &store,
+            &paths,
+            2,
+            Some(1),
+            vec![
+                global_operator(vec![global_retained.clone()]),
+                expiring_operator("expiring-op", vec![expiring_shared.clone()]),
+            ],
+        )
+        .await;
+
+        cleanup_leader_checkpoints(
+            &store,
+            &paths,
+            StateBackendSelector::Parquet,
+            paths.checkpoint_manifest(Generation(1), Epoch(2)),
+            Epoch(2),
+        )
+        .await
+        .unwrap();
+
+        assert!(!exists(&store, &global_old).await);
+        assert!(!exists(&store, &expiring_old).await);
+        assert!(exists(&store, &global_retained).await);
+        assert!(exists(&store, &expiring_shared).await);
+    }
+
+    #[tokio::test]
+    async fn cleanup_malformed_expiring_metadata_is_fail_closed() {
+        let store = MemoryProtocolStore::default();
+        let paths = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J"));
+        let old_file = data_ref(&paths, 2);
+        let mut malformed_operator = expiring_operator("expiring-op", vec![]);
+        malformed_operator
+            .table_checkpoint_metadata
+            .get_mut("expiring-table")
+            .unwrap()
+            .data = vec![0x0a];
+
+        store.put_bytes(&old_file, b"old".to_vec()).await.unwrap();
+        write_gc_checkpoint(&store, &paths, 1, None, vec![malformed_operator]).await;
+        write_gc_checkpoint(
+            &store,
+            &paths,
+            2,
+            Some(1),
+            vec![global_operator(vec![old_file.clone()])],
+        )
+        .await;
+        write_gc_checkpoint(&store, &paths, 3, Some(2), vec![global_operator(vec![])]).await;
+
+        let err = cleanup_leader_checkpoints(
+            &store,
+            &paths,
+            StateBackendSelector::Parquet,
+            paths.checkpoint_manifest(Generation(1), Epoch(3)),
+            Epoch(3),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, StoreError::DecodeProtobuf { .. }));
+        assert!(store.deleted_objects().is_empty());
+        assert!(exists(&store, &old_file).await);
+    }
+
+    #[tokio::test]
+    async fn cleanup_deletes_checkpoint_manifests_oldest_first() {
+        let store = MemoryProtocolStore::default();
+        let paths = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J"));
+        write_gc_checkpoint(&store, &paths, 1, None, vec![global_operator(vec![])]).await;
+        write_gc_checkpoint(&store, &paths, 2, Some(1), vec![global_operator(vec![])]).await;
+        write_gc_checkpoint(&store, &paths, 3, Some(2), vec![global_operator(vec![])]).await;
+
+        cleanup_leader_checkpoints(
+            &store,
+            &paths,
+            StateBackendSelector::Parquet,
+            paths.checkpoint_manifest(Generation(1), Epoch(3)),
+            Epoch(3),
+        )
+        .await
+        .unwrap();
+
+        let deleted = store.deleted_objects();
+        let manifest1 = paths
+            .checkpoint_manifest(Generation(1), Epoch(1))
+            .to_string();
+        let manifest2 = paths
+            .checkpoint_manifest(Generation(1), Epoch(2))
+            .to_string();
+        let manifest3 = paths
+            .checkpoint_manifest(Generation(1), Epoch(3))
+            .to_string();
+        let manifest1_pos = deleted
+            .iter()
+            .position(|path| path == &manifest1)
+            .expect("epoch 1 manifest should be deleted");
+        let manifest2_pos = deleted
+            .iter()
+            .position(|path| path == &manifest2)
+            .expect("epoch 2 manifest should be deleted");
+
+        assert!(manifest1_pos < manifest2_pos);
+        assert!(!deleted.contains(&manifest3));
+    }
+
+    #[tokio::test]
+    async fn cleanup_detects_checkpoint_parent_cycles() {
+        let store = MemoryProtocolStore::default();
+        let paths = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J"));
+        write_gc_checkpoint(&store, &paths, 1, Some(2), vec![global_operator(vec![])]).await;
+        write_gc_checkpoint(&store, &paths, 2, Some(1), vec![global_operator(vec![])]).await;
+
+        let err = cleanup_leader_checkpoints(
+            &store,
+            &paths,
+            StateBackendSelector::Parquet,
+            paths.checkpoint_manifest(Generation(1), Epoch(2)),
+            Epoch(2),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            StoreError::Protocol(ProtocolError::CheckpointCycle {
+                generation: Generation(1),
+                epoch: Epoch(2)
+            })
+        ));
+        assert!(store.deleted_objects().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cleanup_rejects_min_epoch_newer_than_head() {
+        let store = MemoryProtocolStore::default();
+        let paths = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J"));
+        let head = paths.checkpoint_manifest(Generation(1), Epoch(2));
+        write_gc_checkpoint(&store, &paths, 2, None, vec![global_operator(vec![])]).await;
+
+        let err = cleanup_leader_checkpoints(
+            &store,
+            &paths,
+            StateBackendSelector::Parquet,
+            head,
+            Epoch(3),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            StoreError::Protocol(ProtocolError::CheckpointGcMinEpochBeyondHead {
+                head_epoch: Epoch(2),
+                new_min_epoch: Epoch(3),
+            })
+        ));
+        assert!(store.deleted_objects().is_empty());
+    }
+
+    /// Stamps `state_backend` onto every table config of `operator`, so a manifest can state
+    /// which backend wrote it.
+    fn operator_with_selector(
+        mut operator: OperatorCheckpointMetadata,
+        state_backend: &str,
+    ) -> OperatorCheckpointMetadata {
+        operator.table_configs = operator
+            .table_checkpoint_metadata
+            .keys()
+            .map(|table| {
+                (
+                    table.clone(),
+                    TableConfig {
+                        table_type: TableEnum::GlobalKeyValue as i32,
+                        config: vec![],
+                        state_version: 0,
+                        state_backend: state_backend.to_string(),
+                    },
+                )
+            })
+            .collect();
+        operator
+    }
+
+    /// Leader GC on a job whose history predates the selector: every table config is empty,
+    /// which means parquet, and a parquet job still garbage-collects its own state exactly as
+    /// before. The guard must not strand legacy deployments' checkpoints.
+    #[tokio::test]
+    async fn cleanup_still_collects_a_legacy_all_parquet_history() {
+        let store = MemoryProtocolStore::default();
+        let paths = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J"));
+        let old_file = data_ref(&paths, 1);
+        let kept_file = data_ref(&paths, 2);
+
+        store.put_bytes(&old_file, b"1".to_vec()).await.unwrap();
+        store.put_bytes(&kept_file, b"2".to_vec()).await.unwrap();
+        // Epoch 1 states parquet explicitly, epoch 2 says nothing at all: both are this
+        // parquet job's own, and both must be collectable.
+        write_gc_checkpoint(
+            &store,
+            &paths,
+            1,
+            None,
+            vec![operator_with_selector(
+                global_operator(vec![old_file.clone()]),
+                "parquet",
+            )],
+        )
+        .await;
+        write_gc_checkpoint(
+            &store,
+            &paths,
+            2,
+            Some(1),
+            vec![global_operator(vec![kept_file.clone()])],
+        )
+        .await;
+
+        cleanup_leader_checkpoints(
+            &store,
+            &paths,
+            StateBackendSelector::Parquet,
+            paths.checkpoint_manifest(Generation(1), Epoch(2)),
+            Epoch(2),
+        )
+        .await
+        .unwrap();
+
+        assert!(!exists(&store, &old_file).await);
+        assert!(exists(&store, &kept_file).await);
+    }
+
+    /// The hole this round closes: leader GC used to traverse manifests and delete the files
+    /// they name without ever asking who wrote them.
+    ///
+    /// The disagreeing manifest is the *oldest* one, reached last, and it is one of the ones
+    /// being collected — so an implementation that validated per-checkpoint as it deleted, or
+    /// did not validate at all, would already have deleted the newer expiring checkpoint's file
+    /// by the time it got there. Nothing may be deleted.
+    #[tokio::test]
+    async fn cleanup_rejects_a_history_written_by_another_backend() {
+        let store = MemoryProtocolStore::default();
+        let paths = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J"));
+        let foreign_file = data_ref(&paths, 1);
+        let old_file = data_ref(&paths, 2);
+        let kept_file = data_ref(&paths, 3);
+
+        store.put_bytes(&foreign_file, b"1".to_vec()).await.unwrap();
+        store.put_bytes(&old_file, b"2".to_vec()).await.unwrap();
+        store.put_bytes(&kept_file, b"3".to_vec()).await.unwrap();
+        write_gc_checkpoint(
+            &store,
+            &paths,
+            1,
+            None,
+            vec![operator_with_selector(
+                global_operator(vec![foreign_file.clone()]),
+                "stateengine",
+            )],
+        )
+        .await;
+        write_gc_checkpoint(
+            &store,
+            &paths,
+            2,
+            Some(1),
+            vec![global_operator(vec![old_file.clone()])],
+        )
+        .await;
+        write_gc_checkpoint(
+            &store,
+            &paths,
+            3,
+            Some(2),
+            vec![global_operator(vec![kept_file.clone()])],
+        )
+        .await;
+
+        let err = cleanup_leader_checkpoints(
+            &store,
+            &paths,
+            StateBackendSelector::Parquet,
+            paths.checkpoint_manifest(Generation(1), Epoch(3)),
+            Epoch(3),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                StoreError::StateBackend(StateBackendError::CheckpointMismatch { .. })
+            ),
+            "{err:?}"
+        );
+        let message = err.to_string();
+        assert!(message.contains("stateengine"), "{message}");
+
+        assert!(store.deleted_objects().is_empty());
+        assert!(store.deleted_directories().is_empty());
+        assert!(exists(&store, &foreign_file).await);
+        assert!(exists(&store, &old_file).await);
+        assert!(exists(&store, &kept_file).await);
+    }
+
+    /// A retained manifest — one *above* the retention boundary, whose files are only ever
+    /// protected, never deleted — is validated too. Everything reachable is inspected, because
+    /// the whole reachable chain is what names the files.
+    #[tokio::test]
+    async fn cleanup_rejects_a_retained_checkpoint_written_by_another_backend() {
+        let store = MemoryProtocolStore::default();
+        let paths = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J"));
+        let old_file = data_ref(&paths, 1);
+
+        store.put_bytes(&old_file, b"1".to_vec()).await.unwrap();
+        write_gc_checkpoint(
+            &store,
+            &paths,
+            1,
+            None,
+            vec![global_operator(vec![old_file.clone()])],
+        )
+        .await;
+        write_gc_checkpoint(
+            &store,
+            &paths,
+            2,
+            Some(1),
+            vec![operator_with_selector(
+                global_operator(vec![]),
+                "stateengine",
+            )],
+        )
+        .await;
+
+        let err = cleanup_leader_checkpoints(
+            &store,
+            &paths,
+            StateBackendSelector::Parquet,
+            paths.checkpoint_manifest(Generation(1), Epoch(2)),
+            Epoch(2),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                StoreError::StateBackend(StateBackendError::CheckpointMismatch { .. })
+            ),
+            "{err:?}"
+        );
+        assert!(store.deleted_objects().is_empty());
+        assert!(exists(&store, &old_file).await);
+    }
+
+    /// A persisted selector nobody recognizes is a hard failure at GC too, never a fallback to
+    /// the job's own backend — which would delete files under a layout nothing here understands.
+    #[tokio::test]
+    async fn cleanup_rejects_an_unknown_persisted_selector() {
+        let store = MemoryProtocolStore::default();
+        let paths = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J"));
+        let old_file = data_ref(&paths, 1);
+
+        store.put_bytes(&old_file, b"1".to_vec()).await.unwrap();
+        write_gc_checkpoint(
+            &store,
+            &paths,
+            1,
+            None,
+            vec![operator_with_selector(
+                global_operator(vec![old_file.clone()]),
+                "rocksdb",
+            )],
+        )
+        .await;
+        write_gc_checkpoint(&store, &paths, 2, Some(1), vec![global_operator(vec![])]).await;
+
+        let err = cleanup_leader_checkpoints(
+            &store,
+            &paths,
+            StateBackendSelector::Parquet,
+            paths.checkpoint_manifest(Generation(1), Epoch(2)),
+            Epoch(2),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                StoreError::StateBackend(StateBackendError::UnknownValue { ref value, .. })
+                    if value == "rocksdb"
+            ),
+            "{err:?}"
+        );
+        assert!(store.deleted_objects().is_empty());
+        assert!(exists(&store, &old_file).await);
+    }
+
+    /// D96 row 2 (round 1): leader GC's first delete is reachable only through a token for
+    /// the *whole* reachable manifest set, so nothing the traversal named can go before
+    /// every link of the chain has been accounted for.
+    ///
+    /// [`cleanup_leader_checkpoints`] is now classify-then-`delete_classified_history`, and
+    /// the deletion takes nothing but the token — so the three cases below are the complete
+    /// set of ways into it. The chain that agrees deletes; a chain one of whose links was
+    /// written by another backend does not; and — the part that makes the second case a
+    /// claim about the *set* rather than about whichever links happened to be recorded — a
+    /// plan that would delete a checkpoint the traversal never reached does not either.
+    #[tokio::test]
+    async fn gc_requires_validated_manifest_set() {
+        let store = MemoryProtocolStore::default();
+        let paths = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J"));
+        let old_file = data_ref(&paths, 1);
+        let kept_file = data_ref(&paths, 2);
+
+        store.put_bytes(&old_file, b"1".to_vec()).await.unwrap();
+        store.put_bytes(&kept_file, b"2".to_vec()).await.unwrap();
+        write_gc_checkpoint(
+            &store,
+            &paths,
+            1,
+            None,
+            vec![global_operator(vec![old_file.clone()])],
+        )
+        .await;
+        write_gc_checkpoint(
+            &store,
+            &paths,
+            2,
+            Some(1),
+            vec![global_operator(vec![kept_file.clone()])],
+        )
+        .await;
+
+        let owner = |epoch: u64| CheckpointOwner {
+            generation: Generation(1),
+            epoch: Epoch(epoch),
+        };
+        // A classified history as the traversal records one: the links it read, newest
+        // first, and the plan it derived from them.
+        let history = |reached: Vec<(u64, OperatorCheckpointMetadata)>, deleting: Vec<u64>| {
+            let mut history = CheckpointHistory::default();
+            for (epoch, operator) in reached {
+                let mut manifest = checkpoint_for_generation(Generation(1), epoch, None, false);
+                manifest.operators = vec![operator];
+                history.reached(owner(epoch), &manifest);
+            }
+            history.classified(
+                deleting.into_iter().map(owner).collect(),
+                vec![old_file.clone()],
+            );
+            history
+        };
+
+        let agreeing = global_operator(vec![]);
+        let foreign = operator_with_selector(global_operator(vec![]), "stateengine");
+
+        // A link this job did not write: no token, and the deletion has no other argument.
+        let err = Validated::validate(
+            history(vec![(2, agreeing.clone()), (1, foreign)], vec![1]),
+            StateBackendSelector::Parquet,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::StateBackend(StateBackendError::CheckpointMismatch { .. })
+            ),
+            "{err:?}"
+        );
+
+        // A plan naming a checkpoint the traversal never read: nothing validated the
+        // manifest that named its files, so it cannot be collected either.
+        let err = Validated::validate(
+            history(vec![(2, agreeing.clone())], vec![1]),
+            StateBackendSelector::Parquet,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::Protocol(ProtocolError::CheckpointGcUnreached {
+                    generation: Generation(1),
+                    epoch: Epoch(1),
+                })
+            ),
+            "{err:?}"
+        );
+
+        assert!(
+            store.deleted_objects().is_empty(),
+            "a refused history still deleted something"
+        );
+        assert!(exists(&store, &old_file).await);
+
+        // The whole chain agrees: this is the one shape that yields the token, and the
+        // deletion it authorizes is the ordinary one.
+        let validated = Validated::validate(
+            history(vec![(2, agreeing.clone()), (1, agreeing)], vec![1]),
+            StateBackendSelector::Parquet,
+        )
+        .expect("a whole, agreeing history is exactly what a token is for");
+        delete_classified_history(&store, &paths, &validated)
+            .await
+            .unwrap();
+
+        assert!(!exists(&store, &old_file).await);
+        assert!(exists(&store, &kept_file).await);
+    }
+
     #[tokio::test]
     async fn initialize_generation_without_prior_checkpoint_writes_empty_manifest() {
         let store = MemoryProtocolStore::default();
@@ -258,6 +1153,8 @@ mod tests {
                 job_id: JobId::new("J"),
                 generation: Generation(1),
                 updated_at: from_micros(123),
+                state_backend: StateBackendSelector::Parquet,
+                program_operators: HashSet::new(),
             },
             false,
         )
@@ -275,7 +1172,8 @@ mod tests {
             initialization,
             GenerationInitialization::Initialized {
                 generation_manifest: expected_manifest.clone(),
-                recovery: GenerationRecovery::NoCheckpoint
+                recovery: GenerationRecovery::NoCheckpoint,
+                recovery_checkpoint: None,
             }
         );
 
@@ -285,6 +1183,270 @@ mod tests {
                 .unwrap()
                 .expect("new generation manifest should be written");
         assert_eq!(written_manifest, expected_manifest);
+    }
+
+    /// Publishing a generation is what commits a job to a recovery checkpoint, so a
+    /// checkpoint written by another backend has to be refused *before* either the current
+    /// generation file or the new generation manifest is written. The recording store is
+    /// the assertion: after the fixture is in place, a rejected initialization must not
+    /// write a single object.
+    #[tokio::test]
+    async fn initialize_generation_writes_nothing_when_the_recovery_checkpoint_disagrees() {
+        let store = MemoryProtocolStore::default();
+        let paths = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J"));
+        write_current_generation(&store, &paths, Generation(1)).await;
+
+        let checkpoint_ref = paths.checkpoint_manifest(Generation(1), Epoch(1));
+        let mut checkpoint = checkpoint_for_generation(Generation(1), 1, None, false);
+        checkpoint.operators = vec![operator_with_selector(
+            global_operator(vec![]),
+            "stateengine",
+        )];
+        write_canonical_checkpoint(&store, &paths, &checkpoint_ref, &checkpoint).await;
+        put_json(
+            &store,
+            &paths.generation_manifest(Generation(1)),
+            &generation_manifest_for_generation(Generation(1), None, Some(checkpoint_ref.clone())),
+        )
+        .await
+        .unwrap();
+
+        store.forget_writes();
+
+        let err = initialize_generation(
+            &store,
+            InitializeGenerationRequest {
+                pipeline_id: PipelineId::new("P"),
+                job_id: JobId::new("J"),
+                generation: Generation(2),
+                updated_at: from_micros(456),
+                state_backend: StateBackendSelector::Parquet,
+                program_operators: HashSet::from(["op".to_string()]),
+            },
+            true,
+        )
+        .await
+        .expect_err("a recovery checkpoint from another backend must not be published");
+
+        assert!(
+            matches!(
+                err,
+                StoreError::StateBackend(StateBackendError::CheckpointMismatch { .. })
+            ),
+            "{err:?}"
+        );
+
+        assert_eq!(
+            store.written_objects(),
+            Vec::<String>::new(),
+            "no protocol state may be published for a rejected recovery checkpoint"
+        );
+        // and specifically, neither of the two objects publication consists of
+        let current: CurrentGeneration = read_json(&store, &paths.current_generation())
+            .await
+            .unwrap()
+            .expect("the previous current generation should still be there");
+        assert_eq!(current.generation, Generation(1));
+        assert!(
+            read_json::<_, GenerationManifest>(&store, &paths.generation_manifest(Generation(2)))
+                .await
+                .unwrap()
+                .is_none(),
+            "the new generation manifest must not have been written"
+        );
+    }
+
+    /// The compatibility direction: a recovery checkpoint written before the selector
+    /// existed carries no table configs at all, which means parquet, and a parquet job
+    /// still initializes its next generation from it and gets the validated manifest back.
+    #[tokio::test]
+    async fn initialize_generation_publishes_a_legacy_recovery_checkpoint() {
+        let store = MemoryProtocolStore::default();
+        let paths = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J"));
+        write_current_generation(&store, &paths, Generation(1)).await;
+
+        let checkpoint_ref = paths.checkpoint_manifest(Generation(1), Epoch(1));
+        let mut checkpoint = checkpoint_for_generation(Generation(1), 1, None, false);
+        checkpoint.operators = vec![operator_with_selector(global_operator(vec![]), "")];
+        write_canonical_checkpoint(&store, &paths, &checkpoint_ref, &checkpoint).await;
+        put_json(
+            &store,
+            &paths.generation_manifest(Generation(1)),
+            &generation_manifest_for_generation(Generation(1), None, Some(checkpoint_ref.clone())),
+        )
+        .await
+        .unwrap();
+
+        let initialization = initialize_generation(
+            &store,
+            InitializeGenerationRequest {
+                pipeline_id: PipelineId::new("P"),
+                job_id: JobId::new("J"),
+                generation: Generation(2),
+                updated_at: from_micros(456),
+                state_backend: StateBackendSelector::Parquet,
+                program_operators: HashSet::from(["op".to_string()]),
+            },
+            true,
+        )
+        .await
+        .expect("a legacy recovery checkpoint must still be restorable");
+
+        let GenerationInitialization::Initialized {
+            recovery,
+            recovery_checkpoint,
+            ..
+        } = initialization
+        else {
+            panic!("expected the generation to be initialized, got {initialization:?}");
+        };
+        assert_eq!(
+            recovery,
+            GenerationRecovery::Ready {
+                checkpoint_ref: checkpoint_ref.clone()
+            }
+        );
+        assert_eq!(
+            recovery_checkpoint.as_ref(),
+            Some(&checkpoint),
+            "the validated manifest should be handed back rather than left to be re-read"
+        );
+
+        let current: CurrentGeneration = read_json(&store, &paths.current_generation())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.generation, Generation(2));
+        assert!(
+            read_json::<_, GenerationManifest>(&store, &paths.generation_manifest(Generation(2)))
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// Finding 2, in the four shapes a manifest can fail to describe a program.
+    ///
+    /// Publishing a generation is what commits a job to a recovery checkpoint, so a
+    /// manifest that cannot restore the program the workers will build has to be refused
+    /// *before* either the current-generation file or the new generation manifest is
+    /// written. The recording store is the assertion: after the fixture is in place, a
+    /// rejected initialization must not write a single object.
+    ///
+    /// Each shape fails only in a worker if it gets past here — the omitted operator and
+    /// the headerless entry cannot be found by the operator that looks itself up, the
+    /// extra one means the checkpoint belongs to a different program, and the duplicate
+    /// leaves it undefined which entry would be restored — by which point the protocol
+    /// state has already advanced.
+    #[tokio::test]
+    async fn initialize_generation_refuses_every_unrestorable_manifest_shape() {
+        let headerless = OperatorCheckpointMetadata {
+            operator_metadata: None,
+            ..Default::default()
+        };
+
+        let mut problems: Vec<String> = vec![];
+
+        for (name, operators, program, expect) in [
+            (
+                "missing",
+                vec![named_operator("op")],
+                vec!["op", "other"],
+                "other",
+            ),
+            (
+                "extra",
+                vec![named_operator("op"), named_operator("gone")],
+                vec!["op"],
+                "gone",
+            ),
+            (
+                "duplicate",
+                vec![named_operator("op"), named_operator("op")],
+                vec!["op"],
+                "more than once",
+            ),
+            (
+                "headerless",
+                vec![named_operator("op"), headerless.clone()],
+                vec!["op"],
+                "no operator metadata header",
+            ),
+        ] {
+            let store = MemoryProtocolStore::default();
+            let paths = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J"));
+            write_current_generation(&store, &paths, Generation(1)).await;
+
+            let checkpoint_ref = paths.checkpoint_manifest(Generation(1), Epoch(1));
+            let mut checkpoint = checkpoint_for_generation(Generation(1), 1, None, false);
+            checkpoint.operators = operators;
+            write_canonical_checkpoint(&store, &paths, &checkpoint_ref, &checkpoint).await;
+            put_json(
+                &store,
+                &paths.generation_manifest(Generation(1)),
+                &generation_manifest_for_generation(
+                    Generation(1),
+                    None,
+                    Some(checkpoint_ref.clone()),
+                ),
+            )
+            .await
+            .unwrap();
+
+            store.forget_writes();
+
+            let outcome = initialize_generation(
+                &store,
+                InitializeGenerationRequest {
+                    pipeline_id: PipelineId::new("P"),
+                    job_id: JobId::new("J"),
+                    generation: Generation(2),
+                    updated_at: from_micros(456),
+                    state_backend: StateBackendSelector::Parquet,
+                    program_operators: program.iter().map(|s| s.to_string()).collect(),
+                },
+                true,
+            )
+            .await;
+
+            // Collected rather than asserted one shape at a time, so a run reports every
+            // shape that got through instead of stopping at the first.
+            match outcome {
+                Ok(_) => problems.push(format!("{name}: this manifest must not be published")),
+                Err(StoreError::IncompleteManifest(incomplete))
+                    if incomplete.detail.contains(expect) => {}
+                Err(other) => problems.push(format!(
+                    "{name}: expected an incomplete-manifest error naming {expect:?}, got \
+                     {other:?}"
+                )),
+            }
+
+            if !store.written_objects().is_empty() {
+                problems.push(format!(
+                    "{name}: no protocol state may be published for a manifest that cannot \
+                     restore the program, but {:?} was written",
+                    store.written_objects()
+                ));
+            }
+            let current: CurrentGeneration = read_json(&store, &paths.current_generation())
+                .await
+                .unwrap()
+                .expect("the previous current generation should still be there");
+            if current.generation != Generation(1) {
+                problems.push(format!("{name}: the current generation was advanced"));
+            }
+            if read_json::<_, GenerationManifest>(&store, &paths.generation_manifest(Generation(2)))
+                .await
+                .unwrap()
+                .is_some()
+            {
+                problems.push(format!(
+                    "{name}: the new generation manifest must not have been written"
+                ));
+            }
+        }
+
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
     }
 
     #[tokio::test]
@@ -313,6 +1475,8 @@ mod tests {
                 job_id: JobId::new("J"),
                 generation: Generation(2),
                 updated_at: from_micros(456),
+                state_backend: StateBackendSelector::Parquet,
+                program_operators: HashSet::new(),
             },
             false,
         )
@@ -332,7 +1496,8 @@ mod tests {
                 generation_manifest: expected_manifest.clone(),
                 recovery: GenerationRecovery::Ready {
                     checkpoint_ref: checkpoint_ref.clone()
-                }
+                },
+                recovery_checkpoint: Some(checkpoint.clone()),
             }
         );
 
@@ -370,6 +1535,8 @@ mod tests {
                 job_id: JobId::new("J"),
                 generation: Generation(2),
                 updated_at: from_micros(456),
+                state_backend: StateBackendSelector::Parquet,
+                program_operators: HashSet::new(),
             },
             false,
         )
@@ -389,7 +1556,8 @@ mod tests {
                 recovery: GenerationRecovery::ReplayCommit {
                     checkpoint_ref: checkpoint_ref.clone(),
                     commit_permit: commit_permit(checkpoint_ref, &checkpoint),
-                }
+                },
+                recovery_checkpoint: Some(checkpoint.clone()),
             }
         );
     }
@@ -418,6 +1586,8 @@ mod tests {
                 job_id: JobId::new("J"),
                 generation: Generation(3),
                 updated_at: from_micros(789),
+                state_backend: StateBackendSelector::Parquet,
+                program_operators: HashSet::new(),
             },
             false,
         )
@@ -465,6 +1635,8 @@ mod tests {
                 job_id: JobId::new("J"),
                 generation: Generation(2),
                 updated_at: from_micros(456),
+                state_backend: StateBackendSelector::Parquet,
+                program_operators: HashSet::new(),
             },
             false,
         )
@@ -521,6 +1693,8 @@ mod tests {
                 job_id: JobId::new("J"),
                 generation: Generation(3),
                 updated_at: from_micros(456),
+                state_backend: StateBackendSelector::Parquet,
+                program_operators: HashSet::new(),
             },
             false,
         )
@@ -539,7 +1713,8 @@ mod tests {
                 ),
                 recovery: GenerationRecovery::Ready {
                     checkpoint_ref: winner_ref.clone()
-                }
+                },
+                recovery_checkpoint: Some(winner_checkpoint.clone()),
             }
         );
         let written_manifest: GenerationManifest =
@@ -586,6 +1761,8 @@ mod tests {
                 job_id: JobId::new("J"),
                 generation: Generation(3),
                 updated_at: from_micros(456),
+                state_backend: StateBackendSelector::Parquet,
+                program_operators: HashSet::new(),
             },
             false,
         )
@@ -605,7 +1782,8 @@ mod tests {
                 recovery: GenerationRecovery::ReplayCommit {
                     checkpoint_ref: winner_ref.clone(),
                     commit_permit: commit_permit(winner_ref, &winner_checkpoint),
-                }
+                },
+                recovery_checkpoint: Some(winner_checkpoint.clone()),
             }
         );
     }
@@ -623,6 +1801,8 @@ mod tests {
                 job_id: JobId::new("J"),
                 generation: Generation(2),
                 updated_at: from_micros(456),
+                state_backend: StateBackendSelector::Parquet,
+                program_operators: HashSet::new(),
             },
             false,
         )

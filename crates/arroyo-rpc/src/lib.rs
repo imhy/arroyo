@@ -3,6 +3,7 @@ pub mod checkpoints;
 pub mod formats;
 pub mod public_ids;
 pub mod schema_resolver;
+pub mod state_backend;
 pub mod var_str;
 pub mod worker_types;
 
@@ -209,7 +210,7 @@ impl From<LoadCompactedDataReq> for CompactionResult {
 
 #[derive(Debug, Clone)]
 pub struct CheckpointCompleted {
-    pub checkpoint_epoch: u32,
+    pub checkpoint_epoch: u64,
     pub operator_idx: u32,
     pub operator_id: String,
     pub subtask_metadata: SubtaskCheckpointMetadata,
@@ -217,7 +218,7 @@ pub struct CheckpointCompleted {
 
 #[derive(Debug, Clone)]
 pub struct CheckpointEvent {
-    pub checkpoint_epoch: u32,
+    pub checkpoint_epoch: u64,
     pub operator_idx: u32,
     pub operator_id: String,
     pub subtask_idx: u32,
@@ -1002,9 +1003,10 @@ pub async fn grpc_channel_builder(
     endpoint: String,
     our_tls: &Option<TlsConfig>,
     target_tls: &Option<TlsConfig>,
+    connect_timeout: Option<Duration>,
 ) -> Result<Endpoint> {
     let config = config();
-    if let Some(target_tls) = config.get_tls_config(target_tls) {
+    let endpoint = if let Some(target_tls) = config.get_tls_config(target_tls) {
         let mut endpoint = Url::parse(&endpoint)?;
         endpoint
             .set_scheme("https")
@@ -1031,11 +1033,17 @@ pub async fn grpc_channel_builder(
             config_builder = config_builder.identity(Identity::from_pem(our_tls.cert, our_tls.key));
         }
 
-        Ok(b.tls_config(config_builder).context("configuring TLS")?)
+        b.tls_config(config_builder).context("configuring TLS")?
     } else {
         debug!("connecting to grpc endpoint {endpoint}");
-        Ok(Channel::from_shared(endpoint.to_string())?)
-    }
+        Channel::from_shared(endpoint.to_string())?
+    };
+
+    Ok(if let Some(connect_timeout) = connect_timeout {
+        endpoint.connect_timeout(connect_timeout)
+    } else {
+        endpoint
+    })
 }
 
 /// Connect to a gRPC service with optional TLS
@@ -1044,17 +1052,20 @@ pub async fn connect_grpc(
     endpoint: String,
     our_tls: &Option<TlsConfig>,
     tls: &Option<TlsConfig>,
+    connect_timeout: Option<Duration>,
 ) -> Result<Channel> {
-    Ok(grpc_channel_builder(our_name, endpoint, our_tls, tls)
-        .await?
-        .connect()
-        .await?)
+    Ok(
+        grpc_channel_builder(our_name, endpoint, our_tls, tls, connect_timeout)
+            .await?
+            .connect()
+            .await?,
+    )
 }
 
 /// Connect a raw gRPC channel to the controller endpoint.
 pub async fn connect_controller(our_name: &str, our_tls: &Option<TlsConfig>) -> Result<Channel> {
     let endpoint = config().controller_endpoint();
-    connect_grpc(our_name, endpoint, our_tls, &config().controller.tls).await
+    connect_grpc(our_name, endpoint, our_tls, &config().controller.tls, None).await
 }
 
 pub async fn controller_client(
@@ -1077,7 +1088,7 @@ pub async fn job_controller_client(
         &config().controller.tls
     };
 
-    let channel = connect_grpc(our_name, addr, our_tls, their_tls).await?;
+    let channel = connect_grpc(our_name, addr, our_tls, their_tls, None).await?;
     Ok(job_controller_grpc_client::JobControllerGrpcClient::new(
         channel,
     ))
@@ -1088,9 +1099,17 @@ pub async fn job_status_client(
     our_tls: &Option<TlsConfig>,
     worker_id: WorkerId,
     addr: String,
+    connect_timeout: Option<Duration>,
 ) -> Result<job_status_grpc_client::JobStatusGrpcClient<InterceptedService<Channel, InjectWorkerId>>>
 {
-    let channel = connect_grpc(our_name, addr, our_tls, &config().worker.tls).await?;
+    let channel = connect_grpc(
+        our_name,
+        addr,
+        our_tls,
+        &config().worker.tls,
+        connect_timeout,
+    )
+    .await?;
     Ok(
         job_status_grpc_client::JobStatusGrpcClient::with_interceptor(
             channel,
@@ -1250,10 +1269,32 @@ pub struct LeaderContext {
     pub generation: u64,
 }
 
+/// The controller's own durable record of a job's *execution*, kept in the
+/// `job_statuses.state_context` column.
+///
+/// Everything here is written by the controller about a job that is running, and is read
+/// back when a controller starts up and has to rebuild its view of jobs it did not start.
+/// That is what separates it from the `job_configs` row, which is the operator's editable
+/// request: a value that must survive an edit to that row has to live here.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StateContext {
     pub version: u32,
     pub leader: Option<LeaderContext>,
+    /// The state backend this execution of the job is running with, in its persisted
+    /// spelling (`"parquet"` or `"stateengine"`), as recorded when the job's state
+    /// machine was created.
+    ///
+    /// The job's workers, their table configs, and every checkpoint they have written
+    /// carry this value, so a controller that restarts must recover *this* rather than
+    /// re-read `job_configs.state_backend` — that column can have been edited in the
+    /// meantime, and adopting the edited value would let a rebuilt controller administer
+    /// a still-running job under a backend it is not using (M11.T08d).
+    ///
+    /// `None` means the record predates this field: the job's execution was started by a
+    /// build that had no selector at all, so it is parquet. It is deliberately not
+    /// defaulted to the config row's value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_selector: Option<String>,
 }
 
 #[cfg(test)]

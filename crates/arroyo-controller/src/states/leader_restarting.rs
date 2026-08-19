@@ -1,15 +1,16 @@
 use super::{
-    JobContext, State, StateError, Transition, fatal, leader_stop_if_desired_running,
-    scheduling::Scheduling,
+    JobContext, State, StateError, Transition, check_config_update, fatal,
+    leader_stop_if_desired_running, scheduling::Scheduling,
 };
 use crate::JobMessage;
+use crate::states::lifecycle::ConsumptionPoint;
 use crate::states::recovering::Recovering;
 use crate::types::public::RestartMode;
 use arroyo_rpc::config::config;
 use arroyo_rpc::grpc::rpc;
 use arroyo_rpc::grpc::rpc::{JobFailure, JobState, JobStopMode};
 use std::time::{Duration, Instant};
-use tracing::{info, warn};
+use tracing::info;
 
 #[derive(Debug)]
 pub struct LeaderRestarting {
@@ -40,7 +41,22 @@ impl State for LeaderRestarting {
 
                 let started = Instant::now();
 
+                // What the select below parks on so that a lifecycle intent submitted while the
+                // final checkpoint is being taken ends the wait. Never ready on the landed
+                // M11.T08 mechanism — see `JobContext::lifecycle_wakeup`.
+                let wake = ctx.lifecycle_wakeup();
+
                 loop {
+                    // M11.D39a's second consumption point. This restart ends in `Scheduling`,
+                    // which starts a replacement cluster, so a stop decided while the final
+                    // checkpoint is in flight has to be read here rather than after it.
+                    if ctx
+                        .observe_lifecycle_intent(ConsumptionPoint::InsideInterruptibleWait)?
+                        .stops()
+                    {
+                        leader_stop_if_desired_running!(self, ctx.config, ctx);
+                    }
+
                     let timeout = config()
                         .pipeline
                         .checkpoint
@@ -50,14 +66,24 @@ impl State for LeaderRestarting {
                         .unwrap_or(Duration::MAX);
 
                     tokio::select! {
+                        // The loop reads the job's writer at the top of every turn, so ending
+                        // the turn is the whole of what this arm has to do.
+                        _ = wake.notified() => {}
                         msg = ctx.rx.recv() => {
                             match msg {
                                 Some(JobMessage::ConfigUpdate(c)) => {
                                     leader_stop_if_desired_running!(self, c, ctx);
 
+                                    // This restart ends in `Scheduling`, which starts
+                                    // workers from the job's selector; a stop is honoured
+                                    // above, but the job must not be rescheduled from a
+                                    // configuration that changes the backend.
+                                    check_config_update(ctx.execution_selector, &c)?;
                                 }
                                 Some(msg) => {
-                                    warn!(job_id = *ctx.config.id, ?msg, "unexpected job message in leader mode");
+                                    // Routed rather than logged here so a refused
+                                    // configuration reaches the one place that acts on it.
+                                    ctx.handle(msg)?;
                                 }
                                 None => {
                                     panic!("job queue shut down");
@@ -86,7 +112,8 @@ impl State for LeaderRestarting {
             }
             RestartMode::force => {
                 info!(
-                    job_id = *ctx.config.id,
+                    job_id = %ctx.config.id,
+                    pipeline_id = *ctx.pipeline_info.pipeline_id,
                     "force restarting job, tearing down cluster"
                 );
 

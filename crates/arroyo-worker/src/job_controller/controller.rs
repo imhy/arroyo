@@ -1,10 +1,11 @@
+use crate::job_controller::job_metrics::JobMetrics;
 use crate::job_controller::model::{
     CheckpointingOrCommittingState, JobState, RunningJobModel, TaskState, TaskStatus, WorkerState,
     WorkerStatus,
 };
 use crate::job_controller::{
     CheckpointHistory, JobControllerStatus, RetireWorkerLeader, RunningMessage, TaskFailedEvent,
-    WorkerContext, connect_to_worker,
+    WorkerContext, connect_to_worker, job_metrics,
 };
 use anyhow::{anyhow, bail};
 use arroyo_datastream::logical::LogicalProgram;
@@ -15,13 +16,15 @@ use arroyo_rpc::grpc::rpc::{
     TaskAssignment, TaskCheckpointEventType, WorkerPhase,
 };
 use arroyo_rpc::log_event;
+use arroyo_rpc::state_backend::StateBackendSelector;
 use arroyo_server_common::shutdown::ShutdownGuard;
 use arroyo_state::tables::ErasedTable;
 use arroyo_state::tables::expiring_time_key_map::ExpiringTimeKeyTable;
 use arroyo_state::tables::global_keyed_map::GlobalKeyedTable;
 use arroyo_state::{StorageProviderFor, get_storage_provider};
 use arroyo_state_protocol::ProtocolPaths;
-use arroyo_state_protocol::types::{CheckpointRef, Generation};
+use arroyo_state_protocol::gc::cleanup_leader_checkpoints;
+use arroyo_state_protocol::types::{CheckpointRef, Epoch, Generation};
 use arroyo_state_protocol::workflow::{
     CommitPermit, CommittedMarkerOutcome, GenerationInitialization, GenerationRecovery,
     InitializeGenerationRequest, complete_commit, initialize_generation,
@@ -45,7 +48,8 @@ pub struct WorkerJobController {
     checkpoint_interval: Duration,
     status: JobControllerStatus,
     model: RunningJobModel,
-    cleanup_task: Option<JoinHandle<anyhow::Result<u32>>>,
+    cleanup_task: Option<JoinHandle<anyhow::Result<Epoch>>>,
+    cleanup_backoff: Option<SystemTime>,
     rx: Receiver<RunningMessage>,
     stopping: bool,
     failing: bool,
@@ -54,6 +58,10 @@ pub struct WorkerJobController {
 }
 
 const FAILURE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(60);
+/// How many historical checkpoints to keep around
+const CHECKPOINTS_TO_KEEP: u64 = 10;
+/// Don't clean unless we're cleaning at least this many checkpoints
+const CLEAN_AT_LEAST: u64 = 3;
 
 impl std::fmt::Debug for WorkerJobController {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -78,13 +86,15 @@ impl WorkerJobController {
         worker_context: WorkerContext,
         program: Arc<LogicalProgram>,
         tasks: &[TaskAssignment],
-        epoch: u64,
-        min_epoch: u64,
+        epoch: Epoch,
+        min_epoch: Epoch,
         rx: Receiver<RunningMessage>,
         job_status: Arc<Mutex<JobStatus>>,
         checkpoint_history: Arc<Mutex<CheckpointHistory>>,
         checkpoint_interval: Duration,
         parent_ref: Option<(CheckpointRef, CheckpointManifest)>,
+        metrics: Option<JobMetrics>,
+        state_backend: StateBackendSelector,
     ) -> anyhow::Result<Self> {
         info!(job_id =? worker_context.job_id,
             restore_from =? parent_ref.as_ref().map(|p| &p.0),
@@ -137,6 +147,7 @@ impl WorkerJobController {
         let status = JobControllerStatus {
             job_status,
             checkpoint_history,
+            state_backend,
         };
         status.transition(rpc::JobState::JobRunning)?;
 
@@ -152,6 +163,15 @@ impl WorkerJobController {
                 job_id: worker_context.job_id.clone(),
                 generation: Generation(worker_context.generation),
                 updated_at: SystemTime::now(),
+                // The leader validates the checkpoint it is about to recover from against
+                // the job's selector, and does so before this generation is published.
+                state_backend,
+                // ...and against the operators this program's workers will actually
+                // build. Every one of them looks itself up in the recovery manifest as it
+                // constructs its state, so a manifest that does not describe exactly this
+                // set fails in a worker rather than here, once the generation has already
+                // been published.
+                program_operators: program.tasks_per_operator().into_keys().collect(),
             },
             false,
         )
@@ -160,6 +180,7 @@ impl WorkerJobController {
             GenerationInitialization::Initialized {
                 generation_manifest,
                 recovery,
+                ..
             } => (generation_manifest, recovery),
             GenerationInitialization::StaleGeneration { current_generation } => {
                 return Err(RetireWorkerLeader {
@@ -241,15 +262,16 @@ impl WorkerJobController {
             model: RunningJobModel {
                 pipeline_id: worker_context.pipeline_id.clone(),
                 job_id: worker_context.job_id.clone(),
-                generation: worker_context.generation,
+                generation: Generation(worker_context.generation),
                 state: JobState::Running,
                 checkpoint_state: None,
-                epoch: epoch as u32,
-                min_epoch: min_epoch as u32,
+                epoch,
+                min_epoch,
                 last_checkpoint: Instant::now(),
                 workers,
                 tasks,
                 operator_parallelism: program.tasks_per_node(),
+                job_metrics: metrics,
                 program,
                 metric_update_task: None,
                 last_updated_metrics: Instant::now(),
@@ -262,11 +284,13 @@ impl WorkerJobController {
                 worker_leader_mode: true,
                 storage_role: StorageProviderFor::Worker,
                 finished_operators: vec![],
+                state_backend,
                 generation_manifest: Some(generation_manifest),
             },
             status,
             worker_context,
             cleanup_task: None,
+            cleanup_backoff: None,
             rx,
             stopping: false,
             failing: false,
@@ -587,7 +611,7 @@ impl WorkerJobController {
                 Ok(Ok(min_epoch)) => {
                     info!(
                         message = "setting new min epoch",
-                        min_epoch,
+                        min_epoch = *min_epoch,
                         job_id = *self.worker_context.job_id
                     );
                     self.model.min_epoch = min_epoch;
@@ -599,8 +623,7 @@ impl WorkerJobController {
                         error = format!("{:?}", e)
                     );
 
-                    // wait a bit before trying again
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    self.cleanup_backoff = Some(SystemTime::now() + Duration::from_secs(10));
                 }
                 Err(e) => {
                     error!(
@@ -608,21 +631,10 @@ impl WorkerJobController {
                         job_id = *self.worker_context.job_id,
                         error = format!("{:?}", e)
                     );
-
-                    // wait a bit before trying again
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    self.cleanup_backoff = Some(SystemTime::now() + Duration::from_secs(10));
                 }
             }
         }
-
-        // TODO: cleaning
-        // if !self.stopping
-        //     && let Some(new_epoch) = self.model.cleanup_needed()
-        //     && self.cleanup_task.is_none()
-        //     && self.model.checkpoint_state.is_none()
-        // {
-        //     self.cleanup_task = Some(self.start_cleanup(new_epoch));
-        // }
 
         if self.stopping && !self.final_checkpoint_started && self.model.checkpoint_state.is_none()
         {
@@ -643,6 +655,22 @@ impl WorkerJobController {
         {
             // or do we need to start checkpointing?
             self.checkpoint(false).await?;
+        }
+
+        // do we need to start cleaning?
+        let now = SystemTime::now();
+        if !self.stopping
+            && self.cleanup_task.is_none()
+            && self.model.checkpoint_state.is_none()
+            && self.cleanup_backoff.unwrap_or(now) <= now
+        {
+            self.cleanup_task = self.start_cleanup();
+        }
+
+        // update metrics
+        if self.model.last_updated_metrics.elapsed() > job_metrics::COLLECTION_RATE {
+            self.model.update_metrics().await;
+            self.model.last_updated_metrics = Instant::now();
         }
 
         Ok(ControllerProgress::Continue)
@@ -766,7 +794,7 @@ impl WorkerJobController {
             worker
                 .connect
                 .commit(CommitReq {
-                    epoch: self.model.epoch,
+                    epoch: *self.model.epoch,
                     committing_data: committing.committing_data(),
                 })
                 .await?;
@@ -806,6 +834,52 @@ impl WorkerJobController {
 
     pub fn operator_parallelism(&self, node_id: u32) -> Option<usize> {
         self.model.operator_parallelism.get(&node_id).cloned()
+    }
+
+    fn start_cleanup(&mut self) -> Option<JoinHandle<anyhow::Result<Epoch>>> {
+        let job_id = self.worker_context.job_id.clone();
+        let paths = self.model.protocol_paths.clone();
+        // The job's authoritative selector, the same one the model checkpoints and compacts
+        // with. Leader GC deletes files named by manifests it reads back, so it is handed the
+        // selector explicitly and refuses a history any other backend wrote.
+        let state_backend = self.model.state_backend;
+
+        let new_min = Epoch((*self.model.epoch).saturating_sub(CHECKPOINTS_TO_KEEP));
+
+        if (*new_min).saturating_sub(*self.model.min_epoch) < CLEAN_AT_LEAST {
+            return None;
+        }
+
+        let last_checkpoint = self.model.checkpoint_parent_ref.as_ref()?.clone();
+
+        info!(
+            message = "Starting cleaning",
+            job_id = *job_id,
+            min_epoch = *self.model.min_epoch,
+            new_min = *new_min,
+        );
+
+        let start = Instant::now();
+        Some(tokio::spawn(async move {
+            let storage = get_storage_provider(&StorageProviderFor::Worker).await?;
+            cleanup_leader_checkpoints(
+                storage.as_ref(),
+                &paths,
+                state_backend,
+                last_checkpoint,
+                new_min,
+            )
+            .await?;
+
+            info!(
+                message = "Finished cleaning",
+                job_id = *job_id,
+                new_min = *new_min,
+                duration = start.elapsed().as_secs_f32()
+            );
+
+            Ok(new_min)
+        }))
     }
 }
 
@@ -855,7 +929,7 @@ fn manifest_into_commit_req(manifest: CheckpointManifest) -> anyhow::Result<Comm
     }
 
     Ok(CommitReq {
-        epoch: manifest.epoch as u32,
+        epoch: manifest.epoch,
         committing_data,
     })
 }

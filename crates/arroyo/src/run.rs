@@ -167,7 +167,7 @@ async fn run_pipeline(
     if !errors.errors.is_empty() {
         eprintln!("There were some issues with the provided query");
         for error in errors.errors {
-            eprintln!("  * {error}");
+            eprintln!("  * {}", error.message);
         }
         exit(1);
     }
@@ -400,6 +400,7 @@ pub(crate) fn add_client_auth_headers(mut client_builder: ClientBuilder) -> Clie
 pub async fn run(args: RunArgs) {
     let _guard = arroyo_server_common::init_logging_with_filter(
         "pipeline",
+        &[],
         if env::var("RUST_LOG").is_err() {
             unsafe { set_var("RUST_LOG", "WARN") };
             EnvFilter::builder()

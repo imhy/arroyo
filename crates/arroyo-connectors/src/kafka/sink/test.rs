@@ -100,7 +100,8 @@ impl KafkaTopicTester {
             None,
             HashMap::new(),
         )
-        .await;
+        .await
+        .unwrap();
 
         kafka.on_start(&mut ctx).await.unwrap();
 

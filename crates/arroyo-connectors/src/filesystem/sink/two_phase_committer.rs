@@ -110,7 +110,7 @@ impl<TPC: TwoPhaseCommitter> TwoPhaseCommitterOperator<TPC> {
             .await?;
 
         let checkpoint_event = arroyo_rpc::ControlResp::CheckpointEvent(CheckpointEvent {
-            checkpoint_epoch: epoch,
+            checkpoint_epoch: epoch as u64,
             operator_idx: ctx.task_info.operator_idx,
             operator_id: ctx.task_info.operator_id.clone(),
             subtask_idx: ctx.task_info.task_index,
@@ -153,6 +153,8 @@ impl<TPC: TwoPhaseCommitter> ArrowOperator for TwoPhaseCommitterOperator<TPC> {
                 }
                 .encode_to_vec(),
                 state_version: 0,
+                // Stamped in centrally when the operator context is built.
+                state_backend: String::new(),
             },
         );
         tables
