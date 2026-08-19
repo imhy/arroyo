@@ -41,14 +41,19 @@ use crate::states::{Admission, SettlementRescue, StateError};
 
 pub(crate) mod settlement;
 
-pub(crate) use settlement::{HandoverRecord, SettlementBundle, SettlementOwner, hand_over};
-// [`settlement::SettlementOutcome`] is deliberately *not* re-exported here. Nothing in the
-// production half names it — [`super::phases::StartFanOut::issue`] resolves whatever
-// [`hand_over`] returns through `SettlementOutcome::into_fencing_record` without ever
-// binding the type — so a re-export would have to be `#[cfg(test)]`, and a `#[cfg(test)]`
-// attribute this high in the file truncates the production half that
-// `super::phase_tests::phase_graph_production_sources` cuts at the first one, making every
-// source pin over this file vacuous. The tests name `settlement::SettlementOutcome`.
+pub(crate) use settlement::{
+    HandoverRecord, SettlementBundle, SettlementOutcome, SettlementOwner, hand_over,
+    retain_without_a_phase,
+};
+// [`SettlementOutcome`] is re-exported unconditionally, and must stay that way. Review round 4
+// is what put it in the production half at all: [`AttemptLedger::settlement_rescue`] now
+// answers every arm of it instead of discarding the value, where before nothing here named the
+// type — [`super::phases::StartFanOut::issue`] resolves whatever [`hand_over`] returns through
+// `SettlementOutcome::into_fencing_record` without ever binding it — so a re-export for the
+// tests alone would have had to be `#[cfg(test)]`. A line-start `#[cfg(test)]` this high in the
+// file truncates the production half that `super::phase_tests::phase_graph_production_sources`
+// cuts at the first one, which would make every source pin over this file vacuous **while still
+// passing**. Whatever else changes here, no `#[cfg(test)]` may go above the production code.
 
 /// One `StartExecution` the fan-out issued, and whether it has been accounted for.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -163,6 +168,10 @@ impl IssuedAttempts {
 /// [`SettlementOwner`] is recorded — see [`Self::settlement_rescue`]. `None` for every caller
 /// in M11.T25, and for the landed M11.T08 path, whose rescue therefore behaves exactly as it
 /// did before.
+///
+/// An owner that *declines* there leaves the obligation with nobody at all, because the phase
+/// that would otherwise have kept it no longer exists. [`retain_without_a_phase`] is what
+/// answers that, and it does not release the authority behind an unaccounted attempt.
 #[derive(Default)]
 pub(crate) struct AttemptLedger {
     attempts: Mutex<IssuedAttempts>,
@@ -199,14 +208,34 @@ impl AttemptLedger {
     /// together: the inventory is read from this ledger — which the request futures have gone
     /// on writing to inside the rescued region, so it is what the workers actually answered —
     /// and the authority is the admission the rescue is holding.
+    ///
+    /// # Why every arm is answered here
+    ///
+    /// The offer is the same on both paths; the *disposal* is not, because this one has no
+    /// phase to give a declined obligation back to. Review round 4 found this outcome being
+    /// discarded as a statement, which released the job's lifecycle authority the instant an
+    /// owner declined — and this is the half a declining owner is most likely to be reached
+    /// from, since declining is what an owner does while it is shutting down and cancellation
+    /// is what happens to a job's state task when a controller shuts down. So every arm is
+    /// named, and [`retain_without_a_phase`] stands in for the phase that is gone.
     pub(crate) fn settlement_rescue(self: &Arc<Self>) -> Option<SettlementRescue> {
         let owner = Arc::clone(self.owner.as_ref()?);
         let ledger = Arc::clone(self);
         Some(Box::new(move |admission| {
-            hand_over(
-                SettlementBundle::new(admission, ledger.snapshot()),
-                Some(owner.as_ref()),
-            );
+            let bundle = SettlementBundle::new(admission, ledger.snapshot());
+            match hand_over(bundle, Some(owner.as_ref())) {
+                // The obligation left through the seam, or was lost inside it. `hand_over` has
+                // already said which, and logged it: an owner that took it holds the authority
+                // now, and one that dropped it released the authority itself. Neither leaves
+                // this closure anything to hold.
+                SettlementOutcome::Transferred(_) | SettlementOutcome::Abandoned { .. } => {}
+                // Nobody took it. On the phase's own path this is the phase keeping what it was
+                // always able to keep; here the phase is gone, so the obligation is disposed of
+                // by what is still owed on it.
+                SettlementOutcome::SettledInPlace(admission, issued) => {
+                    retain_without_a_phase(admission, issued);
+                }
+            }
         }))
     }
 

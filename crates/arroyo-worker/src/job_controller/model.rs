@@ -480,7 +480,7 @@ impl RunningJobModel {
                 // legacy top-level metadata object, so it takes the metadata back out
                 // rather than carrying the write token: the publication that commits this
                 // generation is gated by the protocol's own whole-manifest check.
-                let metadata = checkpointing.build_metadata().into_metadata();
+                let metadata = checkpointing.build_metadata()?.into_metadata();
 
                 let manifest = CheckpointManifest {
                     pipeline_id,
@@ -683,7 +683,7 @@ impl RunningJobModel {
             CheckpointingOrCommittingState::Checkpointing(mut checkpointing) => {
                 let metadata_span = self.start_or_get_span(JobCheckpointEventType::WritingMetadata);
 
-                let metadata = Validated::validate(checkpointing.build_metadata(), ())?;
+                let metadata = Validated::validate(checkpointing.build_metadata()?, ())?;
 
                 StateBackend::write_checkpoint_metadata(&storage_role, metadata).await?;
 

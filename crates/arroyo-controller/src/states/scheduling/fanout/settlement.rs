@@ -31,6 +31,15 @@
 //! releases the job's publication lock on the spot, and that is reported as
 //! [`SettlementRefusal::Abandoned`] rather than as a transfer.
 //!
+//! # A decline is not the same answer on both paths
+//!
+//! "The phase settles in place" is an answer only where there *is* a phase. On the rescued
+//! path there is not, and review round 4 found the consequence: the rescue discarded the
+//! [`SettlementOutcome`], so a declining owner released the job's lifecycle authority the
+//! instant it said no, with whatever the reconcile budget had given up on still unaccounted
+//! for. [`SettlementOutcome`] is therefore `#[must_use]`, and a declined obligation with
+//! nothing left to answer for it goes to [`retain_without_a_phase`] rather than out of scope.
+//!
 //! **M11.T25 implements no [`SettlementOwner`]**, which is the point rather than an omission:
 //! an owner is only safe once there is a durable record it can be recovered from after a
 //! controller restart, and that record — the M11.D39d fence — is M11.T26's. Until then
@@ -137,6 +146,14 @@ pub(crate) trait SettlementOwner: Send + Sync {
 }
 
 /// What became of an interrupted fan-out's obligation.
+///
+/// `#[must_use]` because dropping this value is a decision and not a formality: the
+/// [`SettledInPlace`](Self::SettledInPlace) arm carries the job's lifecycle authority, so a
+/// caller that lets the outcome fall out of scope has released it. That is exactly what review
+/// round 4 found at the region rescue, where the value was discarded as a statement — the
+/// compiler now refuses it, and every site has to say which arm it is answering.
+#[must_use = "this outcome can carry the job's lifecycle authority; dropping it releases the \
+              authority behind attempts that may still be unaccounted for"]
 pub(crate) enum SettlementOutcome {
     /// It was handed to an owner that outlives the phase, and the owner took it. Unreachable
     /// in M11.T25, which implements no [`SettlementOwner`].
@@ -147,6 +164,10 @@ pub(crate) enum SettlementOutcome {
     /// Reached both when there is no owner to offer it to and when the owner declined, because
     /// those are the same situation from the phase's side: nobody else is going to settle
     /// these attempts.
+    ///
+    /// **Only a phase can act on it.** The name is the returned path's answer, and the rescued
+    /// path has no phase to give it back to — see [`retain_without_a_phase`], which is what
+    /// that path does with this arm instead.
     SettledInPlace(Admission, IssuedAttempts),
     /// An owner was offered it, released the job's publication lock, and took responsibility
     /// for nothing. Unreachable in M11.T25 for the same reason as `Transferred`, and reported
@@ -346,14 +367,16 @@ pub(crate) fn hand_over(
             SettlementOutcome::Transferred(receipt)
         }
         // Declining is orderly, and the answer to it is the answer to having no owner at all:
-        // the phase keeps what it was always able to keep, and the landed
-        // `settle_under_admission` rescue ends the attempts. Nothing was released.
+        // whoever offered the obligation still has it, whole and unreleased. *Who* that is
+        // differs by path, which is why this function returns the obligation rather than
+        // disposing of it — the returned path is a phase and settles in place, and the rescued
+        // path is `retain_without_a_phase`.
         Err(SettlementRefusal::Declined(bundle)) => {
             let (admission, issued) = bundle.keep();
             warn!(
                 outstanding = issued.outstanding_count(),
-                "the job's settlement owner declined an interrupted fan-out's obligation; the \
-                 phase keeps it and settles in place"
+                "the job's settlement owner declined an interrupted fan-out's obligation; \
+                 nothing was released, and whoever offered it still owes the attempts it lists"
             );
             SettlementOutcome::SettledInPlace(admission, issued)
         }
@@ -367,4 +390,73 @@ pub(crate) fn hand_over(
             SettlementOutcome::Abandoned { outstanding }
         }
     }
+}
+
+/// Disposes of an obligation nobody took, where there is no phase left to keep it.
+///
+/// [`SettlementOutcome::SettledInPlace`] is the *returned* path's answer: the phase keeps what
+/// it was always able to keep, releases the authority into token-free
+/// [`Fencing`](super::super::fencing::Fencing) through
+/// [`SettlementOutcome::into_fencing_record`], and carries the inventory there with it, where
+/// the fence reconciliation goes on accounting for the attempts. The rescued path has none of
+/// that — the phase went with the job's state task, which is what being rescued means — so
+/// "settles in place" is not an answer it can give.
+///
+/// Review round 4 found what happens when it is treated as one: the rescue discarded the
+/// outcome, so a declining owner released the job's publication lock on the spot and the
+/// inventory went with it, unread.
+///
+/// The disposal here is therefore by what is still owed:
+///
+/// * **Nothing outstanding.** Every attempt the region issued was answered before it ended, so
+///   the obligation is discharged. The authority is released exactly where a controller with no
+///   owner at all releases it, which is the landed M11.T08 behaviour of
+///   [`settle_under_admission`](crate::states::settle_under_admission).
+/// * **Something outstanding.** An attempt the fan-out stopped offering after spending its
+///   reconcile budget, whose outcome nobody ever learned. Releasing the authority now is the one
+///   thing this mechanism exists to prevent: a refusal would become publishable behind a
+///   `StartExecution` a worker may still apply. Nobody took the obligation and nobody is left
+///   who could, so the authority is **retained** — not released here, and not releasable
+///   afterwards by anything in M11.T25.
+///
+/// # What retaining costs, and why this is the only place it is affordable
+///
+/// The job's publication lock is held for the remaining life of the controller process, and one
+/// `Arc<Mutex<()>>` is never freed. That is affordable *here* and nowhere else, because of when
+/// this runs: the rescue exists precisely because the job's state task has already been dropped,
+/// so the lock being held is one no live phase of that job is waiting on. It is not a general
+/// answer, and it is not offered as one — the general answer is M11.D39d's, which M11.T26 owns:
+/// an acknowledged durable fence makes the outstanding identifiers permanently inapplicable, and
+/// *that*, rather than the passage of time or a lack of anywhere else to put the token, is what
+/// entitles anybody to release the authority standing behind them.
+///
+/// M11.T25 cannot reach this at all: [`PhaseContext::settlement_owner`](super::super::admission::PhaseContext::settlement_owner)
+/// answers `None`, so [`AttemptLedger::settlement_rescue`](super::AttemptLedger::settlement_rescue)
+/// answers `None` and `settle_under_admission` releases the admission itself, exactly as it did
+/// before the seam existed.
+pub(crate) fn retain_without_a_phase(admission: Admission, issued: IssuedAttempts) {
+    let outstanding = issued.outstanding_count();
+    if outstanding == 0 {
+        info!(
+            issued = issued.issued_count(),
+            "the job's settlement owner declined a rescued fan-out's obligation, and every \
+             attempt it issued had already been answered; the lifecycle authority is released \
+             here, exactly as it is for a controller with no settlement owner"
+        );
+        drop(admission);
+        return;
+    }
+
+    error!(
+        outstanding,
+        issued = issued.issued_count(),
+        "the job's settlement owner declined a rescued fan-out's obligation while attempts it \
+         issued are still unaccounted for, and the phase that would have settled them no longer \
+         exists; the job's lifecycle authority is retained rather than released, so that no \
+         refusal can be published behind a StartExecution a worker may still apply"
+    );
+    // Retaining *is* this: the authority's destructor never runs, so the job's publication lock
+    // is never handed back. Releasing it is what would be unsafe, and there is no other party
+    // left to hand it to.
+    std::mem::forget(admission);
 }

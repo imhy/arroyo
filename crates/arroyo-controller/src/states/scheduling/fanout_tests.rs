@@ -672,3 +672,171 @@ async fn a_cancelled_fan_out_without_an_owner_releases_its_admission_as_before()
         "with the attempt accounted for by the answer that arrived, not by the cancellation"
     );
 }
+
+/// An owner that gives a rescued obligation back, which is the one correct way to say no.
+///
+/// A real one declines because it is shutting down, or because it already holds an obligation
+/// for a newer generation of this job. The first of those is why this pairs so badly with
+/// cancellation: a controller shutting down is what cancels the job's state task in the first
+/// place, so "the owner is going away" and "the phase has already gone" are the *same* event
+/// seen twice, and the rescue is where they meet.
+struct DecliningOwner;
+
+impl SettlementOwner for DecliningOwner {
+    fn take_over(&self, bundle: SettlementBundle) -> Result<(), SettlementBundle> {
+        Err(bundle)
+    }
+}
+
+/// The ledger of a fan-out whose obligation `owner` will be offered if it is interrupted.
+fn owned_ledger(owner: impl SettlementOwner + 'static) -> Arc<AttemptLedger> {
+    Arc::new(AttemptLedger::owned_by(Some(
+        Arc::new(owner) as Arc<dyn SettlementOwner>
+    )))
+}
+
+/// Drives `requests` until the worker has been asked, without letting the fan-out finish.
+///
+/// A bound rather than a wait: a row whose request never arrives fails with its own assertion
+/// instead of hanging the suite.
+async fn asked_and_still_running(
+    requests: &mut std::pin::Pin<
+        Box<
+            impl std::future::Future<
+                Output = (Admission, anyhow::Result<HashMap<WorkerId, WorkerClient>>),
+            >,
+        >,
+    >,
+    calls: &Arc<Calls>,
+) {
+    for _ in 0..MAX_TURNS {
+        tokio::select! {
+            _ = &mut *requests => panic!("the fan-out cannot finish before the worker answers"),
+            _ = tokio::time::sleep(TURN) => {}
+        }
+        if !calls.ids().is_empty() {
+            return;
+        }
+    }
+    panic!("the fixture's precondition: the request reached the worker");
+}
+
+/// A cancelled fan-out whose settlement owner **declines** does not release the job's
+/// lifecycle authority while an attempt is unaccounted for (review round 4, finding 1).
+///
+/// This is a regression review round 3 introduced and review round 4 caught. Before round 3
+/// `SettlementBundle::transfer_to` issued a receipt unconditionally, so the rescue's
+/// `Some(owner)` hand-over could only end in `Transferred` and discarding its outcome cost
+/// nothing. Round 3 made a decline observable — correctly — and the rescue went on discarding
+/// what came back, so `SettlementOutcome::SettledInPlace` fell out of scope and released the
+/// admission on the spot. "The phase keeps it and settles in place" is true of
+/// `StartFanOut::issue`; it is false here, because there is no phase.
+///
+/// The row is built out of the two facts that make the hazard real together:
+///
+/// * the worker never answers, so the fan-out spends its reconcile budget and gives the
+///   attempt up — the controller stopped offering the identifier and never learned what the
+///   worker did with it, which is the definition of unaccounted for; and
+/// * the state task is cancelled first, so nothing but the rescue is left to decide.
+///
+/// What must not happen is what happened: the authority released while that attempt is
+/// outstanding, which is a refusal becoming publishable behind a `StartExecution` a worker may
+/// still be applying.
+#[tokio::test]
+async fn a_cancelled_fan_out_whose_owner_declines_retains_the_unaccounted_authority() {
+    let (calls, never) = worker(WorkerId(10), Answers::NeverSettling).await;
+    let (gate, admission) = admitted().await;
+    let attempts = owned_ledger(DecliningOwner);
+
+    let mut requests = Box::pin(fan_out(
+        admission,
+        HashMap::from([(WorkerId(10), never)]),
+        Arc::clone(&attempts),
+    ));
+    asked_and_still_running(&mut requests, &calls).await;
+
+    // The job's state task is cancelled. The rescue is now the only thing holding the
+    // authority, and the region it rescued goes on retrying under it.
+    drop(requests);
+
+    // Wait for the region to reach its own terminal path: the first request plus the whole
+    // reconcile budget, after which the fan-out stops offering the identifier and returns.
+    let mut gave_up = false;
+    for _ in 0..MAX_TURNS {
+        if calls.ids().len() == super::START_EXECUTION_RECONCILE_ATTEMPTS + 1 {
+            gave_up = true;
+            break;
+        }
+        tokio::time::sleep(TURN).await;
+    }
+    assert!(
+        gave_up,
+        "the fixture's precondition: the rescued region spends its budget and gives the \
+         attempt up, which is what leaves it outstanding"
+    );
+    assert_eq!(
+        attempts.snapshot().outstanding_count(),
+        1,
+        "and the ledger says so: nobody answered, so nothing is settled"
+    );
+
+    // Long enough for the region to return and the rescue to run — both are microseconds after
+    // the last request fails, and the whole point is that nothing is released when it does.
+    tokio::time::sleep(NOTHING_HAPPENS_GRACE).await;
+    assert!(
+        gate.admit_publication().is_none(),
+        "the owner declined, and there is no phase to hand the obligation back to, so the \
+         authority is retained rather than released: a refusal published here would be \
+         published behind a StartExecution this worker may still apply"
+    );
+}
+
+/// The same decline, once every attempt has been answered, releases the authority.
+///
+/// The control, and the reason the row above is about the *obligation* rather than about
+/// declining. What entitles a rescue to release the job's publication lock is that nothing is
+/// owed under it — here the worker answers, the ledger settles, and the declined obligation is
+/// discharged, so releasing is exactly what a controller with no owner at all does. A fix that
+/// simply never released would pass the row above and fail this one.
+#[tokio::test]
+async fn a_cancelled_fan_out_whose_owner_declines_releases_a_fully_answered_obligation() {
+    let paused = Arc::new(Paused::default());
+    let (calls, slow) = worker(WorkerId(11), Answers::Pausing(paused.clone())).await;
+    let (gate, admission) = admitted().await;
+    let attempts = owned_ledger(DecliningOwner);
+
+    let mut requests = Box::pin(fan_out(
+        admission,
+        HashMap::from([(WorkerId(11), slow)]),
+        Arc::clone(&attempts),
+    ));
+    asked_and_still_running(&mut requests, &calls).await;
+
+    drop(requests);
+    tokio::time::sleep(NOTHING_HAPPENS_GRACE).await;
+    assert!(
+        gate.admit_publication().is_none(),
+        "nothing is released while the request the fan-out issued is unsettled, owner or no \
+         owner"
+    );
+
+    paused.released.notify_one();
+    let mut released = false;
+    for _ in 0..MAX_TURNS {
+        if gate.admit_publication().is_some() {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(TURN).await;
+    }
+    assert!(
+        released,
+        "and once the worker has answered there is nothing left to be answerable for, so the \
+         declined obligation is discharged and the authority goes"
+    );
+    assert_eq!(
+        attempts.snapshot().outstanding_count(),
+        0,
+        "accounted for by the answer that arrived, not by the cancellation"
+    );
+}

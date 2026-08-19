@@ -198,7 +198,13 @@ async fn checkpoint(ctx: &mut SmokeTestContext<'_>, epoch: u32) {
         }
     }
 
-    let checkpoint_metadata = Validated::validate(checkpoint_state.build_metadata(), ()).unwrap();
+    let checkpoint_metadata = Validated::validate(
+        checkpoint_state
+            .build_metadata()
+            .expect("every operator of the smoke-test program finished its checkpoint"),
+        (),
+    )
+    .unwrap();
     StateBackend::write_checkpoint_metadata(&StorageProviderFor::Worker, checkpoint_metadata)
         .await
         .unwrap();

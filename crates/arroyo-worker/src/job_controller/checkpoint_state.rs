@@ -1,6 +1,7 @@
 use crate::job_controller::committing_state::{CheckpointIdOrRef, CommittingState};
 use anyhow::{anyhow, bail};
 use arroyo_datastream::logical::LogicalProgram;
+use arroyo_rpc::errors::StateError;
 use arroyo_rpc::grpc::api::OperatorCheckpointDetail;
 use arroyo_rpc::grpc::rpc::{
     CheckpointMetadata, OperatorCheckpointMetadata, OperatorMetadata, SubtaskCheckpointMetadata,
@@ -8,12 +9,13 @@ use arroyo_rpc::grpc::rpc::{
     TaskCheckpointCompletedReq, TaskCheckpointEventReq,
 };
 use arroyo_rpc::grpc::{api, rpc};
+use arroyo_rpc::state_backend::validated::Validated;
 use arroyo_rpc::state_backend::{StateBackendSelector, validate_subtask_table_configs};
 use arroyo_rpc::{TaskEventSpans, get_event_spans, grpc, log_trace_event};
 use arroyo_state::tables::ErasedTable;
 use arroyo_state::tables::expiring_time_key_map::ExpiringTimeKeyTable;
 use arroyo_state::tables::global_keyed_map::GlobalKeyedTable;
-use arroyo_state::validated::CheckpointMetadataWrite;
+use arroyo_state::validated::{CheckpointMetadataWrite, CompletedCheckpoint, CompletedOperator};
 use arroyo_state_protocol::types::Epoch;
 use arroyo_types::{from_micros, to_micros};
 use std::collections::{HashMap, HashSet};
@@ -452,7 +454,31 @@ impl CheckpointState {
     /// together, here, where the set of operators that reported completion — each having had
     /// its subtask table configs checked as it did — is known; a caller that had to supply
     /// them separately could supply a different set from the one the metadata names.
-    pub fn build_metadata(&mut self) -> CheckpointMetadataWrite {
+    ///
+    /// # Why the entitlement is a token and not a list
+    ///
+    /// Producing both halves here was never enough, and review round 4 of PR #160 is where
+    /// that showed. The list this used to hand over was `self.operator_state.keys()`, and
+    /// `operator_state` is populated from `program.tasks_per_operator()` when the checkpoint
+    /// is *opened*: every operator of the job is in it from the first moment, whether or not
+    /// it has reported anything. So the "completed operators" were the program's operators,
+    /// the metadata named the same set, and [`CheckpointMetadataWrite`]'s own check compared
+    /// one with the other and always agreed. What actually stood between an unfinished
+    /// checkpoint and its metadata write was [`Self::done`], called by the caller on the way
+    /// past — a convention, not something the write required.
+    ///
+    /// It is carried now: the evidence is a [`Validated<CompletedCheckpoint>`] built from what
+    /// each operator's subtasks actually reported, and it cannot be obtained for an operator
+    /// that has not finished. `done()` is unchanged and still gates *when* a checkpoint is
+    /// finished; what changed is that the write no longer takes anyone's word for it.
+    ///
+    /// # Errors
+    ///
+    /// [`StateError::IncompleteCheckpoint`] if any operator of the job's program has not had
+    /// every one of its subtasks report. Unreachable through the production callers, which
+    /// build metadata only once [`Self::done`] is true — the two conditions are the same one,
+    /// counted per operator here and in total there.
+    pub fn build_metadata(&mut self) -> Result<CheckpointMetadataWrite, StateError> {
         let finish_time = SystemTime::now();
 
         for (op, details) in &self.operator_details {
@@ -493,23 +519,45 @@ impl CheckpointState {
             Default::default(),
         );
 
-        let completed_operators: Vec<String> = self
-            .operator_state
-            .keys()
-            .map(|key| key.to_string())
-            .collect();
+        // What each operator reported, not which operators exist. `operator_state` has held a
+        // record for every operator of the program since the checkpoint was opened, so its
+        // keys alone say nothing; the counters inside are the part that does.
+        let completed = CompletedCheckpoint::new(
+            *self.epoch as u32,
+            self.operator_state
+                .iter()
+                .map(|(operator_id, state)| {
+                    CompletedOperator::reported(
+                        operator_id.clone(),
+                        state.subtasks,
+                        state.subtasks_checkpointed,
+                    )
+                })
+                .collect(),
+        );
+        // The job's program, read through the other derivation of it this checkpoint kept, so
+        // the coverage half of the check compares two things rather than one with itself.
+        let program_operators: HashSet<&str> =
+            self.operator_names.keys().map(String::as_str).collect();
+        let completed = Validated::validate(completed, &program_operators)?;
 
-        CheckpointMetadataWrite::for_completed_checkpoint(
+        let mut completed_operators: Vec<String> =
+            completed.get().operator_ids().map(str::to_string).collect();
+        // A stable order for a set that came out of a `HashMap`: the metadata is written to
+        // storage and compared by tests, and iteration order is not a property of the job.
+        completed_operators.sort_unstable();
+
+        Ok(CheckpointMetadataWrite::for_completed_checkpoint(
             CheckpointMetadata {
                 job_id: self.job_id.to_string(),
                 epoch: *self.epoch as u32,
                 min_epoch: *self.min_epoch as u32,
                 start_time: to_micros(self.start_time),
                 finish_time: to_micros(finish_time),
-                operator_ids: completed_operators.clone(),
+                operator_ids: completed_operators,
             },
-            completed_operators,
-        )
+            &completed,
+        ))
     }
 
     pub fn needs_commit(&self) -> bool {
@@ -524,7 +572,8 @@ impl CheckpointState {
 #[cfg(test)]
 mod tests {
     use super::CheckpointState;
-    use arroyo_datastream::logical::LogicalProgram;
+    use arroyo_datastream::logical::{LogicalNode, LogicalProgram, OperatorName};
+    use arroyo_rpc::errors::StateError;
     use arroyo_rpc::grpc::rpc::{
         SubtaskCheckpointMetadata, TableConfig, TableEnum, TaskCheckpointCompletedReq,
     };
@@ -641,5 +690,87 @@ mod tests {
             "{err:?}"
         );
         assert_eq!(refused.bytes, 0);
+    }
+
+    /// A checkpoint of a program with one operator at `parallelism`, so a report can be one
+    /// of several rather than the whole of it.
+    fn checkpoint_state_of_one_operator(parallelism: usize) -> CheckpointState {
+        let mut program = LogicalProgram::default();
+        program.graph.add_node(LogicalNode::single(
+            1,
+            "node_3".to_string(),
+            OperatorName::ArrowValue,
+            vec![],
+            "the only operator".to_string(),
+            parallelism,
+        ));
+        CheckpointState::new(
+            Arc::new("job_1".to_string()),
+            "chk_1".to_string(),
+            Epoch(4),
+            Epoch(0),
+            Arc::new(program),
+            StateBackendSelector::Parquet,
+        )
+    }
+
+    /// One subtask's finished checkpoint with no tables in it, so the row is about the
+    /// reporting rather than about the merge.
+    fn subtask_reported(subtask_index: u32) -> TaskCheckpointCompletedReq {
+        TaskCheckpointCompletedReq {
+            operator_id: "node_3".to_string(),
+            epoch: 4,
+            metadata: Some(SubtaskCheckpointMetadata {
+                subtask_index,
+                bytes: 8,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// The metadata of a checkpoint an operator has not finished has no write token
+    /// (PR #160 review round 4, finding 2).
+    ///
+    /// What this used to do is the finding: the entitled operators were
+    /// `operator_state.keys()`, and `operator_state` has a record for every operator of the
+    /// program from the moment the checkpoint is *opened*. So the metadata named the program's
+    /// operators, the entitlement named the program's operators, and the token's check
+    /// compared them and agreed — for a checkpoint in which one subtask of two had reported.
+    /// The only thing between that and a published metadata object was `done()`, which the
+    /// caller ran on the way past.
+    ///
+    /// The two halves of the row are the same checkpoint one report apart, so what changes the
+    /// answer is the reporting and nothing else.
+    #[test]
+    fn building_the_metadata_of_an_unfinished_checkpoint_yields_no_write_token() {
+        let mut half = checkpoint_state_of_one_operator(2);
+        half.checkpoint_finished(subtask_reported(0)).unwrap();
+        assert!(
+            !half.done(),
+            "the fixture's precondition: one subtask of two"
+        );
+
+        let err = half
+            .build_metadata()
+            .expect_err("a checkpoint one of whose operators has not finished entitles no write");
+        assert!(
+            matches!(err, StateError::IncompleteCheckpoint { epoch: 4, .. }),
+            "{err:?}"
+        );
+        let message = err.to_string();
+        assert!(message.contains("node_3 (1/2"), "{message}");
+
+        // The same checkpoint, one report later. Nothing else about it changed.
+        half.checkpoint_finished(subtask_reported(1)).unwrap();
+        assert!(half.done());
+        let write = half
+            .build_metadata()
+            .expect("every subtask has reported, so the write is entitled");
+        assert_eq!(
+            write.into_metadata().operator_ids,
+            vec!["node_3".to_string()],
+            "and it names the operator that finished it"
+        );
     }
 }

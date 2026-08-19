@@ -1719,6 +1719,12 @@ impl Admission {
 /// [`Admission`] to pass to the job's owner together with the inventory of what was issued.
 /// See `scheduling::fanout::AttemptLedger::settlement_rescue`.
 ///
+/// What a rescue must *not* do is release that admission on behalf of a phase that no longer
+/// exists. It is handed the authority precisely because there is nobody else left holding it,
+/// so an owner that declines leaves the obligation with nobody — see
+/// `scheduling::fanout::settlement::retain_without_a_phase`, which is why the rescue answers
+/// every arm of what the hand-over returns rather than dropping it.
+///
 /// # What bounds the region
 ///
 /// Not the RPC deadline alone. The worker channels are built with `Endpoint::timeout` (90s in
@@ -1763,6 +1769,11 @@ where
 /// Owned and `'static` on purpose: the rescue runs in a detached task, so anything borrowed
 /// from the phase — which is what was dropped — could not be named here. That is the whole
 /// reason `PhaseContext::settlement_owner` answers with an `Arc` rather than a borrow.
+///
+/// Taking the [`Admission`] by value makes the rescue the last party that can decide anything
+/// about it: there is no path on which this returns and the authority is still somewhere a
+/// phase could reach. What the rescue owes in exchange is a decision for *every* way the
+/// hand-over can end, including the one where nobody takes the obligation.
 pub(crate) type SettlementRescue = Box<dyn FnOnce(Admission) + Send>;
 
 /// The owner [`settle_under_admission`] wraps a region in. Constructed only there.
@@ -2895,7 +2906,9 @@ mod tests {
     use arroyo_rpc::state_backend::validated::Validated;
     use arroyo_rpc::state_backend::{StateBackendError, StateBackendSelector};
     use arroyo_server_common::shutdown::{Shutdown, SignalBehavior};
-    use arroyo_state::validated::CheckpointMetadataWrite;
+    use arroyo_state::validated::{
+        CheckpointMetadataWrite, CompletedCheckpoint, CompletedOperator,
+    };
     use arroyo_state::{BackingStore, StateBackend, StorageProviderFor};
     use arroyo_types::{MachineId, PipelineId, WorkerId};
     use cornucopia_async::DatabaseSource;
@@ -5898,9 +5911,16 @@ mod tests {
         .await
         .unwrap();
 
-        // The write takes a token, so the fixture states which operators it stands behind
-        // the same way the worker that took the checkpoint does — with the set it just
-        // wrote.
+        // The write takes a token, so the fixture stands behind its operator the same way the
+        // worker that took the checkpoint does — with what that operator's subtasks reported.
+        let completed = Validated::validate(
+            CompletedCheckpoint::new(
+                RESTORED_EPOCH,
+                vec![CompletedOperator::reported(OPERATOR_ID.to_string(), 1, 1)],
+            ),
+            &std::collections::HashSet::from([OPERATOR_ID]),
+        )
+        .unwrap();
         StateBackend::write_checkpoint_metadata(
             &dir.role(),
             Validated::validate(
@@ -5913,7 +5933,7 @@ mod tests {
                         finish_time: 0,
                         operator_ids: vec![OPERATOR_ID.to_string()],
                     },
-                    vec![OPERATOR_ID.to_string()],
+                    &completed,
                 ),
                 (),
             )

@@ -1784,10 +1784,12 @@ mod tests {
         TableEnum,
     };
     use arroyo_rpc::state_backend::validated::Validated;
-    use arroyo_state::validated::CheckpointMetadataWrite;
+    use arroyo_state::validated::{
+        CheckpointMetadataWrite, CompletedCheckpoint, CompletedOperator,
+    };
     use arroyo_state::{BackingStore, StateBackend, StorageProviderFor};
     use prost::Message;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1930,9 +1932,23 @@ mod tests {
 
     /// Writes the checkpoint's top-level metadata listing `operator_ids`.
     ///
-    /// The write takes a token, so the fixture states which operators it stands behind the
-    /// same way the worker that took the checkpoint does — with the set it just wrote.
+    /// The write takes a token, so the fixture stands behind those operators the same way the
+    /// worker that took the checkpoint does — with what each operator's subtasks reported.
+    /// Every operator here is single-subtask and has finished, which is what entitles the
+    /// write; a fixture that wanted to write metadata for an unfinished operator could not.
     async fn write_checkpoint_listing(store: &LocalCheckpointStore, operator_ids: &[String]) {
+        let program: HashSet<&str> = operator_ids.iter().map(String::as_str).collect();
+        let completed = Validated::validate(
+            CompletedCheckpoint::new(
+                EPOCH,
+                operator_ids
+                    .iter()
+                    .map(|operator_id| CompletedOperator::reported(operator_id.clone(), 1, 1))
+                    .collect(),
+            ),
+            &program,
+        )
+        .unwrap();
         StateBackend::write_checkpoint_metadata(
             &store.role,
             Validated::validate(
@@ -1945,7 +1961,7 @@ mod tests {
                         finish_time: 0,
                         operator_ids: operator_ids.to_vec(),
                     },
-                    operator_ids.to_vec(),
+                    &completed,
                 ),
                 (),
             )

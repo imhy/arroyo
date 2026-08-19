@@ -2,7 +2,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 
 use arroyo_state::tables::ErasedTable;
 use arroyo_state::tables::global_keyed_map::GlobalKeyedTable;
-use arroyo_state::validated::CheckpointMetadataWrite;
+use arroyo_state::validated::{CheckpointMetadataWrite, CompletedCheckpoint, CompletedOperator};
 use arroyo_state::{BackingStore, StateBackend, StorageProviderFor};
 use rand::random;
 
@@ -29,7 +29,7 @@ use rdkafka::ClientConfig;
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic};
 use rdkafka::producer::{BaseProducer, BaseRecord};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -337,8 +337,21 @@ async fn test_kafka() {
     .await
     .unwrap();
 
-    // The write takes a token, so this fixture states which operators it stands behind the
-    // same way the worker that took the checkpoint does — with the set it just wrote.
+    // The write takes a token, so this fixture stands behind its operator the same way the
+    // worker that took the checkpoint does: with what that operator's subtasks reported. The
+    // one subtask above is the whole of this operator, and it has finished.
+    let completed = Validated::validate(
+        CompletedCheckpoint::new(
+            1,
+            vec![CompletedOperator::reported(
+                task_info.operator_id.clone(),
+                1,
+                1,
+            )],
+        ),
+        &HashSet::from([task_info.operator_id.as_str()]),
+    )
+    .unwrap();
     StateBackend::write_checkpoint_metadata(
         &StorageProviderFor::Worker,
         Validated::validate(
@@ -351,7 +364,7 @@ async fn test_kafka() {
                     finish_time: 0,
                     operator_ids: vec![task_info.operator_id.clone()],
                 },
-                vec![task_info.operator_id.clone()],
+                &completed,
             ),
             (),
         )
