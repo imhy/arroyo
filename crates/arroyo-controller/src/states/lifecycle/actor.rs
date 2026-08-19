@@ -13,7 +13,7 @@ use tracing::{error, info};
 
 use super::intent::{IntentMailbox, IntentVersion, IntentWakeup, LifecycleIntent};
 use crate::JobConfig;
-use crate::states::{JobContext, StateError, fatal};
+use crate::states::{JobContext, StateError, fatal_refused_config};
 use crate::types::public::StopMode;
 
 /// A point at which the job's single writer reads its intent mailbox.
@@ -178,7 +178,7 @@ impl LifecycleDecision {
                     error = %error,
                     "failing job whose persisted configuration was refused"
                 );
-                Err(fatal(
+                Err(fatal_refused_config(
                     "the job's persisted configuration was refused",
                     error.into(),
                 ))

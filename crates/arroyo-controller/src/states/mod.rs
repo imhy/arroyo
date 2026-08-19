@@ -80,6 +80,36 @@ pub enum Transition {
     Advance(StateHolder),
 }
 
+/// Whether a fatal reason is fatal *because of the configuration the job was carrying when it
+/// was raised*.
+///
+/// Every fatal error says the job cannot go on. This says whether a later decision about the
+/// job's configuration is entitled to withdraw it, and that is not a question the message or
+/// the [`errors::ErrorDomain`] can answer: "cannot restore a checkpoint written with a
+/// different state backend" and "the job's persisted configuration was refused" are both
+/// `Internal` fatals carrying a
+/// [`StateBackendError`](arroyo_rpc::state_backend::StateBackendError), and only one of them
+/// stops being true when an operator repairs the row.
+///
+/// The distinction is used by
+/// [`Fencing::coalesce_intent`](crate::states::scheduling::fencing::Fencing::coalesce_intent),
+/// which is the one place a standing reason is reconsidered in the light of something the
+/// job's writer said afterwards.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FatalProvenance {
+    /// The job is being failed *because its persisted configuration was refused*: the reason
+    /// describes the row, and a writer that has since adopted a different row has replaced the
+    /// thing it describes.
+    RefusedConfig,
+    /// The job is being failed for something a configuration cannot answer — its durable
+    /// state, its checkpoints, its cluster, its program. A newer row says nothing about it, so
+    /// nothing may downgrade it on the strength of one.
+    ///
+    /// The default, and deliberately so: [`fatal`] produces this, so a fatal reason nobody has
+    /// classified is one nothing is allowed to withdraw.
+    Unrelated,
+}
+
 #[derive(Error, Debug)]
 pub enum StateError {
     #[error("fatal error: {message:?}")]
@@ -87,6 +117,8 @@ pub enum StateError {
         message: String,
         domain: errors::ErrorDomain,
         source: anyhow::Error,
+        /// Why this is fatal, for the one decision that is allowed to reconsider it.
+        provenance: FatalProvenance,
     },
     #[error("retryable error: {message:?} ")]
     RetryableError {
@@ -98,11 +130,35 @@ pub enum StateError {
     },
 }
 
+/// A fatal reason that is *not* the job's configuration being refused.
+///
+/// The fail-closed default. Use [`fatal_refused_config`] for a refusal, and nothing else: a
+/// reason marked as a refusal is a reason a later adoption may withdraw, so mis-marking one
+/// loses a failure the job should have had.
 pub fn fatal(message: impl Into<String>, source: anyhow::Error) -> StateError {
     StateError::FatalError {
         message: message.into(),
         domain: errors::ErrorDomain::Internal,
         source,
+        provenance: FatalProvenance::Unrelated,
+    }
+}
+
+/// The fatal reason of a job whose persisted configuration was refused.
+///
+/// Identical to [`fatal`] except for what it records about *why*. That record is what lets a
+/// scheduling attempt that has already been interrupted tell the two apart when the job's
+/// writer adopts a newer configuration while it fences: a refusal of the replaced row is no
+/// longer a reason to fail the job, and a reason that was never about the row is unaffected.
+pub(crate) fn fatal_refused_config(
+    message: impl Into<String>,
+    source: anyhow::Error,
+) -> StateError {
+    StateError::FatalError {
+        message: message.into(),
+        domain: errors::ErrorDomain::Internal,
+        source,
+        provenance: FatalProvenance::RefusedConfig,
     }
 }
 
@@ -581,7 +637,7 @@ pub(crate) fn classify_running_config_update(
     // a backend its workers are not using.
     validate_unchanged_job_selector(&current.id, execution_selector, updated.state_backend)
         .map_err(|e| {
-            fatal(
+            fatal_refused_config(
                 "the state backend of a running job cannot be changed",
                 e.into(),
             )
@@ -720,7 +776,7 @@ pub(crate) fn handle_unhandled_message(
                 error = %e,
                 "failing job whose persisted configuration was refused"
             );
-            Err(fatal(
+            Err(fatal_refused_config(
                 "the job's persisted configuration was refused",
                 e.into(),
             ))
@@ -756,7 +812,7 @@ pub(crate) fn check_config_update(
 ) -> Result<(), StateError> {
     validate_unchanged_job_selector(&updated.id, execution_selector, updated.state_backend).map_err(
         |e| {
-            fatal(
+            fatal_refused_config(
                 "the state backend of an existing job cannot be changed",
                 e.into(),
             )
@@ -975,6 +1031,9 @@ impl JobContext<'_> {
                 source: anyhow!("task failed: {}", event.reason),
                 message: event.reason,
                 domain: event.error_domain,
+                // A task that failed is not a row that was refused: repairing the job's
+                // configuration does not un-fail it.
+                provenance: FatalProvenance::Unrelated,
             }),
             errors::RetryHint::WithBackoff => Ok(Transition::next(
                 *state,
@@ -1045,6 +1104,9 @@ impl JobContext<'_> {
                 source: anyhow!("job failed: {}", failure.message),
                 message: failure.message,
                 domain: error_domain,
+                // The job's own workers reported this; the job's configuration did not cause
+                // it and a newer one does not answer it.
+                provenance: FatalProvenance::Unrelated,
             }),
             errors::RetryHint::WithBackoff => Ok(Transition::next(
                 state,
@@ -1196,6 +1258,9 @@ async fn execute_state<'a>(
             message,
             source,
             domain,
+            // Read where it is acted on, not here: by this point the job is failing, and every
+            // fatal reason fails it the same way.
+            provenance: _,
         }) => {
             error!(
                 message = "fatal state error",
@@ -2796,10 +2861,11 @@ mod tests {
         ConsumptionPoint, JobLifecycle, LifecycleActor, LifecycleIntent, LifecycleMode,
     };
     use super::{
-        Admission, AppliedStatus, Failed, Failing, JobContext, LeaderRunning, RefusalGate, Running,
-        RunningConfigUpdate, State, StateMachine, Transition, adopt_refreshed_config,
-        check_config_update, classify_running_config_update, controller_job_failure, errors,
-        execute_state, fatal, handle_unhandled_message, lifecycle,
+        Admission, AppliedStatus, Failed, Failing, FatalProvenance, JobContext, LeaderRunning,
+        RefusalGate, Running, RunningConfigUpdate, State, StateMachine, Transition,
+        adopt_refreshed_config, check_config_update, classify_running_config_update,
+        controller_job_failure, errors, execute_state, fatal, fatal_refused_config,
+        handle_unhandled_message, lifecycle,
     };
     use crate::schedulers::{Scheduler, SchedulerError, StartPipelineReq};
     use crate::states::scheduling::admission::PhaseContext;
@@ -9523,6 +9589,79 @@ mod tests {
         );
     }
 
+    /// A fatal reason that is *not* the job's configuration being refused survives a newer
+    /// configuration (review round 3, finding 1).
+    ///
+    /// The defect: `Fencing::supersede` rewrote every `FatalError` the moment the job's writer
+    /// adopted anything, reading only "the writer decided something" and never why the standing
+    /// reason was fatal. The reviewer's own example is the one used here — the fatal
+    /// `prepare_recovery_checkpoint` raises when the manifest a job would restore from was
+    /// written by another state backend. That is a fact about what is on disk. It is still true
+    /// after any number of adoptions, and turning it into ten retries both hides a permanent
+    /// condition behind a retry budget and reports the wrong cause when the budget runs out.
+    ///
+    /// Both halves run against the same fixture and the same adopted configuration, so the only
+    /// thing that differs between them is the provenance of the reason they start from.
+    #[tokio::test]
+    async fn a_newer_configuration_does_not_withdraw_a_fatal_reason_it_did_not_cause() {
+        async fn fence_under_a_newer_configuration(standing: StateError) -> StateError {
+            let mailbox = intent_mailbox();
+            let mut harness = Harness::new(3).with_actor(&mailbox);
+            let mut ctx = harness.ctx(
+                running_config(StateBackendSelector::Parquet),
+                StateBackendSelector::Parquet,
+            );
+            let phase = PhaseContext::new(&mut ctx);
+            let mut repaired = running_config(StateBackendSelector::Parquet);
+            repaired.restart_nonce = 9;
+            mailbox.submit(LifecycleIntent::Adopt(Box::new(repaired)));
+
+            let Err(reported) = phase
+                .into_fencing(standing, IssuedAttempts::default())
+                .reconcile_and_report()
+            else {
+                panic!("an adoption that does not ask the job to stop is not a stop")
+            };
+            assert_eq!(
+                ctx.config.restart_nonce, 9,
+                "the fixture's precondition: the newer configuration really was adopted, so \
+                 both halves are asked the same question"
+            );
+            reported
+        }
+
+        // The half that must keep working: a refusal of the row the writer has just replaced.
+        let reported = fence_under_a_newer_configuration(refusal_reason()).await;
+        assert!(
+            matches!(reported, StateError::RetryableError { .. }),
+            "the control, and D96 row 9: a job may not be failed for a configuration its own \
+             writer has since replaced — {reported:?}"
+        );
+
+        // The half this row exists for.
+        let reported = fence_under_a_newer_configuration(recovery_backend_mismatch_reason()).await;
+        let StateError::FatalError {
+            message,
+            provenance,
+            ..
+        } = &reported
+        else {
+            panic!(
+                "a checkpoint written by another backend is not a row an operator can repair, \
+                 and the job may not be told to retry ten times for it: {reported:?}"
+            )
+        };
+        assert_eq!(
+            (message.as_str(), *provenance),
+            (
+                "cannot restore a checkpoint written with a different state backend",
+                FatalProvenance::Unrelated
+            ),
+            "and it survives with its own message, so the operator is told what is actually \
+             wrong rather than that some configuration was superseded"
+        );
+    }
+
     /// A retryable reason for fencing is left exactly as it was when a newer configuration is
     /// adopted.
     ///
@@ -9561,6 +9700,53 @@ mod tests {
             ("failed to start the job's workers", 7),
             "with its own message and its own budget: the workers still failed to start, and a \
              newer configuration does not make that untrue"
+        );
+    }
+
+    /// Attempts a settlement owner was offered and then lost are still outstanding (review
+    /// round 3, finding 4).
+    ///
+    /// The accounting half of the transfer fix. A fencing job reports two numbers, and
+    /// `is_settled` is what M11.T26 will read before it may publish `Refused`: an attempt an
+    /// owner took has somebody waiting for its outcome and is deliberately not counted here, so
+    /// an attempt an owner *lost* must be — otherwise a reconciliation answers "settled" for a
+    /// job whose issued `StartExecution` requests nothing at all is accounting for.
+    #[tokio::test]
+    async fn attempts_an_owner_lost_keep_a_reconciliation_unsettled() {
+        let mut harness = Harness::new(3);
+        let mut ctx = harness.ctx(
+            running_config(StateBackendSelector::Parquet),
+            StateBackendSelector::Parquet,
+        );
+        let standing = ctx_retryable(&ctx);
+        let phase = PhaseContext::new(&mut ctx);
+        let mut interrupted = phase.into_fencing(standing, IssuedAttempts::default());
+
+        let fencing = interrupted.fencing_mut();
+        assert!(
+            fencing.reconcile().is_settled(),
+            "the control: an interruption that issued nothing and reached no worker owes \
+             nothing"
+        );
+
+        // What the phase graph records when `hand_over` reports an owner that dropped the
+        // obligation — built through the same conversion the phase uses, so the two cannot
+        // disagree about what an abandoned attempt is.
+        let (_, lost) =
+            super::scheduling::fanout::settlement::SettlementOutcome::Abandoned { outstanding: 2 }
+                .into_fencing_record();
+        fencing.note_handover(lost);
+
+        let reconciliation = fencing.reconcile();
+        assert_eq!(
+            reconciliation.outstanding_attempts, 2,
+            "the attempts the owner was handed and did not keep are back on this job's account, \
+             because nobody else has them"
+        );
+        assert!(
+            !reconciliation.is_settled(),
+            "so the job is not settled, and M11.T26 may not publish `Refused` behind requests a \
+             worker could still apply"
         );
     }
 
@@ -9606,10 +9792,25 @@ mod tests {
     }
 
     /// The fatal refusal a fencing attempt was interrupted by, exactly as
-    /// `LifecycleDecision::Refuse` builds one.
+    /// `LifecycleDecision::Refuse` builds one — including its provenance, which is the whole
+    /// of what makes it withdrawable.
     fn refusal_reason() -> StateError {
-        fatal(
+        fatal_refused_config(
             "the job's persisted configuration was refused",
+            selector_changed().into(),
+        )
+    }
+
+    /// The fatal reason `PhaseContext::prepare_recovery_checkpoint` builds when the manifest a
+    /// job would restore from was written by a different state backend.
+    ///
+    /// A *non*-configuration fatal, reachable from the same phase graph and through the same
+    /// `into_fencing`, built here exactly as `scheduling/admission.rs` builds it — which
+    /// `the_recovery_backend_mismatch_is_not_a_configuration_refusal` pins so this fixture
+    /// cannot quietly stop matching the site it stands for.
+    fn recovery_backend_mismatch_reason() -> StateError {
+        fatal(
+            "cannot restore a checkpoint written with a different state backend",
             selector_changed().into(),
         )
     }

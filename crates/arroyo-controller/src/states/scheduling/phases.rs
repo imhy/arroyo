@@ -42,7 +42,7 @@
 //! landed `Scheduling::next` remains compiled, selected and unchanged.
 
 use super::admission::{Admitted, PhaseContext, PhaseWait};
-use super::fanout::{IssuedAttempts, SettlementBundle, SettlementOutcome, hand_over};
+use super::fanout::{IssuedAttempts, SettlementBundle, hand_over};
 use super::fencing::Interrupted;
 use crate::states::{Admission, JobContext, StateError, Transition};
 
@@ -220,7 +220,10 @@ impl<'a, 'ctx> StartFanOut<'a, 'ctx> {
     /// Consumes the admission, as every irreversible effect does. On an interruption the
     /// obligation — the inventory *and* the authority — is offered to the job's settlement
     /// owner as one unit; M11.T25 has no such owner, so it comes back and the admission is
-    /// released only after the fan-out has settled in place.
+    /// released only after the fan-out has settled in place. An owner that declines, or that
+    /// drops what it is handed, ends here the same way: with an inventory this phase is still
+    /// answerable for and a record of what an owner took or lost. See
+    /// `super::fanout::SettlementOutcome::into_fencing_record`.
     ///
     /// If this future is *dropped* instead — the job's state task cancelled mid-fan-out —
     /// nothing below the `await` runs at all, and the same offer is made from the region rescue
@@ -242,18 +245,14 @@ impl<'a, 'ctx> StartFanOut<'a, 'ctx> {
         };
 
         let owner = ctx.settlement_owner();
-        match hand_over(SettlementBundle::new(admission, issued), owner.as_deref()) {
-            SettlementOutcome::Transferred(receipt) => {
-                let outstanding = receipt.outstanding();
-                let mut interrupted = ctx.into_fencing(reason, IssuedAttempts::default());
-                interrupted.fencing_mut().note_transferred(outstanding);
-                Err(interrupted)
-            }
-            SettlementOutcome::SettledInPlace(admission, issued) => {
-                drop(admission);
-                Err(ctx.into_fencing(reason, issued))
-            }
-        }
+        // The admission is released inside this, and no arm of it hands one back: whatever an
+        // owner did, what is left for the phase is an inventory and a record.
+        let (issued, handover) =
+            hand_over(SettlementBundle::new(admission, issued), owner.as_deref())
+                .into_fencing_record();
+        let mut interrupted = ctx.into_fencing(reason, issued);
+        interrupted.fencing_mut().note_handover(handover);
+        Err(interrupted)
     }
 
     /// Ends the fan-out, releasing the admission into the wait for the tasks it started.

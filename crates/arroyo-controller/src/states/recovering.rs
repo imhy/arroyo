@@ -1,5 +1,6 @@
 use super::{
-    JobContext, State, StateError, Transition, compiling::Compiling, fatal, state_backoff,
+    FatalProvenance, JobContext, State, StateError, Transition, compiling::Compiling, fatal,
+    state_backoff,
 };
 use crate::JobMessage;
 use crate::job_controller::JobController;
@@ -255,6 +256,9 @@ impl State for Recovering {
                 message: format!("Exhausted retries: {}", self.reason),
                 domain: self.domain,
                 source: self.source,
+                // Exhausting the restart budget is a fact about how often the job has failed,
+                // not about the row it is configured by.
+                provenance: FatalProvenance::Unrelated,
             });
         }
 

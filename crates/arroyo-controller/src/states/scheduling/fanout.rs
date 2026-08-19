@@ -41,7 +41,14 @@ use crate::states::{Admission, SettlementRescue, StateError};
 
 pub(crate) mod settlement;
 
-pub(crate) use settlement::{SettlementBundle, SettlementOutcome, SettlementOwner, hand_over};
+pub(crate) use settlement::{HandoverRecord, SettlementBundle, SettlementOwner, hand_over};
+// [`settlement::SettlementOutcome`] is deliberately *not* re-exported here. Nothing in the
+// production half names it — [`super::phases::StartFanOut::issue`] resolves whatever
+// [`hand_over`] returns through `SettlementOutcome::into_fencing_record` without ever
+// binding the type — so a re-export would have to be `#[cfg(test)]`, and a `#[cfg(test)]`
+// attribute this high in the file truncates the production half that
+// `super::phase_tests::phase_graph_production_sources` cuts at the first one, making every
+// source pin over this file vacuous. The tests name `settlement::SettlementOutcome`.
 
 /// One `StartExecution` the fan-out issued, and whether it has been accounted for.
 #[derive(Clone, Debug, PartialEq, Eq)]

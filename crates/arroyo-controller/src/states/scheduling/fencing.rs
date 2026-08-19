@@ -33,7 +33,8 @@
 //! The one thing an interruption does *not* have to end as is a failure. What the job's single
 //! writer said while the attempt was fencing decides that: a stop it decided on ends the
 //! attempt as a stop, and a configuration it has since repaired stops the attempt being fatal
-//! for one the job no longer has. See [`Fencing::coalesce_intent`].
+//! for a *configuration* the job no longer has — and for nothing else, which is what
+//! [`FatalProvenance`] is for. See [`Fencing::coalesce_intent`].
 
 use std::collections::BTreeSet;
 
@@ -41,8 +42,8 @@ use arroyo_types::WorkerId;
 use tracing::info;
 
 use super::admission::{FencedIntent, PhaseContext};
-use super::fanout::IssuedAttempts;
-use crate::states::{StateError, Transition};
+use super::fanout::{HandoverRecord, IssuedAttempts};
+use crate::states::{FatalProvenance, StateError, Transition};
 
 /// The worker generations a stale request issued by this scheduling attempt could still be
 /// delivered to.
@@ -148,13 +149,14 @@ pub(crate) struct Fencing<'a, 'ctx> {
     ctx: PhaseContext<'a, 'ctx>,
     targets: FenceTargets,
     outstanding: IssuedAttempts,
-    /// Attempts a settlement owner took responsibility for, if the controller had one.
+    /// What became of the obligation an interrupted fan-out offered its settlement owner, if
+    /// the controller had one.
     ///
-    /// Always zero in M11.T25, which implements no
-    /// [`SettlementOwner`](super::fanout::SettlementOwner); it is recorded rather than
+    /// Both counts are zero in M11.T25, which implements no
+    /// [`SettlementOwner`](super::fanout::SettlementOwner); the record is kept rather than
     /// assumed so that a reconciliation says how much of the obligation it is still speaking
-    /// for.
-    transferred: usize,
+    /// for — and, separately, how much of it *nobody* is.
+    handover: HandoverRecord,
 }
 
 impl<'a, 'ctx> Fencing<'a, 'ctx> {
@@ -172,13 +174,13 @@ impl<'a, 'ctx> Fencing<'a, 'ctx> {
             ctx,
             targets,
             outstanding,
-            transferred: 0,
+            handover: HandoverRecord::default(),
         }
     }
 
-    /// Records that an owner outside this phase took `attempts` of the obligation over.
-    pub(crate) fn note_transferred(&mut self, attempts: usize) {
-        self.transferred = attempts;
+    /// Records what an owner outside this phase did with the obligation it was offered.
+    pub(crate) fn note_handover(&mut self, handover: HandoverRecord) {
+        self.handover = handover;
     }
 
     /// Reconciles what this job still owes, and reports what is left.
@@ -196,7 +198,13 @@ impl<'a, 'ctx> Fencing<'a, 'ctx> {
         }
         let reconciliation = FenceReconciliation {
             pending_targets: self.targets().pending(),
-            outstanding_attempts: self.outstanding().outstanding_count(),
+            // Attempts an owner was offered and then lost are counted here and transferred
+            // ones are not, which is the whole difference between the two: a transferred
+            // attempt has somebody waiting for its outcome, and an abandoned one has nobody.
+            // Leaving them out would let `is_settled` answer `true` for a job whose issued
+            // requests nothing at all is accounting for.
+            outstanding_attempts: self.outstanding().outstanding_count()
+                + self.handover.abandoned(),
         };
         for (worker, attempt) in self.outstanding().outstanding() {
             info!(
@@ -210,7 +218,8 @@ impl<'a, 'ctx> Fencing<'a, 'ctx> {
             pending_targets = reconciliation.pending_targets,
             issued_attempts = self.outstanding().issued_count(),
             outstanding_attempts = reconciliation.outstanding_attempts,
-            transferred_attempts = self.transferred,
+            transferred_attempts = self.handover.transferred(),
+            abandoned_attempts = self.handover.abandoned(),
             "reconciling a fencing job's outstanding scheduling work"
         );
         reconciliation
@@ -265,9 +274,25 @@ impl<'a, 'ctx> Fencing<'a, 'ctx> {
     /// * **A repaired configuration** — an adoption that does not ask the job to stop — cannot
     ///   undo what already went wrong, so a standing *retryable* reason is left exactly as it
     ///   is, with its own budget and its own message: the workers still failed to start. What
-    ///   it can do is remove the one thing that would have made this attempt **fatal**, because
-    ///   a fatal reason here is the job being failed outright for a configuration that has since
-    ///   been replaced. That is D96 row 9, `repaired_row_not_failed_by_stale_intent`.
+    ///   it can do is remove a reason that is fatal **because of the configuration it has just
+    ///   replaced**, because failing a job outright for a row that no longer exists is the
+    ///   defect this whole mechanism is about. That is D96 row 9,
+    ///   `repaired_row_not_failed_by_stale_intent`.
+    ///
+    /// # What an adoption may not do
+    ///
+    /// An earlier revision of this method downgraded *every* fatal reason, on the argument that
+    /// `FencedIntent::Superseded` derives from "the writer decided something" rather than from
+    /// the standing reason's provenance. That is the wrong half of the pair to read. A job
+    /// interrupted because it "cannot restore a checkpoint written with a different state
+    /// backend" (`admission::PhaseContext::prepare_recovery_checkpoint`) is not failing for its
+    /// row: the manifest on disk was written by another backend and will still have been after
+    /// any number of adoptions. Turning that into ten retries hides a permanent condition behind
+    /// a retry budget and then fails the job with the wrong message.
+    ///
+    /// So the reason itself has to say why it is fatal, and it does — see [`FatalProvenance`],
+    /// whose default is [`Unrelated`](FatalProvenance::Unrelated). A fatal reason nobody has
+    /// classified as a configuration refusal is one nothing here may withdraw.
     ///
     /// Nothing here publishes `Refused` or touches a fence: that needs the durable record
     /// M11.T26 owns.
@@ -285,22 +310,43 @@ impl<'a, 'ctx> Fencing<'a, 'ctx> {
 
     /// Applies a newer, successful decision to the standing reason.
     ///
-    /// Fatal becomes retryable and nothing else changes — see [`Self::coalesce_intent`] for
-    /// why the two cases are not symmetric.
+    /// Exactly one kind of reason is withdrawn here: a fatal one whose provenance is the job's
+    /// configuration having been refused. A retryable reason keeps its message and its budget,
+    /// and a fatal reason about anything else keeps *being* fatal — see
+    /// [`Self::coalesce_intent`] for why the cases are not symmetric.
     fn supersede(&self, standing: &mut StateError) -> IntentCoalescing {
-        if matches!(standing, StateError::RetryableError { .. }) {
-            return IntentCoalescing::Unchanged;
+        match standing {
+            StateError::RetryableError { .. } => IntentCoalescing::Unchanged,
+            StateError::FatalError {
+                provenance: FatalProvenance::Unrelated,
+                message,
+                ..
+            } => {
+                info!(
+                    job_id = %self.ctx.job().config.id,
+                    reason = %message,
+                    "a newer configuration was adopted while this attempt was fencing, and does \
+                     not answer the reason it was interrupted by: the reason is not the job's \
+                     configuration having been refused, so it stands"
+                );
+                IntentCoalescing::Unchanged
+            }
+            StateError::FatalError {
+                provenance: FatalProvenance::RefusedConfig,
+                ..
+            } => {
+                *standing = self.ctx.retryable(
+                    "the configuration this scheduling attempt failed under has been superseded",
+                    anyhow::anyhow!(
+                        "the job's lifecycle writer adopted a newer configuration while the \
+                         attempt was fencing; rescheduling under it rather than failing the job \
+                         for one it no longer has"
+                    ),
+                    10,
+                );
+                IntentCoalescing::Coalesced
+            }
         }
-        *standing = self.ctx.retryable(
-            "the configuration this scheduling attempt failed under has been superseded",
-            anyhow::anyhow!(
-                "the job's lifecycle writer adopted a newer configuration while the attempt was \
-                 fencing; rescheduling under it rather than failing the job for one it no longer \
-                 has"
-            ),
-            10,
-        );
-        IntentCoalescing::Coalesced
     }
 
     /// The targets this job is fencing against.

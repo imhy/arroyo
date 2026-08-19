@@ -154,12 +154,22 @@ pub mod scheduling {
         }
 
         pub trait SettlementOwner: Send + Sync {
-            fn take_over(&self, bundle: SettlementBundle);
+            fn take_over(&self, bundle: SettlementBundle) -> Result<(), SettlementBundle>;
         }
+
+        #[derive(Default)]
+        pub struct HandoverRecord;
 
         pub enum SettlementOutcome {
             Transferred(SettlementReceipt),
             SettledInPlace(Admission, IssuedAttempts),
+            Abandoned { outstanding: usize },
+        }
+
+        impl SettlementOutcome {
+            pub fn into_fencing_record(self) -> (IssuedAttempts, HandoverRecord) {
+                unimplemented!()
+            }
         }
 
         impl SettlementBundle {
@@ -185,7 +195,7 @@ pub mod scheduling {
         }
 
         impl Fencing<'_, '_> {
-            pub fn note_transferred(&mut self, _attempts: usize) {}
+            pub fn note_handover(&mut self, _handover: super::fanout::HandoverRecord) {}
         }
 
         pub struct Interrupted<'a, 'ctx> {

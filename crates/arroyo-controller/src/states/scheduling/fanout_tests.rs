@@ -490,10 +490,11 @@ struct RecordingOwner {
 }
 
 impl SettlementOwner for RecordingOwner {
-    fn take_over(&self, bundle: SettlementBundle) {
+    fn take_over(&self, bundle: SettlementBundle) -> Result<(), SettlementBundle> {
         let (admission, issued) = bundle.into_parts();
         *self.issued.lock().unwrap() = Some(issued);
         *self.held.lock().unwrap() = Some(admission);
+        Ok(())
     }
 }
 
