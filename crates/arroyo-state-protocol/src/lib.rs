@@ -108,7 +108,7 @@ mod tests {
     use crate::types::{
         CommittedMarker, CurrentGeneration, EpochRecord, GenerationManifest, ProtocolError,
     };
-    use crate::validated::CheckpointHistory;
+    use crate::validated::{CheckpointHistory, CollectingJob};
     use crate::workflow::{
         CheckpointPublication, ClaimEpochRecordRequest, CommitAuthorization, CommitPermit,
         CommittedMarkerOutcome, GenerationInitialization, GenerationRecovery, GenerationResolution,
@@ -159,6 +159,32 @@ mod tests {
             parent_checkpoint_ref: parent_checkpoint_ref
                 .map(|checkpoint_ref| checkpoint_ref.to_string()),
         }
+    }
+
+    /// Puts `operators` into `checkpoint`, headed as the checkpoint's own writer heads them.
+    ///
+    /// `finish_checkpoint_leader` fills every entry's `OperatorMetadata` from the same job id
+    /// and epoch it puts in the manifest, so a fixture whose entries disagree with the manifest
+    /// they are in is not a checkpoint any writer produces. Before PR #160 review round 7 these
+    /// fixtures left the entry headers at `job_id: "J", epoch: 0` under manifests at epochs 1,
+    /// 2 and 3, which was incidental rather than deliberate — nothing in the suite asserted on
+    /// it — and it is the only thing this changes. Every assertion in every row below is the one
+    /// M11.T08 landed.
+    fn describing(
+        mut checkpoint: CheckpointManifest,
+        operators: Vec<OperatorCheckpointMetadata>,
+    ) -> CheckpointManifest {
+        checkpoint.operators = operators
+            .into_iter()
+            .map(|mut operator| {
+                if let Some(header) = operator.operator_metadata.as_mut() {
+                    header.job_id.clone_from(&checkpoint.job_id);
+                    header.epoch = checkpoint.epoch as u32;
+                }
+                operator
+            })
+            .collect();
+        checkpoint
     }
 
     fn epoch_record(checkpoint_ref: CheckpointRef, checkpoint: &CheckpointManifest) -> EpochRecord {
@@ -342,17 +368,60 @@ mod tests {
         parent_epoch: Option<u64>,
         operators: Vec<OperatorCheckpointMetadata>,
     ) {
-        let checkpoint_ref = paths.checkpoint_manifest(Generation(1), Epoch(epoch));
+        write_gc_checkpoint_in(
+            store,
+            paths,
+            Generation(1),
+            epoch,
+            parent_epoch.map(|epoch| (Generation(1), epoch)),
+            operators,
+        )
+        .await;
+    }
+
+    /// The same, for a history that spans generations: `generation` is the one this checkpoint
+    /// was written by, and `parent` names the generation and epoch of its parent link.
+    async fn write_gc_checkpoint_in(
+        store: &MemoryProtocolStore,
+        paths: &ProtocolPaths,
+        generation: Generation,
+        epoch: u64,
+        parent: Option<(Generation, u64)>,
+        operators: Vec<OperatorCheckpointMetadata>,
+    ) {
+        let checkpoint_ref = paths.checkpoint_manifest(generation, Epoch(epoch));
         let parent_checkpoint_ref =
-            parent_epoch.map(|epoch| paths.checkpoint_manifest(Generation(1), Epoch(epoch)));
-        let mut checkpoint =
-            checkpoint_for_generation(Generation(1), epoch, parent_checkpoint_ref, false);
-        checkpoint.operators = operators;
+            parent.map(|(generation, epoch)| paths.checkpoint_manifest(generation, Epoch(epoch)));
+        let checkpoint = describing(
+            checkpoint_for_generation(generation, epoch, parent_checkpoint_ref, false),
+            operators,
+        );
         write_canonical_checkpoint(store, paths, &checkpoint_ref, &checkpoint).await;
         put_json(
             store,
-            &paths.committed_marker(Generation(1), Epoch(epoch)),
+            &paths.committed_marker(generation, Epoch(epoch)),
             &committed_marker(checkpoint_ref, epoch),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Replaces the manifest object at `at` with `claimed`, leaving every other object of the
+    /// history exactly where its writer put it.
+    ///
+    /// This is what a misplaced or corrupt manifest looks like from the traversal's side: the
+    /// bytes are readable, the selector agrees, and the object is simply not the checkpoint the
+    /// reference it was read from names.
+    async fn misplace_manifest(
+        store: &MemoryProtocolStore,
+        paths: &ProtocolPaths,
+        at: (Generation, u64),
+        claimed: CheckpointManifest,
+    ) {
+        put_protobuf(
+            store,
+            &paths.checkpoint_manifest(at.0, Epoch(at.1)),
+            &claimed,
         )
         .await
         .unwrap();
@@ -1028,6 +1097,217 @@ mod tests {
         assert!(exists(&store, &old_file).await);
     }
 
+    /// The wiring row for finding 1 on the collecting path: leader GC refuses a reachable
+    /// manifest that is not the checkpoint the reference it was read from names, and deletes
+    /// nothing (PR #160 review round 7).
+    ///
+    /// Reached through [`cleanup_leader_checkpoints`] rather than through the token's check on
+    /// its own, because the claim is that the *production* traversal records the reference and
+    /// that the deletion cannot be reached without the binding — not that a helper exists.
+    /// Every object [`delete_classified_history`] removes is built from the generation and epoch
+    /// the manifest claims for itself, so the misplaced link below is one whose deletion would
+    /// have been aimed at `generations/7/` — a prefix nothing in this history occupies.
+    ///
+    /// The misplaced manifest is the *oldest* one and one of the ones being collected, so an
+    /// implementation that bound identity per checkpoint as it deleted would already have
+    /// removed the newer one's objects by the time it got there.
+    #[tokio::test]
+    async fn cleanup_refuses_a_manifest_that_is_not_the_checkpoint_its_reference_names() {
+        let store = MemoryProtocolStore::default();
+        let paths = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J"));
+        let old_file = data_ref(&paths, 1);
+        let kept_file = data_ref(&paths, 2);
+
+        store.put_bytes(&old_file, b"1".to_vec()).await.unwrap();
+        store.put_bytes(&kept_file, b"2".to_vec()).await.unwrap();
+        write_gc_checkpoint(
+            &store,
+            &paths,
+            1,
+            None,
+            vec![global_operator(vec![old_file.clone()])],
+        )
+        .await;
+        write_gc_checkpoint(
+            &store,
+            &paths,
+            2,
+            Some(1),
+            vec![global_operator(vec![kept_file.clone()])],
+        )
+        .await;
+
+        // Read from generation 1 epoch 1's reference; claims to be generation 7's.
+        misplace_manifest(
+            &store,
+            &paths,
+            (Generation(1), 1),
+            describing(
+                checkpoint_for_generation(Generation(7), 1, None, false),
+                vec![global_operator(vec![old_file.clone()])],
+            ),
+        )
+        .await;
+
+        let err = cleanup_leader_checkpoints(
+            &store,
+            &paths,
+            StateBackendSelector::Parquet,
+            paths.checkpoint_manifest(Generation(1), Epoch(2)),
+            Epoch(2),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                StoreError::Protocol(ProtocolError::CheckpointManifestMisplaced { .. })
+            ),
+            "{err:?}"
+        );
+        let message = err.to_string();
+        assert!(message.contains("generation 7"), "{message}");
+
+        assert!(store.deleted_objects().is_empty());
+        assert!(store.deleted_directories().is_empty());
+        assert!(exists(&store, &old_file).await);
+        assert!(exists(&store, &kept_file).await);
+    }
+
+    /// The wiring row for finding 2 on the collecting path: an entry headed for another
+    /// checkpoint refuses the whole history, and nothing is deleted (PR #160 review round 7).
+    ///
+    /// The manifest is exactly where it says it is here; only the entry's header moves. Leader
+    /// GC reads those headers to name the operator whose table metadata it is decoding, so an
+    /// entry from another checkpoint describes files under a directory this checkpoint does not
+    /// own — and doubt on a deleting path resolves to retain.
+    #[tokio::test]
+    async fn cleanup_refuses_a_manifest_entry_headed_for_another_checkpoint() {
+        let store = MemoryProtocolStore::default();
+        let paths = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J"));
+        let old_file = data_ref(&paths, 1);
+        let kept_file = data_ref(&paths, 2);
+
+        store.put_bytes(&old_file, b"1".to_vec()).await.unwrap();
+        store.put_bytes(&kept_file, b"2".to_vec()).await.unwrap();
+        write_gc_checkpoint(
+            &store,
+            &paths,
+            1,
+            None,
+            vec![global_operator(vec![old_file.clone()])],
+        )
+        .await;
+        write_gc_checkpoint(
+            &store,
+            &paths,
+            2,
+            Some(1),
+            vec![global_operator(vec![kept_file.clone()])],
+        )
+        .await;
+
+        // Everything about this manifest is right except the epoch its one entry is headed
+        // with, which is a checkpoint two generations of this job ago.
+        let mut planted = checkpoint_for_generation(Generation(1), 1, None, false);
+        let mut operator = global_operator(vec![old_file.clone()]);
+        operator.operator_metadata.as_mut().unwrap().epoch = 5;
+        planted.operators = vec![operator];
+        misplace_manifest(&store, &paths, (Generation(1), 1), planted).await;
+
+        let err = cleanup_leader_checkpoints(
+            &store,
+            &paths,
+            StateBackendSelector::Parquet,
+            paths.checkpoint_manifest(Generation(1), Epoch(2)),
+            Epoch(2),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(err, StoreError::IncompleteManifest(ref m) if m.detail.contains("epoch 5")),
+            "{err:?}"
+        );
+
+        assert!(store.deleted_objects().is_empty());
+        assert!(store.deleted_directories().is_empty());
+        assert!(exists(&store, &old_file).await);
+        assert!(exists(&store, &kept_file).await);
+    }
+
+    /// The difference the collecting row must admit: a reachable history spans generations and
+    /// a range of epochs, and still mints its token (PR #160 review round 7).
+    ///
+    /// The positive half of the identity binding, and the reason the rule is "each manifest is
+    /// the checkpoint *its own* reference names" rather than "every manifest carries one
+    /// identity". This chain is four checkpoints across two generations and four epochs, so no
+    /// single identity describes it; a check that bound the chain to one would refuse every
+    /// history a restarted job has.
+    #[tokio::test]
+    async fn cleanup_collects_a_history_spanning_generations_and_epochs() {
+        let store = MemoryProtocolStore::default();
+        let paths = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J"));
+
+        let file = |generation: u64, epoch: u64| {
+            checkpoint_ref(&format!(
+                "{}/operator-op/table-table-000",
+                paths.checkpoint_dir(Generation(generation), Epoch(epoch))
+            ))
+        };
+        let old = [file(1, 1), file(1, 2)];
+        let kept = [file(2, 3), file(2, 4)];
+        for object in old.iter().chain(kept.iter()) {
+            store.put_bytes(object, b"x".to_vec()).await.unwrap();
+        }
+
+        for (generation, epoch, parent, object) in [
+            (1u64, 1u64, None, &old[0]),
+            (1, 2, Some((Generation(1), 1u64)), &old[1]),
+            (2, 3, Some((Generation(1), 2)), &kept[0]),
+            (2, 4, Some((Generation(2), 3)), &kept[1]),
+        ] {
+            write_gc_checkpoint_in(
+                &store,
+                &paths,
+                Generation(generation),
+                epoch,
+                parent,
+                vec![global_operator(vec![object.clone()])],
+            )
+            .await;
+        }
+
+        cleanup_leader_checkpoints(
+            &store,
+            &paths,
+            StateBackendSelector::Parquet,
+            paths.checkpoint_manifest(Generation(2), Epoch(4)),
+            Epoch(3),
+        )
+        .await
+        .expect("a chain whose every link is where it says it is collects, across generations");
+
+        for object in &old {
+            assert!(
+                !exists(&store, object).await,
+                "{object} should be collected"
+            );
+        }
+        for object in &kept {
+            assert!(exists(&store, object).await, "{object} should be retained");
+        }
+        assert!(
+            !exists(&store, &paths.checkpoint_manifest(Generation(1), Epoch(2))).await,
+            "the collected generation's manifests should be gone"
+        );
+        assert!(
+            exists(&store, &paths.checkpoint_manifest(Generation(2), Epoch(3))).await,
+            "the retained generation's manifests should still be there"
+        );
+    }
+
     /// D96 row 2 (round 1): leader GC's first delete is reachable only through a token for
     /// the *whole* reachable manifest set, so nothing the traversal named can go before
     /// every link of the chain has been accounted for.
@@ -1068,14 +1348,25 @@ mod tests {
             generation: Generation(1),
             epoch: Epoch(epoch),
         };
+        let collecting = CollectingJob {
+            state_backend: StateBackendSelector::Parquet,
+            paths: &paths,
+        };
         // A classified history as the traversal records one: the links it read, newest
-        // first, and the plan it derived from them.
+        // first — each with the reference it was read from, which is what binds what a
+        // manifest says about itself to where it actually was — and the plan it derived
+        // from them.
         let history = |reached: Vec<(u64, OperatorCheckpointMetadata)>, deleting: Vec<u64>| {
             let mut history = CheckpointHistory::default();
             for (epoch, operator) in reached {
-                let mut manifest = checkpoint_for_generation(Generation(1), epoch, None, false);
-                manifest.operators = vec![operator];
-                history.reached(owner(epoch), &manifest);
+                let manifest = describing(
+                    checkpoint_for_generation(Generation(1), epoch, None, false),
+                    vec![operator],
+                );
+                history.reached(
+                    paths.checkpoint_manifest(Generation(1), Epoch(epoch)),
+                    &manifest,
+                );
             }
             history.classified(
                 deleting.into_iter().map(owner).collect(),
@@ -1090,7 +1381,7 @@ mod tests {
         // A link this job did not write: no token, and the deletion has no other argument.
         let err = Validated::validate(
             history(vec![(2, agreeing.clone()), (1, foreign)], vec![1]),
-            StateBackendSelector::Parquet,
+            collecting,
         )
         .unwrap_err();
         assert!(
@@ -1103,11 +1394,8 @@ mod tests {
 
         // A plan naming a checkpoint the traversal never read: nothing validated the
         // manifest that named its files, so it cannot be collected either.
-        let err = Validated::validate(
-            history(vec![(2, agreeing.clone())], vec![1]),
-            StateBackendSelector::Parquet,
-        )
-        .unwrap_err();
+        let err = Validated::validate(history(vec![(2, agreeing.clone())], vec![1]), collecting)
+            .unwrap_err();
         assert!(
             matches!(
                 err,
@@ -1127,9 +1415,38 @@ mod tests {
 
         // The whole chain agrees: this is the one shape that yields the token, and the
         // deletion it authorizes is the ordinary one.
+        // A link that is not the checkpoint the reference it was read from names: no token
+        // either, because every object the deletion removes is built from the generation and
+        // epoch those bytes claim (PR #160 review round 7, finding 1).
+        let mut misplaced = CheckpointHistory::default();
+        misplaced.reached(
+            paths.checkpoint_manifest(Generation(1), Epoch(2)),
+            &describing(
+                checkpoint_for_generation(Generation(1), 2, None, false),
+                vec![agreeing.clone()],
+            ),
+        );
+        misplaced.reached(
+            paths.checkpoint_manifest(Generation(1), Epoch(1)),
+            // Read from epoch 1's reference, claiming to be epoch 9.
+            &describing(
+                checkpoint_for_generation(Generation(1), 9, None, false),
+                vec![agreeing.clone()],
+            ),
+        );
+        misplaced.classified(vec![owner(1)], vec![old_file.clone()]);
+        let err = Validated::validate(misplaced, collecting).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::Protocol(ProtocolError::CheckpointManifestMisplaced { .. })
+            ),
+            "{err:?}"
+        );
+
         let validated = Validated::validate(
             history(vec![(2, agreeing.clone()), (1, agreeing)], vec![1]),
-            StateBackendSelector::Parquet,
+            collecting,
         )
         .expect("a whole, agreeing history is exactly what a token is for");
         delete_classified_history(&store, &paths, &validated)
@@ -1197,11 +1514,13 @@ mod tests {
         write_current_generation(&store, &paths, Generation(1)).await;
 
         let checkpoint_ref = paths.checkpoint_manifest(Generation(1), Epoch(1));
-        let mut checkpoint = checkpoint_for_generation(Generation(1), 1, None, false);
-        checkpoint.operators = vec![operator_with_selector(
-            global_operator(vec![]),
-            "stateengine",
-        )];
+        let checkpoint = describing(
+            checkpoint_for_generation(Generation(1), 1, None, false),
+            vec![operator_with_selector(
+                global_operator(vec![]),
+                "stateengine",
+            )],
+        );
         write_canonical_checkpoint(&store, &paths, &checkpoint_ref, &checkpoint).await;
         put_json(
             &store,
@@ -1266,8 +1585,10 @@ mod tests {
         write_current_generation(&store, &paths, Generation(1)).await;
 
         let checkpoint_ref = paths.checkpoint_manifest(Generation(1), Epoch(1));
-        let mut checkpoint = checkpoint_for_generation(Generation(1), 1, None, false);
-        checkpoint.operators = vec![operator_with_selector(global_operator(vec![]), "")];
+        let checkpoint = describing(
+            checkpoint_for_generation(Generation(1), 1, None, false),
+            vec![operator_with_selector(global_operator(vec![]), "")],
+        );
         write_canonical_checkpoint(&store, &paths, &checkpoint_ref, &checkpoint).await;
         put_json(
             &store,
@@ -1378,8 +1699,10 @@ mod tests {
             write_current_generation(&store, &paths, Generation(1)).await;
 
             let checkpoint_ref = paths.checkpoint_manifest(Generation(1), Epoch(1));
-            let mut checkpoint = checkpoint_for_generation(Generation(1), 1, None, false);
-            checkpoint.operators = operators;
+            let checkpoint = describing(
+                checkpoint_for_generation(Generation(1), 1, None, false),
+                operators,
+            );
             write_canonical_checkpoint(&store, &paths, &checkpoint_ref, &checkpoint).await;
             put_json(
                 &store,
@@ -1444,6 +1767,189 @@ mod tests {
                     "{name}: the new generation manifest must not have been written"
                 ));
             }
+        }
+
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
+    /// Points generation 1's manifest at `checkpoint_ref` and writes `checkpoint` there, then
+    /// forgets the writes so a refusal's "nothing was published" can be asserted.
+    async fn stage_recovery_candidate(
+        store: &MemoryProtocolStore,
+        paths: &ProtocolPaths,
+        checkpoint_ref: &CheckpointRef,
+        checkpoint: &CheckpointManifest,
+    ) {
+        write_current_generation(store, paths, Generation(1)).await;
+        write_canonical_checkpoint(store, paths, checkpoint_ref, checkpoint).await;
+        put_json(
+            store,
+            &paths.generation_manifest(Generation(1)),
+            &generation_manifest_for_generation(Generation(1), None, Some(checkpoint_ref.clone())),
+        )
+        .await
+        .unwrap();
+        store.forget_writes();
+    }
+
+    /// Nothing at all was published, for a refused initialization.
+    async fn assert_published_nothing(
+        store: &MemoryProtocolStore,
+        paths: &ProtocolPaths,
+        name: &str,
+        problems: &mut Vec<String>,
+    ) {
+        if !store.written_objects().is_empty() {
+            problems.push(format!(
+                "{name}: no protocol state may be published, but {:?} was written",
+                store.written_objects()
+            ));
+        }
+        let current: CurrentGeneration = read_json(store, &paths.current_generation())
+            .await
+            .unwrap()
+            .expect("the previous current generation should still be there");
+        if current.generation != Generation(1) {
+            problems.push(format!("{name}: the current generation was advanced"));
+        }
+        if read_json::<_, GenerationManifest>(store, &paths.generation_manifest(Generation(2)))
+            .await
+            .unwrap()
+            .is_some()
+        {
+            problems.push(format!(
+                "{name}: the new generation manifest must not have been written"
+            ));
+        }
+    }
+
+    /// The wiring row for finding 1 on the publishing path: `initialize_generation` refuses a
+    /// recovery manifest that is not the checkpoint the reference it was read from names, and
+    /// publishes neither of the two objects publication consists of (PR #160 review round 7).
+    ///
+    /// Every case is read from generation 1 epoch 1's own reference — the one the previous
+    /// generation's manifest records — and differs from it in exactly one of the four
+    /// identities the manifest carries, including the two that would otherwise be inferred from
+    /// the others. The recovery resolution succeeds in all four: the epoch record, the parent
+    /// status and the selector all agree, which is what makes this a test of the identity
+    /// binding and not of the resolution around it.
+    ///
+    /// `generation` and `epoch` are the two review round 6 left out, on the reasoning that a
+    /// recovery checkpoint is always from an earlier generation and epoch. That is true of the
+    /// generation being *published* and says nothing about the *reference*.
+    #[tokio::test]
+    async fn initialize_generation_refuses_a_recovery_manifest_that_is_not_where_it_says_it_is() {
+        let mut problems: Vec<String> = vec![];
+
+        for (name, pipeline_id, job_id, generation, epoch) in [
+            ("another pipeline", "P2", "J", 1u64, 1u64),
+            ("another job", "P", "J2", 1, 1),
+            ("another generation", "P", "J", 3, 1),
+            ("another epoch", "P", "J", 1, 9),
+        ] {
+            let store = MemoryProtocolStore::default();
+            let paths = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J"));
+
+            // Always read from generation 1, epoch 1: the location is fixed and only what the
+            // object claims about itself moves.
+            let checkpoint_ref = paths.checkpoint_manifest(Generation(1), Epoch(1));
+            let mut checkpoint =
+                checkpoint_for_generation(Generation(generation), epoch, None, false);
+            checkpoint.pipeline_id = pipeline_id.to_string();
+            checkpoint.job_id = job_id.to_string();
+            let checkpoint = describing(checkpoint, vec![named_operator("op")]);
+            stage_recovery_candidate(&store, &paths, &checkpoint_ref, &checkpoint).await;
+
+            let outcome = initialize_generation(
+                &store,
+                InitializeGenerationRequest {
+                    pipeline_id: PipelineId::new("P"),
+                    job_id: JobId::new("J"),
+                    generation: Generation(2),
+                    updated_at: from_micros(456),
+                    state_backend: StateBackendSelector::Parquet,
+                    program_operators: HashSet::from(["op".to_string()]),
+                },
+                true,
+            )
+            .await;
+
+            match outcome {
+                Ok(_) => problems.push(format!(
+                    "{name}: a manifest that is not the checkpoint its reference names must \
+                     not be published"
+                )),
+                Err(StoreError::Protocol(ProtocolError::CheckpointManifestMisplaced {
+                    ref checkpoint_ref,
+                    ..
+                })) if *checkpoint_ref == paths.checkpoint_manifest(Generation(1), Epoch(1)) => {}
+                Err(other) => problems.push(format!(
+                    "{name}: expected a misplaced-manifest error naming the reference, got \
+                     {other:?}"
+                )),
+            }
+
+            assert_published_nothing(&store, &paths, name, &mut problems).await;
+        }
+
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
+    /// The wiring row for finding 2 on the publishing path: `initialize_generation` refuses a
+    /// recovery manifest whose entry is headed for another checkpoint, and publishes nothing
+    /// (PR #160 review round 7).
+    ///
+    /// The outer manifest is right, the reference is right, and the operator set covers the
+    /// program exactly — the finding's exact shape. What the header decides is which state
+    /// directory the restoring worker reads and which one expiring-table compaction writes to,
+    /// so accepting it publishes a generation pointed at another checkpoint's state.
+    #[tokio::test]
+    async fn initialize_generation_refuses_a_recovery_manifest_entry_from_another_checkpoint() {
+        let mut problems: Vec<String> = vec![];
+
+        for (name, header_job, header_epoch, expect) in [
+            ("another job", "J2", 1u32, "job \"J2\""),
+            ("another epoch", "J", 5, "epoch 5"),
+        ] {
+            let store = MemoryProtocolStore::default();
+            let paths = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J"));
+
+            let checkpoint_ref = paths.checkpoint_manifest(Generation(1), Epoch(1));
+            let mut checkpoint = checkpoint_for_generation(Generation(1), 1, None, false);
+            let mut operator = named_operator("op");
+            let header = operator.operator_metadata.as_mut().unwrap();
+            header.job_id = header_job.to_string();
+            header.epoch = header_epoch;
+            checkpoint.operators = vec![operator];
+            stage_recovery_candidate(&store, &paths, &checkpoint_ref, &checkpoint).await;
+
+            let outcome = initialize_generation(
+                &store,
+                InitializeGenerationRequest {
+                    pipeline_id: PipelineId::new("P"),
+                    job_id: JobId::new("J"),
+                    generation: Generation(2),
+                    updated_at: from_micros(456),
+                    state_backend: StateBackendSelector::Parquet,
+                    program_operators: HashSet::from(["op".to_string()]),
+                },
+                true,
+            )
+            .await;
+
+            match outcome {
+                Ok(_) => problems.push(format!(
+                    "{name}: an entry headed for another checkpoint must not be published"
+                )),
+                Err(StoreError::IncompleteManifest(ref incomplete))
+                    if incomplete.detail.contains(expect) => {}
+                Err(other) => problems.push(format!(
+                    "{name}: expected an incomplete-manifest error naming {expect:?}, got \
+                     {other:?}"
+                )),
+            }
+
+            assert_published_nothing(&store, &paths, name, &mut problems).await;
         }
 
         assert!(problems.is_empty(), "{}", problems.join("\n"));
@@ -2737,6 +3243,66 @@ mod tests {
                 canonical_ref: winner_ref
             }
         );
+    }
+
+    /// The write side of the identity binding: a checkpoint manifest may only be published at
+    /// the reference its own generation and epoch name (PR #160 review round 7).
+    ///
+    /// [`publish_checkpoint`] is the only producer of a checkpoint manifest object in Arroyo,
+    /// so this is what makes "a manifest is where it says it is" a property of the store rather
+    /// than a convention `finish_checkpoint_leader` happens to keep — and the read-side rules
+    /// that refuse a misplaced object have a matching write-side rule that cannot create one.
+    ///
+    /// Nothing is written for a refused publication: the manifest object is the *first* thing
+    /// this function creates, so a late rejection would leave an object no reader will accept.
+    #[tokio::test]
+    async fn publish_checkpoint_refuses_a_manifest_written_away_from_its_own_reference() {
+        let store = MemoryProtocolStore::default();
+        let paths = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J"));
+        write_current_generation(&store, &paths, Generation(1)).await;
+
+        let checkpoint = checkpoint(1, None, false);
+        let manifest = generation_manifest(None, None);
+        store.forget_writes();
+
+        // Generation 1, epoch 1's manifest, offered at generation 1 epoch 2's reference.
+        let elsewhere = paths.checkpoint_manifest(Generation(1), Epoch(2));
+        let err = publish_checkpoint(
+            &store,
+            PublishCheckpointRequest {
+                generation_manifest: &manifest,
+                checkpoint_ref: &elsewhere,
+                checkpoint: &checkpoint,
+                created_at: from_micros(42),
+            },
+        )
+        .await
+        .expect_err("a manifest may not be published away from its own reference");
+
+        assert!(
+            matches!(
+                err,
+                StoreError::Protocol(ProtocolError::CheckpointManifestMisplaced { .. })
+            ),
+            "{err:?}"
+        );
+        assert_eq!(store.written_objects(), Vec::<String>::new());
+        assert!(!exists(&store, &elsewhere).await);
+
+        // Its own reference publishes, and is otherwise the same call.
+        let own = paths.checkpoint_manifest(Generation(1), Epoch(1));
+        publish_checkpoint(
+            &store,
+            PublishCheckpointRequest {
+                generation_manifest: &manifest,
+                checkpoint_ref: &own,
+                checkpoint: &checkpoint,
+                created_at: from_micros(42),
+            },
+        )
+        .await
+        .expect("a manifest published at its own reference is the ordinary case");
+        assert!(exists(&store, &own).await);
     }
 
     #[tokio::test]

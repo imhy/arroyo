@@ -32,6 +32,7 @@ pub mod validated;
 pub use arroyo_types::state_backend::*;
 
 use crate::grpc::rpc::{CheckpointManifest, OperatorCheckpointMetadata, TableConfig};
+use crate::state_backend::validated::identity::{CheckpointIdentity, check_operator_header};
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
@@ -134,8 +135,74 @@ pub struct IncompleteManifest {
     pub detail: String,
 }
 
-/// Checks that a restored checkpoint manifest describes **exactly** the operators the
-/// job's workers are going to build, one valid entry each.
+/// Checks that a restored checkpoint manifest, and every entry in it, is the checkpoint the
+/// caller read it for — and yields the operator ids its entries describe.
+///
+/// A manifest states the identity of its checkpoint many times over: once in its own
+/// `pipeline_id`/`job_id`/`generation`/`epoch`, and once more in every entry's
+/// `OperatorMetadata` header, which carries a `job_id` and an `epoch` of its own. Until review
+/// round 7 of PR #160 nothing compared the header with anything: it was read for its
+/// `operator_id` and no other field, so an entry lifted out of another job's or another
+/// epoch's checkpoint — carrying the right operator id — described state that is not this
+/// checkpoint's, and the worker that looks itself up in this manifest would restore from it.
+///
+/// `checkpoint` is the identity the *caller* established, and this check is worth exactly what
+/// established it. The one production caller of
+/// [`validate_manifest_covers_program`] binds it to the `CheckpointRef` the manifest was read
+/// from before calling (`arroyo_state_protocol::types::identify_checkpoint_manifest`), which is
+/// what makes this a comparison of storage's answer against the caller's question rather than
+/// of a value with itself. Passing an identity taken out of the same manifest would type-check
+/// and prove nothing; the parameter exists so that the caller has to have decided.
+///
+/// Nothing here reads or writes storage.
+///
+/// # Errors
+///
+/// Returns [`IncompleteManifest`] if the manifest names a different job or epoch than
+/// `checkpoint`, if its epoch is wider than the epoch a checkpoint object can carry, if an
+/// entry has no operator metadata header, or if an entry's header names a different job or
+/// epoch. Coverage is *not* checked here — see [`validate_manifest_covers_program`].
+pub fn validate_manifest_identity<'a>(
+    manifest: &'a CheckpointManifest,
+    checkpoint: &CheckpointIdentity,
+) -> Result<Vec<&'a str>, IncompleteManifest> {
+    let incomplete = |detail: String| IncompleteManifest {
+        epoch: manifest.epoch,
+        detail,
+    };
+
+    let claimed =
+        CheckpointIdentity::at_wide_epoch(manifest.job_id.as_str(), manifest.epoch, incomplete)?;
+    checkpoint.check_matches("the checkpoint manifest", &claimed, incomplete)?;
+
+    let mut described = Vec::with_capacity(manifest.operators.len());
+    for (index, operator) in manifest.operators.iter().enumerate() {
+        // A headerless entry cannot be found by the worker that needs it — the lookup
+        // matches on the header's operator id — so it is not a description of anything.
+        let Some(header) = operator.operator_metadata.as_ref() else {
+            return Err(incomplete(format!(
+                "entry {index} has no operator metadata header, so no operator can match it"
+            )));
+        };
+
+        // Which operator the entry describes is the entry's own to say — the coverage check
+        // below compares the whole list against the program as a set. Which *checkpoint* it
+        // belongs to is not, and that is the pair of fields this compares.
+        check_operator_header(
+            checkpoint.operator(header.operator_id.as_str()),
+            operator,
+            incomplete,
+        )?;
+
+        described.push(header.operator_id.as_str());
+    }
+
+    Ok(described)
+}
+
+/// Checks that a restored checkpoint manifest is the checkpoint the caller read it for and
+/// describes **exactly** the operators the job's workers are going to build, one valid entry
+/// each.
 ///
 /// This is the leader-mode preflight for restoring, and it exists for the same reason the
 /// legacy path's is a whole-set check rather than a per-item one: a worker constructs
@@ -155,17 +222,23 @@ pub struct IncompleteManifest {
 /// truth the legacy path's preflight uses. Both a checkpoint's entries and the program's
 /// operator set are compared as sets, so the manifest's order does not matter.
 ///
+/// `checkpoint` is which checkpoint the caller read this manifest for; see
+/// [`validate_manifest_identity`], which this runs first. Coverage is a claim about a
+/// *particular* checkpoint's entries, so identity is the coarser question and is answered
+/// before it: an entry set can cover the program perfectly and still belong to another job.
+///
 /// Nothing here reads or writes storage: it is pure set arithmetic over an object the
 /// caller has already read, so it can run before the caller publishes anything.
 ///
 /// # Errors
 ///
-/// Returns [`IncompleteManifest`] if any entry has no operator header, if two entries name
-/// the same operator, if an operator of the program is not described, or if the manifest
-/// describes an operator the program does not contain. Operators are listed sorted so the
-/// message is stable.
+/// Returns [`IncompleteManifest`] for anything [`validate_manifest_identity`] reports, if two
+/// entries name the same operator, if an operator of the program is not described, or if the
+/// manifest describes an operator the program does not contain. Operators are listed sorted so
+/// the message is stable.
 pub fn validate_manifest_covers_program(
     manifest: &CheckpointManifest,
+    checkpoint: &CheckpointIdentity,
     restoring: &HashSet<&str>,
 ) -> Result<(), IncompleteManifest> {
     let incomplete = |detail: String| IncompleteManifest {
@@ -173,21 +246,14 @@ pub fn validate_manifest_covers_program(
         detail,
     };
 
-    let mut listed: HashSet<&str> = HashSet::with_capacity(manifest.operators.len());
-    for (index, operator) in manifest.operators.iter().enumerate() {
-        // A headerless entry cannot be found by the worker that needs it — the lookup
-        // matches on the header's operator id — so it is not a description of anything.
-        let Some(header) = operator.operator_metadata.as_ref() else {
-            return Err(incomplete(format!(
-                "entry {index} has no operator metadata header, so no operator can match it"
-            )));
-        };
+    let described = validate_manifest_identity(manifest, checkpoint)?;
 
-        if !listed.insert(header.operator_id.as_str()) {
+    let mut listed: HashSet<&str> = HashSet::with_capacity(described.len());
+    for operator_id in described {
+        if !listed.insert(operator_id) {
             return Err(incomplete(format!(
-                "operator {} is described more than once, so which of its entries would \
-                 be restored is not defined",
-                header.operator_id
+                "operator {operator_id} is described more than once, so which of its entries \
+                 would be restored is not defined"
             )));
         }
     }
@@ -266,8 +332,8 @@ fn validate_table_configs(
 #[cfg(test)]
 mod tests {
     use super::{
-        StateBackendError, StateBackendSelector, validate_manifest_covers_program,
-        validate_restored_checkpoint, validate_restored_manifest,
+        CheckpointIdentity, StateBackendError, StateBackendSelector,
+        validate_manifest_covers_program, validate_restored_checkpoint, validate_restored_manifest,
         validate_restored_operator_metadata, validate_subtask_table_configs,
     };
     use crate::grpc::rpc::{
@@ -524,13 +590,35 @@ mod tests {
         );
     }
 
+    /// The checkpoint the fixtures below are of: job `job_1`, epoch 7.
+    ///
+    /// Named once so that the manifest, its entries' headers and the identity the caller asks
+    /// for cannot drift apart in a fixture the way they did in the code — which is what review
+    /// round 7 of PR #160 found. Before that round `manifest()` left `job_id` at its `Default`
+    /// empty string while `described()` headed every entry `job_1`, so the fixtures were
+    /// *incoherent* about which checkpoint they were; a doc comment in
+    /// `arroyo-state-protocol` read that incoherence as a deliberate disagreement the rows were
+    /// testing, and it was not. Only the identity fields moved; every assertion below is the
+    /// one M11.T08 landed.
+    const JOB: &str = "job_1";
+    const EPOCH: u32 = 7;
+
+    fn asked_for() -> CheckpointIdentity {
+        CheckpointIdentity::new(JOB, EPOCH)
+    }
+
     /// An entry for `operator_id`, headed as the writer heads it.
     fn described(operator_id: &str) -> OperatorCheckpointMetadata {
+        headed(JOB, operator_id, EPOCH)
+    }
+
+    /// An entry headed exactly as stated, for the rows that vary one identity at a time.
+    fn headed(job_id: &str, operator_id: &str, epoch: u32) -> OperatorCheckpointMetadata {
         OperatorCheckpointMetadata {
             operator_metadata: Some(OperatorMetadata {
-                job_id: "job_1".to_string(),
+                job_id: job_id.to_string(),
                 operator_id: operator_id.to_string(),
-                epoch: 7,
+                epoch,
                 min_watermark: None,
                 max_watermark: None,
                 parallelism: 1,
@@ -540,8 +628,17 @@ mod tests {
     }
 
     fn manifest(operators: Vec<OperatorCheckpointMetadata>) -> CheckpointManifest {
+        manifest_of(JOB, u64::from(EPOCH), operators)
+    }
+
+    fn manifest_of(
+        job_id: &str,
+        epoch: u64,
+        operators: Vec<OperatorCheckpointMetadata>,
+    ) -> CheckpointManifest {
         CheckpointManifest {
-            epoch: 7,
+            job_id: job_id.to_string(),
+            epoch,
             operators,
             ..Default::default()
         }
@@ -559,12 +656,13 @@ mod tests {
     fn a_manifest_describing_exactly_the_program_is_accepted() {
         validate_manifest_covers_program(
             &manifest(vec![described("b"), described("a")]),
+            &asked_for(),
             &program(&["a", "b"]),
         )
         .unwrap();
 
         // ...including the degenerate case of a program with no operators at all
-        validate_manifest_covers_program(&manifest(vec![]), &program(&[])).unwrap();
+        validate_manifest_covers_program(&manifest(vec![]), &asked_for(), &program(&[])).unwrap();
     }
 
     /// The defect: an operator the program contains but the manifest omits used to pass,
@@ -574,6 +672,7 @@ mod tests {
     fn a_manifest_that_omits_an_operator_is_refused() {
         let err = validate_manifest_covers_program(
             &manifest(vec![described("a")]),
+            &asked_for(),
             &program(&["a", "b"]),
         )
         .unwrap_err();
@@ -588,6 +687,7 @@ mod tests {
     fn a_manifest_with_an_extra_operator_is_refused() {
         let err = validate_manifest_covers_program(
             &manifest(vec![described("a"), described("c")]),
+            &asked_for(),
             &program(&["a"]),
         )
         .unwrap_err();
@@ -600,6 +700,7 @@ mod tests {
     fn a_manifest_describing_an_operator_twice_is_refused() {
         let err = validate_manifest_covers_program(
             &manifest(vec![described("a"), described("a")]),
+            &asked_for(),
             &program(&["a"]),
         )
         .unwrap_err();
@@ -619,6 +720,7 @@ mod tests {
                     ..Default::default()
                 },
             ]),
+            &asked_for(),
             &program(&["a"]),
         )
         .unwrap_err();
@@ -638,5 +740,111 @@ mod tests {
             }]),
         )
         .expect("the selector half has nothing to say about a headerless entry");
+    }
+
+    /// An entry whose `OperatorMetadata` header belongs to another checkpoint is refused, and
+    /// each identity is varied on its own (PR #160 review round 7, finding 2).
+    ///
+    /// The finding, exactly: this function read the header for its `operator_id` and no other
+    /// field, so a manifest with the right outer job and the right operator ids could carry an
+    /// entry headed with another job's or another epoch's identity — everything else correct,
+    /// the operator set covering the program exactly — and be published as a recovery
+    /// checkpoint. The header is what a restoring worker reads its watermark out of, and its
+    /// `job_id`/`epoch` are what expiring-table compaction builds the path of every file it
+    /// writes from, so the entry aims writes at a directory that is not this checkpoint's.
+    ///
+    /// One case per identity, each from an entry that agrees in the others: the wrong-job entry
+    /// is at the right epoch and names the right operator, and the wrong-epoch entry names the
+    /// right job and the right operator. Varying both at once would leave either check able to
+    /// carry the row on its own.
+    #[test]
+    fn a_manifest_entry_headed_for_another_checkpoint_is_refused() {
+        // The direction that must keep working, first: a manifest whose entries are headed for
+        // the checkpoint the manifest is, covering the program exactly.
+        validate_manifest_covers_program(
+            &manifest(vec![described("a"), described("b")]),
+            &asked_for(),
+            &program(&["a", "b"]),
+        )
+        .expect("entries headed for their own checkpoint are what a manifest is made of");
+
+        let wrong_job = validate_manifest_covers_program(
+            &manifest(vec![described("a"), headed("job_2", "b", EPOCH)]),
+            &asked_for(),
+            &program(&["a", "b"]),
+        )
+        .unwrap_err();
+        assert_eq!(wrong_job.epoch, 7);
+        assert!(wrong_job.detail.contains("job \"job_2\""), "{wrong_job}");
+        assert!(wrong_job.detail.contains("operator b"), "{wrong_job}");
+
+        let wrong_epoch = validate_manifest_covers_program(
+            &manifest(vec![described("a"), headed(JOB, "b", 8)]),
+            &asked_for(),
+            &program(&["a", "b"]),
+        )
+        .unwrap_err();
+        assert!(wrong_epoch.detail.contains("epoch 8"), "{wrong_epoch}");
+        assert!(wrong_epoch.detail.contains("operator b"), "{wrong_epoch}");
+
+        // And the case the operator-id-only check was built for still fails the way it did:
+        // an entry headed for an operator the program does not contain is extra, not
+        // misheaded, so it is the coverage half that reports it.
+        let extra = validate_manifest_covers_program(
+            &manifest(vec![described("a"), described("c")]),
+            &asked_for(),
+            &program(&["a"]),
+        )
+        .unwrap_err();
+        assert!(extra.detail.contains('c'), "{extra}");
+    }
+
+    /// A manifest that is not the checkpoint the caller read it for is refused before its
+    /// entries are looked at (PR #160 review round 7, finding 1).
+    ///
+    /// The identity is the coarser claim, so it is answered first: a manifest can describe the
+    /// program's operators perfectly and still be another job's or another epoch's, and once it
+    /// is accepted every path derived from it points somewhere else. Job and epoch are varied
+    /// independently, and the epoch is varied both by a value that fits a checkpoint epoch and
+    /// by one that does not — the second is the pair a truncating cast would have made equal.
+    #[test]
+    fn a_manifest_that_is_not_the_checkpoint_it_was_read_for_is_refused() {
+        let covering = || vec![described("a")];
+
+        validate_manifest_covers_program(&manifest(covering()), &asked_for(), &program(&["a"]))
+            .expect("the manifest of the checkpoint that was asked for is the ordinary case");
+
+        let other_job = validate_manifest_covers_program(
+            &manifest_of("job_2", u64::from(EPOCH), vec![headed("job_2", "a", EPOCH)]),
+            &asked_for(),
+            &program(&["a"]),
+        )
+        .unwrap_err();
+        assert!(other_job.detail.contains("job_2"), "{other_job}");
+        assert!(
+            other_job.detail.contains("different checkpoint"),
+            "{other_job}"
+        );
+
+        let other_epoch = validate_manifest_covers_program(
+            &manifest_of(JOB, 8, vec![headed(JOB, "a", 8)]),
+            &asked_for(),
+            &program(&["a"]),
+        )
+        .unwrap_err();
+        assert_eq!(other_epoch.epoch, 8, "the error names the manifest's epoch");
+        assert!(other_epoch.detail.contains("epoch 8"), "{other_epoch}");
+        assert!(other_epoch.detail.contains("epoch 7"), "{other_epoch}");
+
+        let unrepresentable = validate_manifest_covers_program(
+            &manifest_of(JOB, u64::from(u32::MAX) + 1 + u64::from(EPOCH), covering()),
+            &asked_for(),
+            &program(&["a"]),
+        )
+        .unwrap_err();
+        assert!(
+            unrepresentable.detail.contains("wider than"),
+            "{unrepresentable}"
+        );
     }
 }

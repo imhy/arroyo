@@ -6,9 +6,9 @@
 //! only producer of either is [`CheckpointCleanup::operators`], which takes the token — and
 //! that is only true while they live in one module.
 
-use super::identity::{CheckpointIdentity, check_operator_header};
 use arroyo_rpc::errors::StateError;
 use arroyo_rpc::grpc::rpc::{OperatorCheckpointMetadata, TableCheckpointMetadata, TableConfig};
+use arroyo_rpc::state_backend::validated::identity::{CheckpointIdentity, check_operator_header};
 use arroyo_rpc::state_backend::validated::{Validated, WholeObject};
 use arroyo_rpc::state_backend::{StateBackendSelector, validate_restored_operator_metadata};
 

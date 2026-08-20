@@ -1,7 +1,7 @@
 use crate::ProtocolPaths;
 use crate::store::{ProtocolStore, StoreError, read_protobuf};
 use crate::types::{CheckpointRef, Epoch, Generation, ProtocolError};
-use crate::validated::{CheckpointHistory, validate_history};
+use crate::validated::{CheckpointHistory, CollectingJob, validate_history};
 use arroyo_rpc::grpc::rpc::{
     CheckpointManifest, ExpiringKeyedTimeTableCheckpointMetadata,
     GlobalKeyedTableTaskCheckpointMetadata, TableCheckpointMetadata, TableEnum,
@@ -37,11 +37,20 @@ pub(crate) struct CheckpointOwner {
 /// *whole* chain, and [`delete_classified_history`] takes nothing else — so a caller cannot
 /// arrive at the deletion with a chain that was only partly classified.
 ///
+/// Since review round 7 of PR #160 the token's check also binds each reached manifest to the
+/// reference it was read from. `paths` is what makes that possible and is why it is handed to
+/// [`validate_history`] rather than only to [`delete_classified_history`]: every object this
+/// function removes is built from a generation and an epoch that came out of the manifest's own
+/// bytes, so a misplaced or corrupt object would otherwise aim the deletes at a checkpoint
+/// nobody asked about.
+///
 /// # Errors
 ///
-/// Returns [`StoreError::StateBackend`] if any reachable manifest disagrees with `job`, in which
-/// case nothing has been deleted, alongside the storage and protocol failures traversal can
-/// otherwise produce.
+/// Returns [`StoreError::StateBackend`] if any reachable manifest disagrees with `job`,
+/// [`StoreError::Protocol`] if one is not the checkpoint its reference names, or
+/// [`StoreError::IncompleteManifest`] if an entry of one is headed for another checkpoint — in
+/// each case nothing has been deleted — alongside the storage and protocol failures traversal
+/// can otherwise produce.
 pub async fn cleanup_leader_checkpoints<S>(
     store: &S,
     paths: &ProtocolPaths,
@@ -54,7 +63,10 @@ where
 {
     let cleanup = validate_history(
         classify_checkpoint_history(store, job, head, new_min_epoch).await?,
-        job,
+        CollectingJob {
+            state_backend: job,
+            paths,
+        },
     )?;
 
     delete_classified_history(store, paths, &cleanup).await
@@ -221,7 +233,7 @@ where
             protected_files.extend(files);
         }
 
-        history.reached(owner, &manifest);
+        history.reached(checkpoint_ref.clone(), &manifest);
 
         next = manifest
             .parent_checkpoint_ref

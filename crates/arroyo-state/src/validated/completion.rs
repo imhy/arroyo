@@ -56,7 +56,7 @@ use arroyo_rpc::state_backend::validated::WholeObject;
 use std::collections::{BTreeSet, HashSet};
 
 use super::check_program_coverage;
-use super::identity::CheckpointIdentity;
+use arroyo_rpc::state_backend::validated::identity::CheckpointIdentity;
 
 /// What one operator reported while this process took a checkpoint.
 ///

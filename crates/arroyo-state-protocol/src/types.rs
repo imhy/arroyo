@@ -1,6 +1,7 @@
 use crate::ProtocolPaths;
 /// Protobuf checkpoint manifest used as the publication point for checkpoint data.
 pub use arroyo_rpc::grpc::rpc::CheckpointManifest;
+use arroyo_rpc::state_backend::validated::identity::CheckpointIdentity;
 use arroyo_types::{JobId, PipelineId, to_micros};
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
@@ -48,6 +49,22 @@ pub enum ProtocolError {
     CheckpointGcMinEpochBeyondHead {
         head_epoch: Epoch,
         new_min_epoch: Epoch,
+    },
+    /// A checkpoint manifest read back from storage is not the checkpoint the reference it was
+    /// read from names.
+    ///
+    /// Every path that acts on a manifest — the generation manifest that records it as a
+    /// recovery point, the traversal that follows its parent link, the deletes that are built
+    /// from its generation and epoch — is built out of the identity it claims, so a misplaced
+    /// or corrupt object aims those paths rather than merely describing itself wrongly. See
+    /// [`identify_checkpoint_manifest`].
+    #[error(
+        "the checkpoint manifest at `{checkpoint_ref}` claims to be {claimed}, which is not \
+         the checkpoint that reference names"
+    )]
+    CheckpointManifestMisplaced {
+        checkpoint_ref: CheckpointRef,
+        claimed: String,
     },
     /// A garbage-collection plan would delete a checkpoint the reachable-history traversal
     /// never read, so nothing validated the manifest that named its files.
@@ -359,6 +376,69 @@ pub(crate) fn checkpoint_parent_checkpoint_ref(
         .as_ref()
         .map(|checkpoint_ref| CheckpointRef::new(checkpoint_ref.clone()))
         .transpose()
+}
+
+/// Establishes which checkpoint a manifest is, by requiring it to agree with the reference it
+/// was read from.
+///
+/// A `CheckpointManifest` read back out of storage carries its own `pipeline_id`, `job_id`,
+/// `generation` and `epoch`, and until review round 7 of PR #160 nothing on either leader-mode
+/// path compared any of the four with the `CheckpointRef` the bytes came from. That is not a
+/// description problem. `resolve_generation_manifest` rebuilds its [`ProtocolPaths`] out of
+/// the first two, and leader GC builds every object it deletes —
+/// `paths.checkpoint_manifest`, `paths.committed_marker`, `paths.epoch_record` — out of the
+/// last two. A misplaced or corrupt object therefore *aims* later reads and deletes at a
+/// checkpoint nobody asked about.
+///
+/// The check is by reconstruction rather than by parsing: `paths` is built from the job's own
+/// pipeline and job ids, so rebuilding the manifest path from the identity the object claims
+/// and comparing it with the reference the object was read from binds all four fields at once,
+/// without taking a path apart into components an id could contain.
+///
+/// It returns the [`CheckpointIdentity`] rather than `()` on purpose. That identity is what
+/// [`arroyo_rpc::state_backend::validate_manifest_covers_program`] compares the manifest's
+/// entries against, and producing it here is what makes "the entries belong to the checkpoint
+/// the reference names" unbypassable: there is no other constructor of the value that check
+/// takes, so a caller cannot reach the entry check without having passed this one.
+///
+/// # What is deliberately *not* required
+///
+/// Nothing here says the manifest's generation or epoch is the current one. A recovery
+/// checkpoint is by construction from an earlier generation and an earlier epoch — that is what
+/// recovering means — and a history traversal spans a range of both. What is required is that
+/// each manifest is the checkpoint *its own reference* names, which is a different quantity
+/// from the generation being published, and confusing the two would refuse every legitimate
+/// publication that has any history to recover from.
+///
+/// # Errors
+///
+/// Returns [`ProtocolError::CheckpointManifestMisplaced`] if the manifest names another
+/// pipeline or job, if rebuilding its path from its own generation and epoch does not produce
+/// `checkpoint_ref`, or if its epoch is wider than the epoch a checkpoint object can carry.
+pub(crate) fn identify_checkpoint_manifest(
+    paths: &ProtocolPaths,
+    checkpoint_ref: &CheckpointRef,
+    manifest: &CheckpointManifest,
+) -> Result<CheckpointIdentity, ProtocolError> {
+    let misplaced = || ProtocolError::CheckpointManifestMisplaced {
+        checkpoint_ref: checkpoint_ref.clone(),
+        claimed: format!(
+            "pipeline {}, job {}, generation {}, epoch {}",
+            manifest.pipeline_id, manifest.job_id, manifest.generation, manifest.epoch
+        ),
+    };
+
+    if manifest.pipeline_id != **paths.pipeline_id() || manifest.job_id != **paths.job_id() {
+        return Err(misplaced());
+    }
+
+    if paths.checkpoint_manifest(Generation(manifest.generation), Epoch(manifest.epoch))
+        != *checkpoint_ref
+    {
+        return Err(misplaced());
+    }
+
+    CheckpointIdentity::at_wide_epoch(manifest.job_id.as_str(), manifest.epoch, |_| misplaced())
 }
 
 pub(crate) fn validate_epoch_record_matches_checkpoint(

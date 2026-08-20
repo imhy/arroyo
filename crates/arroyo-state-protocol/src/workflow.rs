@@ -10,7 +10,7 @@ use crate::store::{
 use crate::types::{
     CheckpointRef, CommittedMarker, CurrentGeneration, Epoch, EpochRecord, Generation,
     GenerationManifest, ProtocolError, checkpoint_parent_checkpoint_ref,
-    validate_epoch_record_matches_checkpoint,
+    identify_checkpoint_manifest, validate_epoch_record_matches_checkpoint,
 };
 use crate::validated::{GenerationPublication, PublishingJob};
 use arroyo_rpc::grpc::rpc::CheckpointManifest;
@@ -649,6 +649,11 @@ where
 
 /// Publishes a completed checkpoint and claims its epoch record.
 ///
+/// `request.checkpoint_ref` must be the reference the manifest's own generation and epoch
+/// name, under the generation manifest's pipeline and job: a checkpoint manifest is read back
+/// by reference and every path derived from it comes out of the identity it carries, so an
+/// object written anywhere else is one no reader can safely act on.
+///
 /// Correct caller sequence:
 /// 1. Write all checkpoint state files.
 /// 2. Call this function with the immutable protobuf checkpoint manifest.
@@ -669,6 +674,16 @@ where
         request.generation_manifest.pipeline_id.clone(),
         request.generation_manifest.job_id.clone(),
     );
+
+    // The write side of the same relationship the read side enforces. Every reader of a
+    // checkpoint manifest — [`initialize_generation`]'s recovery publication and the leader-GC
+    // traversal — now requires the object to be the checkpoint the reference it was read from
+    // names (design item M11.D39c; PR #160 review round 7). This is the one place in Arroyo
+    // that creates such an object, so refusing to *write* a manifest anywhere but at its own
+    // reference is what makes the read-side rule a property of the store rather than a
+    // convention the writer happens to keep. `finish_checkpoint_leader` builds both halves out
+    // of the same job, generation and epoch, so no legitimate publication is refused.
+    identify_checkpoint_manifest(&paths, request.checkpoint_ref, request.checkpoint)?;
 
     let is_current_generation =
         read_json::<_, CurrentGeneration>(store, &paths.current_generation())

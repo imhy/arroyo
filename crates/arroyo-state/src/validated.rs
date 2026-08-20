@@ -19,7 +19,15 @@
 //! epoch of the range was collected. It is also about *identity*: which checkpoint of which job
 //! the object is, and whether every part of it agrees about that. Review rounds 4, 5 and 6 of
 //! PR #160 each found one identity relationship unstated, so this module now states all of them
-//! in one place, and [`identity`] holds the vocabulary they share.
+//! in one place, and
+//! [`arroyo_rpc::state_backend::validated::identity`] holds the vocabulary they share — with
+//! the two families in `arroyo-state-protocol`, which review round 7 brought under the same
+//! matrix.
+//!
+//! The matrix spans three crates, because the D39c set does. The five rows this crate owns are
+//! first; the two `arroyo-state-protocol` owns are last, and review round 7 of PR #160 is the
+//! round that brought them under the same model rather than leaving them with an identity
+//! vocabulary of their own.
 //!
 //! | Boundary | Identities that must agree | Evidence | Effect derived from |
 //! |---|---|---|---|
@@ -28,12 +36,18 @@
 //! | [`RestorableCheckpoint`] | job, epoch, and every persisted operator header's job/operator/epoch | the loaded objects | the token |
 //! | [`CheckpointCleanup`] | job, the retained epoch, **each** dropped epoch, and every header | the collected range | the token |
 //! | [`CheckpointMetadataWrite`] | the exact checkpoint identity, and the operator set | whichever family above entitles it | the token |
+//! | `GenerationPublication` | the manifest's pipeline/job/generation/epoch against the `CheckpointRef` it was read from, every entry header's job/epoch against the manifest's, the program's operator set, the selector | the reference the recovery search resolved | the token |
+//! | `CheckpointHistory` | each reached manifest against **its own** reference, each of its entry headers against it, the selector, and that every deletion candidate was reached | the traversal | the token |
 //!
-//! Two of those rows must admit a legitimate difference rather than demand equality, and say so
-//! rather than leaving it to be inferred. A cleanup spans epochs by construction — one retained
-//! and a range of dropped ones — so its rule is "each object carries *the epoch it was collected
-//! at*", not "every object carries one epoch". And a report legitimately omits a table it had no
-//! data for, so nothing requires a table to appear in every subtask's report.
+//! Three of those rows must admit a legitimate difference rather than demand equality, and say
+//! so rather than leaving it to be inferred. A cleanup spans epochs by construction — one
+//! retained and a range of dropped ones — so its rule is "each object carries *the epoch it was
+//! collected at*", not "every object carries one epoch". A report legitimately omits a table it
+//! had no data for, so nothing requires a table to appear in every subtask's report. And a
+//! recovery checkpoint is by construction from an earlier generation and an earlier epoch than
+//! the generation being published, while a history traversal spans a range of both — so those
+//! two rows bind each manifest to *its own reference* rather than to one identity, and each
+//! carries a positive test for the difference.
 //!
 //! Four families live beside their owners in child modules rather than here, and for the same
 //! reason: each is self-contained, and each would otherwise push this file past the 500-line
@@ -44,8 +58,10 @@
 //! token to build on — nothing was restored, compacted or cleaned up — so what entitles its
 //! first metadata write is the completion the checkpoint's own bookkeeping recorded, and that
 //! has to be a checked value rather than a list the writer passes itself. [`subtask`] carries
-//! the report that completion is added up from, and [`identity`] the identity vocabulary every
-//! row of the table above is written in.
+//! the report that completion is added up from. The identity vocabulary every row of the table
+//! above is written in used to be a fourth child module here; review round 7 of PR #160 moved
+//! it to [`arroyo_rpc::state_backend::validated::identity`], where the sibling crates can reach
+//! it, and it is re-exported from here unchanged.
 //!
 //! The views handed out from a token — [`ValidatedOperatorCleanup`] and [`ValidatedTable`]
 //! — exist for the same reason one level down: `files_to_keep` decides which files a
@@ -56,14 +72,15 @@
 
 pub mod cleanup;
 pub mod completion;
-pub mod identity;
 pub mod subtask;
 
+pub use arroyo_rpc::state_backend::validated::identity::{
+    CheckpointIdentity, OperatorObject, check_operator_header,
+};
 pub use cleanup::{
     CheckpointCleanup, CleanupScope, OperatorCleanup, ValidatedOperatorCleanup, ValidatedTable,
 };
 pub use completion::{CompletedCheckpoint, CompletedOperator};
-pub use identity::{CheckpointIdentity, OperatorObject, check_operator_header};
 pub use subtask::{ReportingOperator, SubtaskReport};
 
 use arroyo_rpc::errors::StateError;

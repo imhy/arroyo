@@ -24,14 +24,30 @@
 //! validates and restores exactly as it did, and one written after it is byte-identical. What
 //! changed is which *call sites* can name the value an operation needs.
 //!
-//! Review round 6 of PR #160 added one qualification to that, and it is a behavioural one
-//! rather than a format one. The checks now compare the identity a persisted object *claims*
-//! — a checkpoint metadata object's `job_id` and `epoch`, an operator object's header — with
-//! the identity the caller read it under. Every object Arroyo has ever written agrees, because
-//! both writers derive the path from the object: `write_checkpoint_metadata` from
-//! `metadata.job_id`/`epoch` and `write_operator_checkpoint_metadata` from the header. So no
-//! well-formed deployment sees a difference. An object that does *not* agree — corrupt,
-//! misplaced, or planted — used to be acted on and now fails loudly, which is the point.
+//! Review rounds 6 and 7 of PR #160 added one qualification to that, and it is a behavioural
+//! one rather than a format one. The checks now compare the identity a persisted object
+//! *claims* — a checkpoint metadata object's `job_id` and `epoch`, an operator object's header,
+//! a leader-mode manifest's `pipeline_id`/`job_id`/`generation`/`epoch` and every entry header
+//! under it — with the identity the caller read it under. Every object Arroyo has ever written
+//! agrees, because every writer derives the path from the object: `write_checkpoint_metadata`
+//! from `metadata.job_id`/`epoch`, `write_operator_checkpoint_metadata` from the header, and
+//! `finish_checkpoint_leader` builds both the manifest's four fields and the `CheckpointRef` it
+//! writes it to out of the same job, generation and epoch, stamping every entry header from the
+//! same two. So no well-formed deployment sees a difference. An object that does *not* agree —
+//! corrupt, misplaced, or planted — used to be acted on and now fails loudly, which is the
+//! point.
+//!
+//! # Which checkpoint a token is about
+//!
+//! Shape is only half of a whole-object claim. The other half is *identity*: which checkpoint
+//! of which job the object is, and whether every part of it agrees about that. [`identity`]
+//! holds the vocabulary every family states that in — one [`CheckpointIdentity`], one
+//! comparison, one persisted-header check — so that a boundary in `arroyo-state`, one in
+//! `arroyo-state-protocol` and one in this crate all ask the question in the same words rather
+//! than in three that can drift apart. Review round 7 of PR #160 is what moved it here; see
+//! that module's own docs for why.
+//!
+//! [`CheckpointIdentity`]: identity::CheckpointIdentity
 //!
 //! # Why the token cannot be forged
 //!
@@ -56,6 +72,8 @@
 //! is described, that the operator set is exactly the program's, that no required object is
 //! absent — has to be checked here. A check that only re-reads a flag the constructor set
 //! proves nothing, because the token would then be as forgeable as the flag.
+
+pub mod identity;
 
 use std::fmt;
 
