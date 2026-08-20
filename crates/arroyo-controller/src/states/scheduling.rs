@@ -1940,10 +1940,11 @@ mod tests {
         let program: HashSet<&str> = operator_ids.iter().map(String::as_str).collect();
         let completed = Validated::validate(
             CompletedCheckpoint::new(
+                JOB_ID.to_string(),
                 EPOCH,
                 operator_ids
                     .iter()
-                    .map(|operator_id| CompletedOperator::reported(operator_id.clone(), 1, 1))
+                    .map(|operator_id| CompletedOperator::reported(operator_id.clone(), 1, [0]))
                     .collect(),
             ),
             &program,

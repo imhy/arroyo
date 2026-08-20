@@ -342,11 +342,12 @@ async fn test_kafka() {
     // one subtask above is the whole of this operator, and it has finished.
     let completed = Validated::validate(
         CompletedCheckpoint::new(
+            task_info.job_id.clone(),
             1,
             vec![CompletedOperator::reported(
                 task_info.operator_id.clone(),
                 1,
-                1,
+                [0],
             )],
         ),
         &HashSet::from([task_info.operator_id.as_str()]),

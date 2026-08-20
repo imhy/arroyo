@@ -13,12 +13,15 @@
 //! caller cannot reach an effect without the token, and the only way to a token is the
 //! check — see [`arroyo_rpc::state_backend::validated`] for why it cannot be forged.
 //!
-//! Three of the types here are the whole objects those operations need; the fourth,
-//! [`CompletedCheckpoint`], is the evidence one of them is derived *from*. A checkpoint this
-//! process just took has no earlier token to build on — nothing was restored, compacted or
-//! cleaned up — so what entitles its first metadata write is the completion the checkpoint's
-//! own bookkeeping recorded, and that has to be a checked value rather than a list the writer
-//! passes itself.
+//! Two families live beside their owners in child modules rather than here, and for the same
+//! reason: each is self-contained, and each would otherwise push this file past the 500-line
+//! production boundary M11.T25's plan sets. [`cleanup`] carries the whole object a checkpoint
+//! cleanup acts on together with the views its token hands out, which is what keeps those
+//! views constructor-free. [`completion`] carries [`CompletedCheckpoint`], the evidence one of
+//! the objects here is derived *from*: a checkpoint this process just took has no earlier
+//! token to build on — nothing was restored, compacted or cleaned up — so what entitles its
+//! first metadata write is the completion the checkpoint's own bookkeeping recorded, and that
+//! has to be a checked value rather than a list the writer passes itself.
 //!
 //! The views handed out from a token — [`ValidatedOperatorCleanup`] and [`ValidatedTable`]
 //! — exist for the same reason one level down: `files_to_keep` decides which files a
@@ -28,10 +31,12 @@
 //! live in [`cleanup`], which is what keeps "no public constructor" true.
 
 pub mod cleanup;
+pub mod completion;
 
 pub use cleanup::{
     CheckpointCleanup, CleanupScope, OperatorCleanup, ValidatedOperatorCleanup, ValidatedTable,
 };
+pub use completion::{CompletedCheckpoint, CompletedIdentity, CompletedOperator};
 
 use arroyo_rpc::errors::StateError;
 use arroyo_rpc::grpc::rpc::{CheckpointMetadata, OperatorCheckpointMetadata};
@@ -184,126 +189,6 @@ impl WholeObject for RestorableCheckpoint {
         Ok(())
     }
 }
-/// What one operator reported while this process took a checkpoint.
-///
-/// `subtasks` is how many subtasks the job's program gives that operator, fixed when the
-/// checkpoint was opened; `subtasks_checkpointed` is how many of them have since reported a
-/// finished checkpoint. The two are recorded rather than reduced to a flag because "finished"
-/// is the *comparison*, and a flag would be exactly the kind of constructor-set field
-/// [`WholeObject`] warns about — as forgeable as whoever set it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompletedOperator {
-    operator_id: String,
-    subtasks: usize,
-    subtasks_checkpointed: usize,
-}
-
-impl CompletedOperator {
-    /// What the checkpoint has heard from `operator_id` so far.
-    pub fn reported(operator_id: String, subtasks: usize, subtasks_checkpointed: usize) -> Self {
-        Self {
-            operator_id,
-            subtasks,
-            subtasks_checkpointed,
-        }
-    }
-
-    /// The operator this is about.
-    pub fn operator_id(&self) -> &str {
-        &self.operator_id
-    }
-
-    /// Whether every subtask the program gives this operator has reported.
-    fn finished(&self) -> bool {
-        self.subtasks > 0 && self.subtasks_checkpointed == self.subtasks
-    }
-}
-
-/// A checkpoint this process has just taken, and what each of the job's operators reported.
-///
-/// The whole object behind the *first* write of a checkpoint's top-level metadata — the one
-/// case that has no earlier token to derive from, because nothing has been restored,
-/// compacted, or cleaned up. Review round 4 of PR #160 found that gap being filled with a
-/// caller-supplied `Vec<String>`: [`CheckpointMetadataWrite::for_completed_checkpoint`] took
-/// the metadata and the "completed" list side by side, so copying `metadata.operator_ids` into
-/// the second argument minted a token that had checked nothing. This type is what that
-/// argument became.
-///
-/// Its check is the `done()` the worker used to run beside the write, decomposed and carried:
-/// the metadata cannot name an operator this does not list, and this cannot list an operator
-/// that has not finished. See [`Self::check_whole`].
-#[derive(Debug, Clone)]
-pub struct CompletedCheckpoint {
-    epoch: u32,
-    operators: Vec<CompletedOperator>,
-}
-
-impl CompletedCheckpoint {
-    /// Everything the checkpoint has heard, at the moment its metadata is built.
-    pub fn new(epoch: u32, operators: Vec<CompletedOperator>) -> Self {
-        Self { epoch, operators }
-    }
-
-    /// The operators, in the order they were collected.
-    pub fn operators(&self) -> &[CompletedOperator] {
-        &self.operators
-    }
-
-    /// The operator ids, for the metadata that is entitled by them.
-    pub fn operator_ids(&self) -> impl Iterator<Item = &str> {
-        self.operators.iter().map(CompletedOperator::operator_id)
-    }
-}
-
-impl WholeObject for CompletedCheckpoint {
-    /// The operators the job's program contains — the authority on what "all of them" means.
-    ///
-    /// Borrowed from the caller for the same reason [`RestoringProgram`] borrows it: the check
-    /// is about the program the checkpoint was taken of, and that set is not something the
-    /// checkpoint's own bookkeeping may be asked to confirm about itself.
-    type Context<'a> = &'a HashSet<&'a str>;
-    type Error = StateError;
-
-    /// Exact program coverage, and every operator finished.
-    ///
-    /// Both halves are needed and neither implies the other. Coverage alone is what the old
-    /// caller-supplied list already had, and it says nothing about whether an operator did
-    /// anything; completion alone would let a write name a set that was never the job's.
-    ///
-    /// The completion half is the load-bearing one, and it is the `CheckpointState::done()`
-    /// check the worker used to run *beside* this write rather than carry into it: an operator
-    /// is finished when every subtask its program gives it has reported a finished checkpoint,
-    /// and an operator with no subtasks has reported nothing whatever its counters say.
-    fn check_whole(&self, program: &HashSet<&str>) -> Result<(), StateError> {
-        check_program_coverage(self.epoch, self.operator_ids(), program)?;
-
-        let mut unfinished: Vec<String> = self
-            .operators
-            .iter()
-            .filter(|operator| !operator.finished())
-            .map(|operator| {
-                format!(
-                    "{} ({}/{} subtasks)",
-                    operator.operator_id, operator.subtasks_checkpointed, operator.subtasks
-                )
-            })
-            .collect();
-        if !unfinished.is_empty() {
-            unfinished.sort_unstable();
-            return Err(StateError::IncompleteCheckpoint {
-                epoch: self.epoch,
-                detail: format!(
-                    "operator(s) {} have not finished this checkpoint, so nothing has vouched \
-                     for the state a write would publish for them",
-                    unfinished.join(", ")
-                ),
-            });
-        }
-
-        Ok(())
-    }
-}
-
 /// A checkpoint's top-level metadata together with the operator set that entitles it to be
 /// written.
 ///
@@ -315,6 +200,17 @@ impl WholeObject for CompletedCheckpoint {
 pub struct CheckpointMetadataWrite {
     metadata: CheckpointMetadata,
     validated_operators: Vec<String>,
+    /// The checkpoint the entitlement is evidence *of*, where the entitlement knows.
+    ///
+    /// A completion does: it is the record of one job finishing one epoch, and
+    /// [`CompletedCheckpoint`] carries both. A restore preflight and a cleanup do not, and
+    /// this is `None` for them — they derive from a token built out of the objects that
+    /// already exist under the checkpoint being rewritten, so their entitlement is about
+    /// those objects rather than about an identity. Binding those two families is out of
+    /// this round's scope and would move the cleanup and restore call sites; what is in
+    /// scope, and what review round 5 of PR #160 found open, is that a completion carried an
+    /// identity nothing ever compared.
+    completed: Option<CompletedIdentity>,
 }
 
 impl CheckpointMetadataWrite {
@@ -332,6 +228,7 @@ impl CheckpointMetadataWrite {
                 .iter()
                 .map(|(operator_id, _)| operator_id.clone())
                 .collect(),
+            completed: None,
         }
     }
 
@@ -346,6 +243,7 @@ impl CheckpointMetadataWrite {
             validated_operators: CheckpointCleanup::operators(cleanup)
                 .map(|operator| operator.operator_id().to_string())
                 .collect(),
+            completed: None,
         }
     }
 
@@ -360,6 +258,14 @@ impl CheckpointMetadataWrite {
     /// "the metadata names exactly the operators that were validated" — a comparison of two
     /// values the same caller supplied. `for_completed_checkpoint(md.clone(),
     /// md.operator_ids.clone())` was a valid write token that had validated nothing.
+    ///
+    /// It also records *which* checkpoint the evidence is of. Review round 5 of PR #160 found
+    /// that the evidence and the metadata were only ever compared by operator set, so a
+    /// completion of job A epoch 4 entitled the metadata of job B epoch 5 whenever both named
+    /// the same operators — which two epochs of one job always do, and two jobs running the
+    /// same pipeline usually do. The plan this implements requires validation to cover *every
+    /// epoch* before the first effect (M11.T25d), and an epoch nothing compares is not
+    /// covered. [`Self::check_whole`] compares both halves.
     pub fn for_completed_checkpoint(
         metadata: CheckpointMetadata,
         completed: &Validated<CompletedCheckpoint>,
@@ -367,6 +273,7 @@ impl CheckpointMetadataWrite {
         Self {
             metadata,
             validated_operators: completed.get().operator_ids().map(str::to_string).collect(),
+            completed: Some(completed.get().identity()),
         }
     }
 
@@ -380,8 +287,28 @@ impl WholeObject for CheckpointMetadataWrite {
     type Context<'a> = ();
     type Error = StateError;
 
-    /// The metadata names exactly the operators that were validated, once each.
+    /// The metadata is the checkpoint the entitlement is evidence of, and it names exactly the
+    /// operators that were validated, once each.
+    ///
+    /// The identity half runs first because it is the coarser claim: an entitlement for a
+    /// different checkpoint is wrong however well its operator set lines up, and operator sets
+    /// line up between checkpoints far more often than not — every epoch of one job has the
+    /// same operators as every other. It is checked only where the entitlement carries an
+    /// identity; see the [`completed`](Self) field for which do and why.
     fn check_whole(&self, _context: ()) -> Result<(), StateError> {
+        if let Some(completed) = &self.completed
+            && (completed.job_id != self.metadata.job_id || completed.epoch != self.metadata.epoch)
+        {
+            return Err(StateError::Other {
+                table: String::new(),
+                error: format!(
+                    "the metadata for job {} epoch {} is entitled by the completion of job {} \
+                     epoch {}, which is a different checkpoint",
+                    self.metadata.job_id, self.metadata.epoch, completed.job_id, completed.epoch
+                ),
+            });
+        }
+
         let named: BTreeSet<&str> = self
             .metadata
             .operator_ids
@@ -426,11 +353,17 @@ mod tests {
     use arroyo_rpc::state_backend::validated::Validated;
     use std::collections::HashSet;
 
-    /// A checkpoint's top-level metadata naming `operator_ids`.
+    /// A checkpoint's top-level metadata naming `operator_ids`, for job `job_1` epoch 4.
     fn metadata(operator_ids: &[&str]) -> CheckpointMetadata {
+        metadata_of("job_1", 4, operator_ids)
+    }
+
+    /// A checkpoint's top-level metadata, with its identity spelled out — for the rows about
+    /// which checkpoint an entitlement is evidence of.
+    fn metadata_of(job_id: &str, epoch: u32, operator_ids: &[&str]) -> CheckpointMetadata {
         CheckpointMetadata {
-            job_id: "job_1".to_string(),
-            epoch: 4,
+            job_id: job_id.to_string(),
+            epoch,
             min_epoch: 0,
             start_time: 0,
             finish_time: 0,
@@ -440,7 +373,7 @@ mod tests {
 
     /// One operator's report, with every subtask in.
     fn finished(operator_id: &str, subtasks: usize) -> CompletedOperator {
-        CompletedOperator::reported(operator_id.to_string(), subtasks, subtasks)
+        CompletedOperator::reported(operator_id.to_string(), subtasks, 0..subtasks as u32)
     }
 
     /// The write of a checkpoint this process just took needs evidence that it was taken
@@ -463,10 +396,11 @@ mod tests {
         // anything to publish for, and there is no token for it.
         let unfinished = Validated::validate(
             CompletedCheckpoint::new(
+                "job_1".to_string(),
                 4,
                 vec![
                     finished("node_1", 1),
-                    CompletedOperator::reported("node_2".to_string(), 2, 1),
+                    CompletedOperator::reported("node_2".to_string(), 2, [0]),
                 ],
             ),
             &program,
@@ -487,7 +421,7 @@ mod tests {
         // Nor is one obtained by leaving it out: the evidence then does not cover the job's
         // program, which is the half that was already there.
         let dropped = Validated::validate(
-            CompletedCheckpoint::new(4, vec![finished("node_1", 1)]),
+            CompletedCheckpoint::new("job_1".to_string(), 4, vec![finished("node_1", 1)]),
             &program,
         )
         .unwrap_err();
@@ -497,10 +431,11 @@ mod tests {
         // a completed checkpoint, it is an operator nothing was heard from.
         let empty = Validated::validate(
             CompletedCheckpoint::new(
+                "job_1".to_string(),
                 4,
                 vec![
                     finished("node_1", 1),
-                    CompletedOperator::reported("node_2".to_string(), 0, 0),
+                    CompletedOperator::reported("node_2".to_string(), 0, []),
                 ],
             ),
             &program,
@@ -515,10 +450,11 @@ mod tests {
         let self_supplied: HashSet<&str> = named.operator_ids.iter().map(String::as_str).collect();
         let forged = Validated::validate(
             CompletedCheckpoint::new(
+                "job_1".to_string(),
                 4,
                 vec![
-                    CompletedOperator::reported("node_1".to_string(), 1, 0),
-                    CompletedOperator::reported("node_2".to_string(), 1, 0),
+                    CompletedOperator::reported("node_1".to_string(), 1, []),
+                    CompletedOperator::reported("node_2".to_string(), 1, []),
                 ],
             ),
             &self_supplied,
@@ -528,7 +464,11 @@ mod tests {
 
         // A checkpoint every operator did finish entitles its own metadata...
         let completed = Validated::validate(
-            CompletedCheckpoint::new(4, vec![finished("node_1", 1), finished("node_2", 2)]),
+            CompletedCheckpoint::new(
+                "job_1".to_string(),
+                4,
+                vec![finished("node_1", 1), finished("node_2", 2)],
+            ),
             &program,
         )
         .unwrap();
@@ -557,5 +497,97 @@ mod tests {
         )
         .unwrap_err();
         assert!(short.to_string().contains("node_2"), "{short}");
+    }
+
+    /// A completion entitles the checkpoint it is a completion *of*, and no other (PR #160
+    /// review round 5, finding 2).
+    ///
+    /// The finding, exactly: `CompletedCheckpoint` recorded an epoch that only ever reached an
+    /// error message, recorded no job at all, and `for_completed_checkpoint` copied nothing but
+    /// operator ids across — so the token's whole check was a comparison of two operator sets.
+    /// Two epochs of one job always name the same operators, and two jobs running the same
+    /// pipeline usually do, so that comparison agreed for exactly the pairs it needed to
+    /// refuse. Review round 4 disclosed the missing epoch binding as a residual for M11.T26;
+    /// this row is it being closed instead.
+    ///
+    /// The evidence below is held fixed and only the metadata's identity moves, so what
+    /// changes the answer is the identity and nothing else — the operator set is the same
+    /// `{node_1, node_2}` in every case, which is the situation the finding describes.
+    #[test]
+    fn completion_evidence_entitles_only_the_checkpoint_it_is_evidence_of() {
+        let program: HashSet<&str> = HashSet::from(["node_1", "node_2"]);
+        let completed = Validated::validate(
+            CompletedCheckpoint::new(
+                "job_a".to_string(),
+                4,
+                vec![finished("node_1", 1), finished("node_2", 2)],
+            ),
+            &program,
+        )
+        .unwrap();
+
+        // Its own checkpoint: entitled.
+        Validated::validate(
+            CheckpointMetadataWrite::for_completed_checkpoint(
+                metadata_of("job_a", 4, &["node_1", "node_2"]),
+                &completed,
+            ),
+            (),
+        )
+        .expect("the checkpoint the evidence is of is the one it entitles");
+
+        // Another job's, with an operator set that matches exactly.
+        let other_job = Validated::validate(
+            CheckpointMetadataWrite::for_completed_checkpoint(
+                metadata_of("job_b", 4, &["node_1", "node_2"]),
+                &completed,
+            ),
+            (),
+        )
+        .unwrap_err();
+        let message = other_job.to_string();
+        assert!(message.contains("job_b"), "{message}");
+        assert!(message.contains("job_a"), "{message}");
+        assert!(message.contains("different checkpoint"), "{message}");
+
+        // A later epoch of the same job — the pair the finding names, and the one an operator
+        // set can never tell apart.
+        let other_epoch = Validated::validate(
+            CheckpointMetadataWrite::for_completed_checkpoint(
+                metadata_of("job_a", 5, &["node_1", "node_2"]),
+                &completed,
+            ),
+            (),
+        )
+        .unwrap_err();
+        let message = other_epoch.to_string();
+        assert!(message.contains("epoch 5"), "{message}");
+        assert!(message.contains("epoch 4"), "{message}");
+
+        // An earlier epoch too: the binding is equality, not a floor a replay could clear.
+        let earlier_epoch = Validated::validate(
+            CheckpointMetadataWrite::for_completed_checkpoint(
+                metadata_of("job_a", 3, &["node_1", "node_2"]),
+                &completed,
+            ),
+            (),
+        )
+        .unwrap_err();
+        assert!(
+            earlier_epoch.to_string().contains("different checkpoint"),
+            "{earlier_epoch}"
+        );
+
+        // The two other entitlements carry no identity and are unchanged by this round: a
+        // cleanup's `min_epoch` rewrite still turns on the operators whose epochs it checked.
+        // That is stated here so the scope of the binding is visible in a test rather than
+        // only in a doc comment.
+        let cleanup_shaped = CheckpointMetadataWrite {
+            metadata: metadata_of("job_a", 4, &["node_1", "node_2"]),
+            validated_operators: vec!["node_1".to_string(), "node_2".to_string()],
+            completed: None,
+        };
+        Validated::validate(cleanup_shaped, ())
+            .expect("an entitlement with no identity is checked by operator set alone");
     }
 }

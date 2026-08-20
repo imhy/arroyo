@@ -18,7 +18,7 @@ use arroyo_state::tables::global_keyed_map::GlobalKeyedTable;
 use arroyo_state::validated::{CheckpointMetadataWrite, CompletedCheckpoint, CompletedOperator};
 use arroyo_state_protocol::types::Epoch;
 use arroyo_types::{from_micros, to_micros};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tracing::{debug, warn};
@@ -49,10 +49,25 @@ pub struct CheckpointState {
     operator_names: HashMap<String, String>,
 }
 
+/// What one operator of the job being checkpointed has reported so far.
+///
+/// `reported` is the set of subtask indices that have sent a finished checkpoint, not a count
+/// of the messages that arrived. Those were the same thing until review round 5 of PR #160
+/// found that they are not: `finish_subtask` incremented a counter for every message without
+/// looking at the index it carried, so at parallelism 2 two reports from subtask 0 made the
+/// operator "complete" while subtask 1 had never been heard from — and, since M11.T25d, that
+/// counter is what entitles the checkpoint's metadata write. Counting the subtasks that
+/// reported rather than the reports that arrived is the fail-closed direction: a duplicate no
+/// longer advances completion, so a checkpoint waits for the subtask that genuinely has not
+/// reported.
+///
+/// A report is admitted by [`Self::check_reportable`] *before* any of it is folded in, so a
+/// duplicate or an out-of-range index changes nothing about this operator's watermarks, times,
+/// bytes or table state rather than being merged and then discounted.
 #[derive(Debug, Clone)]
 pub struct OperatorState {
     subtasks: usize,
-    subtasks_checkpointed: usize,
+    reported: BTreeSet<u32>,
     bytes: usize,
     pub start_time: Option<SystemTime>,
     pub finish_time: Option<SystemTime>,
@@ -64,7 +79,7 @@ impl OperatorState {
     fn new(subtasks: usize) -> Self {
         OperatorState {
             subtasks,
-            subtasks_checkpointed: 0,
+            reported: BTreeSet::new(),
             bytes: 0,
             start_time: None,
             finish_time: None,
@@ -73,6 +88,56 @@ impl OperatorState {
         }
     }
 
+    /// Whether this operator can still count a report from `subtask_index`.
+    ///
+    /// Two reasons it cannot, and both are refused rather than absorbed:
+    ///
+    /// - **The operator has no such subtask.** `subtask_index` is a field of a message from a
+    ///   worker, and the program is what says how many subtasks this operator has. An index at
+    ///   or above that is either a report for a different program or a report from an execution
+    ///   this checkpoint is not accumulating, and counting it would complete the operator
+    ///   without one of its actual subtasks.
+    /// - **That subtask has already reported this checkpoint.** No path re-reports: a subtask
+    ///   sends `ControlResp::CheckpointCompleted` once per barrier from `TableManager`, the
+    ///   worker's control loop makes one unary call per message and cancels the worker rather
+    ///   than retrying it, and the job controller drops any report whose epoch is not the one
+    ///   in flight. A second report for an index that already reported is therefore not a retry
+    ///   but two writers — a zombie execution's subtask alongside the live one, which is the
+    ///   condition M11.D39's fence exists to end. Merging its bytes, watermark and table state
+    ///   over the live subtask's would publish a checkpoint made of two executions, so it is
+    ///   refused.
+    ///
+    /// # Errors
+    ///
+    /// A plain `anyhow` error, which the job controller treats as it treats the two guards
+    /// beside this one — an unexpected operator id and a subtask whose table configs disagree
+    /// with the job: the checkpoint does not complete and the job fails and restarts from the
+    /// last one that did. That is louder than the alternative and deliberately so; the quiet
+    /// alternative is the checkpoint publishing state it never received.
+    fn check_reportable(&self, operator_id: &str, subtask_index: u32) -> anyhow::Result<()> {
+        if subtask_index as usize >= self.subtasks {
+            bail!(
+                "operator {operator_id} has {} subtask(s), so subtask {subtask_index} is not \
+                 one of them",
+                self.subtasks
+            );
+        }
+        if self.reported.contains(&subtask_index) {
+            bail!(
+                "subtask {subtask_index} of operator {operator_id} has already reported this \
+                 checkpoint"
+            );
+        }
+        Ok(())
+    }
+
+    /// Folds one admitted subtask report in, returning the operator's merged table metadata
+    /// once every subtask of it has reported.
+    ///
+    /// The caller admits the report through [`Self::check_reportable`] first. Recording the
+    /// index in a set rather than bumping a counter is what makes that admission belt and
+    /// braces rather than the only line of defence: a duplicate that reached here anyway would
+    /// still not move the operator any closer to complete.
     fn finish_subtask(
         &mut self,
         c: SubtaskCheckpointMetadata,
@@ -80,7 +145,7 @@ impl OperatorState {
         HashMap<String, TableConfig>,
         HashMap<String, TableCheckpointMetadata>,
     )> {
-        self.subtasks_checkpointed += 1;
+        self.reported.insert(c.subtask_index);
         self.watermarks.push(c.watermark.map(from_micros));
         self.start_time = match self.start_time {
             Some(existing_start_time) => Some(existing_start_time.min(from_micros(c.start_time))),
@@ -108,7 +173,7 @@ impl OperatorState {
                 .insert(table_metadata.subtask_index, table_metadata);
         }
 
-        if self.subtasks == self.subtasks_checkpointed {
+        if self.subtasks == self.reported.len() {
             let (table_configs, table_metadatas) = self
                 .table_state
                 .drain()
@@ -289,11 +354,19 @@ impl CheckpointState {
     /// Merging a subtask that selects a different backend would produce a checkpoint that
     /// is partly one backend's and partly another's, which nothing could later restore.
     ///
+    /// The subtask *index* is checked in the same place and for the same reason: an index the
+    /// operator does not have, or one that has already reported, is refused before anything of
+    /// it is merged rather than merged and then discounted
+    /// ([`OperatorState::check_reportable`]). Review round 5 of PR #160 found neither being
+    /// checked at all, so a report's identity had no bearing on whether the operator counted
+    /// it as one of its subtasks.
+    ///
     /// # Errors
     ///
     /// Fails if the request carries no metadata, if the operator is not part of this
-    /// checkpoint, or — carrying an [`arroyo_rpc::state_backend::StateBackendError`] the
-    /// caller can downcast — if the subtask's table configs disagree with the job.
+    /// checkpoint, if the report is one the operator cannot count, or — carrying an
+    /// [`arroyo_rpc::state_backend::StateBackendError`] the caller can downcast — if the
+    /// subtask's table configs disagree with the job.
     pub fn checkpoint_finished(
         &mut self,
         c: TaskCheckpointCompletedReq,
@@ -310,6 +383,15 @@ impl CheckpointState {
             metadata.subtask_index,
             &metadata.table_configs,
         )?;
+
+        // Before the bytes and the UI detail below, which are the first things this report
+        // changes about the checkpoint. An operator this checkpoint does not have is left to
+        // the `unexpected operator checkpoint` error further down, which is where it has always
+        // been refused; what is checked here is the index, against the operator's own record of
+        // which of its subtasks have been heard from.
+        if let Some(operator_state) = self.operator_state.get(&c.operator_id) {
+            operator_state.check_reportable(&c.operator_id, metadata.subtask_index)?;
+        }
 
         debug!(
             message = "Checkpoint finished",
@@ -409,9 +491,8 @@ impl CheckpointState {
                         ExpiringTimeKeyTable::committing_data(config.clone(), checkpoint_metadata)
                     }
                 } {
-                    for i in 0..operator_state.subtasks_checkpointed {
-                        self.subtasks_to_commit
-                            .insert((c.operator_id.clone(), i as u32));
+                    for i in &operator_state.reported {
+                        self.subtasks_to_commit.insert((c.operator_id.clone(), *i));
                     }
                     self.commit_data
                         .entry(c.operator_id.clone())
@@ -432,7 +513,7 @@ impl CheckpointState {
                     epoch: *self.epoch as u32,
                     min_watermark,
                     max_watermark,
-                    parallelism: operator_state.subtasks_checkpointed as u64,
+                    parallelism: operator_state.reported.len() as u64,
                 }),
             };
 
@@ -471,6 +552,17 @@ impl CheckpointState {
     /// each operator's subtasks actually reported, and it cannot be obtained for an operator
     /// that has not finished. `done()` is unchanged and still gates *when* a checkpoint is
     /// finished; what changed is that the write no longer takes anyone's word for it.
+    ///
+    /// # Which checkpoint the evidence is of
+    ///
+    /// Review round 5 of PR #160 found the evidence saying nothing about that. It recorded an
+    /// epoch that only ever reached an error message and recorded no job at all, and the write
+    /// token compared operator sets alone — so a completion of one checkpoint entitled the
+    /// metadata of any other whose operators matched, which every epoch of a job's does. The
+    /// evidence now names the job and the epoch, and the token compares both against the
+    /// metadata. Here the two agree by construction, because both are read from `self.job_id`
+    /// and `self.epoch` a few lines apart; the comparison is for every other caller, and for
+    /// this one if those two lines ever drift.
     ///
     /// # Errors
     ///
@@ -521,8 +613,11 @@ impl CheckpointState {
 
         // What each operator reported, not which operators exist. `operator_state` has held a
         // record for every operator of the program since the checkpoint was opened, so its
-        // keys alone say nothing; the counters inside are the part that does.
+        // keys alone say nothing; the subtask indices inside are the part that does — and they
+        // are indices rather than a count because a count cannot tell one subtask reporting
+        // twice from two subtasks reporting once.
         let completed = CompletedCheckpoint::new(
+            self.job_id.to_string(),
             *self.epoch as u32,
             self.operator_state
                 .iter()
@@ -530,7 +625,7 @@ impl CheckpointState {
                     CompletedOperator::reported(
                         operator_id.clone(),
                         state.subtasks,
-                        state.subtasks_checkpointed,
+                        state.reported.iter().copied(),
                     )
                 })
                 .collect(),
@@ -772,5 +867,96 @@ mod tests {
             vec!["node_3".to_string()],
             "and it names the operator that finished it"
         );
+    }
+
+    /// A subtask reporting twice is refused, and does not complete the operator it is a
+    /// subtask of (PR #160 review round 5, finding 1).
+    ///
+    /// The finding, exactly: `finish_subtask` opened with a bare `subtasks_checkpointed += 1`
+    /// and never looked at `c.subtask_index`, so at parallelism 2 the second report from
+    /// subtask 0 made `2 == 2`, completed the operator, and — since review round 4 — entitled
+    /// the checkpoint's metadata write, while subtask 1 had never been heard from. The counter
+    /// is pre-existing Arroyo behaviour; treating it as proof of completion is what M11.T25
+    /// added, which is why this is fixed here.
+    ///
+    /// Both halves are asserted. The refusal is the guard, and it is *before* the merge: the
+    /// duplicate leaves the checkpoint's bytes exactly where the first report left them, so
+    /// nothing of it is folded in and then discounted. The completion is the evidence, and the
+    /// operator is still one subtask short afterwards — a duplicate does not stall a checkpoint
+    /// that would otherwise have completed, it declines to complete one that had not.
+    #[test]
+    fn a_second_report_from_the_same_subtask_is_refused_before_it_is_counted() {
+        let mut duplicated = checkpoint_state_of_one_operator(2);
+        duplicated.checkpoint_finished(subtask_reported(0)).unwrap();
+        assert_eq!(
+            duplicated.bytes, 8,
+            "the fixture's precondition: one report"
+        );
+
+        let err = duplicated
+            .checkpoint_finished(subtask_reported(0))
+            .expect_err("a subtask that has reported cannot report again");
+        let message = err.to_string();
+        assert!(message.contains("subtask 0"), "{message}");
+        assert!(message.contains("node_3"), "{message}");
+        assert!(message.contains("already reported"), "{message}");
+
+        // Refused before the merge, so nothing of it reached the checkpoint.
+        assert_eq!(duplicated.bytes, 8, "{:?}", duplicated.bytes);
+
+        // And the operator is still one subtask short, so there is no write token: this is the
+        // `2 == 2` the finding names, no longer reached.
+        assert!(!duplicated.done());
+        let unfinished = duplicated
+            .build_metadata()
+            .expect_err("two reports from one subtask are not two subtasks");
+        assert!(
+            matches!(
+                unfinished,
+                StateError::IncompleteCheckpoint { epoch: 4, .. }
+            ),
+            "{unfinished:?}"
+        );
+        let message = unfinished.to_string();
+        assert!(message.contains("node_3 (1/2"), "{message}");
+        assert!(message.contains("subtask(s) 1 did not report"), "{message}");
+
+        // The subtask that had not reported is the whole of the difference.
+        duplicated.checkpoint_finished(subtask_reported(1)).unwrap();
+        assert!(duplicated.done());
+        duplicated
+            .build_metadata()
+            .expect("both subtasks have now reported");
+    }
+
+    /// A report carrying an index the operator does not have is refused rather than counted
+    /// (PR #160 review round 5, finding 1).
+    ///
+    /// The other half of the same finding: `subtask_index` is a field of a message from a
+    /// worker, and nothing compared it against the parallelism the program gives the operator.
+    /// An out-of-range index counted exactly like an in-range one, so a single report from
+    /// subtask 5 of a two-subtask operator was half of that operator's completion.
+    ///
+    /// It is refused at the same point as a disagreeing table config and leaves the checkpoint
+    /// as untouched, which is what `bytes` asserts.
+    #[test]
+    fn a_subtask_index_the_operator_does_not_have_is_refused() {
+        let mut refused = checkpoint_state_of_one_operator(2);
+        let err = refused
+            .checkpoint_finished(subtask_reported(5))
+            .expect_err("an operator with two subtasks has no subtask 5");
+        let message = err.to_string();
+        assert!(message.contains("node_3"), "{message}");
+        assert!(message.contains("subtask 5"), "{message}");
+        assert!(message.contains("2 subtask(s)"), "{message}");
+
+        assert_eq!(refused.bytes, 0);
+        assert!(refused.operator_details.is_empty());
+        assert!(!refused.done());
+
+        // The boundary itself: index 1 is the last one a two-subtask operator has, and it is
+        // admitted — so the guard is a range and not an off-by-one that refuses everything.
+        refused.checkpoint_finished(subtask_reported(1)).unwrap();
+        assert_eq!(refused.bytes, 8);
     }
 }

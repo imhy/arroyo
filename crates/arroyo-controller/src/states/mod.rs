@@ -5915,8 +5915,9 @@ mod tests {
         // worker that took the checkpoint does — with what that operator's subtasks reported.
         let completed = Validated::validate(
             CompletedCheckpoint::new(
+                "job_abc".to_string(),
                 RESTORED_EPOCH,
-                vec![CompletedOperator::reported(OPERATOR_ID.to_string(), 1, 1)],
+                vec![CompletedOperator::reported(OPERATOR_ID.to_string(), 1, [0])],
             ),
             &std::collections::HashSet::from([OPERATOR_ID]),
         )
