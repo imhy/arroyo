@@ -15,7 +15,10 @@ use arroyo_rpc::{TaskEventSpans, get_event_spans, grpc, log_trace_event};
 use arroyo_state::tables::ErasedTable;
 use arroyo_state::tables::expiring_time_key_map::ExpiringTimeKeyTable;
 use arroyo_state::tables::global_keyed_map::GlobalKeyedTable;
-use arroyo_state::validated::{CheckpointMetadataWrite, CompletedCheckpoint, CompletedOperator};
+use arroyo_state::validated::{
+    CheckpointMetadataWrite, CompletedCheckpoint, CompletedOperator, ReportingOperator,
+    SubtaskReport,
+};
 use arroyo_state_protocol::types::Epoch;
 use arroyo_types::{from_micros, to_micros};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -61,9 +64,16 @@ pub struct CheckpointState {
 /// longer advances completion, so a checkpoint waits for the subtask that genuinely has not
 /// reported.
 ///
-/// A report is admitted by [`Self::check_reportable`] *before* any of it is folded in, so a
-/// duplicate or an out-of-range index changes nothing about this operator's watermarks, times,
-/// bytes or table state rather than being merged and then discounted.
+/// A report is admitted *before* any of it is folded in, so a duplicate or an out-of-range
+/// index changes nothing about this operator's watermarks, times, bytes or table state rather
+/// than being merged and then discounted. Since review round 6 of PR #160 that admission is a
+/// whole-object check rather than a guard the merge site remembers to run: [`finish_subtask`]
+/// takes a [`Validated<SubtaskReport>`], and the only way to one is
+/// [`SubtaskReport::check_whole`], which carries the same two rules and the ones round 6
+/// added — that every table payload in the report names the same subtask the report does, and
+/// that every table it names is one it also describes.
+///
+/// [`finish_subtask`]: OperatorState::finish_subtask
 #[derive(Debug, Clone)]
 pub struct OperatorState {
     subtasks: usize,
@@ -88,89 +98,72 @@ impl OperatorState {
         }
     }
 
-    /// Whether this operator can still count a report from `subtask_index`.
+    /// The context [`SubtaskReport`] is checked against: what this operator's own bookkeeping
+    /// knows about itself.
     ///
-    /// Two reasons it cannot, and both are refused rather than absorbed:
-    ///
-    /// - **The operator has no such subtask.** `subtask_index` is a field of a message from a
-    ///   worker, and the program is what says how many subtasks this operator has. An index at
-    ///   or above that is either a report for a different program or a report from an execution
-    ///   this checkpoint is not accumulating, and counting it would complete the operator
-    ///   without one of its actual subtasks.
-    /// - **That subtask has already reported this checkpoint.** No path re-reports: a subtask
-    ///   sends `ControlResp::CheckpointCompleted` once per barrier from `TableManager`, the
-    ///   worker's control loop makes one unary call per message and cancels the worker rather
-    ///   than retrying it, and the job controller drops any report whose epoch is not the one
-    ///   in flight. A second report for an index that already reported is therefore not a retry
-    ///   but two writers — a zombie execution's subtask alongside the live one, which is the
-    ///   condition M11.D39's fence exists to end. Merging its bytes, watermark and table state
-    ///   over the live subtask's would publish a checkpoint made of two executions, so it is
-    ///   refused.
-    ///
-    /// # Errors
-    ///
-    /// A plain `anyhow` error, which the job controller treats as it treats the two guards
-    /// beside this one — an unexpected operator id and a subtask whose table configs disagree
-    /// with the job: the checkpoint does not complete and the job fails and restarts from the
-    /// last one that did. That is louder than the alternative and deliberately so; the quiet
-    /// alternative is the checkpoint publishing state it never received.
-    fn check_reportable(&self, operator_id: &str, subtask_index: u32) -> anyhow::Result<()> {
-        if subtask_index as usize >= self.subtasks {
-            bail!(
-                "operator {operator_id} has {} subtask(s), so subtask {subtask_index} is not \
-                 one of them",
-                self.subtasks
-            );
+    /// Nothing here comes from the report, which is the point — a report cannot be asked to
+    /// confirm that it is one this operator can still count.
+    fn admitting<'a>(
+        &'a self,
+        operator_id: &'a str,
+        job: StateBackendSelector,
+    ) -> ReportingOperator<'a> {
+        ReportingOperator {
+            operator_id,
+            subtasks: self.subtasks,
+            already_reported: &self.reported,
+            job,
         }
-        if self.reported.contains(&subtask_index) {
-            bail!(
-                "subtask {subtask_index} of operator {operator_id} has already reported this \
-                 checkpoint"
-            );
-        }
-        Ok(())
     }
 
-    /// Folds one admitted subtask report in, returning the operator's merged table metadata
+    /// Folds one checked subtask report in, returning the operator's merged table metadata
     /// once every subtask of it has reported.
     ///
-    /// The caller admits the report through [`Self::check_reportable`] first. Recording the
-    /// index in a set rather than bumping a counter is what makes that admission belt and
-    /// braces rather than the only line of defence: a duplicate that reached here anyway would
-    /// still not move the operator any closer to complete.
+    /// Takes the token rather than the report, so there is no spelling of this that merges a
+    /// report whose identities were never compared with each other or with this operator's
+    /// record. Recording the index in a set rather than bumping a counter is what makes that
+    /// belt and braces rather than the only line of defence: a duplicate that reached here
+    /// anyway would still not move the operator any closer to complete.
+    ///
+    /// The table payloads are filed under the *report's* subtask index rather than under each
+    /// payload's own copy of it. The two are equal — that is what the token establishes — and
+    /// using the checked one is the code saying which of them is authoritative. Until review
+    /// round 6 of PR #160 the payload's copy was used and never compared, so a payload
+    /// labelled with another subtask's index overwrote that subtask's contribution in this map
+    /// while the top-level accounting recorded a fresh report.
     fn finish_subtask(
         &mut self,
-        c: SubtaskCheckpointMetadata,
+        report: Validated<SubtaskReport>,
     ) -> Option<(
         HashMap<String, TableConfig>,
         HashMap<String, TableCheckpointMetadata>,
     )> {
-        self.reported.insert(c.subtask_index);
-        self.watermarks.push(c.watermark.map(from_micros));
+        let subtask_index = report.get().subtask_index();
+        let (watermark, start_time, finish_time, bytes) = {
+            let c = report.get().metadata();
+            (c.watermark, c.start_time, c.finish_time, c.bytes)
+        };
+
+        self.reported.insert(subtask_index);
+        self.watermarks.push(watermark.map(from_micros));
         self.start_time = match self.start_time {
-            Some(existing_start_time) => Some(existing_start_time.min(from_micros(c.start_time))),
-            None => Some(from_micros(c.start_time)),
+            Some(existing_start_time) => Some(existing_start_time.min(from_micros(start_time))),
+            None => Some(from_micros(start_time)),
         };
         self.finish_time = match self.finish_time {
-            Some(existing_finish_time) => {
-                Some(existing_finish_time.max(from_micros(c.finish_time)))
-            }
-            None => Some(from_micros(c.finish_time)),
+            Some(existing_finish_time) => Some(existing_finish_time.max(from_micros(finish_time))),
+            None => Some(from_micros(finish_time)),
         };
-        self.bytes += c.bytes as usize;
-        for (table, table_metadata) in c.table_metadata {
+        self.bytes += bytes as usize;
+        for (table, table_config, table_metadata) in SubtaskReport::into_tables(report) {
             self.table_state
                 .entry(table)
-                .or_insert_with_key(|key| TableState {
-                    table_config: c
-                        .table_configs
-                        .get(key)
-                        .expect("should have metadata")
-                        .clone(),
+                .or_insert_with(|| TableState {
+                    table_config,
                     subtask_tables: HashMap::new(),
                 })
                 .subtask_tables
-                .insert(table_metadata.subtask_index, table_metadata);
+                .insert(subtask_index, table_metadata);
         }
 
         if self.subtasks == self.reported.len() {
@@ -188,6 +181,32 @@ impl OperatorState {
             Some((table_configs, table_metadatas))
         } else {
             None
+        }
+    }
+}
+
+/// A subtask report that has passed its whole-object check, or one for an operator this
+/// checkpoint does not have.
+///
+/// The second case is not an error here, and deliberately: an unexpected operator id has always
+/// been refused a few lines further on, *after* the report's bytes and UI detail are recorded,
+/// and one of M11.T08's landed rows turns on that being where the merge becomes observable. The
+/// alternative — refusing earlier — would be a better order and a changed behaviour, which is
+/// not this round's to make. What the enum buys is that the two cases are told apart once, by
+/// name, instead of a token being minted for an operator nothing knows about.
+enum ReportAdmission {
+    /// The report, checked against the operator it was delivered to.
+    Admitted(Validated<SubtaskReport>),
+    /// A report for an operator this checkpoint does not have.
+    UnknownOperator(SubtaskCheckpointMetadata),
+}
+
+impl ReportAdmission {
+    /// The report itself, for the bytes, times and UI detail recorded before the merge.
+    fn metadata(&self) -> &SubtaskCheckpointMetadata {
+        match self {
+            Self::Admitted(report) => report.get().metadata(),
+            Self::UnknownOperator(metadata) => metadata,
         }
     }
 }
@@ -354,12 +373,14 @@ impl CheckpointState {
     /// Merging a subtask that selects a different backend would produce a checkpoint that
     /// is partly one backend's and partly another's, which nothing could later restore.
     ///
-    /// The subtask *index* is checked in the same place and for the same reason: an index the
-    /// operator does not have, or one that has already reported, is refused before anything of
-    /// it is merged rather than merged and then discounted
-    /// ([`OperatorState::check_reportable`]). Review round 5 of PR #160 found neither being
-    /// checked at all, so a report's identity had no bearing on whether the operator counted
-    /// it as one of its subtasks.
+    /// The report's *identities* are checked in the same place and for the same reason, and
+    /// since review round 6 of PR #160 they are checked as one whole object
+    /// ([`SubtaskReport`]): a subtask index the operator does not have, one that has already
+    /// reported, a table payload naming a different subtask than the report does, and a table
+    /// the report names but does not describe are all refused before anything of the report is
+    /// merged, rather than merged and then discounted. Round 5 found the first two unchecked;
+    /// round 6 found that a report carries its subtask index twice and only the first copy was
+    /// ever read.
     ///
     /// # Errors
     ///
@@ -372,26 +393,36 @@ impl CheckpointState {
         c: TaskCheckpointCompletedReq,
     ) -> anyhow::Result<Option<OperatorCheckpointMetadata>> {
         // TODO: UI management
-        let metadata = c
-            .metadata
-            .as_ref()
-            .ok_or_else(|| anyhow!("missing metadata for operator {}", c.operator_id))?;
+        let TaskCheckpointCompletedReq {
+            operator_id,
+            metadata,
+            time,
+            ..
+        } = c;
+        let metadata =
+            metadata.ok_or_else(|| anyhow!("missing metadata for operator {operator_id}"))?;
 
+        // Runs here as well as inside the whole-object check below, because an operator this
+        // checkpoint does not have never reaches that check — it is refused by the `unexpected
+        // operator checkpoint` error further down, which is where it has always been refused —
+        // and a report from another backend must not be merged even then.
         validate_subtask_table_configs(
             self.state_backend,
-            &c.operator_id,
+            &operator_id,
             metadata.subtask_index,
             &metadata.table_configs,
         )?;
 
         // Before the bytes and the UI detail below, which are the first things this report
-        // changes about the checkpoint. An operator this checkpoint does not have is left to
-        // the `unexpected operator checkpoint` error further down, which is where it has always
-        // been refused; what is checked here is the index, against the operator's own record of
-        // which of its subtasks have been heard from.
-        if let Some(operator_state) = self.operator_state.get(&c.operator_id) {
-            operator_state.check_reportable(&c.operator_id, metadata.subtask_index)?;
-        }
+        // changes about the checkpoint.
+        let report = match self.operator_state.get(&operator_id) {
+            Some(operator_state) => ReportAdmission::Admitted(Validated::validate(
+                SubtaskReport::new(operator_id.clone(), metadata),
+                operator_state.admitting(&operator_id, self.state_backend),
+            )?),
+            None => ReportAdmission::UnknownOperator(metadata),
+        };
+        let metadata = report.metadata();
 
         debug!(
             message = "Checkpoint finished",
@@ -399,15 +430,15 @@ impl CheckpointState {
             job_id = *self.job_id,
             epoch = *self.epoch,
             min_epoch = *self.min_epoch,
-            operator_id = %c.operator_id,
+            operator_id = %operator_id,
             subtask_index = metadata.subtask_index,
-            time = c.time);
+            time = time);
 
         let operator_detail = self
             .operator_details
-            .entry(c.operator_id.clone())
+            .entry(operator_id.clone())
             .or_insert_with(|| OperatorCheckpointDetail {
-                operator_id: c.operator_id.clone(),
+                operator_id: operator_id.clone(),
                 start_time: metadata.start_time,
                 finish_time: None,
                 has_state: false,
@@ -434,21 +465,23 @@ impl CheckpointState {
                 }
             });
         detail.bytes = Some(metadata.bytes);
-        detail.finish_time = Some(c.time);
+        detail.finish_time = Some(time);
 
+        let ReportAdmission::Admitted(report) = report else {
+            return Err(anyhow!("unexpected operator checkpoint {operator_id}"));
+        };
         let operator_state = self
             .operator_state
-            .get_mut(&c.operator_id)
-            .ok_or_else(|| anyhow!("unexpected operator checkpoint {}", c.operator_id))?;
-        if let Some((table_configs, table_checkpoint_metadata)) = operator_state.finish_subtask(
-            c.metadata
-                .ok_or_else(|| anyhow!("missing metadata for operator {}", c.operator_id))?,
-        ) {
+            .get_mut(&operator_id)
+            .ok_or_else(|| anyhow!("unexpected operator checkpoint {operator_id}"))?;
+        if let Some((table_configs, table_checkpoint_metadata)) =
+            operator_state.finish_subtask(report)
+        {
             self.operators_checkpointed += 1;
 
             Self::log_checkpoint_event(
                 &self.operator_names,
-                Some(&c.operator_id),
+                Some(&operator_id),
                 None,
                 self.epoch,
                 operator_state.bytes as u64,
@@ -492,10 +525,10 @@ impl CheckpointState {
                     }
                 } {
                     for i in &operator_state.reported {
-                        self.subtasks_to_commit.insert((c.operator_id.clone(), *i));
+                        self.subtasks_to_commit.insert((operator_id.clone(), *i));
                     }
                     self.commit_data
-                        .entry(c.operator_id.clone())
+                        .entry(operator_id.clone())
                         .or_default()
                         .insert(table.clone(), committing_data);
                 }
@@ -509,7 +542,7 @@ impl CheckpointState {
                 table_configs,
                 operator_metadata: Some(OperatorMetadata {
                     job_id: self.job_id.to_string(),
-                    operator_id: c.operator_id,
+                    operator_id,
                     epoch: *self.epoch as u32,
                     min_watermark,
                     max_watermark,
@@ -670,10 +703,13 @@ mod tests {
     use arroyo_datastream::logical::{LogicalNode, LogicalProgram, OperatorName};
     use arroyo_rpc::errors::StateError;
     use arroyo_rpc::grpc::rpc::{
-        SubtaskCheckpointMetadata, TableConfig, TableEnum, TaskCheckpointCompletedReq,
+        GlobalKeyedTableConfig, GlobalKeyedTableSubtaskCheckpointMetadata,
+        GlobalKeyedTableTaskCheckpointMetadata, SubtaskCheckpointMetadata, TableConfig, TableEnum,
+        TableSubtaskCheckpointMetadata, TaskCheckpointCompletedReq,
     };
     use arroyo_rpc::state_backend::{StateBackendError, StateBackendSelector};
     use arroyo_state_protocol::types::Epoch;
+    use prost::Message;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -927,6 +963,137 @@ mod tests {
         duplicated
             .build_metadata()
             .expect("both subtasks have now reported");
+    }
+
+    /// One subtask's finished checkpoint carrying a single global table, whose payload claims
+    /// `table_subtask_index`.
+    ///
+    /// The two indices are separate parameters because they are separate fields on the wire,
+    /// and a fixture that could not tell them apart could not see the round-6 finding.
+    fn subtask_reported_with_table(
+        subtask_index: u32,
+        table_subtask_index: u32,
+    ) -> TaskCheckpointCompletedReq {
+        let mut report = subtask_reported(subtask_index);
+        let metadata = report.metadata.as_mut().unwrap();
+        metadata.table_metadata = HashMap::from([(
+            "g".to_string(),
+            TableSubtaskCheckpointMetadata {
+                subtask_index: table_subtask_index,
+                table_type: TableEnum::GlobalKeyValue as i32,
+                data: GlobalKeyedTableSubtaskCheckpointMetadata {
+                    subtask_index: table_subtask_index,
+                    file: Some(format!("file-{table_subtask_index}")),
+                    commit_data: None,
+                }
+                .encode_to_vec(),
+            },
+        )]);
+        metadata.table_configs = HashMap::from([(
+            "g".to_string(),
+            TableConfig {
+                table_type: TableEnum::GlobalKeyValue as i32,
+                config: GlobalKeyedTableConfig {
+                    table_name: "g".to_string(),
+                    description: "global".to_string(),
+                    uses_two_phase_commit: false,
+                }
+                .encode_to_vec(),
+                state_version: 0,
+                state_backend: String::new(),
+            },
+        )]);
+        report
+    }
+
+    /// A report whose table state is labelled with another subtask's index is refused before
+    /// any of it is merged (PR #160 review round 6, finding 1).
+    ///
+    /// The finding end to end, at the boundary it actually crosses. A report carries its
+    /// subtask index twice — once at the top and once per table payload — and review round 5
+    /// made the operator's completion accounting turn on the first copy while nothing ever read
+    /// the second. So at parallelism 2 the top-level indices `{0, 1}` completed the operator
+    /// while both payloads were filed under subtask 0: the second overwrote the first in
+    /// `TableState::subtask_tables`, and the checkpoint certified state subtask 1 never
+    /// contributed. The global-table merger then accepted the one-entry map without complaint.
+    ///
+    /// Both indices are varied independently, which is what a row varying only the top-level
+    /// one could never have shown. The refused report leaves the checkpoint's bytes exactly
+    /// where the first report left them, so nothing of it is merged and then discounted.
+    #[test]
+    fn a_report_whose_table_state_names_another_subtask_is_refused_before_it_is_merged() {
+        let mut checkpoint = checkpoint_state_of_one_operator(2);
+        checkpoint
+            .checkpoint_finished(subtask_reported_with_table(0, 0))
+            .unwrap();
+        assert_eq!(
+            checkpoint.bytes, 8,
+            "the fixture's precondition: one report"
+        );
+
+        let err = checkpoint
+            .checkpoint_finished(subtask_reported_with_table(1, 0))
+            .expect_err("subtask 1's report may not carry subtask 0's table state");
+        let message = err.to_string();
+        assert!(message.contains("subtask 1"), "{message}");
+        assert!(message.contains("node_3"), "{message}");
+        assert!(message.contains("table g"), "{message}");
+        assert!(message.contains("labelled subtask 0"), "{message}");
+
+        // Refused before the merge: nothing of it reached the checkpoint, and the operator is
+        // still one subtask short, so there is no write token.
+        assert_eq!(checkpoint.bytes, 8);
+        assert!(!checkpoint.done());
+        let unfinished = checkpoint
+            .build_metadata()
+            .expect_err("an operator one subtask short entitles no write");
+        assert!(
+            unfinished
+                .to_string()
+                .contains("subtask(s) 1 did not report"),
+            "{unfinished}"
+        );
+
+        // The legitimate report — the two copies agreeing, which is what `TableManager` stamps
+        // — completes the operator and merges both subtasks' table state.
+        let metadata = checkpoint
+            .checkpoint_finished(subtask_reported_with_table(1, 1))
+            .unwrap()
+            .expect("both subtasks have now reported");
+        assert!(checkpoint.done());
+        let merged = GlobalKeyedTableTaskCheckpointMetadata::decode(
+            &metadata.table_checkpoint_metadata.get("g").unwrap().data[..],
+        )
+        .unwrap();
+        let mut files = merged.files;
+        files.sort();
+        assert_eq!(
+            files,
+            vec!["file-0".to_string(), "file-1".to_string()],
+            "each subtask's table state must survive the merge"
+        );
+    }
+
+    /// A report naming a table it carries no config for is refused rather than panicking
+    /// (PR #160 review round 6, finding 1).
+    ///
+    /// The merge used to reach `table_configs.get(key).expect("should have metadata")` on a key
+    /// taken straight out of a message from a worker, so a report naming a table it did not
+    /// describe took the job controller down with a panic on caller-supplied data. It is now a
+    /// refusal naming the table, which is what the two guards beside it do.
+    #[test]
+    fn a_report_naming_a_table_it_does_not_describe_is_refused_rather_than_panicking() {
+        let mut checkpoint = checkpoint_state_of_one_operator(2);
+        let mut undescribed = subtask_reported_with_table(0, 0);
+        undescribed.metadata.as_mut().unwrap().table_configs.clear();
+
+        let err = checkpoint
+            .checkpoint_finished(undescribed)
+            .expect_err("a report must describe every table it carries state for");
+        let message = err.to_string();
+        assert!(message.contains("table g"), "{message}");
+        assert!(message.contains("no config for it"), "{message}");
+        assert_eq!(checkpoint.bytes, 0);
     }
 
     /// A report carrying an index the operator does not have is refused rather than counted

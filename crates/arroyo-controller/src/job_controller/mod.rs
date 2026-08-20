@@ -9,6 +9,7 @@ use anyhow::bail;
 use arroyo_rpc::checkpoints::CheckpointMetadataStore;
 use arroyo_rpc::grpc::rpc::{CommitReq, StopExecutionReq, StopMode};
 use arroyo_rpc::identity::WorkerClient;
+use arroyo_state::validated::CheckpointIdentity;
 use arroyo_state::{BackingStore, StateBackend, StorageProviderFor};
 use arroyo_types::{JobId, PipelineId, WorkerId};
 use rand::{Rng, rng};
@@ -361,6 +362,10 @@ impl JobController {
             StateBackend::cleanup_checkpoint(
                 &storage_role,
                 state_backend,
+                // The checkpoint this controller asked storage for, passed beside the object
+                // that came back so the two can be compared: every path the cleanup deletes
+                // from is derived from the object, not from these arguments.
+                CheckpointIdentity::new(job_id.as_str(), *cur_epoch as u32),
                 checkpoint,
                 *min_epoch as u32,
                 *new_min as u32,

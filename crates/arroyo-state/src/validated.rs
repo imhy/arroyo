@@ -13,7 +13,29 @@
 //! caller cannot reach an effect without the token, and the only way to a token is the
 //! check — see [`arroyo_rpc::state_backend::validated`] for why it cannot be forged.
 //!
-//! Two families live beside their owners in child modules rather than here, and for the same
+//! # The identity matrix
+//!
+//! A whole-object check is not only about *shape* — that every operator is present, that every
+//! epoch of the range was collected. It is also about *identity*: which checkpoint of which job
+//! the object is, and whether every part of it agrees about that. Review rounds 4, 5 and 6 of
+//! PR #160 each found one identity relationship unstated, so this module now states all of them
+//! in one place, and [`identity`] holds the vocabulary they share.
+//!
+//! | Boundary | Identities that must agree | Evidence | Effect derived from |
+//! |---|---|---|---|
+//! | [`SubtaskReport`] | job (selector), operator, subtask, every table payload's subtask | the report | the token's own pairing |
+//! | [`CompletedCheckpoint`] | job, epoch, operator set, every subtask of every operator | what the checkpoint heard | the token |
+//! | [`RestorableCheckpoint`] | job, epoch, and every persisted operator header's job/operator/epoch | the loaded objects | the token |
+//! | [`CheckpointCleanup`] | job, the retained epoch, **each** dropped epoch, and every header | the collected range | the token |
+//! | [`CheckpointMetadataWrite`] | the exact checkpoint identity, and the operator set | whichever family above entitles it | the token |
+//!
+//! Two of those rows must admit a legitimate difference rather than demand equality, and say so
+//! rather than leaving it to be inferred. A cleanup spans epochs by construction — one retained
+//! and a range of dropped ones — so its rule is "each object carries *the epoch it was collected
+//! at*", not "every object carries one epoch". And a report legitimately omits a table it had no
+//! data for, so nothing requires a table to appear in every subtask's report.
+//!
+//! Four families live beside their owners in child modules rather than here, and for the same
 //! reason: each is self-contained, and each would otherwise push this file past the 500-line
 //! production boundary M11.T25's plan sets. [`cleanup`] carries the whole object a checkpoint
 //! cleanup acts on together with the views its token hands out, which is what keeps those
@@ -21,7 +43,9 @@
 //! the objects here is derived *from*: a checkpoint this process just took has no earlier
 //! token to build on — nothing was restored, compacted or cleaned up — so what entitles its
 //! first metadata write is the completion the checkpoint's own bookkeeping recorded, and that
-//! has to be a checked value rather than a list the writer passes itself.
+//! has to be a checked value rather than a list the writer passes itself. [`subtask`] carries
+//! the report that completion is added up from, and [`identity`] the identity vocabulary every
+//! row of the table above is written in.
 //!
 //! The views handed out from a token — [`ValidatedOperatorCleanup`] and [`ValidatedTable`]
 //! — exist for the same reason one level down: `files_to_keep` decides which files a
@@ -32,11 +56,15 @@
 
 pub mod cleanup;
 pub mod completion;
+pub mod identity;
+pub mod subtask;
 
 pub use cleanup::{
     CheckpointCleanup, CleanupScope, OperatorCleanup, ValidatedOperatorCleanup, ValidatedTable,
 };
-pub use completion::{CompletedCheckpoint, CompletedIdentity, CompletedOperator};
+pub use completion::{CompletedCheckpoint, CompletedOperator};
+pub use identity::{CheckpointIdentity, OperatorObject, check_operator_header};
+pub use subtask::{ReportingOperator, SubtaskReport};
 
 use arroyo_rpc::errors::StateError;
 use arroyo_rpc::grpc::rpc::{CheckpointMetadata, OperatorCheckpointMetadata};
@@ -56,6 +84,14 @@ pub struct RestoringProgram<'a> {
     pub job: StateBackendSelector,
     /// The operators the job's workers will build.
     pub restoring: &'a HashSet<&'a str>,
+    /// The checkpoint the caller asked storage for.
+    ///
+    /// Every persisted operator header in the object being checked has to carry this job, this
+    /// epoch, and the operator the object was read for. Without it the header was read for its
+    /// operator id alone, which is the round-6 finding: an object headed with another job's or
+    /// another epoch's identity, stored under the path the caller reads, passed whole-object
+    /// validation and then redirected the writes compaction derives from that header.
+    pub expected: &'a CheckpointIdentity,
 }
 
 /// Checks that `listed` names exactly the operators in `restoring`, once each.
@@ -120,17 +156,34 @@ pub fn check_program_coverage<'a>(
 /// having built one at all rather than something a later check has to remember.
 #[derive(Debug, Clone)]
 pub struct RestorableCheckpoint {
-    epoch: u32,
+    checkpoint: CheckpointIdentity,
     operators: Vec<(String, OperatorCheckpointMetadata)>,
 }
 
 impl RestorableCheckpoint {
     /// Collects one checkpoint's loaded operator metadata, before it is checked.
     ///
-    /// `operators` must be everything the operation will act on, in the order the caller
-    /// will act in; the check is over exactly this list.
-    pub fn new(epoch: u32, operators: Vec<(String, OperatorCheckpointMetadata)>) -> Self {
-        Self { epoch, operators }
+    /// `checkpoint` is the checkpoint the objects were read for — the job whose prefix they
+    /// live under and the epoch within it — and `operators` must be everything the operation
+    /// will act on, in the order the caller will act in; the check is over exactly this list.
+    ///
+    /// Recording the identity in the value rather than only in the check's context is what
+    /// lets it travel: the metadata rewrite that follows a restore is entitled by this token,
+    /// and what it needs to know is which checkpoint was validated, not which one the caller
+    /// says it was.
+    pub fn new(
+        checkpoint: CheckpointIdentity,
+        operators: Vec<(String, OperatorCheckpointMetadata)>,
+    ) -> Self {
+        Self {
+            checkpoint,
+            operators,
+        }
+    }
+
+    /// The checkpoint these objects were read for.
+    pub fn checkpoint(&self) -> &CheckpointIdentity {
+        &self.checkpoint
     }
 
     /// The operators, in the order they were collected.
@@ -148,41 +201,42 @@ impl WholeObject for RestorableCheckpoint {
     type Context<'a> = RestoringProgram<'a>;
     type Error = StateError;
 
-    /// Exact program coverage, an operator header on every object naming the operator it was
-    /// loaded for, and every table config agreeing with the job's selector.
+    /// The checkpoint the caller asked for, exact program coverage, a persisted header on
+    /// every object carrying **that** job, that epoch and the operator it was loaded for, and
+    /// every table config agreeing with the job's selector.
     ///
-    /// The header is not decoration: `TableManager::load` reads the restored watermark
-    /// straight out of it, so an object without one — or one describing a different operator
-    /// — panics a worker, which is past every effect this check runs in front of.
+    /// The header is not decoration and it is not description. `TableManager::load` reads the
+    /// restored watermark straight out of it — with an `unwrap` — so an object without one
+    /// panics a worker, which is past every effect this check runs in front of. And its
+    /// `job_id` and `epoch` are what expiring-table compaction builds the path of every file it
+    /// writes from, so a header naming another checkpoint redirects those writes. Until review
+    /// round 6 of PR #160 only `operator_id` was read; the other two fields were treated as
+    /// description of an object whose provenance the caller was trusted to know.
+    ///
+    /// The first comparison — the identity the value was built with against the identity the
+    /// context declares — is the weaker of the two, because one caller supplies both. It is
+    /// here so that a future constructor cannot collect one checkpoint's objects and declare
+    /// another, which is exactly the drift that produced the `completed: None` entitlements.
+    /// The per-object comparisons are the load-bearing ones: those compare a caller's question
+    /// against what storage actually returned.
     fn check_whole(&self, program: RestoringProgram<'_>) -> Result<(), StateError> {
-        let incomplete = |detail: String| StateError::IncompleteCheckpoint {
-            epoch: self.epoch,
-            detail,
-        };
+        let epoch = self.checkpoint.epoch();
+        let incomplete = |detail: String| StateError::IncompleteCheckpoint { epoch, detail };
+
+        program.expected.check_matches(
+            "the checkpoint these objects were collected for",
+            &self.checkpoint,
+            incomplete,
+        )?;
 
         check_program_coverage(
-            self.epoch,
+            epoch,
             self.operators.iter().map(|(id, _)| id.as_str()),
             program.restoring,
         )?;
 
         for (operator_id, metadata) in &self.operators {
-            match metadata.operator_metadata.as_ref() {
-                Some(header) if header.operator_id == *operator_id => {}
-                Some(header) => {
-                    return Err(incomplete(format!(
-                        "the checkpoint metadata object for operator {operator_id} is headed \
-                         \"{}\" instead",
-                        header.operator_id
-                    )));
-                }
-                None => {
-                    return Err(incomplete(format!(
-                        "the checkpoint metadata object for operator {operator_id} has no \
-                         operator header, which the worker that builds it requires"
-                    )));
-                }
-            }
+            check_operator_header(self.checkpoint.operator(operator_id), metadata, incomplete)?;
             validate_restored_operator_metadata(program.job, metadata)?;
         }
 
@@ -200,17 +254,23 @@ impl WholeObject for RestorableCheckpoint {
 pub struct CheckpointMetadataWrite {
     metadata: CheckpointMetadata,
     validated_operators: Vec<String>,
-    /// The checkpoint the entitlement is evidence *of*, where the entitlement knows.
+    /// The checkpoint this entitlement is evidence *of*. Never absent.
     ///
-    /// A completion does: it is the record of one job finishing one epoch, and
-    /// [`CompletedCheckpoint`] carries both. A restore preflight and a cleanup do not, and
-    /// this is `None` for them — they derive from a token built out of the objects that
-    /// already exist under the checkpoint being rewritten, so their entitlement is about
-    /// those objects rather than about an identity. Binding those two families is out of
-    /// this round's scope and would move the cleanup and restore call sites; what is in
-    /// scope, and what review round 5 of PR #160 found open, is that a completion carried an
-    /// identity nothing ever compared.
-    completed: Option<CompletedIdentity>,
+    /// Review round 5 of PR #160 gave this to one of the three constructors and left the
+    /// other two saying `None`, on the grounds that a restore preflight and a cleanup derive
+    /// from objects that "already exist under the checkpoint being rewritten". Round 6's
+    /// diagnosis is that this was provenance mistaken for validation: it describes how
+    /// today's callers obtain those objects, and a type that skips its check whenever a field
+    /// is `None` enforces nothing — the next constructor added is one `None` away from
+    /// entitling any checkpoint whose operator set happens to line up, which every epoch of
+    /// one job's does.
+    ///
+    /// So every constructor supplies it, the `Option` is gone, and
+    /// [`Self::check_whole`] has no branch in which the comparison does not run. Each family
+    /// takes it from the token it derives from — the preflight's checkpoint, the cleanup's
+    /// checkpoint, the completion's — so the identity travels with the evidence rather than
+    /// being re-declared by the writer.
+    entitled: CheckpointIdentity,
 }
 
 impl CheckpointMetadataWrite {
@@ -228,7 +288,7 @@ impl CheckpointMetadataWrite {
                 .iter()
                 .map(|(operator_id, _)| operator_id.clone())
                 .collect(),
-            completed: None,
+            entitled: preflight.get().checkpoint().clone(),
         }
     }
 
@@ -243,7 +303,7 @@ impl CheckpointMetadataWrite {
             validated_operators: CheckpointCleanup::operators(cleanup)
                 .map(|operator| operator.operator_id().to_string())
                 .collect(),
-            completed: None,
+            entitled: cleanup.get().checkpoint().clone(),
         }
     }
 
@@ -273,7 +333,7 @@ impl CheckpointMetadataWrite {
         Self {
             metadata,
             validated_operators: completed.get().operator_ids().map(str::to_string).collect(),
-            completed: Some(completed.get().identity()),
+            entitled: completed.get().checkpoint().clone(),
         }
     }
 
@@ -293,21 +353,17 @@ impl WholeObject for CheckpointMetadataWrite {
     /// The identity half runs first because it is the coarser claim: an entitlement for a
     /// different checkpoint is wrong however well its operator set lines up, and operator sets
     /// line up between checkpoints far more often than not — every epoch of one job has the
-    /// same operators as every other. It is checked only where the entitlement carries an
-    /// identity; see the [`completed`](Self) field for which do and why.
+    /// same operators as every other. Since review round 6 of PR #160 it runs for every
+    /// entitlement rather than for the one family that happened to carry an identity; see the
+    /// [`entitled`](Self) field.
     fn check_whole(&self, _context: ()) -> Result<(), StateError> {
-        if let Some(completed) = &self.completed
-            && (completed.job_id != self.metadata.job_id || completed.epoch != self.metadata.epoch)
-        {
-            return Err(StateError::Other {
+        let written = CheckpointIdentity::claimed_by(&self.metadata);
+        written.check_matches("the entitlement", &self.entitled, |error| {
+            StateError::Other {
                 table: String::new(),
-                error: format!(
-                    "the metadata for job {} epoch {} is entitled by the completion of job {} \
-                     epoch {}, which is a different checkpoint",
-                    self.metadata.job_id, self.metadata.epoch, completed.job_id, completed.epoch
-                ),
-            });
-        }
+                error,
+            }
+        })?;
 
         let named: BTreeSet<&str> = self
             .metadata
@@ -347,7 +403,9 @@ impl WholeObject for CheckpointMetadataWrite {
 
 #[cfg(test)]
 mod tests {
-    use super::{CheckpointMetadataWrite, CompletedCheckpoint, CompletedOperator};
+    use super::{
+        CheckpointIdentity, CheckpointMetadataWrite, CompletedCheckpoint, CompletedOperator,
+    };
     use arroyo_rpc::errors::StateError;
     use arroyo_rpc::grpc::rpc::CheckpointMetadata;
     use arroyo_rpc::state_backend::validated::Validated;
@@ -578,16 +636,23 @@ mod tests {
             "{earlier_epoch}"
         );
 
-        // The two other entitlements carry no identity and are unchanged by this round: a
-        // cleanup's `min_epoch` rewrite still turns on the operators whose epochs it checked.
-        // That is stated here so the scope of the binding is visible in a test rather than
-        // only in a doc comment.
+        // The other two entitlements now carry an identity too, and there is no longer a shape
+        // of this struct that has none: `entitled` is not an `Option`. Review round 5 left the
+        // restore and cleanup constructors saying `None`, and what stood here was a
+        // hand-assembled `cleanup_shaped` value asserting that an entitlement without an
+        // identity passed on its operator set alone. Round 6's diagnosis is that this was the
+        // defect rather than the scope: a check that a future constructor can skip by leaving
+        // a field empty is not a check. The rows for the other two families are in
+        // `parquet.rs`, where their tokens can be derived rather than fabricated.
         let cleanup_shaped = CheckpointMetadataWrite {
             metadata: metadata_of("job_a", 4, &["node_1", "node_2"]),
             validated_operators: vec!["node_1".to_string(), "node_2".to_string()],
-            completed: None,
+            entitled: CheckpointIdentity::new("job_a", 5),
         };
-        Validated::validate(cleanup_shaped, ())
-            .expect("an entitlement with no identity is checked by operator set alone");
+        let wrong_epoch = Validated::validate(cleanup_shaped, ()).unwrap_err();
+        assert!(
+            wrong_epoch.to_string().contains("different checkpoint"),
+            "{wrong_epoch}"
+        );
     }
 }

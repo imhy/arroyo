@@ -6,6 +6,7 @@
 //! only producer of either is [`CheckpointCleanup::operators`], which takes the token — and
 //! that is only true while they live in one module.
 
+use super::identity::{CheckpointIdentity, check_operator_header};
 use arroyo_rpc::errors::StateError;
 use arroyo_rpc::grpc::rpc::{OperatorCheckpointMetadata, TableCheckpointMetadata, TableConfig};
 use arroyo_rpc::state_backend::validated::{Validated, WholeObject};
@@ -17,9 +18,20 @@ use arroyo_rpc::state_backend::{StateBackendSelector, validate_restored_operator
 /// checkpoint. Those older epochs may predate a restart onto a different backend, so all of
 /// them have to be checked — and checked before the first delete, because the operators are
 /// collected concurrently and a delete by one cannot be taken back by another's refusal.
+///
+/// # The three epochs
+///
+/// A cleanup is the one boundary in [`crate::validated`] whose objects legitimately carry
+/// *different* epochs, and the identity rule has to say so rather than demand one epoch
+/// everywhere. `checkpoint` is the checkpoint whose top-level metadata the cleanup rewrites —
+/// the job's current one, whose `min_epoch` is being advanced — and it is neither of the other
+/// two. `new_min_epoch` is the epoch being retained, and every operator's retained object must
+/// carry it. `old_min_epoch..new_min_epoch` are the epochs being dropped, and each dropped
+/// object must carry **the epoch it was collected at**, not the retained one and not the
+/// checkpoint's.
 #[derive(Debug, Clone)]
 pub struct CheckpointCleanup {
-    job_id: String,
+    checkpoint: CheckpointIdentity,
     old_min_epoch: u32,
     new_min_epoch: u32,
     operators: Vec<OperatorCleanup>,
@@ -52,34 +64,50 @@ impl OperatorCleanup {
     }
 }
 
-/// The job and the operator list a [`CheckpointCleanup`] has to match.
+/// The job, the checkpoint, and the operator list a [`CheckpointCleanup`] has to match.
 #[derive(Debug, Clone, Copy)]
 pub struct CleanupScope<'a> {
     /// The state backend the job selected.
     pub job: StateBackendSelector,
     /// The checkpoint's own operator list, in order.
     pub operator_ids: &'a [String],
+    /// The checkpoint the caller asked storage for: the job doing the cleanup, and the epoch
+    /// of the top-level metadata object whose `min_epoch` is being advanced.
+    ///
+    /// Every path a cleanup deletes from is built out of the collected object rather than out
+    /// of the caller's arguments — deliberately, so that what is deleted from is what was
+    /// checked. That is only worth anything if the collected object is the one the caller
+    /// asked for, which is what this is compared against.
+    pub expected: &'a CheckpointIdentity,
 }
 
 impl CheckpointCleanup {
     /// Collects the whole cleanup, before it is checked.
+    ///
+    /// `checkpoint` is the checkpoint whose top-level metadata is being rewritten, not the
+    /// epoch being retained; see the [type docs](Self) for the three epochs a cleanup holds.
     pub fn new(
-        job_id: String,
+        checkpoint: CheckpointIdentity,
         old_min_epoch: u32,
         new_min_epoch: u32,
         operators: Vec<OperatorCleanup>,
     ) -> Self {
         Self {
-            job_id,
+            checkpoint,
             old_min_epoch,
             new_min_epoch,
             operators,
         }
     }
 
+    /// The checkpoint whose top-level metadata this cleanup rewrites.
+    pub fn checkpoint(&self) -> &CheckpointIdentity {
+        &self.checkpoint
+    }
+
     /// The job whose checkpoints are being collected.
     pub fn job_id(&self) -> &str {
-        &self.job_id
+        self.checkpoint.job_id()
     }
 
     /// The first epoch being dropped.
@@ -112,18 +140,32 @@ impl WholeObject for CheckpointCleanup {
     type Context<'a> = CleanupScope<'a>;
     type Error = StateError;
 
-    /// Every operator of the checkpoint, every epoch of the range, and every one of their
-    /// table configs.
+    /// The checkpoint the caller asked for, every operator of it, every epoch of the range,
+    /// every one of those objects' persisted headers, and every one of their table configs.
     ///
     /// The structural half — that the operators are exactly the checkpoint's and that each
     /// carries exactly the epochs in `old_min_epoch..new_min_epoch` — is what stops a
     /// caller from earning a token for a cleanup it only partly collected and then deleting
     /// the rest anyway.
+    ///
+    /// The identity half is what review round 6 of PR #160 added, and it is per object rather
+    /// than per call. Every path this cleanup deletes from is derived from the collected value
+    /// — `job_id()`, `old_min_epoch()`, `new_min_epoch()` — so a collected object headed for
+    /// another job or another epoch does not merely describe the wrong thing, it *aims* the
+    /// deletions. The rule is the one the [type docs](Self) state: the retained object carries
+    /// `new_min_epoch`, each dropped object carries the epoch it was collected at, and all of
+    /// them carry this job.
     fn check_whole(&self, scope: CleanupScope<'_>) -> Result<(), StateError> {
         let structural = |error: String| StateError::Other {
             table: String::new(),
             error,
         };
+
+        scope.expected.check_matches(
+            "the checkpoint this cleanup collected",
+            &self.checkpoint,
+            structural,
+        )?;
 
         if self.operators.len() != scope.operator_ids.len()
             || self
@@ -134,7 +176,7 @@ impl WholeObject for CheckpointCleanup {
         {
             return Err(structural(format!(
                 "the cleanup of job {} collected operators {:?}, but the checkpoint lists {:?}",
-                self.job_id,
+                self.job_id(),
                 self.operators
                     .iter()
                     .map(|o| o.operator_id.as_str())
@@ -142,6 +184,13 @@ impl WholeObject for CheckpointCleanup {
                 scope.operator_ids,
             )));
         }
+
+        // The epoch each collected object is expected to carry, per object. The retained
+        // object's is `new_min_epoch` and a dropped object's is its own epoch; both are this
+        // job's, because a cleanup never spans jobs (there is no clone or restore-from-another
+        // -job path in Arroyo, so an object under this job's prefix headed with another job's
+        // id is misplaced by definition).
+        let retained_at = self.checkpoint.at_epoch(self.new_min_epoch);
 
         for operator in &self.operators {
             let collected: Vec<u32> = operator.dropped.iter().map(|(epoch, _)| *epoch).collect();
@@ -154,8 +203,22 @@ impl WholeObject for CheckpointCleanup {
                 )));
             }
 
+            check_operator_header(
+                retained_at.operator(&operator.operator_id),
+                &operator.retained,
+                structural,
+            )?;
             validate_restored_operator_metadata(scope.job, &operator.retained)?;
-            for metadata in operator.dropped.iter().filter_map(|(_, m)| m.as_ref()) {
+
+            for (epoch, metadata) in &operator.dropped {
+                let Some(metadata) = metadata else { continue };
+                check_operator_header(
+                    self.checkpoint
+                        .at_epoch(*epoch)
+                        .operator(&operator.operator_id),
+                    metadata,
+                    structural,
+                )?;
                 validate_restored_operator_metadata(scope.job, metadata)?;
             }
         }

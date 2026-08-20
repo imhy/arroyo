@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use bincode::config::Configuration;
 use bincode::{Decode, Encode};
 
-use crate::validated::CheckpointMetadataWrite;
+use crate::validated::{CheckpointIdentity, CheckpointMetadataWrite};
 use arroyo_rpc::config::config;
 use arroyo_rpc::df::ArroyoSchema;
 use arroyo_rpc::state_backend::StateBackendSelector;
@@ -190,9 +190,17 @@ pub trait BackingStore {
     /// state that some run of this job wrote, and every one of them is checked against
     /// `job` before any file is deleted, so a job can never delete another backend's
     /// files.
+    ///
+    /// `checkpoint` is the checkpoint the caller asked for — its own job id, and the epoch of
+    /// the top-level metadata object whose `min_epoch` this advances. It is passed separately
+    /// from `metadata` on purpose: every path a cleanup deletes from is derived from the
+    /// collected objects rather than from the arguments, so the objects have to be shown to be
+    /// the ones the caller meant rather than trusted to be because of where the caller got
+    /// them (design item M11.D39c; PR #160 review round 6).
     async fn cleanup_checkpoint(
         role: &StorageProviderFor,
         job: StateBackendSelector,
+        checkpoint: CheckpointIdentity,
         metadata: CheckpointMetadata,
         old_min_epoch: u32,
         new_min_epoch: u32,

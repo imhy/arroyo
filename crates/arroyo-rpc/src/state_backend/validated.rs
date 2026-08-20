@@ -24,6 +24,15 @@
 //! validates and restores exactly as it did, and one written after it is byte-identical. What
 //! changed is which *call sites* can name the value an operation needs.
 //!
+//! Review round 6 of PR #160 added one qualification to that, and it is a behavioural one
+//! rather than a format one. The checks now compare the identity a persisted object *claims*
+//! — a checkpoint metadata object's `job_id` and `epoch`, an operator object's header — with
+//! the identity the caller read it under. Every object Arroyo has ever written agrees, because
+//! both writers derive the path from the object: `write_checkpoint_metadata` from
+//! `metadata.job_id`/`epoch` and `write_operator_checkpoint_metadata` from the header. So no
+//! well-formed deployment sees a difference. An object that does *not* agree — corrupt,
+//! misplaced, or planted — used to be acted on and now fails loudly, which is the point.
+//!
 //! # Why the token cannot be forged
 //!
 //! [`Validated<T>`] holds a private field, has no public constructor, and deliberately

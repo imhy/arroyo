@@ -2,9 +2,9 @@ use crate::tables::expiring_time_key_map::ExpiringTimeKeyTable;
 use crate::tables::global_keyed_map::GlobalKeyedTable;
 use crate::tables::{CompactionConfig, ErasedTable};
 use crate::validated::{
-    CheckpointCleanup, CheckpointMetadataWrite, CleanupScope, OperatorCleanup,
+    CheckpointCleanup, CheckpointIdentity, CheckpointMetadataWrite, CleanupScope, OperatorCleanup,
     RestorableCheckpoint, RestoringProgram, ValidatedOperatorCleanup, ValidatedTable,
-    check_program_coverage,
+    check_operator_header, check_program_coverage,
 };
 use crate::{BackingStore, StorageProviderFor, get_storage_provider};
 use arroyo_rpc::errors::StateError;
@@ -49,6 +49,22 @@ impl BackingStore for ParquetBackend {
         "parquet"
     }
 
+    /// Loads one checkpoint's top-level metadata, and checks that the object is the one that
+    /// was asked for.
+    ///
+    /// The path is built from `job_id` and `epoch`; the object carries its own copy of both.
+    /// Until review round 6 of PR #160 nothing compared them, and the object's copies are what
+    /// everything downstream uses — `load_checkpoint_operators` reads every operator object
+    /// from `metadata.job_id`/`metadata.epoch`, `cleanup_checkpoint` deletes from them, and
+    /// `write_checkpoint_metadata` writes back to them. An object of another checkpoint stored
+    /// under this path therefore redirected all of that; checking here is what makes "the
+    /// checkpoint the caller asked for" true rather than assumed, for every caller including
+    /// the worker's own restore (`Program::from_logical`), which has no token at all.
+    ///
+    /// # Errors
+    ///
+    /// [`StateError::IncompleteCheckpoint`] if the object names a different job or epoch,
+    /// alongside the storage and decode failures reading it can produce.
     async fn load_checkpoint_metadata(
         role: &StorageProviderFor,
         job_id: &str,
@@ -59,9 +75,31 @@ impl BackingStore for ParquetBackend {
             .get(metadata_path(&base_path(job_id, epoch)).as_str())
             .await?;
         let metadata = CheckpointMetadata::decode(&data[..])?;
+        CheckpointIdentity::new(job_id, epoch).check_matches(
+            "the checkpoint metadata object read from this checkpoint's path",
+            &CheckpointIdentity::claimed_by(&metadata),
+            |detail| StateError::IncompleteCheckpoint { epoch, detail },
+        )?;
         Ok(metadata)
     }
 
+    /// Loads one operator's checkpoint metadata, and checks that the object is headed as the
+    /// one that was asked for.
+    ///
+    /// Absent is `None`, as it has always been — the callers that require the object say so
+    /// themselves. Present but headed for another job, another operator or another epoch is a
+    /// failure rather than a value, because the header is authoritative input downstream:
+    /// `TableManager::load` reads the restored watermark out of it, and expiring-table
+    /// compaction builds the path of every file it writes from its `job_id`, `operator_id` and
+    /// `epoch`. Checking it here covers every reader of an operator object in one place,
+    /// including the worker's restore; each whole-object token checks it again over the value
+    /// it actually holds, so the guarantee does not depend on where the value came from.
+    ///
+    /// # Errors
+    ///
+    /// [`StateError::IncompleteCheckpoint`] if the object carries no header or one naming a
+    /// different job, operator or epoch, alongside the storage and decode failures reading it
+    /// can produce.
     async fn load_operator_metadata(
         role: &StorageProviderFor,
         job_id: &str,
@@ -69,11 +107,19 @@ impl BackingStore for ParquetBackend {
         epoch: u32,
     ) -> Result<Option<OperatorCheckpointMetadata>, StateError> {
         let storage_client = get_storage_provider(role).await?;
-        storage_client
+        let Some(data) = storage_client
             .get_if_present(metadata_path(&operator_path(job_id, epoch, operator_id)).as_str())
             .await?
-            .map(|data| Ok(OperatorCheckpointMetadata::decode(&data[..])?))
-            .transpose()
+        else {
+            return Ok(None);
+        };
+        let metadata = OperatorCheckpointMetadata::decode(&data[..])?;
+        check_operator_header(
+            CheckpointIdentity::new(job_id, epoch).operator(operator_id),
+            &metadata,
+            |detail| StateError::IncompleteCheckpoint { epoch, detail },
+        )?;
+        Ok(Some(metadata))
     }
 
     async fn write_operator_checkpoint_metadata(
@@ -118,6 +164,7 @@ impl BackingStore for ParquetBackend {
     async fn cleanup_checkpoint(
         role: &StorageProviderFor,
         job: StateBackendSelector,
+        checkpoint: CheckpointIdentity,
         mut metadata: CheckpointMetadata,
         old_min_epoch: u32,
         min_epoch: u32,
@@ -170,7 +217,7 @@ impl BackingStore for ParquetBackend {
 
         let cleanup = Validated::validate(
             CheckpointCleanup::new(
-                metadata.job_id.clone(),
+                CheckpointIdentity::claimed_by(&metadata),
                 old_min_epoch,
                 min_epoch,
                 collected
@@ -181,6 +228,7 @@ impl BackingStore for ParquetBackend {
             CleanupScope {
                 job,
                 operator_ids: &metadata.operator_ids,
+                expected: &checkpoint,
             },
         )?;
 
@@ -196,7 +244,11 @@ impl BackingStore for ParquetBackend {
 
         // Every path below is derived from the token rather than from the arguments, so the
         // job and the epoch range that are deleted from are literally the ones the check
-        // covered.
+        // covered. That is only worth anything because the check now compares the collected
+        // object's identity against `checkpoint`, the one the caller asked for: until review
+        // round 6 of PR #160 the paths came from a `job_id` nothing had checked, which made
+        // "derived from the token" a statement about where the value was read rather than
+        // about what it is.
         let deleting_from = cleanup.get();
         let mut deleting: FuturesUnordered<_> = plans
             .into_iter()
@@ -346,6 +398,7 @@ impl ParquetBackend {
     pub async fn load_checkpoint_operators(
         role: &StorageProviderFor,
         job: StateBackendSelector,
+        checkpoint: &CheckpointIdentity,
         restoring: &HashSet<&str>,
         metadata: &CheckpointMetadata,
     ) -> Result<Validated<RestorableCheckpoint>, StateError> {
@@ -394,13 +447,17 @@ impl ParquetBackend {
         // headers, the exact coverage, and every table config — is the token's job.
         Validated::validate(
             RestorableCheckpoint::new(
-                metadata.epoch,
+                CheckpointIdentity::claimed_by(metadata),
                 loaded
                     .into_iter()
                     .map(|(_, operator_id, loaded)| (operator_id, loaded))
                     .collect(),
             ),
-            RestoringProgram { job, restoring },
+            RestoringProgram {
+                job,
+                restoring,
+                expected: checkpoint,
+            },
         )
     }
 
@@ -452,9 +509,14 @@ impl ParquetBackend {
         loaded.sort_by_key(|(position, _, _)| *position);
 
         let compacting: HashSet<&str> = operator_ids.iter().map(String::as_str).collect();
+        // The identity the caller asked for. Compaction is the call site with the most to lose
+        // from a header nothing checked: `compact_loaded_operator` hands the header to the
+        // table implementations, and the expiring-table compactor builds the path of every
+        // file it writes out of the header's `job_id`, `operator_id` and `epoch`.
+        let expected = CheckpointIdentity::new(job_id.as_str(), epoch);
         let checkpoint = Validated::validate(
             RestorableCheckpoint::new(
-                epoch,
+                expected.clone(),
                 loaded
                     .into_iter()
                     .map(|(_, operator_id, metadata)| (operator_id, metadata))
@@ -463,6 +525,7 @@ impl ParquetBackend {
             RestoringProgram {
                 job,
                 restoring: &compacting,
+                expected: &expected,
             },
         )?;
 
@@ -678,8 +741,8 @@ impl ParquetStats {
 mod tests {
     use super::{HashSet, ParquetBackend, base_path, metadata_path, operator_path};
     use crate::validated::{
-        CheckpointCleanup, CheckpointMetadataWrite, CleanupScope, OperatorCleanup,
-        RestorableCheckpoint, RestoringProgram,
+        CheckpointCleanup, CheckpointIdentity, CheckpointMetadataWrite, CleanupScope,
+        OperatorCleanup, RestorableCheckpoint, RestoringProgram,
     };
     use crate::{BackingStore, StorageProviderFor, get_storage_provider};
     use arroyo_rpc::errors::StateError;
@@ -848,6 +911,11 @@ mod tests {
         operator_ids.iter().copied().collect()
     }
 
+    /// The checkpoint a caller asked storage for: this fixture's job, at `epoch`.
+    fn asked_for(epoch: u32) -> CheckpointIdentity {
+        CheckpointIdentity::new(JOB_ID, epoch)
+    }
+
     /// The compatibility direction of the cleanup guard: a job whose checkpoints predate the
     /// selector (every table config empty) still collects its own old epochs. The guard must
     /// not strand a legacy deployment's state.
@@ -860,6 +928,7 @@ mod tests {
         ParquetBackend::cleanup_checkpoint(
             &store.role,
             StateBackendSelector::Parquet,
+            asked_for(1),
             checkpoint_metadata(&["node_1"], 1),
             0,
             1,
@@ -895,6 +964,7 @@ mod tests {
         let err = ParquetBackend::cleanup_checkpoint(
             &store.role,
             StateBackendSelector::Parquet,
+            asked_for(2),
             checkpoint_metadata(&["node_1"], 2),
             0,
             2,
@@ -943,6 +1013,7 @@ mod tests {
         let err = ParquetBackend::cleanup_checkpoint(
             &store.role,
             StateBackendSelector::Parquet,
+            asked_for(1),
             checkpoint_metadata(&["node_1", "node_2"], 1),
             0,
             1,
@@ -1035,6 +1106,7 @@ mod tests {
         let err = ParquetBackend::load_checkpoint_operators(
             &store.role,
             StateBackendSelector::Parquet,
+            &asked_for(1),
             &restoring(&["node_1", "node_2"]),
             &checkpoint_metadata(&["node_1", "node_2"], 1),
         )
@@ -1065,6 +1137,7 @@ mod tests {
         let preflight = ParquetBackend::load_checkpoint_operators(
             &store.role,
             StateBackendSelector::Parquet,
+            &asked_for(1),
             &restoring(&["node_1", "node_2"]),
             &checkpoint_metadata(&["node_1", "node_2"], 1),
         )
@@ -1094,6 +1167,7 @@ mod tests {
         let err = ParquetBackend::load_checkpoint_operators(
             &store.role,
             StateBackendSelector::Parquet,
+            &asked_for(1),
             &restoring(&["node_1", "node_2"]),
             &checkpoint_metadata(&["node_1", "node_2"], 1),
         )
@@ -1123,6 +1197,7 @@ mod tests {
         let err = ParquetBackend::load_checkpoint_operators(
             &store.role,
             StateBackendSelector::Parquet,
+            &asked_for(1),
             &restoring(&["node_1", "node_2"]),
             // the checkpoint lists only node_1, so node_2's disagreeing metadata is never
             // read by the preflight — but node_2 is built by every worker all the same
@@ -1166,6 +1241,7 @@ mod tests {
         let err = ParquetBackend::load_checkpoint_operators(
             &store.role,
             StateBackendSelector::Parquet,
+            &asked_for(1),
             &restoring(&["node_1", "node_2"]),
             &checkpoint_metadata(&["node_1", "node_2"], 1),
         )
@@ -1192,6 +1268,7 @@ mod tests {
         let err = ParquetBackend::load_checkpoint_operators(
             &store.role,
             StateBackendSelector::Parquet,
+            &asked_for(1),
             &restoring(&["node_1"]),
             &checkpoint_metadata(&["node_1", "node_2"], 1),
         )
@@ -1275,6 +1352,7 @@ mod tests {
         let err = ParquetBackend::cleanup_checkpoint(
             &store.role,
             StateBackendSelector::Parquet,
+            asked_for(1),
             checkpoint_metadata(&["node_1", "node_2"], 1),
             0,
             1,
@@ -1309,14 +1387,16 @@ mod tests {
         // The token half. `operator_ids` is the checkpoint's own list, which is what the
         // collected cleanup has to match.
         let operator_ids = vec!["node_1".to_string(), "node_2".to_string()];
+        let expected = asked_for(1);
         let scope = CleanupScope {
             job: StateBackendSelector::Parquet,
             operator_ids: &operator_ids,
+            expected: &expected,
         };
 
         Validated::validate(
             CheckpointCleanup::new(
-                JOB_ID.to_string(),
+                asked_for(1),
                 0,
                 1,
                 vec![
@@ -1330,7 +1410,7 @@ mod tests {
 
         let missing_epoch = Validated::validate(
             CheckpointCleanup::new(
-                JOB_ID.to_string(),
+                asked_for(1),
                 0,
                 1,
                 vec![
@@ -1349,12 +1429,7 @@ mod tests {
         );
 
         let missing_operator = Validated::validate(
-            CheckpointCleanup::new(
-                JOB_ID.to_string(),
-                0,
-                1,
-                vec![agreeing_operator("node_1", &[0])],
-            ),
+            CheckpointCleanup::new(asked_for(1), 0, 1, vec![agreeing_operator("node_1", &[0])]),
             scope,
         )
         .unwrap_err();
@@ -1444,7 +1519,7 @@ mod tests {
         // The token half: a set that is not the whole job cannot be checked at all.
         let partial = Validated::validate(
             RestorableCheckpoint::new(
-                1,
+                asked_for(1),
                 vec![(
                     "node_1".to_string(),
                     operator_metadata("node_1", 1, "parquet", &[]),
@@ -1453,6 +1528,7 @@ mod tests {
             RestoringProgram {
                 job: StateBackendSelector::Parquet,
                 restoring: &restoring(&["node_1", "node_2"]),
+                expected: &asked_for(1),
             },
         )
         .unwrap_err();
@@ -1461,6 +1537,389 @@ mod tests {
             "{partial:?}"
         );
         assert!(partial.to_string().contains("node_2"), "{partial}");
+    }
+
+    /// One operator's metadata object, written straight to the path the loader reads, headed
+    /// for whatever job, operator and epoch the caller names.
+    ///
+    /// `write_operator_checkpoint_metadata` derives its path *from* the header, so it cannot
+    /// produce a misplaced object; this is how one arrives from outside, which is exactly the
+    /// situation the identity checks exist for.
+    async fn put_foreign_object(
+        store: &LocalCheckpointStore,
+        at_epoch: u32,
+        at_operator: &str,
+        header_job: &str,
+        header_operator: &str,
+        header_epoch: u32,
+    ) {
+        let mut object = operator_metadata(header_operator, header_epoch, "parquet", &[]);
+        object.operator_metadata.as_mut().unwrap().job_id = header_job.to_string();
+        store
+            .put(
+                &metadata_path(&operator_path(JOB_ID, at_epoch, at_operator)),
+                object.encode_to_vec(),
+            )
+            .await;
+    }
+
+    /// A persisted operator object headed for another checkpoint is refused even though it is
+    /// stored where this checkpoint's object belongs (PR #160 review round 6, finding 3).
+    ///
+    /// This is the reviewer's attack, written the way the reviewer described it. `OperatorMetadata`
+    /// carries `job_id`, `operator_id` and `epoch`; only the second was ever compared. The token
+    /// that results is consumed by compaction, and the expiring-table compactor builds the path of
+    /// every file it writes out of all three — so an object planted under the expected path
+    /// redirected writes *after* "whole-object validation" had passed it.
+    ///
+    /// Each field is varied independently, from an object that agrees in the other two, because
+    /// that is what a row varying only the top-level identity could never see.
+    #[tokio::test]
+    async fn a_foreign_operator_object_under_the_expected_path_is_refused() {
+        let store = LocalCheckpointStore::new("foreign-header");
+
+        // Right operator, right epoch, another job's id.
+        put_foreign_object(&store, 1, "node_1", "job_2", "node_1", 1).await;
+        let other_job = ParquetBackend::load_checkpoint_operators(
+            &store.role,
+            StateBackendSelector::Parquet,
+            &asked_for(1),
+            &restoring(&["node_1"]),
+            &checkpoint_metadata(&["node_1"], 1),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(other_job, StateError::IncompleteCheckpoint { epoch: 1, .. }),
+            "{other_job:?}"
+        );
+        assert!(
+            other_job.to_string().contains("job \"job_2\""),
+            "{other_job}"
+        );
+
+        // Right job, right operator, another epoch — the pair no operator set can tell apart.
+        put_foreign_object(&store, 1, "node_1", JOB_ID, "node_1", 7).await;
+        let other_epoch = ParquetBackend::load_checkpoint_operators(
+            &store.role,
+            StateBackendSelector::Parquet,
+            &asked_for(1),
+            &restoring(&["node_1"]),
+            &checkpoint_metadata(&["node_1"], 1),
+        )
+        .await
+        .unwrap_err();
+        assert!(other_epoch.to_string().contains("epoch 7"), "{other_epoch}");
+
+        // And compaction, which is the HIGH-impact consumer of the same token: it refuses the
+        // object rather than compacting under the identity the object claims.
+        let compaction = ParquetBackend::compact_checkpoint(
+            &store.role,
+            StateBackendSelector::Parquet,
+            Arc::new(JOB_ID.to_string()),
+            vec!["node_1".to_string()],
+            1,
+        )
+        .await
+        .unwrap_err();
+        assert!(compaction.to_string().contains("epoch 7"), "{compaction}");
+
+        // The control: the same call with the object headed as it should be goes through, so
+        // the refusals above are the header and nothing else.
+        write_epoch(&store, "node_1", 1, "parquet").await;
+        ParquetBackend::load_checkpoint_operators(
+            &store.role,
+            StateBackendSelector::Parquet,
+            &asked_for(1),
+            &restoring(&["node_1"]),
+            &checkpoint_metadata(&["node_1"], 1),
+        )
+        .await
+        .expect("an object headed as this checkpoint's is this checkpoint's");
+        ParquetBackend::compact_checkpoint(
+            &store.role,
+            StateBackendSelector::Parquet,
+            Arc::new(JOB_ID.to_string()),
+            vec!["node_1".to_string()],
+            1,
+        )
+        .await
+        .expect("and it compacts");
+    }
+
+    /// The token itself refuses a foreign header, not only the loader that produced it
+    /// (PR #160 review round 6, finding 3).
+    ///
+    /// The loader check above covers every reader of an operator object in one place. It is
+    /// not the guarantee, though: it is a property of *where the value came from*, and a
+    /// validate-then-act token that leaned on that would be back to caller provenance. So the
+    /// whole-object check makes the same statement about the value it actually holds, and this
+    /// row is that check run on a hand-built value the loader never touched.
+    #[test]
+    fn a_restorable_checkpoints_own_check_refuses_a_foreign_header() {
+        let mut foreign = operator_metadata("node_1", 1, "parquet", &[]);
+        foreign.operator_metadata.as_mut().unwrap().job_id = "job_2".to_string();
+
+        let refused = Validated::validate(
+            RestorableCheckpoint::new(asked_for(1), vec![("node_1".to_string(), foreign)]),
+            RestoringProgram {
+                job: StateBackendSelector::Parquet,
+                restoring: &restoring(&["node_1"]),
+                expected: &asked_for(1),
+            },
+        )
+        .unwrap_err();
+        assert!(refused.to_string().contains("job_2"), "{refused}");
+
+        // And a token collected for one checkpoint cannot be declared to be about another,
+        // which is the drift that produced the identity-free entitlements round 5 left behind.
+        let misdeclared = Validated::validate(
+            RestorableCheckpoint::new(
+                asked_for(1),
+                vec![(
+                    "node_1".to_string(),
+                    operator_metadata("node_1", 1, "parquet", &[]),
+                )],
+            ),
+            RestoringProgram {
+                job: StateBackendSelector::Parquet,
+                restoring: &restoring(&["node_1"]),
+                expected: &CheckpointIdentity::new(JOB_ID, 2),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            misdeclared.to_string().contains("different checkpoint"),
+            "{misdeclared}"
+        );
+    }
+
+    /// A checkpoint's own top-level metadata object has to be the checkpoint that was asked
+    /// for (PR #160 review round 6, finding 3).
+    ///
+    /// One level above the operator headers, and the same shape: the path is built from the
+    /// caller's job id and epoch, the object carries its own copy of both, and every operator
+    /// object the preflight then reads is read from the object's copies. The worker's own
+    /// restore (`Program::from_logical`) reads this object with no token at all, which is why
+    /// the check lives in the loader as well as in the tokens downstream of it.
+    #[tokio::test]
+    async fn a_top_level_metadata_object_claiming_another_checkpoint_is_refused() {
+        let store = LocalCheckpointStore::new("foreign-checkpoint");
+        write_epoch(&store, "node_1", 1, "parquet").await;
+
+        let mut foreign = checkpoint_metadata(&["node_1"], 1);
+        foreign.job_id = "job_2".to_string();
+        store
+            .put(
+                &metadata_path(&base_path(JOB_ID, 1)),
+                foreign.encode_to_vec(),
+            )
+            .await;
+
+        let err = ParquetBackend::load_checkpoint_metadata(&store.role, JOB_ID, 1)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, StateError::IncompleteCheckpoint { epoch: 1, .. }),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("job_2"), "{err}");
+
+        // The epoch half, varied on its own.
+        let mut wrong_epoch = checkpoint_metadata(&["node_1"], 1);
+        wrong_epoch.epoch = 6;
+        store
+            .put(
+                &metadata_path(&base_path(JOB_ID, 1)),
+                wrong_epoch.encode_to_vec(),
+            )
+            .await;
+        let err = ParquetBackend::load_checkpoint_metadata(&store.role, JOB_ID, 1)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("epoch 6"), "{err}");
+
+        // The control.
+        store
+            .put(
+                &metadata_path(&base_path(JOB_ID, 1)),
+                checkpoint_metadata(&["node_1"], 1).encode_to_vec(),
+            )
+            .await;
+        ParquetBackend::load_checkpoint_metadata(&store.role, JOB_ID, 1)
+            .await
+            .expect("the object at this checkpoint's path, claiming to be it, is it");
+    }
+
+    /// A cleanup's objects are bound to the epoch each of them was collected at — and a
+    /// cleanup legitimately spans epochs, so the rule is per object rather than per call
+    /// (PR #160 review round 6, findings 2 and 3).
+    ///
+    /// The positive half is the one that has to come first, because it is what a rule of
+    /// "every object carries the checkpoint's epoch" would have broken: a real cleanup holds
+    /// three different epochs at once — the top-level metadata object at the job's current
+    /// epoch, the retained operator objects at `new_min_epoch`, and one dropped object per
+    /// epoch in `old_min_epoch..new_min_epoch`.
+    #[tokio::test]
+    async fn a_cleanup_binds_each_object_to_the_epoch_it_was_collected_at() {
+        let store = LocalCheckpointStore::new("cleanup-identity");
+        let dropped_0 = write_epoch(&store, "node_1", 0, "parquet").await;
+        let dropped_1 = write_epoch(&store, "node_1", 1, "parquet").await;
+        let retained = write_epoch(&store, "node_1", 2, "parquet").await;
+
+        // The positive: three epochs, three different expectations, all satisfied.
+        ParquetBackend::cleanup_checkpoint(
+            &store.role,
+            StateBackendSelector::Parquet,
+            asked_for(3),
+            checkpoint_metadata(&["node_1"], 3),
+            0,
+            2,
+        )
+        .await
+        .expect("a cleanup spanning a retained epoch and a range of dropped ones is ordinary");
+        assert!(!store.exists(&dropped_0).await);
+        assert!(!store.exists(&dropped_1).await);
+        assert!(store.exists(&retained).await);
+
+        // The negative, on a fresh store: the retained object headed for the epoch being
+        // dropped rather than the epoch being kept. Nothing may be deleted.
+        let store = LocalCheckpointStore::new("cleanup-identity-negative");
+        let dropped = write_epoch(&store, "node_1", 0, "parquet").await;
+        put_foreign_object(&store, 1, "node_1", JOB_ID, "node_1", 0).await;
+
+        let err = ParquetBackend::cleanup_checkpoint(
+            &store.role,
+            StateBackendSelector::Parquet,
+            asked_for(2),
+            checkpoint_metadata(&["node_1"], 2),
+            0,
+            1,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("epoch 0"), "{err}");
+        assert!(
+            store.exists(&dropped).await,
+            "a refused cleanup deleted a file"
+        );
+
+        // And the caller's own declaration is compared too: a cleanup told it is collecting
+        // one checkpoint while the object says another is refused before the first delete.
+        let store = LocalCheckpointStore::new("cleanup-identity-declared");
+        let dropped = write_epoch(&store, "node_1", 0, "parquet").await;
+        write_epoch(&store, "node_1", 1, "parquet").await;
+        let err = ParquetBackend::cleanup_checkpoint(
+            &store.role,
+            StateBackendSelector::Parquet,
+            CheckpointIdentity::new("job_2", 2),
+            checkpoint_metadata(&["node_1"], 2),
+            0,
+            1,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("different checkpoint"), "{err}");
+        assert!(store.exists(&dropped).await);
+    }
+
+    /// Every metadata-rewrite entitlement is bound to the checkpoint it is evidence of, not
+    /// just the completion one (PR #160 review round 6, finding 2).
+    ///
+    /// Review round 5 bound the completion entitlement and left `after_restore_preflight` and
+    /// `after_cleanup` supplying `None`, so those two writes were checked by operator set
+    /// alone — and every epoch of a job has the same operator set. Both tokens here are real,
+    /// derived from objects on disk rather than assembled by hand, which is what makes the
+    /// refusals below about the binding rather than about the fixture.
+    #[tokio::test]
+    async fn a_restore_and_a_cleanup_entitle_only_their_own_checkpoint() {
+        let store = LocalCheckpointStore::new("entitlement-identity");
+        write_epoch(&store, "node_1", 1, "parquet").await;
+
+        let preflight = ParquetBackend::load_checkpoint_operators(
+            &store.role,
+            StateBackendSelector::Parquet,
+            &asked_for(1),
+            &restoring(&["node_1"]),
+            &checkpoint_metadata(&["node_1"], 1),
+        )
+        .await
+        .unwrap();
+
+        // Its own checkpoint: entitled.
+        Validated::validate(
+            CheckpointMetadataWrite::after_restore_preflight(
+                checkpoint_metadata(&["node_1"], 1),
+                &preflight,
+            ),
+            (),
+        )
+        .expect("the checkpoint the preflight covered is the one it entitles");
+
+        // Another epoch of the same job, same operator set — the case an operator-set check
+        // cannot see.
+        let other_epoch = Validated::validate(
+            CheckpointMetadataWrite::after_restore_preflight(
+                checkpoint_metadata(&["node_1"], 9),
+                &preflight,
+            ),
+            (),
+        )
+        .unwrap_err();
+        assert!(
+            other_epoch.to_string().contains("different checkpoint"),
+            "{other_epoch}"
+        );
+
+        // Another job, same operator set.
+        let mut other_job = checkpoint_metadata(&["node_1"], 1);
+        other_job.job_id = "job_2".to_string();
+        let refused = Validated::validate(
+            CheckpointMetadataWrite::after_restore_preflight(other_job, &preflight),
+            (),
+        )
+        .unwrap_err();
+        assert!(refused.to_string().contains("job_2"), "{refused}");
+
+        // The cleanup entitlement, likewise, against a token derived from a real collection.
+        let operator_ids = vec!["node_1".to_string()];
+        let expected = asked_for(2);
+        let cleanup = Validated::validate(
+            CheckpointCleanup::new(
+                asked_for(2),
+                0,
+                1,
+                vec![OperatorCleanup::new(
+                    "node_1".to_string(),
+                    operator_metadata("node_1", 1, "parquet", &[]),
+                    vec![(0, Some(operator_metadata("node_1", 0, "parquet", &[])))],
+                )],
+            ),
+            CleanupScope {
+                job: StateBackendSelector::Parquet,
+                operator_ids: &operator_ids,
+                expected: &expected,
+            },
+        )
+        .expect("a whole, agreeing, correctly headed cleanup");
+
+        Validated::validate(
+            CheckpointMetadataWrite::after_cleanup(checkpoint_metadata(&["node_1"], 2), &cleanup),
+            (),
+        )
+        .expect("the checkpoint the cleanup collected is the one its rewrite entitles");
+
+        let wrong_checkpoint = Validated::validate(
+            CheckpointMetadataWrite::after_cleanup(checkpoint_metadata(&["node_1"], 3), &cleanup),
+            (),
+        )
+        .unwrap_err();
+        assert!(
+            wrong_checkpoint
+                .to_string()
+                .contains("different checkpoint"),
+            "{wrong_checkpoint}"
+        );
     }
 
     /// D96 row 4 (round 2): rewriting a checkpoint's top-level metadata takes only a token,
@@ -1482,6 +1941,7 @@ mod tests {
         let preflight = ParquetBackend::load_checkpoint_operators(
             &store.role,
             StateBackendSelector::Parquet,
+            &asked_for(1),
             &restoring(&["node_1", "node_2"]),
             &metadata,
         )

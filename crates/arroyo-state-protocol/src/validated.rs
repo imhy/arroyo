@@ -130,6 +130,20 @@ impl WholeObject for GenerationPublication {
     /// and vice versa — is what stops a publication naming a checkpoint whose manifest was
     /// never read at all, which is the state the two checks above would otherwise have
     /// nothing to say about.
+    ///
+    /// The identity half is the leader-mode row of the matrix in
+    /// [`arroyo_state::validated`](../../arroyo_state/validated/index.html): the recovery
+    /// manifest has to belong to the pipeline and job that is publishing. It is the one
+    /// identity of the four a manifest carries that must be *equal*; the generation and the
+    /// epoch legitimately differ, because a recovery checkpoint is always an earlier one.
+    ///
+    /// One relationship inside the manifest is **not** checked here and is disclosed rather
+    /// than assumed away: each entry's own `OperatorMetadata` header carries a `job_id` and an
+    /// `epoch`, and nothing compares them with the manifest's. Closing that means tightening
+    /// [`validate_manifest_covers_program`], which is landed M11.T08 code whose regression
+    /// fixtures deliberately build entries whose header job and epoch differ from the
+    /// manifest's — so it cannot be closed without editing carried tests, which M11.T25's plan
+    /// forbids. See PR #160 review round 6.
     fn check_whole(&self, job: PublishingJob<'_>) -> Result<(), StoreError> {
         match (&self.base_checkpoint_ref, &self.recovery_checkpoint) {
             (Some(checkpoint_ref), None) => {
@@ -152,6 +166,24 @@ impl WholeObject for GenerationPublication {
             .recovery_checkpoint
             .as_ref()
             .expect("matched as present above");
+
+        // Which job's checkpoint this is. The manifest was read from a reference under this
+        // job's own prefix, and it names the pipeline and job it belongs to; until review round
+        // 6 of PR #160 nothing compared the two, so a manifest belonging to another job, stored
+        // where this one's belongs, was published as this generation's recovery point — and
+        // `resolve_generation_manifest` rebuilds its `ProtocolPaths` out of exactly those two
+        // fields, so the mis-identification would then aim later reads and deletes.
+        //
+        // The *generation* and the *epoch* are deliberately not compared. A recovery checkpoint
+        // is by construction from an earlier generation and an earlier epoch — that is what
+        // recovering means — so demanding equality there would refuse every legitimate
+        // publication that has any history to recover from.
+        if checkpoint.pipeline_id != *self.pipeline_id || checkpoint.job_id != *self.job_id {
+            return Err(StoreError::Protocol(
+                ProtocolError::CheckpointManifestMismatch,
+            ));
+        }
+
         validate_manifest_covers_program(checkpoint, job.program_operators)?;
         validate_restored_manifest(job.state_backend, checkpoint)?;
         Ok(())
@@ -284,4 +316,97 @@ pub(crate) fn validate_history(
     job: StateBackendSelector,
 ) -> Result<Validated<CheckpointHistory>, StoreError> {
     Validated::validate(history, job)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GenerationPublication, PublishingJob};
+    use crate::store::StoreError;
+    use crate::types::{CheckpointRef, Generation, ProtocolError};
+    use arroyo_rpc::grpc::rpc::CheckpointManifest;
+    use arroyo_rpc::state_backend::StateBackendSelector;
+    use arroyo_rpc::state_backend::validated::Validated;
+    use arroyo_types::{JobId, PipelineId};
+    use std::collections::HashSet;
+    use std::time::SystemTime;
+
+    /// A recovery manifest claiming to belong to `pipeline_id`/`job_id`, at `generation` and
+    /// `epoch`, describing no operators.
+    fn recovery(
+        pipeline_id: &str,
+        job_id: &str,
+        generation: u64,
+        epoch: u64,
+    ) -> CheckpointManifest {
+        CheckpointManifest {
+            pipeline_id: pipeline_id.to_string(),
+            job_id: job_id.to_string(),
+            generation,
+            epoch,
+            min_epoch: epoch,
+            operators: vec![],
+            ..Default::default()
+        }
+    }
+
+    /// A publication of generation 4 of pipeline `P`, job `J`, recovering from `manifest`.
+    fn publish(manifest: CheckpointManifest) -> Result<(), StoreError> {
+        let program: HashSet<&str> = HashSet::new();
+        Validated::validate(
+            GenerationPublication::new(
+                PipelineId::new("P"),
+                JobId::new("J"),
+                Generation(4),
+                SystemTime::UNIX_EPOCH,
+                Some(CheckpointRef::new("P/J/checkpoints/g-1/e-2").unwrap()),
+                Some(manifest),
+            ),
+            PublishingJob {
+                state_backend: StateBackendSelector::Parquet,
+                program_operators: &program,
+            },
+        )
+        .map(|_| ())
+    }
+
+    /// A generation may only be published against a recovery checkpoint belonging to the job
+    /// that is publishing — and its generation and epoch legitimately differ (PR #160 review
+    /// round 6).
+    ///
+    /// The leader-mode row of the identity matrix. `resolve_generation_manifest` rebuilds its
+    /// `ProtocolPaths` out of the manifest's own `pipeline_id` and `job_id`, so a manifest
+    /// belonging to another job — stored where this one's belongs — would aim later reads and
+    /// deletes. The positive case has to come first, because a rule of "the manifest names this
+    /// generation and this epoch" would refuse every publication that has any history at all:
+    /// recovering *means* reaching back past the current generation.
+    #[test]
+    fn a_generation_publishes_only_against_its_own_jobs_recovery_checkpoint() {
+        publish(recovery("P", "J", 1, 2))
+            .expect("an earlier generation and epoch of this job is what recovery is");
+
+        // Each identity varied on its own, from a manifest that agrees in the other.
+        let other_job = publish(recovery("P", "J2", 1, 2)).unwrap_err();
+        assert!(
+            matches!(
+                other_job,
+                StoreError::Protocol(ProtocolError::CheckpointManifestMismatch)
+            ),
+            "{other_job:?}"
+        );
+
+        let other_pipeline = publish(recovery("P2", "J", 1, 2)).unwrap_err();
+        assert!(
+            matches!(
+                other_pipeline,
+                StoreError::Protocol(ProtocolError::CheckpointManifestMismatch)
+            ),
+            "{other_pipeline:?}"
+        );
+
+        // ...and the two that must *not* be compared, stated as a positive so the exemption is
+        // pinned rather than merely absent: the generation being published is 4, and a recovery
+        // checkpoint from generation 3 at a much older epoch is ordinary.
+        publish(recovery("P", "J", 3, 0))
+            .expect("a recovery checkpoint is always from an earlier generation and epoch");
+    }
 }

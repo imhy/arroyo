@@ -40,7 +40,7 @@ use arroyo_rpc::{LeaderContext, grpc_channel_builder};
 use arroyo_state::{
     BackingStore, StateBackend, StorageProviderFor, get_storage_provider,
     tables::{ErasedTable, global_keyed_map::GlobalKeyedTable},
-    validated::CheckpointMetadataWrite,
+    validated::{CheckpointIdentity, CheckpointMetadataWrite},
 };
 use arroyo_state_protocol::types::Generation;
 use arroyo_state_protocol::workflow::{
@@ -861,30 +861,37 @@ async fn prepare_restored_checkpoint(
     // checked is the workers' own, not the checkpoint's list, so an operator the
     // checkpoint omits cannot slip past unread and then fail in a worker.
     let expected: HashSet<&str> = restoring.keys().map(String::as_str).collect();
-    let preflight =
-        StateBackend::load_checkpoint_operators(storage_role, job, &expected, &metadata)
-            .await
-            .map_err(|err| match err {
-                StateStoreError::StateBackendError(e) => RestorePreparationError::Fatal {
-                    message: "cannot restore a checkpoint written with a different state backend"
-                        .to_string(),
-                    source: e.into(),
-                },
-                // Not retryable: the same checkpoint, and the same program, are read again on
-                // every attempt.
-                err @ StateStoreError::IncompleteCheckpoint { .. } => {
-                    RestorePreparationError::Fatal {
-                        message:
-                            "cannot restore a checkpoint that does not cover the job's operators"
-                                .to_string(),
-                        source: err.into(),
-                    }
-                }
-                err => RestorePreparationError::Retryable {
-                    message: format!("Failed to load operator metadata for epoch {epoch}"),
-                    source: err.into(),
-                },
-            })?;
+    // The checkpoint this job asked for: its own id, and the epoch its own `checkpoints` row
+    // named. Every operator object the preflight reads is read from the *loaded object's*
+    // `job_id` and `epoch`, and the metadata rewrite below writes back to them, so what the
+    // caller asked for has to be carried in beside them rather than assumed to match.
+    let asked_for = CheckpointIdentity::new(job_id, epoch as u32);
+    let preflight = StateBackend::load_checkpoint_operators(
+        storage_role,
+        job,
+        &asked_for,
+        &expected,
+        &metadata,
+    )
+    .await
+    .map_err(|err| match err {
+        StateStoreError::StateBackendError(e) => RestorePreparationError::Fatal {
+            message: "cannot restore a checkpoint written with a different state backend"
+                .to_string(),
+            source: e.into(),
+        },
+        // Not retryable: the same checkpoint, and the same program, are read again on
+        // every attempt.
+        err @ StateStoreError::IncompleteCheckpoint { .. } => RestorePreparationError::Fatal {
+            message: "cannot restore a checkpoint that does not cover the job's operators"
+                .to_string(),
+            source: err.into(),
+        },
+        err => RestorePreparationError::Retryable {
+            message: format!("Failed to load operator metadata for epoch {epoch}"),
+            source: err.into(),
+        },
+    })?;
 
     let mut committing_state = None;
     if *needs_commits {

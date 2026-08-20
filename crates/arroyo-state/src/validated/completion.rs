@@ -35,15 +35,28 @@
 //! was compared against the metadata the token entitled — so a completion of job A epoch 4
 //! could authorize the metadata of job B epoch 5 whenever their operator sets matched.
 //! [`CompletedCheckpoint`] now carries both halves of the checkpoint's identity and hands
-//! them out as a [`CompletedIdentity`], which
+//! them out as a [`CheckpointIdentity`], which
 //! [`CheckpointMetadataWrite`](super::CheckpointMetadataWrite) checks against the metadata it
 //! is being asked to entitle.
+//!
+//! # What review round 6 changed here
+//!
+//! Two things, neither of them in this file's own logic. The identity type is now
+//! [`CheckpointIdentity`], shared with every other family rather than private to this one, so
+//! that "which checkpoint is this about?" has one spelling across the matrix in
+//! [`crate::validated`]. And the *subtask* half of the evidence got a boundary of its own:
+//! [`CompletedOperator`] records the top-level index each report carried, and until round 6
+//! nothing checked that a report's table payloads carried the same index — so the indices
+//! `{0, 1}` could be recorded here while both reports' table state was filed under subtask 0.
+//! That relationship is now checked where the report is merged, by
+//! [`SubtaskReport`](super::SubtaskReport).
 
 use arroyo_rpc::errors::StateError;
 use arroyo_rpc::state_backend::validated::WholeObject;
 use std::collections::{BTreeSet, HashSet};
 
 use super::check_program_coverage;
+use super::identity::CheckpointIdentity;
 
 /// What one operator reported while this process took a checkpoint.
 ///
@@ -149,28 +162,6 @@ impl CompletedOperator {
     }
 }
 
-/// The checkpoint a [`CompletedCheckpoint`] is evidence of: one job, one epoch.
-///
-/// Handed out so that [`CheckpointMetadataWrite`](super::CheckpointMetadataWrite) can compare
-/// it against the metadata the evidence is being asked to entitle. Before review round 5 of
-/// PR #160 there was nothing to compare: the completion recorded an epoch that only ever
-/// reached an error message, and recorded no job at all, so a validated completion was
-/// interchangeable between checkpoints whose operator sets happened to match.
-///
-/// This binds *reuse*, not fabrication. Nothing here stops a caller inventing a
-/// [`CompletedCheckpoint`] that names any job and epoch it likes — what stops that is the
-/// completion half, which requires naming every subtask index of every operator, and the fact
-/// that production's only producer — `CheckpointState::build_metadata` in `arroyo-worker` —
-/// derives the identity and the metadata from the same two fields of the checkpoint it is
-/// closing.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompletedIdentity {
-    /// The job whose checkpoint was completed.
-    pub job_id: String,
-    /// The epoch that was completed.
-    pub epoch: u32,
-}
-
 /// A checkpoint this process has just taken, and what each of the job's operators reported.
 ///
 /// The whole object behind the *first* write of a checkpoint's top-level metadata — the one
@@ -188,8 +179,7 @@ pub struct CompletedIdentity {
 /// [`CheckpointMetadataWrite::for_completed_checkpoint`]: super::CheckpointMetadataWrite::for_completed_checkpoint
 #[derive(Debug, Clone)]
 pub struct CompletedCheckpoint {
-    job_id: String,
-    epoch: u32,
+    checkpoint: CheckpointIdentity,
     operators: Vec<CompletedOperator>,
 }
 
@@ -202,20 +192,24 @@ impl CompletedCheckpoint {
     /// accumulating for, not a description of the metadata object about to be written. The
     /// two being separately supplied is what makes the comparison in
     /// [`CheckpointMetadataWrite::check_whole`](super::CheckpointMetadataWrite) a comparison.
+    ///
+    /// This binds *reuse*, not fabrication, and the distinction is worth stating rather than
+    /// glossing: nothing here stops a caller inventing a [`CompletedCheckpoint`] that names
+    /// any job and epoch it likes. What stops that is the completion half — every subtask
+    /// index of every operator has to be named — together with the fact that production's only
+    /// producer, `CheckpointState::build_metadata` in `arroyo-worker`, derives the identity and
+    /// the metadata from the same two fields of the checkpoint it is closing. That second half
+    /// is a property of the caller, not of this type.
     pub fn new(job_id: String, epoch: u32, operators: Vec<CompletedOperator>) -> Self {
         Self {
-            job_id,
-            epoch,
+            checkpoint: CheckpointIdentity::new(job_id, epoch),
             operators,
         }
     }
 
     /// The checkpoint this is evidence of.
-    pub fn identity(&self) -> CompletedIdentity {
-        CompletedIdentity {
-            job_id: self.job_id.clone(),
-            epoch: self.epoch,
-        }
+    pub fn checkpoint(&self) -> &CheckpointIdentity {
+        &self.checkpoint
     }
 
     /// The operators, in the order they were collected.
@@ -258,7 +252,7 @@ impl WholeObject for CompletedCheckpoint {
     /// identity becomes a claim only when it is used to entitle a particular metadata object,
     /// which is where it is compared.
     fn check_whole(&self, program: &HashSet<&str>) -> Result<(), StateError> {
-        check_program_coverage(self.epoch, self.operator_ids(), program)?;
+        check_program_coverage(self.checkpoint.epoch(), self.operator_ids(), program)?;
 
         let mut unfinished: Vec<String> = self
             .operators
@@ -269,7 +263,7 @@ impl WholeObject for CompletedCheckpoint {
         if !unfinished.is_empty() {
             unfinished.sort_unstable();
             return Err(StateError::IncompleteCheckpoint {
-                epoch: self.epoch,
+                epoch: self.checkpoint.epoch(),
                 detail: format!(
                     "operator(s) {} have not finished this checkpoint, so nothing has vouched \
                      for the state a write would publish for them",
