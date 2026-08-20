@@ -1,5 +1,6 @@
-use crate::states::lifecycle::ConsumptionPoint;
-use crate::{JobMessage, states::stop_if_desired_non_running};
+use crate::states::LeavingForStop;
+use crate::states::lifecycle::{ConsumptionPoint, leaving};
+use crate::{JobConfig, JobMessage, states::stop_if_desired_non_running};
 
 use super::{
     JobContext, State, StateError, Transition, check_config_update, handle_unhandled_message,
@@ -13,6 +14,14 @@ pub struct Rescaling {}
 impl State for Rescaling {
     fn name(&self) -> &'static str {
         "Rescaling"
+    }
+
+    /// Leaves. `Rescaling` initiates the job's final checkpoint on the first turn of its loop,
+    /// *after* the consumption point that a stop taken at the state boundary has already been
+    /// removed from, and then ends in `Scheduling`. Answering here is what stops a rescale
+    /// that an operator has cancelled from taking a checkpoint and starting a new cluster.
+    fn leave_for_stop(self: Box<Self>, config: &JobConfig) -> LeavingForStop {
+        leaving::leaves_not_running(self, config)
     }
 
     async fn next(mut self: Box<Self>, ctx: &mut JobContext) -> Result<Transition, StateError> {

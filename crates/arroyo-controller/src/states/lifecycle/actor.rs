@@ -75,6 +75,8 @@ impl ConsumptionPoint {
 /// reimplementing the mapping from stop mode to state, so a stop that arrives through the
 /// mailbox and a stop that arrives as a `ConfigUpdate` cannot come to mean different things.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[must_use = "a consumed intent is consumed once: whatever discards this outcome is the last \
+              thing that could act on it"]
 pub(crate) enum ObservedIntent {
     /// Nothing was decided, or what was decided leaves the job doing what it was doing.
     ///

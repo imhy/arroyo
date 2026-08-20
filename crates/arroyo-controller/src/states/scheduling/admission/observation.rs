@@ -175,10 +175,17 @@ impl PhaseContext<'_, '_> {
     /// means — catches a stop that reached the configuration by any route, not only the one
     /// this call just observed.
     fn observe(&mut self, at: ConsumptionPoint) -> Result<PhaseWait, StateError> {
-        self.ctx.observe_lifecycle_intent(at)?;
-        Ok(match self.stop_if_desired() {
-            Some(stop) => PhaseWait::Leave(stop),
-            None => PhaseWait::Continue,
+        let observed = self.ctx.observe_lifecycle_intent(at)?;
+        Ok(match (observed, self.stop_if_desired()) {
+            // Either reading is enough to leave, and the configuration is the one that names
+            // the transition: that mapping lives in one macro and this is not a second copy of
+            // it.
+            (_, Some(stop)) => PhaseWait::Leave(stop),
+            // `ObservedIntent::Stop` *is* `stop_mode != none`, and every mode but `none` names
+            // a transition, so reaching here means both readings say the job carries on. The
+            // observation is matched rather than dropped because what a phase does with
+            // `Continue` is enter the fan-out.
+            (ObservedIntent::Continue | ObservedIntent::Stop, None) => PhaseWait::Continue,
         })
     }
 }

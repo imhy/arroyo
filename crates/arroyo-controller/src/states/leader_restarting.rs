@@ -2,8 +2,10 @@ use super::{
     JobContext, State, StateError, Transition, check_config_update, fatal,
     leader_stop_if_desired_running, scheduling::Scheduling,
 };
+use crate::JobConfig;
 use crate::JobMessage;
-use crate::states::lifecycle::ConsumptionPoint;
+use crate::states::LeavingForStop;
+use crate::states::lifecycle::{ConsumptionPoint, leaving};
 use crate::states::recovering::Recovering;
 use crate::types::public::RestartMode;
 use arroyo_rpc::config::config;
@@ -21,6 +23,15 @@ pub struct LeaderRestarting {
 impl State for LeaderRestarting {
     fn name(&self) -> &'static str {
         "Restarting"
+    }
+
+    /// Leaves. `RestartMode::safe` sends the leader a checkpoint-stop as its first statement,
+    /// before the loop that holds its consumption point, and `RestartMode::force` tears the
+    /// cluster down; both end in `Scheduling`. A stop consumed at the state boundary is
+    /// invisible to this state's own observation, so answering it here is what keeps a
+    /// cancelled restart from checkpointing and rescheduling anyway.
+    fn leave_for_stop(self: Box<Self>, config: &JobConfig) -> LeavingForStop {
+        leaving::leaves_running_under_leader(self, config)
     }
 
     async fn next(mut self: Box<Self>, ctx: &mut JobContext) -> Result<Transition, StateError> {
@@ -54,7 +65,7 @@ impl State for LeaderRestarting {
                         .observe_lifecycle_intent(ConsumptionPoint::InsideInterruptibleWait)?
                         .stops()
                     {
-                        leader_stop_if_desired_running!(self, ctx.config, ctx);
+                        leader_stop_if_desired_running!(self, ctx.config);
                     }
 
                     let timeout = config()
@@ -72,7 +83,7 @@ impl State for LeaderRestarting {
                         msg = ctx.rx.recv() => {
                             match msg {
                                 Some(JobMessage::ConfigUpdate(c)) => {
-                                    leader_stop_if_desired_running!(self, c, ctx);
+                                    leader_stop_if_desired_running!(self, c);
 
                                     // This restart ends in `Scheduling`, which starts
                                     // workers from the job's selector; a stop is honoured

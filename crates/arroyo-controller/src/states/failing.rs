@@ -2,6 +2,8 @@ use tracing::warn;
 
 use super::recovering::Recovering;
 use super::{Failed, JobContext, State, StateError, Transition};
+use crate::JobConfig;
+use crate::states::LeavingForStop;
 
 /// Intermediate state that attempts to cleanly shut down the pipeline before transitioning to Failed.
 #[derive(Debug)]
@@ -11,6 +13,14 @@ pub struct Failing {}
 impl State for Failing {
     fn name(&self) -> &'static str {
         "Failing"
+    }
+
+    /// Stays. The job is already failing; this tears the cluster down — which is what a stop
+    /// would do to it — and hands to `Failed`, which is terminal. A stop cannot pre-empt a
+    /// failure, and turning this into a `Stopping` would record the job as stopped when it
+    /// had in fact failed.
+    fn leave_for_stop(self: Box<Self>, _config: &JobConfig) -> LeavingForStop {
+        LeavingForStop::Stays(self)
     }
 
     async fn next(self: Box<Self>, ctx: &mut JobContext) -> Result<Transition, StateError> {

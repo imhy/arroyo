@@ -2,9 +2,10 @@ use super::{
     FatalProvenance, JobContext, State, StateError, Transition, compiling::Compiling, fatal,
     state_backoff,
 };
-use crate::JobMessage;
 use crate::job_controller::JobController;
 use crate::job_controller::leader_manager::LeaderManager;
+use crate::states::LeavingForStop;
+use crate::{JobConfig, JobMessage};
 use arroyo_rpc::config::config;
 use arroyo_rpc::errors::ErrorDomain;
 use arroyo_rpc::grpc::rpc::{JobState, JobStopMode, StopMode};
@@ -236,6 +237,19 @@ impl Recovering {
 impl State for Recovering {
     fn name(&self) -> &'static str {
         "Recovering"
+    }
+
+    /// Stays. Everything `Recovering` does is the tear-down a stop performs — it backs off,
+    /// cleans up the job controller or the leader, and stops the workers — and it is entered
+    /// only from a failure, where no final checkpoint is possible and every stop mode would
+    /// map to an immediate one anyway. What it hands to is `Compiling`, which answers the same
+    /// stop before `Scheduling` starts anything.
+    ///
+    /// It is therefore not a state that *misses* a stop; it is a state that reaches the same
+    /// place by its own route. The one thing a stop would change is how long that takes: the
+    /// restart backoff runs first, and a job told to stop waits it out.
+    fn leave_for_stop(self: Box<Self>, _config: &JobConfig) -> LeavingForStop {
+        LeavingForStop::Stays(self)
     }
 
     async fn next(mut self: Box<Self>, ctx: &mut JobContext) -> Result<Transition, StateError> {

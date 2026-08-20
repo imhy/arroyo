@@ -171,6 +171,13 @@ impl State for Created {
         "Created"
     }
 
+    /// Stays. `Created` writes nothing, starts nothing and waits on nothing; the whole of its
+    /// body is the transition to `Compiling`, which answers the same stop before anything
+    /// reaches `Scheduling`.
+    fn leave_for_stop(self: Box<Self>, _config: &JobConfig) -> LeavingForStop {
+        LeavingForStop::Stays(self)
+    }
+
     async fn next(self: Box<Self>, _: &mut JobContext) -> Result<Transition, StateError> {
         Ok(Transition::next(*self, Compiling))
     }
@@ -199,6 +206,13 @@ impl State for Failed {
         "Failed"
     }
 
+    /// Stays. The job has already failed; `handle_terminal` tears its workers down, which is
+    /// everything a stop would do to a job in this state, and what `Failed` reads the
+    /// configuration for is the *restart* nonce, not the stop mode.
+    fn leave_for_stop(self: Box<Self>, _config: &JobConfig) -> LeavingForStop {
+        LeavingForStop::Stays(self)
+    }
+
     async fn next(self: Box<Self>, ctx: &mut JobContext) -> Result<Transition, StateError> {
         handle_terminal(ctx).await;
         if ctx.config.restart_nonce != ctx.status.restart_nonce {
@@ -223,6 +237,12 @@ impl State for Finished {
         "Finished"
     }
 
+    /// Stays. The job's sources are exhausted and it has ended; `handle_terminal` tears its
+    /// workers down and the state machine stops. There is nothing left for a stop to stop.
+    fn leave_for_stop(self: Box<Self>, _config: &JobConfig) -> LeavingForStop {
+        LeavingForStop::Stays(self)
+    }
+
     async fn next(self: Box<Self>, ctx: &mut JobContext) -> Result<Transition, StateError> {
         handle_terminal(ctx).await;
         Ok(Transition::Stop)
@@ -240,6 +260,14 @@ pub struct Stopped {}
 impl State for Stopped {
     fn name(&self) -> &'static str {
         "Stopped"
+    }
+
+    /// Stays, and is the one terminal state for which that is a *read* rather than an
+    /// absence of one: `Stopped` already consults `stop_mode` unconditionally, and restarts
+    /// the job only when it is `none`. A stop published at the boundary is therefore honoured
+    /// by the body itself — the job stays stopped instead of being compiled again.
+    fn leave_for_stop(self: Box<Self>, _config: &JobConfig) -> LeavingForStop {
+        LeavingForStop::Stays(self)
     }
 
     async fn next(self: Box<Self>, ctx: &mut JobContext) -> Result<Transition, StateError> {
@@ -433,6 +461,11 @@ impl TransitionTo<Recovering> for LeaderRescaling {
     }
 }
 impl TransitionTo<LeaderStopping> for LeaderRescaling {}
+// A checkpoint-stop decided while the job was still running reaches `LeaderRescaling` at the
+// state boundary, and a rescale that has not started yet has no reason to throw the final
+// checkpoint away: the edge exists so `leave_for_stop` can honour the mode the operator asked
+// for rather than downgrading it.
+impl TransitionTo<LeaderCheckpointStopping> for LeaderRescaling {}
 
 impl TransitionTo<Stopping> for CheckpointStopping {}
 impl TransitionTo<Stopped> for CheckpointStopping {
@@ -537,7 +570,7 @@ macro_rules! stop_if_desired_non_running {
 }
 
 macro_rules! leader_stop_if_desired_running {
-    ($self:ident, $config:expr, $ctx:expr) => {
+    ($self:ident, $config:expr) => {
         use crate::states::leader_checkpoint_stopping::LeaderCheckpointStopping;
         use crate::states::leader_stopping::{LeaderStopBehavior, LeaderStopping};
         use crate::types::public::StopMode;
@@ -1135,6 +1168,46 @@ pub trait State: Sync + Send + 'static + Debug {
         false
     }
 
+    /// What this state does about a stop that was decided **before it ran**.
+    ///
+    /// # Why every state has to answer this, and why the answer cannot be defaulted
+    ///
+    /// A lifecycle intent is consumed once. [`execute_state`] is M11.D39a's first consumption
+    /// point, so a stop the job's writer decided while the *previous* state was running is
+    /// consumed at the boundary, published into [`JobContext::config`], and is no longer
+    /// there for this state to observe: its own
+    /// [`observe_lifecycle_intent`](JobContext::observe_lifecycle_intent) would answer
+    /// [`ObservedIntent::Continue`], because nothing new has been decided since. A state that
+    /// learned about a stop only that way would therefore start a final checkpoint, a
+    /// replacement cluster or a leader stop that the job had already been told not to start.
+    ///
+    /// So the boundary asks instead, and this is the question. There is deliberately **no
+    /// default body**: a default would be an answer given on behalf of a state by something
+    /// that cannot see what the state is about to do, and a state added later would inherit
+    /// it silently. Answering is what makes "a consumed stop reaches the state that has to
+    /// act on it" a property of the loop rather than of each state remembering to look —
+    /// the same argument the refusal gate and the choice of state body are already made on.
+    ///
+    /// # What the two answers mean
+    ///
+    /// [`LeavingForStop::Leaves`] is this state's own stop transition, built by invoking the
+    /// landed `stop_if_desired*` macro for its family through
+    /// [`lifecycle::leaving`](lifecycle::leaving) — never by restating the mapping, so a stop
+    /// that arrives as an intent and a stop that arrives as a
+    /// [`JobMessage::ConfigUpdate`] cannot come to mean different things.
+    ///
+    /// [`LeavingForStop::Stays`] hands the state back and lets its body run, and it is a
+    /// claim the implementation site has to justify: that nothing this state goes on to do
+    /// outruns the stop, either because its body *is* the stop, or because it does nothing
+    /// irreversible before handing to a state that answers the same question.
+    ///
+    /// Called only for a job whose lifecycle is M11.D39a's single writer, and only when that
+    /// writer has decided the job stops. Under
+    /// [`LifecycleMode::LegacyT08`](lifecycle::LifecycleMode::LegacyT08) — production through
+    /// M11.T25 — there is no writer, the boundary observes
+    /// [`ObservedIntent::Continue`] always, and this is never called at all.
+    fn leave_for_stop(self: Box<Self>, config: &JobConfig) -> LeavingForStop;
+
     async fn next(self: Box<Self>, ctx: &mut JobContext) -> Result<Transition, StateError>;
 }
 
@@ -1149,6 +1222,40 @@ pub trait TransitionTo<S: State> {
 pub struct StateHolder {
     state: Box<dyn State>,
     update_fn: TransitionFn,
+}
+
+/// What a state does about a stop that was decided before it ran (M11.T25, M11.D39a).
+///
+/// Returned by [`State::leave_for_stop`] and consumed by [`execute_state`], which either takes
+/// the transition or runs the body it was handed back. The state is carried *inside* the
+/// "stays" answer rather than kept by the caller, so answering the question is the only way to
+/// get the state back: running it without answering is not something a caller can express.
+///
+/// The three mappings that produce [`Self::Leaves`] live in [`lifecycle::leaving`], one per
+/// family of states, and each invokes the landed `stop_if_desired*` macro rather than restating
+/// it.
+#[must_use = "a stop decided before this state ran is answered by leaving or by a stated \
+              reason for staying; dropping the answer is how the stop gets lost"]
+pub enum LeavingForStop {
+    /// The state leaves now, for the transition it named. Its body does not run.
+    Leaves(Transition),
+    /// The state's body runs anyway. The implementation site says why the stop is not lost by
+    /// letting it.
+    Stays(Box<dyn State>),
+}
+
+impl LeavingForStop {
+    /// Folds one of the landed stop macros' two outcomes into this answer.
+    ///
+    /// The macros `return` a [`Transition`] from the body they are invoked in and fall through
+    /// when the configuration asks for no stop, which is why each helper in
+    /// [`lifecycle::leaving`] wraps one in a function whose `Err` is the untouched state.
+    fn of<S: State>(answered: Result<Transition, Box<S>>) -> Self {
+        match answered {
+            Ok(transition) => LeavingForStop::Leaves(transition),
+            Err(state) => LeavingForStop::Stays(state),
+        }
+    }
 }
 
 impl Transition {
@@ -1203,25 +1310,39 @@ async fn execute_state<'a>(
     // production through M11.T25 — there is no actor, this is a no-op, and the gate above
     // is the mechanism, unchanged.
     //
-    // A stop decided here is *published* rather than acted on, and that is not a gap: the
-    // states that go on to do something irreversible — `Scheduling` in either of its bodies,
-    // `Running`, `LeaderRunning` — all open with their own `stop_if_desired*` on the very
-    // configuration this writes, and the states that loop instead read it on their first turn.
-    // `execute_state` holds a `Box<dyn State>` and could not name the transition anyway: what
-    // leaving means is the state's own, which is why it is the state that answers.
-    let gated = gated.and_then(|()| {
-        ctx.observe_lifecycle_intent(ConsumptionPoint::BeforeIrreversiblePhase)
-            .map(|_| ())
-    });
+    // What is consumed here is consumed *from* the state that runs next: an intent is decided
+    // once, so a stop read at this boundary is one the state's own consumption points will
+    // never report. It is therefore not enough to publish it into `ctx.config` and hope the
+    // state looks — `Restarting` starts its final checkpoint before its first look,
+    // `LeaderRescaling` and `LeaderCheckpointStopping` stop the leader without ever looking,
+    // and `CheckpointStopping` would carry on taking a checkpoint an operator had asked it to
+    // abandon. So the boundary hands the outcome to the state, through `leave_for_stop`, which
+    // every state must implement and none can default. `execute_state` holds a
+    // `Box<dyn State>` and could not name the transition itself: what leaving means is the
+    // state's own, which is why it is the state that answers — but *whether* it is asked is
+    // the loop's, which is why the question is here.
+    let observed = gated
+        .and_then(|()| ctx.observe_lifecycle_intent(ConsumptionPoint::BeforeIrreversiblePhase));
 
-    // Which body a state runs is the job's lifecycle mechanism's to choose, and choosing it
-    // here rather than inside each state is the same argument as the two reads above: a state
-    // that had to remember to ask would be a state that could forget. Production takes the
-    // legacy branch for every state of every job — `runs_fenced_lifecycle` is false unless the
-    // job was built with the D39a single writer, which no production construction site does.
-    let outcome = match gated {
-        Ok(()) => scheduling::run_state_body(state, &mut ctx).await,
+    let leaving = match observed {
         Err(refused) => Err(refused),
+        // Nothing was decided, or what was decided leaves the job doing what it was doing.
+        Ok(ObservedIntent::Continue) => Ok(LeavingForStop::Stays(state)),
+        Ok(ObservedIntent::Stop) => Ok(state.leave_for_stop(&ctx.config)),
+    };
+
+    // One place a state body is entered from, and everything that stands before a job's next
+    // irreversible work stands before it: the gate, the writer, and the state's own answer to
+    // what the writer decided. Which body it is, is the job's lifecycle mechanism's to choose,
+    // and choosing it here rather than inside each state is the same argument as the reads
+    // above — a state that had to remember to ask would be a state that could forget.
+    // Production takes the legacy branch for every state of every job:
+    // `runs_fenced_lifecycle` is false unless the job was built with the D39a single writer,
+    // which no production construction site does.
+    let outcome = match leaving {
+        Err(refused) => Err(refused),
+        Ok(LeavingForStop::Leaves(transition)) => Ok(transition),
+        Ok(LeavingForStop::Stays(state)) => scheduling::run_state_body(state, &mut ctx).await,
     };
 
     let next: Option<Box<dyn State>> = match outcome {
@@ -2864,16 +2985,22 @@ impl StateMachine {
 
 #[cfg(test)]
 mod tests {
+    use super::leader_stopping::LeaderStopBehavior;
     use super::lifecycle::classification::{
         SelectorClassification, UndecidableSelector, classify_selector,
     };
     use super::lifecycle::intent::{IntentVersion, VersionedIntent};
     use super::lifecycle::{
         ConsumptionPoint, JobLifecycle, LifecycleActor, LifecycleIntent, LifecycleMode,
+        ObservedIntent,
     };
+    use super::stopping::StopBehavior;
     use super::{
-        Admission, AppliedStatus, Failed, Failing, FatalProvenance, JobContext, LeaderRunning,
-        RefusalGate, Running, RunningConfigUpdate, State, StateMachine, Transition,
+        Admission, AppliedStatus, CheckpointStopping, Compiling, Created, Failed, Failing,
+        FatalProvenance, Finished, Finishing, JobContext, LeaderCheckpointStopping,
+        LeaderFinishing, LeaderRescaling, LeaderRestarting, LeaderRunning, LeaderStopping,
+        LeavingForStop, Recovering, RefusalGate, Rescaling, Restarting, Running,
+        RunningConfigUpdate, State, StateMachine, Stopped, Stopping, Transition,
         adopt_refreshed_config, check_config_update, classify_running_config_update,
         controller_job_failure, errors, execute_state, fatal, fatal_refused_config,
         handle_unhandled_message, lifecycle,
@@ -4946,6 +5073,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl State for PublishesAfterTheGateSnapshot {
+        /// Stays: this fixture exists to publish a refusal at a chosen instant, and the rows
+        /// that use it build no lifecycle actor, so the boundary never asks.
+        fn leave_for_stop(self: Box<Self>, _config: &JobConfig) -> LeavingForStop {
+            LeavingForStop::Stays(self)
+        }
+
         fn name(&self) -> &'static str {
             "PublishesAfterTheGateSnapshot"
         }
@@ -7532,6 +7665,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl State for ReadsItsRefusal {
+        /// Stays, for the same reason: the row that uses it is about a refusal a state reads
+        /// off its own channel, and its context carries no lifecycle actor.
+        fn leave_for_stop(self: Box<Self>, _config: &JobConfig) -> LeavingForStop {
+            LeavingForStop::Stays(self)
+        }
+
         fn name(&self) -> &'static str {
             "ReadsItsRefusal"
         }
@@ -7999,8 +8138,13 @@ mod tests {
 
         let mut harness = Harness::new(current.restart_nonce).with_actor(&mailbox);
         let mut ctx = harness.ctx(current.clone(), StateBackendSelector::Parquet);
-        ctx.observe_lifecycle_intent(ConsumptionPoint::BeforeIrreversiblePhase)
-            .expect("an accepted row is adopted, not refused");
+        assert_eq!(
+            ctx.observe_lifecycle_intent(ConsumptionPoint::BeforeIrreversiblePhase)
+                .expect("an accepted row is adopted, not refused"),
+            ObservedIntent::Continue,
+            "and the row asks for no stop, so the boundary leaves the job doing what it was \
+             doing"
+        );
         assert_eq!(
             ctx.config, accepted,
             "and the writer is what adopts it, at a point strictly after the classification \
@@ -8536,8 +8680,12 @@ mod tests {
 
         let mut harness = Harness::new(current.restart_nonce).with_actor(&mailbox);
         let mut ctx = harness.ctx(current.clone(), StateBackendSelector::Parquet);
-        ctx.observe_lifecycle_intent(ConsumptionPoint::BeforeIrreversiblePhase)
-            .expect("an unchanged selector is adopted, not refused");
+        assert_eq!(
+            ctx.observe_lifecycle_intent(ConsumptionPoint::BeforeIrreversiblePhase)
+                .expect("an unchanged selector is adopted, not refused"),
+            ObservedIntent::Continue,
+            "and an edit that only changes the checkpoint interval is not a stop"
+        );
         assert_eq!(
             ctx.config, unchanged_selector,
             "and the writer adopts it, at a point strictly after the classification that let \
@@ -10032,5 +10180,550 @@ mod tests {
             job_failure: Some(failure.clone()),
             ..Default::default()
         }
+    }
+
+    // ------------------------------------------------------------------------------------
+    // A stop decided *between* states — PR #160 review comment 5358055190.
+    //
+    // The state boundary is M11.D39a's first consumption point, and an intent is consumed
+    // once. So a stop the writer decided while the previous state was running is taken at the
+    // boundary and is no longer there for the state that runs next to observe: publishing it
+    // into `ctx.config` and returning is not enough, because `Restarting` starts its final
+    // checkpoint before its first look, `Rescaling` and `CheckpointStopping` look only after
+    // theirs has begun, and `LeaderRescaling` and `LeaderCheckpointStopping` stop the leader
+    // without ever looking. The boundary therefore hands the outcome to the state, through
+    // `State::leave_for_stop`.
+    // ------------------------------------------------------------------------------------
+
+    /// Runs one state through the state boundary with a stop standing in the job's mailbox.
+    ///
+    /// The configuration the state is *handed* asks for no stop — only the mailbox carries
+    /// one — which is exactly the shape of the finding: the stop arrives between two states,
+    /// so nothing the state can read on its own account mentions it until the boundary
+    /// publishes it.
+    ///
+    /// The context is given no `JobController` and no `LeaderManager`, and that is the second
+    /// half of every row below. `Restarting`, `Rescaling` and `CheckpointStopping` dereference
+    /// the first as their opening effect, and `LeaderRestarting`, `LeaderRescaling` and
+    /// `LeaderCheckpointStopping` dereference the second: a state whose body ran at all would
+    /// panic here rather than reach a transition, so "it transitioned" and "its body never
+    /// started the effect" are the same assertion.
+    async fn a_stop_arriving_between_states(
+        state: Box<dyn State>,
+        stop_mode: StopMode,
+    ) -> Box<dyn State> {
+        let mut stopped = running_config(StateBackendSelector::Parquet);
+        stopped.stop_mode = stop_mode;
+        let mailbox = intent_mailbox();
+        mailbox.submit(LifecycleIntent::Adopt(Box::new(stopped)));
+
+        let running = running_config(StateBackendSelector::Parquet);
+        assert_eq!(
+            running.stop_mode,
+            StopMode::none,
+            "the control on the fixture: the state is handed a configuration that asks for \
+             nothing, so a state that leaves can only have been told to by the boundary"
+        );
+        let mut harness = Harness::new(running.restart_nonce)
+            .with_db(sqlite_startable_job("Running", 2))
+            .with_actor(&mailbox);
+        let ctx = harness.ctx(running, StateBackendSelector::Parquet);
+
+        let (next, _ctx) = execute_state(state, ctx).await;
+        next.expect("a job that is stopping transitions; it does not end its own state machine")
+    }
+
+    /// The mechanism itself: the boundary *consumes* the intent it acts on, so the state that
+    /// runs next cannot observe it for itself.
+    ///
+    /// This is the row that would have found the finding, stated as the property rather than
+    /// as any state's behaviour. Publication is not enough on its own — that is what the
+    /// second assertion here says — so whatever the boundary does with the outcome is the last
+    /// chance the decision gets.
+    #[tokio::test]
+    async fn the_state_boundary_consumes_the_stop_it_publishes() {
+        let mut stopped = running_config(StateBackendSelector::Parquet);
+        stopped.stop_mode = StopMode::immediate;
+        let mailbox = intent_mailbox();
+        mailbox.submit(LifecycleIntent::Adopt(Box::new(stopped)));
+
+        let running = running_config(StateBackendSelector::Parquet);
+        let mut harness = Harness::new(running.restart_nonce)
+            .with_db(sqlite_startable_job("Running", 2))
+            .with_actor(&mailbox);
+        let ctx = harness.ctx(running, StateBackendSelector::Parquet);
+
+        // `Created` is the one state whose body cannot mask the mechanism: it reads nothing,
+        // starts nothing, and always advances to `Compiling`.
+        let (next, mut ctx) = execute_state(Box::new(Created), ctx).await;
+
+        assert_eq!(
+            next.as_ref().map(|s| s.name()),
+            Some("Compiling"),
+            "`Created` stays, so the body ran — this row is about what the boundary left \
+             behind, not about a state that left"
+        );
+        assert_eq!(
+            ctx.config.stop_mode,
+            StopMode::immediate,
+            "the boundary published the stop into the job's configuration"
+        );
+        assert_eq!(
+            ctx.observe_lifecycle_intent(ConsumptionPoint::InsideInterruptibleWait)
+                .expect("an adopted configuration is not a refusal"),
+            ObservedIntent::Continue,
+            "and consumed it: the next state's own consumption point reports nothing, which \
+             is why publishing alone is not enough and the boundary has to route the outcome \
+             to the state it is about to run"
+        );
+    }
+
+    /// `Restarting` honours a stop that arrived between states instead of taking a final
+    /// checkpoint and rescheduling the job.
+    ///
+    /// `RestartMode::safe` initiates the job's final checkpoint as its first statement, above
+    /// the loop that holds its consumption point, and then ends in `Scheduling` — a
+    /// replacement cluster for a job an operator has stopped.
+    #[tokio::test]
+    async fn restarting_honors_a_stop_that_arrived_between_states() {
+        let left = a_stop_arriving_between_states(
+            Box::new(Restarting {
+                mode: RestartMode::safe,
+            }),
+            StopMode::immediate,
+        )
+        .await;
+
+        assert_eq!(
+            format!("{left:?}"),
+            "Stopping { stop_mode: StopJob(Immediate) }",
+            "the transition `stop_if_desired_non_running!` names for an immediate stop, \
+             reached before `checkpoint(true)` — which, with no `JobController` in this \
+             context, would have panicked"
+        );
+    }
+
+    /// The same for `RestartMode::force`, whose body tears the cluster down and reschedules.
+    #[tokio::test]
+    async fn a_force_restart_honors_a_stop_that_arrived_between_states() {
+        let left = a_stop_arriving_between_states(
+            Box::new(Restarting {
+                mode: RestartMode::force,
+            }),
+            StopMode::force,
+        )
+        .await;
+
+        assert_eq!(
+            format!("{left:?}"),
+            "Stopping { stop_mode: StopWorkers }",
+            "and a `force` stop reaches the workers directly, which is the same mapping the \
+             landed macro makes for a job that is not running"
+        );
+    }
+
+    /// `LeaderRestarting` honours a stop that arrived between states rather than sending the
+    /// leader a checkpoint-stop and rescheduling.
+    #[tokio::test]
+    async fn leader_restarting_honors_a_stop_that_arrived_between_states() {
+        let left = a_stop_arriving_between_states(
+            Box::new(LeaderRestarting {
+                mode: RestartMode::safe,
+            }),
+            StopMode::graceful,
+        )
+        .await;
+
+        assert_eq!(
+            format!("{left:?}"),
+            "LeaderStopping { stop_behavior: StopJob(JobStopGraceful) }",
+            "leader mode's own stop state, by leader mode's own mapping — reached before \
+             `stop_leader(JobStopCheckpoint)`, which with no `LeaderManager` in this context \
+             would have panicked"
+        );
+    }
+
+    /// `Rescaling` honours a stop that arrived between states rather than taking a final
+    /// checkpoint and scheduling a resized cluster.
+    #[tokio::test]
+    async fn rescaling_honors_a_stop_that_arrived_between_states() {
+        let left =
+            a_stop_arriving_between_states(Box::new(Rescaling {}), StopMode::checkpoint).await;
+
+        assert_eq!(
+            format!("{left:?}"),
+            "Stopping { stop_mode: StopJob(Immediate) }",
+            "a rescale that has not begun has nothing running to checkpoint, so every stop \
+             mode ends it now — the landed `stop_if_desired_non_running!` mapping, unchanged"
+        );
+    }
+
+    /// `LeaderRescaling` — the leader-mode twin of `Rescaling`, and a state with no
+    /// consumption point of its own at all.
+    ///
+    /// It sends the leader a checkpoint-stop and waits inside `handle_leader_stopping`, so the
+    /// state boundary is the only place it can learn that the job it is about to rescale has
+    /// been stopped. Unlike its twin it can still honour the *mode*: nothing has been sent
+    /// yet, so a `checkpoint` stop keeps its final checkpoint instead of being downgraded.
+    #[tokio::test]
+    async fn leader_rescaling_honors_a_stop_that_arrived_between_states() {
+        let left =
+            a_stop_arriving_between_states(Box::new(LeaderRescaling {}), StopMode::checkpoint)
+                .await;
+
+        assert_eq!(
+            format!("{left:?}"),
+            "LeaderCheckpointStopping",
+            "the stop an operator asked for, not the rescale it cancelled"
+        );
+    }
+
+    /// `CheckpointStopping` escalates a stop that arrived between states instead of going on
+    /// taking a final checkpoint.
+    ///
+    /// The narrow case, and the one that costs an operator the most: the job is already
+    /// stopping the careful way, and the only thing an `immediate` stop means is "stop waiting
+    /// for that checkpoint". Its loop escalates only when its own consumption point reports a
+    /// stop, and the boundary has already taken the one that matters.
+    #[tokio::test]
+    async fn checkpoint_stopping_escalates_a_stop_that_arrived_between_states() {
+        let left =
+            a_stop_arriving_between_states(Box::new(CheckpointStopping {}), StopMode::immediate)
+                .await;
+
+        assert_eq!(
+            format!("{left:?}"),
+            "Stopping { stop_mode: StopJob(Immediate) }",
+            "the same escalation its message loop makes, at the one point the loop can no \
+             longer make it"
+        );
+    }
+
+    /// `LeaderCheckpointStopping` — the leader-mode twin, which sends its checkpoint-stop
+    /// before it reaches the shared wait that holds its consumption point.
+    #[tokio::test]
+    async fn leader_checkpoint_stopping_escalates_a_stop_that_arrived_between_states() {
+        let left = a_stop_arriving_between_states(
+            Box::new(LeaderCheckpointStopping {}),
+            StopMode::immediate,
+        )
+        .await;
+
+        assert_eq!(
+            format!("{left:?}"),
+            "LeaderStopping { stop_behavior: StopJob(JobStopImmediate) }",
+            "by `leader_stop_escalation`, which is the rule the wait below it applies — one \
+             mapping, read at both points, rather than a second copy at this one"
+        );
+    }
+
+    /// A `CheckpointStopping` asked to stop the way it is already stopping stays and finishes
+    /// its checkpoint.
+    ///
+    /// The control for the escalation rows, and the reason "leaves" is not the right answer
+    /// for every state: turning a `checkpoint` stop into a transition here would throw away
+    /// the final checkpoint the operator asked for.
+    #[test]
+    fn checkpoint_stopping_stays_for_the_stop_it_is_already_making() {
+        for stop_mode in [StopMode::checkpoint, StopMode::graceful] {
+            let mut config = running_config(StateBackendSelector::Parquet);
+            config.stop_mode = stop_mode;
+            let LeavingForStop::Stays(stayed) =
+                Box::new(CheckpointStopping {}).leave_for_stop(&config)
+            else {
+                panic!("a {stop_mode:?} stop is what `CheckpointStopping` is already doing");
+            };
+            assert_eq!(stayed.name(), "CheckpointStopping");
+        }
+    }
+
+    /// What this suite expects a state to do about a stop that was decided before it ran.
+    #[derive(Debug)]
+    enum ExpectedAnswer {
+        /// The boundary hands the state this transition and the state's body never runs. The
+        /// string is the whole `Debug` of the state transitioned to, not its name: `Stopping`
+        /// and `LeaderStopping` both call themselves "Stopping", and the stop *behaviour* is
+        /// the part an operator would notice being wrong.
+        Leaves(&'static str),
+        /// The state's body runs anyway. The reason is at the implementation site, and the
+        /// sweep below records that one was given rather than that the question was skipped.
+        Stays,
+    }
+
+    /// Every state in this module, and what each does about a stop it did not read itself.
+    ///
+    /// The reviewer named four states. The defect is not four states: it is any state that
+    /// learns about a stop only from an observation the boundary has already consumed. So the
+    /// domain here is *every* `impl State for` in `states/`, checked against the source by
+    /// `every_state_answers_a_stop_that_was_decided_before_it_ran` rather than against a list
+    /// someone has to remember to extend.
+    fn every_state_and_its_answer() -> Vec<(&'static str, StopMode, Box<dyn State>, ExpectedAnswer)>
+    {
+        vec![
+            // Nothing irreversible, and hands to a state that answers the same stop.
+            (
+                "Created",
+                StopMode::immediate,
+                Box::new(Created),
+                ExpectedAnswer::Stays,
+            ),
+            // Hands to `Scheduling`, which persists a generation and starts a cluster.
+            (
+                "Compiling",
+                StopMode::immediate,
+                Box::new(Compiling),
+                ExpectedAnswer::Leaves("Stopping { stop_mode: StopJob(Immediate) }"),
+            ),
+            (
+                "Scheduling",
+                StopMode::graceful,
+                Box::new(Scheduling {}),
+                ExpectedAnswer::Leaves("Stopping { stop_mode: StopJob(Immediate) }"),
+            ),
+            (
+                "Running",
+                StopMode::checkpoint,
+                Box::new(Running {}),
+                ExpectedAnswer::Leaves("CheckpointStopping"),
+            ),
+            (
+                "LeaderRunning",
+                StopMode::checkpoint,
+                Box::new(LeaderRunning {
+                    started: Instant::now(),
+                }),
+                ExpectedAnswer::Leaves("LeaderCheckpointStopping"),
+            ),
+            (
+                "Restarting",
+                StopMode::immediate,
+                Box::new(Restarting {
+                    mode: RestartMode::safe,
+                }),
+                ExpectedAnswer::Leaves("Stopping { stop_mode: StopJob(Immediate) }"),
+            ),
+            (
+                "LeaderRestarting",
+                StopMode::immediate,
+                Box::new(LeaderRestarting {
+                    mode: RestartMode::safe,
+                }),
+                ExpectedAnswer::Leaves(
+                    "LeaderStopping { stop_behavior: StopJob(JobStopImmediate) }",
+                ),
+            ),
+            (
+                "Rescaling",
+                StopMode::immediate,
+                Box::new(Rescaling {}),
+                ExpectedAnswer::Leaves("Stopping { stop_mode: StopJob(Immediate) }"),
+            ),
+            (
+                "LeaderRescaling",
+                StopMode::immediate,
+                Box::new(LeaderRescaling {}),
+                ExpectedAnswer::Leaves(
+                    "LeaderStopping { stop_behavior: StopJob(JobStopImmediate) }",
+                ),
+            ),
+            (
+                "CheckpointStopping",
+                StopMode::immediate,
+                Box::new(CheckpointStopping {}),
+                ExpectedAnswer::Leaves("Stopping { stop_mode: StopJob(Immediate) }"),
+            ),
+            (
+                "LeaderCheckpointStopping",
+                StopMode::immediate,
+                Box::new(LeaderCheckpointStopping {}),
+                ExpectedAnswer::Leaves(
+                    "LeaderStopping { stop_behavior: StopJob(JobStopImmediate) }",
+                ),
+            ),
+            // The states that are already the stop, or already ending, or already failing.
+            // Each says why at its implementation site; the sweep records that it said so.
+            (
+                "Stopping",
+                StopMode::force,
+                Box::new(Stopping {
+                    stop_mode: StopBehavior::StopWorkers,
+                }),
+                ExpectedAnswer::Stays,
+            ),
+            (
+                "LeaderStopping",
+                StopMode::force,
+                Box::new(LeaderStopping {
+                    stop_behavior: LeaderStopBehavior::StopWorkers,
+                }),
+                ExpectedAnswer::Stays,
+            ),
+            (
+                "Finishing",
+                StopMode::immediate,
+                Box::new(Finishing {}),
+                ExpectedAnswer::Stays,
+            ),
+            (
+                "LeaderFinishing",
+                StopMode::immediate,
+                Box::new(LeaderFinishing {}),
+                ExpectedAnswer::Stays,
+            ),
+            (
+                "Failing",
+                StopMode::immediate,
+                Box::new(Failing {}),
+                ExpectedAnswer::Stays,
+            ),
+            (
+                "Recovering",
+                StopMode::immediate,
+                Box::new(Recovering {
+                    source: anyhow::anyhow!("a worker died"),
+                    reason: "a worker died".to_string(),
+                    domain: errors::ErrorDomain::Internal,
+                }),
+                ExpectedAnswer::Stays,
+            ),
+            (
+                "Failed",
+                StopMode::immediate,
+                Box::new(Failed),
+                ExpectedAnswer::Stays,
+            ),
+            (
+                "Finished",
+                StopMode::immediate,
+                Box::new(Finished),
+                ExpectedAnswer::Stays,
+            ),
+            (
+                "Stopped",
+                StopMode::immediate,
+                Box::new(Stopped {}),
+                ExpectedAnswer::Stays,
+            ),
+        ]
+    }
+
+    /// Every state in `states/`, taken from the source tree rather than from a list.
+    ///
+    /// The directory is walked rather than a set of `include_str!`s enumerated, so that a state
+    /// added in a *new file* is covered too: a list of files is the same maintenance hazard as
+    /// a list of states, one level up.
+    fn every_state_in_the_module() -> std::collections::BTreeSet<String> {
+        /// Everything in a file before its test module, so a state that stands in for one in a
+        /// test does not have to be answered for.
+        fn production_half(source: &str) -> &str {
+            match source.find("\n#[cfg(test)]") {
+                Some(at) => &source[..at],
+                None => source,
+            }
+        }
+
+        fn walk(dir: &std::path::Path, found: &mut std::collections::BTreeSet<String>) {
+            const MARKER: &str = "impl State for ";
+            for entry in std::fs::read_dir(dir).expect("the states module's own source") {
+                let path = entry.expect("a readable directory entry").path();
+                if path.is_dir() {
+                    walk(&path, found);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).expect("a readable source file");
+                let source = production_half(&source);
+                found.extend(source.match_indices(MARKER).map(|(at, _)| {
+                    source[at + MARKER.len()..]
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect::<String>()
+                }));
+            }
+        }
+
+        let mut found = std::collections::BTreeSet::new();
+        walk(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/states"),
+            &mut found,
+        );
+        assert!(
+            found.len() >= 20,
+            "the walk found {} states, which is fewer than `states/` had when this was \
+             written — it has stopped reading the source it quantifies over",
+            found.len()
+        );
+        found
+    }
+
+    /// Every state answers a stop that was decided before it ran, and the answer is the one
+    /// this suite records.
+    ///
+    /// The row the finding asked for, quantified over the states rather than over the four
+    /// names the review listed. Each `Leaves` entry is driven through `execute_state`, so it
+    /// proves the wiring — the boundary asks, and the answer is what the loop acts on — and
+    /// not merely that a method exists. Each `Stays` entry is asserted at the method, because
+    /// running those bodies needs a live `JobController` or `LeaderManager`; what makes them
+    /// safe is written beside each implementation and summarised in the commit message.
+    #[tokio::test]
+    async fn every_state_answers_a_stop_that_was_decided_before_it_ran() {
+        for (name, stop_mode, state, expected) in every_state_and_its_answer() {
+            match expected {
+                ExpectedAnswer::Leaves(next) => {
+                    let left = a_stop_arriving_between_states(state, stop_mode).await;
+                    assert_eq!(
+                        format!("{left:?}"),
+                        next,
+                        "{name}: a stop consumed at the state boundary must reach this state, \
+                         and it leaves for the transition its own family's macro names"
+                    );
+                }
+                ExpectedAnswer::Stays => {
+                    let mut config = running_config(StateBackendSelector::Parquet);
+                    config.stop_mode = stop_mode;
+                    let LeavingForStop::Stays(stayed) = state.leave_for_stop(&config) else {
+                        panic!(
+                            "{name}: this state is recorded as staying, and a state that \
+                             leaves has changed what the job does about a stop"
+                        );
+                    };
+                    assert!(
+                        format!("{stayed:?}").starts_with(name),
+                        "{name}: staying hands the same state back to be run"
+                    );
+                }
+            }
+        }
+
+        let answered: std::collections::BTreeSet<String> = every_state_and_its_answer()
+            .into_iter()
+            .map(|(name, ..)| name.to_string())
+            .collect();
+        assert_eq!(
+            answered,
+            every_state_in_the_module(),
+            "the domain this row quantifies over is every state in `states/`, read from the \
+             source. A state added without an entry here is a state whose answer to a stop \
+             nothing has looked at"
+        );
+    }
+
+    /// The forcing function itself: `State::leave_for_stop` is declared without a body.
+    ///
+    /// A default would be an answer given on a state's behalf by something that cannot see
+    /// what the state is about to do, and a state added later would inherit it in silence.
+    /// Declaring it without one is what makes `every_state_and_its_answer` above possible to
+    /// keep complete: the compiler refuses the state that has not answered.
+    #[test]
+    fn the_state_trait_admits_no_default_answer_to_a_stop() {
+        assert!(
+            include_str!("mod.rs").contains(
+                "fn leave_for_stop(self: Box<Self>, config: &JobConfig) -> LeavingForStop;\n"
+            ),
+            "declared and not defined: a state that could inherit an answer is a state that \
+             could forget to give one, which is the defect this closes"
+        );
     }
 }

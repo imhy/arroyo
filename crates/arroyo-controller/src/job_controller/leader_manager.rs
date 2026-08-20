@@ -212,7 +212,15 @@ impl LeaderManager {
 /// One rule with two readers: the configuration updates this wait consumes from the job's
 /// channel, and the lifecycle intents M11.D39a's single writer publishes into its
 /// configuration. Written once so the two cannot come to disagree about what a stop mode means.
-fn leader_stop_escalation(config: &JobConfig) -> Option<LeaderStopBehavior> {
+/// The stop that overtakes a leader-mode stop already in progress, if the job's configuration
+/// asks for one.
+///
+/// `pub(crate)` so that the state boundary answers with the same rule this wait does:
+/// `LeaderCheckpointStopping` sends the leader its checkpoint-stop before reaching the wait,
+/// so a stop consumed at the boundary — which the wait's own consumption point can no longer
+/// report — has to be answered before that send, and answering it by a second copy of this
+/// mapping is how the two would come to disagree.
+pub(crate) fn leader_stop_escalation(config: &JobConfig) -> Option<LeaderStopBehavior> {
     match config.stop_mode {
         SqlStopMode::force => Some(LeaderStopBehavior::StopWorkers),
         SqlStopMode::immediate => Some(LeaderStopBehavior::StopJob(JobStopMode::JobStopImmediate)),

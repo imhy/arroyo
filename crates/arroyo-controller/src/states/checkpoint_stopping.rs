@@ -1,6 +1,7 @@
 use arroyo_rpc::grpc;
 use tracing::debug;
 
+use crate::states::LeavingForStop;
 use crate::states::lifecycle::ConsumptionPoint;
 use crate::types::public::StopMode;
 use crate::{JobConfig, JobMessage, states::StateError};
@@ -45,6 +46,23 @@ fn escalation(config: &JobConfig) -> Option<Transition> {
 impl State for CheckpointStopping {
     fn name(&self) -> &'static str {
         "CheckpointStopping"
+    }
+
+    /// Leaves only for a stop that *overtakes* the one it is already making, through the same
+    /// [`escalation`] rule its message loop uses.
+    ///
+    /// This is the state the finding named that could do the most damage by staying: its loop
+    /// escalates only when its own consumption point reports a stop, and a stop consumed at
+    /// the state boundary never reaches that point, so an operator who gave up on a hanging
+    /// final checkpoint would be waiting on it still.
+    ///
+    /// A `checkpoint` or `graceful` stop is what this state is already doing, so it stays and
+    /// finishes the checkpoint.
+    fn leave_for_stop(self: Box<Self>, config: &JobConfig) -> LeavingForStop {
+        match escalation(config) {
+            Some(escalated) => LeavingForStop::Leaves(escalated),
+            None => LeavingForStop::Stays(self),
+        }
     }
 
     async fn next(mut self: Box<Self>, ctx: &mut JobContext) -> Result<Transition, StateError> {

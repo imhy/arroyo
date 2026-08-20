@@ -1,9 +1,10 @@
-use crate::JobMessage;
-use crate::states::lifecycle::ConsumptionPoint;
+use crate::states::LeavingForStop;
+use crate::states::lifecycle::{ConsumptionPoint, leaving};
 use crate::states::recovering::Recovering;
 use crate::states::scheduling::Scheduling;
 use crate::states::stop_if_desired_non_running;
 use crate::types::public::RestartMode;
+use crate::{JobConfig, JobMessage};
 
 use super::{
     JobContext, State, StateError, Transition, check_config_update, handle_unhandled_message,
@@ -18,6 +19,15 @@ pub struct Restarting {
 impl State for Restarting {
     fn name(&self) -> &'static str {
         "Restarting"
+    }
+
+    /// Leaves. `RestartMode::safe` initiates the job's final checkpoint as its very first
+    /// statement — before its loop's first consumption point — and `RestartMode::force` tears
+    /// the cluster down; both then end in `Scheduling`, which starts a replacement cluster. A
+    /// stop consumed at the state boundary is one this state can no longer observe for itself,
+    /// so without this the restart would run to completion and the job would be rescheduled.
+    fn leave_for_stop(self: Box<Self>, config: &JobConfig) -> LeavingForStop {
+        leaving::leaves_not_running(self, config)
     }
 
     async fn next(mut self: Box<Self>, ctx: &mut JobContext) -> Result<Transition, StateError> {

@@ -1,4 +1,6 @@
 use super::{JobContext, State, Stopped, Transition};
+use crate::JobConfig;
+use crate::states::LeavingForStop;
 use crate::states::StateError;
 use arroyo_rpc::config::config;
 use arroyo_rpc::grpc::rpc;
@@ -22,6 +24,13 @@ pub struct LeaderStopping {
 impl State for LeaderStopping {
     fn name(&self) -> &'static str {
         "Stopping"
+    }
+
+    /// Stays, for the same reason [`Stopping`](crate::states::stopping::Stopping) does: this
+    /// state is the stop, and the behaviour it holds is the one that was decided when it was
+    /// constructed.
+    fn leave_for_stop(self: Box<Self>, _config: &JobConfig) -> LeavingForStop {
+        LeavingForStop::Stays(self)
     }
 
     async fn next(mut self: Box<Self>, ctx: &mut JobContext) -> Result<Transition, StateError> {

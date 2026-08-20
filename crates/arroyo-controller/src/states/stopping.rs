@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use crate::JobConfig;
+use crate::states::LeavingForStop;
 use crate::states::StateError;
 use arroyo_rpc::grpc::rpc::StopMode;
 use tokio::time::timeout;
@@ -24,6 +26,13 @@ pub struct Stopping {
 impl State for Stopping {
     fn name(&self) -> &'static str {
         "Stopping"
+    }
+
+    /// Stays. This state *is* the stop: leaving it for a stop would be leaving it for itself,
+    /// and the behaviour it was constructed with — graceful, immediate, or straight to the
+    /// workers — is the one the decision that created it asked for.
+    fn leave_for_stop(self: Box<Self>, _config: &JobConfig) -> LeavingForStop {
+        LeavingForStop::Stays(self)
     }
 
     async fn next(mut self: Box<Self>, ctx: &mut JobContext) -> Result<Transition, StateError> {

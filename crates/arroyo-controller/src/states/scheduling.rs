@@ -13,11 +13,16 @@ use tonic::{Code, Request};
 use tracing::{debug, error, info, warn};
 
 use super::{
-    Admission, JobContext, State, Transition, check_config_update, leader_running::LeaderRunning,
-    lifecycle::ConsumptionPoint, running::Running, settle_under_admission,
+    Admission, JobContext, State, Transition, check_config_update,
+    leader_running::LeaderRunning,
+    lifecycle::{ConsumptionPoint, leaving},
+    running::Running,
+    settle_under_admission,
 };
+use crate::JobConfig;
 use crate::job_controller::checkpoint_store::DbCheckpointMetadataStore;
 use crate::job_controller::leader_manager::LeaderManager;
+use crate::states::LeavingForStop;
 use crate::{JobMessage, schedulers::SchedulerError};
 use crate::{
     job_controller::JobController, queries::controller_queries, states::stop_if_desired_non_running,
@@ -1186,6 +1191,17 @@ impl Scheduling {
 impl State for Scheduling {
     fn name(&self) -> &'static str {
         Self::NAME
+    }
+
+    /// Leaves, by the same macro both of this state's bodies open with.
+    ///
+    /// `Scheduling` already reads the published configuration before it does anything, in the
+    /// legacy body's first statement and in the phase graph's `schedule`, so this changes no
+    /// outcome for it. It is here because the trait admits no default: the state that persists
+    /// an incremented generation and starts a cluster is the last one whose stop check should
+    /// depend on a statement staying first in a five-hundred-line function.
+    fn leave_for_stop(self: Box<Self>, config: &JobConfig) -> LeavingForStop {
+        leaving::leaves_not_running(self, config)
     }
 
     async fn next(mut self: Box<Self>, ctx: &mut JobContext) -> Result<Transition, StateError> {

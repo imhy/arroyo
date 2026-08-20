@@ -5,9 +5,11 @@ use tokio::time::MissedTickBehavior;
 
 use tracing::error;
 
+use crate::JobConfig;
 use crate::JobMessage;
+use crate::states::LeavingForStop;
 use crate::states::finishing::Finishing;
-use crate::states::lifecycle::ConsumptionPoint;
+use crate::states::lifecycle::{ConsumptionPoint, leaving};
 use crate::states::recovering::Recovering;
 use crate::states::rescaling::Rescaling;
 use crate::states::restarting::Restarting;
@@ -27,6 +29,15 @@ pub struct Running {}
 impl State for Running {
     fn name(&self) -> &'static str {
         "Running"
+    }
+
+    /// Leaves, by the same macro the body's own first statement uses. `Running` already reads
+    /// the published configuration before it does anything, so this changes no outcome for it
+    /// — it is here because the trait admits no default, and a state whose answer happens to
+    /// be redundant today is exactly the state that stops being redundant when its body grows
+    /// a statement above that read.
+    fn leave_for_stop(self: Box<Self>, config: &JobConfig) -> LeavingForStop {
+        leaving::leaves_running(self, config)
     }
 
     async fn next(mut self: Box<Self>, ctx: &mut JobContext) -> Result<Transition, StateError> {

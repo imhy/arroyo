@@ -1,3 +1,5 @@
+use crate::JobConfig;
+use crate::states::LeavingForStop;
 use crate::states::StateError;
 
 use super::{Finished, JobContext, State, Transition};
@@ -9,6 +11,12 @@ pub struct Finishing {}
 impl State for Finishing {
     fn name(&self) -> &'static str {
         "Finishing"
+    }
+
+    /// Stays. The job's sources are exhausted and its workers are ending on their own;
+    /// `Finishing` starts nothing and waits for that to complete, and `Finished` is terminal.
+    fn leave_for_stop(self: Box<Self>, _config: &JobConfig) -> LeavingForStop {
+        LeavingForStop::Stays(self)
     }
 
     async fn next(mut self: Box<Self>, ctx: &mut JobContext) -> Result<Transition, StateError> {

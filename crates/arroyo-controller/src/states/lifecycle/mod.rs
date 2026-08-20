@@ -9,6 +9,11 @@
 //! [`LifecycleActor`] in the job's own state task that is the only thing which decides and
 //! publishes.
 //!
+//! [`leaving`] holds the other half of a decision: what the state that runs next does about a
+//! stop the writer decided while the previous one was running. The boundary consumes such an
+//! intent, so the state can no longer observe it for itself, and routing it is what keeps a
+//! consumed stop from being a lost one.
+//!
 //! [`classification`] holds the rules that run before either of them: a job's selector is
 //! fixed at its first execution, a row that disagrees with it earns a typed refusal, and a
 //! durable record that will not decode skips the job rather than being defaulted (M11.D39f).
@@ -23,6 +28,7 @@
 pub(crate) mod actor;
 pub(crate) mod classification;
 pub(crate) mod intent;
+pub(crate) mod leaving;
 pub(crate) mod mode;
 
 #[cfg(test)]

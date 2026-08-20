@@ -1,11 +1,13 @@
 use super::{JobContext, State, Transition, controller_job_failure};
+use crate::JobConfig;
 use crate::JobMessage;
+use crate::states::LeavingForStop;
 use crate::states::StateError;
 use crate::states::leader_finishing::LeaderFinishing;
 use crate::states::leader_rescaling::LeaderRescaling;
 use crate::states::leader_restarting::LeaderRestarting;
 use crate::states::leader_stop_if_desired_running;
-use crate::states::lifecycle::ConsumptionPoint;
+use crate::states::lifecycle::{ConsumptionPoint, leaving};
 use crate::states::{RunningConfigUpdate, classify_running_config_update};
 use anyhow::anyhow;
 use arroyo_rpc::config::config;
@@ -27,6 +29,13 @@ impl State for LeaderRunning {
         "Running"
     }
 
+    /// Leaves, by the same macro the body's own entry check uses, and for the same reason
+    /// [`Running`](crate::states::running::Running) does: the answer is redundant with that
+    /// check today and the trait admits no default, so it cannot stop being made.
+    fn leave_for_stop(self: Box<Self>, config: &JobConfig) -> LeavingForStop {
+        leaving::leaves_running_under_leader(self, config)
+    }
+
     async fn next(mut self: Box<Self>, ctx: &mut JobContext) -> Result<Transition, StateError> {
         let pipeline_config = &config().clone().pipeline;
 
@@ -36,7 +45,7 @@ impl State for LeaderRunning {
         let mut poll_interval = tokio::time::interval(*config().controller.leader_poll_interval);
         poll_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
-        leader_stop_if_desired_running!(self, ctx.config, ctx);
+        leader_stop_if_desired_running!(self, ctx.config);
 
         if ctx.leader_manager.is_none() {
             return ctx
@@ -80,7 +89,7 @@ impl State for LeaderRunning {
                 .observe_lifecycle_intent(ConsumptionPoint::InsideInterruptibleWait)?
                 .stops()
             {
-                leader_stop_if_desired_running!(self, ctx.config, ctx);
+                leader_stop_if_desired_running!(self, ctx.config);
             }
 
             if ctx.leader_manager().last_heartbeat.elapsed()
@@ -119,7 +128,7 @@ impl State for LeaderRunning {
                 msg = ctx.rx.recv() => {
                     match msg {
                         Some(JobMessage::ConfigUpdate(c)) => {
-                            leader_stop_if_desired_running!(self, c, ctx);
+                            leader_stop_if_desired_running!(self, c);
 
                             // Shared with legacy mode: refuses a state-backend change and
                             // decides whether the rest of the update needs a restart. The
