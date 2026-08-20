@@ -87,6 +87,38 @@ impl GenerationPublication {
         self.generation
     }
 
+    /// The pipeline this generation is being published for.
+    pub fn pipeline_id(&self) -> &PipelineId {
+        &self.pipeline_id
+    }
+
+    /// The path builder for this job's protocol objects.
+    ///
+    /// Derived from the publication rather than handed in beside it, so that every object a
+    /// publishing effect writes is addressed out of the same pipeline and job the identity
+    /// check below bound the recovery manifest to. A separately supplied path builder would be
+    /// a second, unchecked statement of the same identity.
+    pub fn paths(&self) -> ProtocolPaths {
+        ProtocolPaths::new(self.pipeline_id.clone(), self.job_id.clone())
+    }
+
+    /// The recovery checkpoint this publication commits to: the reference the generation
+    /// manifest would record, together with the manifest that was read from it.
+    ///
+    /// Returned as a pair because the check below is what makes them one — present together,
+    /// and the manifest being the checkpoint the reference names. An effect that could take one
+    /// without the other would be back to two independently supplied values, which is the state
+    /// the token exists to leave behind.
+    pub fn recovery_checkpoint(&self) -> Option<(&CheckpointRef, &CheckpointManifest)> {
+        match (&self.base_checkpoint_ref, &self.recovery_checkpoint) {
+            (Some(checkpoint_ref), Some(checkpoint)) => Some((checkpoint_ref, checkpoint)),
+            // A token cannot carry one without the other — `check_whole` refuses that
+            // publication — so all three remaining shapes mean the same thing here. They are
+            // enumerated rather than absorbed by a wildcard.
+            (Some(_), None) | (None, Some(_)) | (None, None) => None,
+        }
+    }
+
     /// The current-generation fence this publication would write.
     pub fn current_generation(&self, now: SystemTime) -> CurrentGeneration {
         CurrentGeneration::new(
@@ -180,7 +212,7 @@ impl WholeObject for GenerationPublication {
         // from rather than taken from the manifest's own word for it. Everything below depends
         // on the answer: the entry headers are compared with it, and the generation manifest
         // this publication writes records the reference itself.
-        let paths = ProtocolPaths::new(self.pipeline_id.clone(), self.job_id.clone());
+        let paths = self.paths();
         let identity = identify_checkpoint_manifest(&paths, checkpoint_ref, checkpoint)?;
 
         validate_manifest_covers_program(checkpoint, &identity, job.program_operators)?;

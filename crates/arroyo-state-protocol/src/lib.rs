@@ -124,8 +124,10 @@ mod tests {
     use arroyo_rpc::state_backend::validated::Validated;
     use arroyo_rpc::state_backend::{StateBackendError, StateBackendSelector};
     use arroyo_types::{JobId, PipelineId, from_micros};
+    use async_trait::async_trait;
     use prost::Message;
     use std::collections::HashSet;
+    use std::sync::Mutex;
     use std::time::SystemTime;
 
     fn checkpoint_ref(path: &str) -> CheckpointRef {
@@ -1955,6 +1957,628 @@ mod tests {
         assert!(problems.is_empty(), "{}", problems.join("\n"));
     }
 
+    /// An entry a parquet job can restore: `operator_id`'s tables, carrying the table configs a
+    /// checkpoint written before the selector existed reports, which is what parquet means.
+    fn restorable_operator(operator_id: &str) -> OperatorCheckpointMetadata {
+        operator_with_selector(named_operator(operator_id), "")
+    }
+
+    /// The worker leader's own request: generation 2, and `update_current_generation` false, so
+    /// the current generation is read and conformed to rather than written. This is the shape
+    /// PR #160 review round 8 is about — it is the only one that can reach an unclaimed
+    /// recovery candidate, because the controller writes the current generation before the
+    /// leader runs.
+    fn leader_initialization(program_operators: &[&str]) -> InitializeGenerationRequest {
+        InitializeGenerationRequest {
+            pipeline_id: PipelineId::new("P"),
+            job_id: JobId::new("J"),
+            generation: Generation(2),
+            updated_at: from_micros(456),
+            state_backend: StateBackendSelector::Parquet,
+            program_operators: program_operators
+                .iter()
+                .map(|operator| operator.to_string())
+                .collect(),
+        }
+    }
+
+    /// Points generation 1's manifest at `checkpoint_ref` and writes `checkpoint` there with
+    /// **no epoch record** — the unclaimed shape — under a store whose current generation is
+    /// already the one being initialized.
+    ///
+    /// This is what the two round-7 rows could not stage: they call
+    /// `initialize_generation(.., true)` against already-canonical state, so the epoch is
+    /// claimed before the call and no claim happens during it.
+    async fn stage_unclaimed_recovery_candidate(
+        store: &MemoryProtocolStore,
+        paths: &ProtocolPaths,
+        checkpoint_ref: &CheckpointRef,
+        checkpoint: &CheckpointManifest,
+    ) {
+        write_current_generation(store, paths, Generation(2)).await;
+        put_protobuf(store, checkpoint_ref, checkpoint)
+            .await
+            .unwrap();
+        put_json(
+            store,
+            &paths.generation_manifest(Generation(1)),
+            &generation_manifest_for_generation(Generation(1), None, Some(checkpoint_ref.clone())),
+        )
+        .await
+        .unwrap();
+        store.forget_writes();
+    }
+
+    /// Nothing was written, and in particular no epoch was taken — neither the one the
+    /// reference names nor the one the object claims for itself.
+    async fn assert_claimed_nothing(
+        store: &MemoryProtocolStore,
+        paths: &ProtocolPaths,
+        name: &str,
+        problems: &mut Vec<String>,
+    ) {
+        if !store.written_objects().is_empty() {
+            problems.push(format!(
+                "{name}: no protocol state may be written, but {:?} was",
+                store.written_objects()
+            ));
+        }
+        for epoch in [1, 9] {
+            if read_json::<_, EpochRecord>(store, &paths.epoch_record(Epoch(epoch)))
+                .await
+                .unwrap()
+                .is_some()
+            {
+                problems.push(format!(
+                    "{name}: epoch {epoch} was claimed for a rejected recovery candidate"
+                ));
+            }
+        }
+        if read_json::<_, GenerationManifest>(store, &paths.generation_manifest(Generation(2)))
+            .await
+            .unwrap()
+            .is_some()
+        {
+            problems.push(format!(
+                "{name}: the new generation manifest must not have been written"
+            ));
+        }
+    }
+
+    /// Which family of check a recovery candidate is expected to fail.
+    #[derive(Debug, Clone, Copy)]
+    enum Refusal {
+        /// The manifest is not the checkpoint the reference it was read from names.
+        Misplaced,
+        /// The manifest cannot restore the program, and the message names `&'static str`.
+        Unrestorable(&'static str),
+        /// The manifest was written by a backend this job does not select.
+        ForeignBackend,
+    }
+
+    /// PR #160 review round 8: an unclaimed recovery candidate does not get its epoch until it
+    /// has earned the publication token, and a candidate that fails to earn it leaves the epoch
+    /// exactly as it found it.
+    ///
+    /// One row per validation family rather than one row that trips whichever check fires
+    /// first, because the ordering being asserted is between *each* check and the claim, not
+    /// between the first check and the claim.
+    ///
+    /// Each case ends by putting a manifest the job *can* restore at the same reference and
+    /// initializing again. That is the assertion the epoch-absence check exists for: a claim
+    /// made for the rejected candidate would have been immutable, and the valid checkpoint for
+    /// the same epoch would have been orphaned by it for good — a state no later fence can
+    /// repair, which is why this belongs to T25 and not to T26.
+    #[tokio::test]
+    async fn initialize_generation_claims_no_epoch_for_a_recovery_candidate_it_refuses() {
+        let mut problems: Vec<String> = vec![];
+
+        // Read from generation 1 epoch 1's own reference in every case; only the object at it
+        // moves.
+        let misplaced = {
+            let mut checkpoint = checkpoint_for_generation(Generation(1), 9, None, false);
+            checkpoint.min_epoch = 9;
+            describing(checkpoint, vec![restorable_operator("op")])
+        };
+        let uncovered = describing(
+            checkpoint_for_generation(Generation(1), 1, None, false),
+            vec![restorable_operator("op")],
+        );
+        let foreign_entry = {
+            let mut checkpoint = checkpoint_for_generation(Generation(1), 1, None, false);
+            let mut operator = restorable_operator("op");
+            operator.operator_metadata.as_mut().unwrap().job_id = "J2".to_string();
+            checkpoint.operators = vec![operator];
+            checkpoint
+        };
+        let foreign_backend = describing(
+            checkpoint_for_generation(Generation(1), 1, None, false),
+            vec![operator_with_selector(named_operator("op"), "stateengine")],
+        );
+
+        for (name, candidate, program, refusal) in [
+            (
+                "misplaced manifest",
+                &misplaced,
+                &["op"][..],
+                Refusal::Misplaced,
+            ),
+            (
+                "operator coverage",
+                &uncovered,
+                &["op", "other"][..],
+                Refusal::Unrestorable("other"),
+            ),
+            (
+                "entry identity",
+                &foreign_entry,
+                &["op"][..],
+                Refusal::Unrestorable("job \"J2\""),
+            ),
+            (
+                "backend selector",
+                &foreign_backend,
+                &["op"][..],
+                Refusal::ForeignBackend,
+            ),
+        ] {
+            let store = MemoryProtocolStore::default();
+            let paths = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J"));
+            let checkpoint_ref = paths.checkpoint_manifest(Generation(1), Epoch(1));
+            stage_unclaimed_recovery_candidate(&store, &paths, &checkpoint_ref, candidate).await;
+
+            let outcome =
+                initialize_generation(&store, leader_initialization(program), false).await;
+
+            match (refusal, outcome) {
+                (_, Ok(initialized)) => problems.push(format!(
+                    "{name}: this candidate must not be published, got {initialized:?}"
+                )),
+                (
+                    Refusal::Misplaced,
+                    Err(StoreError::Protocol(ProtocolError::CheckpointManifestMisplaced {
+                        checkpoint_ref: ref named,
+                        ..
+                    })),
+                ) if *named == checkpoint_ref => {}
+                (
+                    Refusal::Unrestorable(expect),
+                    Err(StoreError::IncompleteManifest(ref detail)),
+                ) if detail.detail.contains(expect) => {}
+                (
+                    Refusal::ForeignBackend,
+                    Err(StoreError::StateBackend(StateBackendError::CheckpointMismatch { .. })),
+                ) => {}
+                (expected, Err(other)) => {
+                    problems.push(format!("{name}: expected {expected:?}, got {other:?}"))
+                }
+            }
+
+            assert_claimed_nothing(&store, &paths, name, &mut problems).await;
+
+            // The epoch is still there to be taken: the checkpoint that should have been at
+            // this reference all along claims it and the generation initializes from it.
+            let restorable = describing(
+                checkpoint_for_generation(Generation(1), 1, None, false),
+                program.iter().copied().map(restorable_operator).collect(),
+            );
+            put_protobuf(&store, &checkpoint_ref, &restorable)
+                .await
+                .unwrap();
+
+            match initialize_generation(&store, leader_initialization(program), false).await {
+                Ok(GenerationInitialization::Initialized { recovery, .. })
+                    if recovery
+                        == (GenerationRecovery::Ready {
+                            checkpoint_ref: checkpoint_ref.clone(),
+                        }) => {}
+                other => problems.push(format!(
+                    "{name}: a valid candidate for the same epoch must still recover, got \
+                     {other:?}"
+                )),
+            }
+
+            match read_json::<_, EpochRecord>(&store, &paths.epoch_record(Epoch(1)))
+                .await
+                .unwrap()
+            {
+                Some(record)
+                    if record.checkpoint_ref == checkpoint_ref
+                        && record.generation == Generation(1)
+                        && record.epoch == Epoch(1) => {}
+                other => problems.push(format!(
+                    "{name}: the epoch should now be owned by the valid checkpoint, got {other:?}"
+                )),
+            }
+        }
+
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
+    /// A refused candidate is a refusal, not a hint to look further back.
+    ///
+    /// Deferring the claim raised the question of what a failed validation does to the search,
+    /// and the answer has to be "stops it": an older generation's checkpoint is a *different*
+    /// recovery point, so quietly initializing from it would restore a job from state its
+    /// operator asked nothing about. Generation 0 here holds a perfectly restorable canonical
+    /// checkpoint, and initialization still fails on generation 1's candidate.
+    #[tokio::test]
+    async fn initialize_generation_does_not_fall_back_past_a_recovery_candidate_it_refuses() {
+        let store = MemoryProtocolStore::default();
+        let paths = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J"));
+
+        let older_ref = paths.checkpoint_manifest(Generation(0), Epoch(0));
+        let older = describing(
+            checkpoint_for_generation(Generation(0), 0, None, false),
+            vec![restorable_operator("op")],
+        );
+        write_canonical_checkpoint(&store, &paths, &older_ref, &older).await;
+        put_json(
+            &store,
+            &paths.generation_manifest(Generation(0)),
+            &generation_manifest_for_generation(Generation(0), None, Some(older_ref.clone())),
+        )
+        .await
+        .unwrap();
+
+        let candidate_ref = paths.checkpoint_manifest(Generation(1), Epoch(1));
+        let candidate = describing(
+            checkpoint_for_generation(Generation(1), 1, None, false),
+            vec![operator_with_selector(named_operator("op"), "stateengine")],
+        );
+        stage_unclaimed_recovery_candidate(&store, &paths, &candidate_ref, &candidate).await;
+
+        let err = initialize_generation(&store, leader_initialization(&["op"]), false)
+            .await
+            .expect_err("a refused candidate must not become a search for an older one");
+
+        assert!(
+            matches!(
+                err,
+                StoreError::StateBackend(StateBackendError::CheckpointMismatch { .. })
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            store.written_objects(),
+            Vec::<String>::new(),
+            "a refused candidate publishes nothing, including from an older generation"
+        );
+        assert!(
+            read_json::<_, EpochRecord>(&store, &paths.epoch_record(Epoch(1)))
+                .await
+                .unwrap()
+                .is_none(),
+            "the refused candidate's epoch must still be unclaimed"
+        );
+        assert!(
+            read_json::<_, GenerationManifest>(&store, &paths.generation_manifest(Generation(2)))
+                .await
+                .unwrap()
+                .is_none(),
+            "no generation manifest may be published for an older checkpoint instead"
+        );
+    }
+
+    /// The positive half: a candidate that earns the token is claimed, and the claim is what
+    /// decides how this generation recovers from it.
+    ///
+    /// `needs_commit` is the dimension that separates the two outcomes, so it is varied rather
+    /// than fixed, and the replay-commit case drives the permit through `complete_commit` —
+    /// a permit that cannot write the marker it authorizes is not a permit.
+    #[tokio::test]
+    async fn initialize_generation_claims_an_unclaimed_recovery_candidate_it_validated() {
+        let mut problems: Vec<String> = vec![];
+
+        for needs_commit in [false, true] {
+            let name = if needs_commit {
+                "needs commit"
+            } else {
+                "ready"
+            };
+            let store = MemoryProtocolStore::default();
+            let paths = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J"));
+            let checkpoint_ref = paths.checkpoint_manifest(Generation(1), Epoch(1));
+            let checkpoint = describing(
+                checkpoint_for_generation(Generation(1), 1, None, needs_commit),
+                vec![restorable_operator("op")],
+            );
+            stage_unclaimed_recovery_candidate(&store, &paths, &checkpoint_ref, &checkpoint).await;
+
+            let initialization =
+                initialize_generation(&store, leader_initialization(&["op"]), false)
+                    .await
+                    .expect("a candidate this job can restore must initialize");
+
+            let GenerationInitialization::Initialized {
+                generation_manifest,
+                recovery,
+                recovery_checkpoint,
+            } = initialization
+            else {
+                problems.push(format!("{name}: expected an initialized generation"));
+                continue;
+            };
+
+            assert_eq!(
+                generation_manifest,
+                {
+                    let mut expected = GenerationManifest::new(
+                        PipelineId::new("P"),
+                        JobId::new("J"),
+                        Generation(2),
+                        Some(checkpoint_ref.clone()),
+                        456,
+                    );
+                    expected.latest_checkpoint_ref = None;
+                    expected
+                },
+                "{name}"
+            );
+            assert_eq!(recovery_checkpoint.as_ref(), Some(&checkpoint), "{name}");
+
+            let record = read_json::<_, EpochRecord>(&store, &paths.epoch_record(Epoch(1)))
+                .await
+                .unwrap()
+                .expect("the claim writes the epoch record");
+            assert_eq!(record.checkpoint_ref, checkpoint_ref, "{name}");
+            assert_eq!(record.epoch, Epoch(1), "{name}");
+            assert_eq!(record.generation, Generation(1), "{name}");
+            assert_eq!(record.pipeline_id, PipelineId::new("P"), "{name}");
+            assert_eq!(record.job_id, JobId::new("J"), "{name}");
+
+            match (needs_commit, recovery) {
+                (
+                    false,
+                    GenerationRecovery::Ready {
+                        checkpoint_ref: got,
+                    },
+                ) => {
+                    assert_eq!(got, checkpoint_ref, "{name}");
+                }
+                (
+                    true,
+                    GenerationRecovery::ReplayCommit {
+                        checkpoint_ref: got,
+                        commit_permit,
+                    },
+                ) => {
+                    assert_eq!(got, checkpoint_ref, "{name}");
+                    assert_eq!(commit_permit.checkpoint_ref(), &checkpoint_ref, "{name}");
+                    assert_eq!(commit_permit.epoch_record(), &record, "{name}");
+
+                    let completion = complete_commit(&store, &commit_permit, Generation(2))
+                        .await
+                        .expect("the permit must authorize the commit it was issued for");
+                    assert_eq!(completion, CommittedMarkerOutcome::Created, "{name}");
+                    assert!(
+                        exists(&store, &paths.committed_marker(Generation(1), Epoch(1))).await,
+                        "{name}: the marker the permit authorized should be there"
+                    );
+                }
+                (_, other) => problems.push(format!("{name}: unexpected recovery {other:?}")),
+            }
+        }
+
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
+    /// A store that hides an object from the *first* read of it and shows it afterwards.
+    ///
+    /// This is exactly how an epoch claimed between resolution and the claim looks from inside
+    /// `initialize_generation`: the search sees a candidate nothing owns, and the conditional
+    /// create that follows finds the record already there. Nothing else changes — in particular
+    /// the hidden object is fully present for the create, which is what makes the claim lose.
+    struct HidesFromTheFirstRead {
+        inner: MemoryProtocolStore,
+        hidden: Mutex<HashSet<String>>,
+    }
+
+    impl HidesFromTheFirstRead {
+        fn hiding(inner: MemoryProtocolStore, path: &CheckpointRef) -> Self {
+            Self {
+                inner,
+                hidden: Mutex::new(HashSet::from([path.to_string()])),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ProtocolStore for HidesFromTheFirstRead {
+        async fn read_bytes(&self, path: &CheckpointRef) -> Result<Option<Vec<u8>>, StoreError> {
+            if self.hidden.lock().unwrap().remove(&path.to_string()) {
+                return Ok(None);
+            }
+            self.inner.read_bytes(path).await
+        }
+
+        async fn put_bytes(&self, path: &CheckpointRef, bytes: Vec<u8>) -> Result<(), StoreError> {
+            self.inner.put_bytes(path, bytes).await
+        }
+
+        async fn create_bytes(
+            &self,
+            path: &CheckpointRef,
+            bytes: Vec<u8>,
+        ) -> Result<CreateResult<Vec<u8>>, StoreError> {
+            self.inner.create_bytes(path, bytes).await
+        }
+
+        async fn delete_object(&self, path: &CheckpointRef) -> Result<(), StoreError> {
+            self.inner.delete_object(path).await
+        }
+
+        async fn delete_directory(&self, path: &str) {
+            self.inner.delete_directory(path).await
+        }
+    }
+
+    /// Losing the claim after validation redirects to the epoch's canonical checkpoint, and
+    /// that checkpoint is validated in its own right before anything is published for it.
+    ///
+    /// Deferring the claim created this path: the claim can now come back `Orphaned` *after* a
+    /// publication token has been produced, and that token certifies the candidate that lost.
+    /// Publishing on it would record a generation manifest pointing at a checkpoint nothing
+    /// checked — so the redirect is re-read and re-checked, and the second case proves the
+    /// re-check is real by making the winner one this job cannot restore.
+    #[tokio::test]
+    async fn initialize_generation_revalidates_the_canonical_checkpoint_after_a_lost_claim() {
+        for (name, winner_operator, expect_published) in [
+            ("restorable winner", restorable_operator("op"), true),
+            (
+                "winner from another backend",
+                operator_with_selector(named_operator("op"), "stateengine"),
+                false,
+            ),
+        ] {
+            let memory = MemoryProtocolStore::default();
+            let paths = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J"));
+
+            // The winner owns epoch 1 and lives under generation 0; the loser is generation 1's
+            // candidate for the same epoch.
+            let winner_ref = paths.checkpoint_manifest(Generation(0), Epoch(1));
+            let winner = describing(
+                checkpoint_for_generation(Generation(0), 1, None, false),
+                vec![winner_operator],
+            );
+            write_canonical_checkpoint(&memory, &paths, &winner_ref, &winner).await;
+
+            let loser_ref = paths.checkpoint_manifest(Generation(1), Epoch(1));
+            let loser = describing(
+                checkpoint_for_generation(Generation(1), 1, None, false),
+                vec![restorable_operator("op")],
+            );
+            stage_unclaimed_recovery_candidate(&memory, &paths, &loser_ref, &loser).await;
+
+            let store =
+                HidesFromTheFirstRead::hiding(memory.clone(), &paths.epoch_record(Epoch(1)));
+
+            let outcome =
+                initialize_generation(&store, leader_initialization(&["op"]), false).await;
+
+            if !expect_published {
+                assert!(
+                    matches!(
+                        outcome,
+                        Err(StoreError::StateBackend(
+                            StateBackendError::CheckpointMismatch { .. }
+                        ))
+                    ),
+                    "{name}: the redirect must be validated in its own right, got {outcome:?}"
+                );
+                assert_eq!(
+                    memory.written_objects(),
+                    Vec::<String>::new(),
+                    "{name}: nothing may be published for a redirect that fails validation"
+                );
+                assert!(
+                    read_json::<_, GenerationManifest>(
+                        &memory,
+                        &paths.generation_manifest(Generation(2))
+                    )
+                    .await
+                    .unwrap()
+                    .is_none(),
+                    "{name}: no generation manifest may be written"
+                );
+                continue;
+            }
+
+            let GenerationInitialization::Initialized {
+                generation_manifest,
+                recovery,
+                recovery_checkpoint,
+            } = outcome.expect("the canonical checkpoint is restorable")
+            else {
+                panic!("{name}: expected an initialized generation");
+            };
+
+            assert_eq!(
+                recovery,
+                GenerationRecovery::Ready {
+                    checkpoint_ref: winner_ref.clone()
+                },
+                "{name}"
+            );
+            assert_eq!(
+                recovery_checkpoint.as_ref(),
+                Some(&winner),
+                "{name}: the manifest handed back must be the winner's, not the loser's"
+            );
+            assert_eq!(
+                generation_manifest.base_checkpoint_ref,
+                Some(winner_ref.clone()),
+                "{name}: the published generation manifest must record the winner"
+            );
+
+            let written: GenerationManifest =
+                read_json(&memory, &paths.generation_manifest(Generation(2)))
+                    .await
+                    .unwrap()
+                    .expect("{name}: the generation manifest should be published");
+            assert_eq!(written.base_checkpoint_ref, Some(winner_ref), "{name}");
+
+            let record = read_json::<_, EpochRecord>(&memory, &paths.epoch_record(Epoch(1)))
+                .await
+                .unwrap()
+                .expect("the winner's epoch record is untouched");
+            assert_eq!(
+                record.checkpoint_ref,
+                paths.checkpoint_manifest(Generation(0), Epoch(1)),
+                "{name}: the loser must not have taken the epoch"
+            );
+            assert_eq!(
+                loser.epoch, 1,
+                "{name}: the loser and the winner must be for the same epoch, or this row \
+                 proves nothing"
+            );
+        }
+    }
+
+    /// The recovery search resolves; it does not write.
+    ///
+    /// PR #160 review round 8: an epoch record written while resolving made a candidate the
+    /// canonical checkpoint of its epoch before `initialize_generation` had checked it, and an
+    /// epoch record is immutable. The fix moved the claim to the far side of the publication
+    /// token, and this is what keeps it there — a source pin over the resolution module naming
+    /// every entry point in `store` through which a byte can be written or removed, plus the
+    /// two workflow functions that wrap them.
+    ///
+    /// Line comments are stripped first, so the module's own prose may discuss the claim it
+    /// deliberately does not make. Adding a write to that module fails this row, which is the
+    /// forcing function rather than a stale assertion.
+    #[test]
+    fn the_recovery_resolution_module_reaches_no_persistent_write() {
+        let source = include_str!("workflow/recovery.rs")
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let reached: Vec<&str> = [
+            "put_bytes",
+            "create_bytes",
+            "delete_object",
+            "delete_directory",
+            "put_json",
+            "put_protobuf",
+            "create_json_if_not_exist",
+            "create_protobuf",
+            "claim_epoch_record",
+            "mark_committed",
+        ]
+        .into_iter()
+        .filter(|entry_point| source.contains(entry_point))
+        .collect();
+
+        assert!(
+            reached.is_empty(),
+            "the recovery search must perform no persistent write, but it reaches {reached:?}; \
+             an effect that makes a checkpoint canonical belongs after the publication token, \
+             not inside the search that found the candidate"
+        );
+    }
+
     #[tokio::test]
     async fn initialize_generation_restores_previous_ready_checkpoint() {
         let store = MemoryProtocolStore::default();
@@ -2915,8 +3539,17 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(temp_dir).await;
     }
 
+    /// An unclaimed candidate under the current generation is *reported*, not taken.
+    ///
+    /// Renamed from `resolve_generation_manifest_claims_unclaimed_current_latest` in PR #160
+    /// review round 8, which is the round that moved the claim out of resolution: writing the
+    /// epoch record here made the candidate the canonical checkpoint of its epoch before
+    /// anything had established that the job asking could restore it, and an epoch record is
+    /// immutable. The claim itself is asserted by
+    /// `initialize_generation_claims_an_unclaimed_recovery_candidate_it_validated`; what is
+    /// asserted here is that resolution left the epoch alone.
     #[tokio::test]
-    async fn resolve_generation_manifest_claims_unclaimed_current_latest() {
+    async fn resolve_generation_manifest_reports_an_unclaimed_current_latest_without_claiming_it() {
         let store = MemoryProtocolStore::default();
         let paths = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J"));
         write_current_generation(&store, &paths, Generation(1)).await;
@@ -2928,22 +3561,39 @@ mod tests {
             .unwrap();
 
         let manifest = generation_manifest(None, Some(checkpoint_ref.clone()));
+        store.forget_writes();
 
         let resolution = resolve_generation_manifest(&store, &manifest, Generation(1))
             .await
             .unwrap();
 
-        assert_eq!(resolution, GenerationResolution::Ready { checkpoint_ref });
+        assert_eq!(
+            resolution,
+            GenerationResolution::ClaimRequired { checkpoint_ref }
+        );
         assert!(
             read_json::<_, EpochRecord>(&store, &paths.epoch_record(Epoch(1)))
                 .await
                 .unwrap()
-                .is_some()
+                .is_none(),
+            "resolving must not claim the epoch"
+        );
+        assert_eq!(
+            store.written_objects(),
+            Vec::<String>::new(),
+            "resolving a generation manifest writes nothing at all"
         );
     }
 
+    /// The same for a candidate that still owes external commit: which of `Ready` and
+    /// `ReplayCommit` it becomes is decided by the claim, so resolution reports the candidate
+    /// and says nothing about the commit. Renamed from
+    /// `resolve_generation_manifest_claims_unclaimed_commit_checkpoint` in PR #160 review
+    /// round 8; the replay-commit permit it used to assert is now asserted by
+    /// `initialize_generation_claims_an_unclaimed_recovery_candidate_it_validated`.
     #[tokio::test]
-    async fn resolve_generation_manifest_claims_unclaimed_commit_checkpoint() {
+    async fn resolve_generation_manifest_reports_an_unclaimed_commit_checkpoint_without_claiming_it()
+     {
         let store = MemoryProtocolStore::default();
         let paths = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J"));
         write_current_generation(&store, &paths, Generation(1)).await;
@@ -2955,21 +3605,30 @@ mod tests {
             .unwrap();
 
         let manifest = generation_manifest(None, Some(checkpoint_ref.clone()));
+        store.forget_writes();
 
         let resolution = resolve_generation_manifest(&store, &manifest, Generation(1))
             .await
             .unwrap();
 
-        match resolution {
-            GenerationResolution::ReplayCommit {
-                checkpoint_ref: recovered_ref,
-                commit_permit,
-            } => {
-                assert_eq!(recovered_ref, checkpoint_ref);
-                assert_eq!(commit_permit.checkpoint_ref(), &checkpoint_ref);
+        assert_eq!(
+            resolution,
+            GenerationResolution::ClaimRequired {
+                checkpoint_ref: checkpoint_ref.clone()
             }
-            other => panic!("expected replay commit resolution, got {other:?}"),
-        }
+        );
+        assert!(
+            read_json::<_, EpochRecord>(&store, &paths.epoch_record(Epoch(1)))
+                .await
+                .unwrap()
+                .is_none(),
+            "resolving must not claim the epoch"
+        );
+        assert_eq!(
+            store.written_objects(),
+            Vec::<String>::new(),
+            "resolving a generation manifest writes nothing at all"
+        );
     }
 
     #[tokio::test]
@@ -3337,6 +3996,18 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+        // PR #160 review round 8: a refused publication writes nothing at all. This check used
+        // to run *after* the manifest object had been created, so a checkpoint whose parent was
+        // not ready left its manifest behind for a publication that never happened.
+        assert!(
+            !exists(&store, &child_ref).await,
+            "a refused publication must not leave the checkpoint manifest behind"
+        );
+        assert_eq!(
+            store.written_objects(),
+            vec![paths.current_generation().to_string()],
+            "only the fixture's own current-generation write should have happened"
         );
     }
 }

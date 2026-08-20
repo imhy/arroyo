@@ -1,7 +1,7 @@
+mod recovery;
+
 use crate::ProtocolPaths;
-use crate::resolve::{
-    EpochClaimOutcome, ParentCheckpointStatus, ResolveDecision, ResolveFailure, resolve_candidate,
-};
+use crate::resolve::{EpochClaimOutcome, ParentCheckpointStatus, ResolveFailure};
 use crate::state::{CheckpointState, derive_checkpoint_state};
 use crate::store::{
     CreateResult, ProtocolStore, StoreError, create_json_if_not_exist, create_protobuf, put_json,
@@ -9,25 +9,30 @@ use crate::store::{
 };
 use crate::types::{
     CheckpointRef, CommittedMarker, CurrentGeneration, Epoch, EpochRecord, Generation,
-    GenerationManifest, ProtocolError, checkpoint_parent_checkpoint_ref,
-    identify_checkpoint_manifest, validate_epoch_record_matches_checkpoint,
+    GenerationManifest, ProtocolError, identify_checkpoint_manifest,
+    validate_epoch_record_matches_checkpoint,
 };
 use crate::validated::{GenerationPublication, PublishingJob};
 use arroyo_rpc::grpc::rpc::CheckpointManifest;
 use arroyo_rpc::state_backend::StateBackendSelector;
 use arroyo_rpc::state_backend::validated::Validated;
 use arroyo_types::{JobId, PipelineId};
+use recovery::{RecoverySearch, find_recovery_checkpoint, resolve_canonical_recovery_ref};
 use std::collections::HashSet;
 use std::time::SystemTime;
 
+pub use recovery::{GenerationResolution, resolve_generation_manifest};
+
 /// Request to claim canonical ownership of a checkpoint's epoch.
 ///
-/// Callers normally use this through [`publish_checkpoint`] or
-/// [`resolve_generation_manifest`]. Use it directly only when the checkpoint
-/// manifest has already been published and parent safety has already been
-/// checked.
+/// Crate-internal, and deliberately so. An epoch record is immutable: writing one names the
+/// canonical checkpoint of that epoch permanently, so the two operations allowed to write one
+/// are [`publish_checkpoint`], which has already bound the manifest to the reference it is
+/// publishing at, and [`initialize_generation`], which has already validated the publication
+/// the recovery candidate belongs to. Before PR #160 review round 8 this was public and any
+/// caller could take an epoch for a manifest nothing had checked.
 #[derive(Debug, Clone)]
-pub struct ClaimEpochRecordRequest<'a> {
+pub(crate) struct ClaimEpochRecordRequest<'a> {
     pub epoch_record_path: &'a CheckpointRef,
     pub pipeline_id: &'a PipelineId,
     pub generation: Generation,
@@ -43,26 +48,6 @@ pub enum CommittedMarkerOutcome {
     Created,
     /// The marker already existed for the same checkpoint.
     AlreadyCommitted,
-}
-
-/// Result of resolving a generation manifest candidate.
-///
-/// This is used both during recovery and when initializing a replacement
-/// generation. A `ReplayCommit` result means callers may restore the checkpoint
-/// only to replay external commit before normal execution continues.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GenerationResolution {
-    Ready {
-        checkpoint_ref: CheckpointRef,
-    },
-    ReplayCommit {
-        checkpoint_ref: CheckpointRef,
-        commit_permit: CommitPermit,
-    },
-    StopOrphaned {
-        canonical_ref: CheckpointRef,
-    },
-    Failed(ResolveFailure),
 }
 
 /// Input for starting a new worker generation.
@@ -253,20 +238,29 @@ pub enum CommitAuthorization {
 ///
 /// # Recovery-checkpoint validation and write ordering
 ///
-/// Publishing a generation is what commits this job to a recovery checkpoint: the current
-/// generation file names the generation, and the generation manifest records its link to
-/// the checkpoint it will restore from. Both are persistent protocol state, so the
-/// recovery checkpoint has to be resolved, read, and checked *before* either of them is
-/// written — validating afterwards would report the problem only once the job had already
-/// advanced.
+/// Publishing a generation is what commits this job to a recovery checkpoint. Three
+/// persistent objects say so: the current generation file names the generation, the
+/// generation manifest records its link to the checkpoint it will restore from, and — when
+/// the candidate the search found had no owner yet — the *epoch record* names that candidate
+/// the canonical checkpoint of its epoch. All three are protocol state a restart reads, so the
+/// recovery checkpoint has to be resolved, read, and checked *before* any of them is written.
 ///
-/// Two things are checked, and both are whole-set claims about the manifest rather than
-/// per-entry ones:
+/// The epoch record is the sharpest of the three because it is immutable. Until PR #160 review
+/// round 8 it was written during the search, before the checks below had run: a manifest this
+/// job could not restore was made canonical and only then rejected, leaving a checkpoint no
+/// job would ever recover from owning an epoch, and possibly orphaning a valid checkpoint for
+/// the same epoch. Resolution now reports an unclaimed candidate instead of taking it, and the
+/// claim happens here, on the far side of the token.
 ///
-/// 1. It must describe exactly `request.program_operators`, one entry each, carrying an
+/// Three things are checked, and each is a whole-set claim about the manifest rather than a
+/// per-entry one:
+///
+/// 1. It must be the checkpoint the reference it was read from names, entry headers included
+///    (added in review round 7).
+/// 2. It must describe exactly `request.program_operators`, one entry each, carrying an
 ///    operator header. Every one of those operators looks itself up in this manifest as it
 ///    builds its state; an entry the manifest merely happens to contain proves nothing.
-/// 2. Every table config in it must agree with `request.state_backend`.
+/// 3. Every table config in it must agree with `request.state_backend`.
 ///
 /// The resolved manifest is returned in
 /// [`GenerationInitialization::Initialized::recovery_checkpoint`] so callers use the same
@@ -274,11 +268,13 @@ pub enum CommitAuthorization {
 ///
 /// # Errors
 ///
-/// Returns [`StoreError::IncompleteManifest`] if the recovery checkpoint does not describe
-/// exactly the operators the job's workers will build, or [`StoreError::StateBackend`] if
-/// it was written by a different backend than the job selects or names an unknown one. In
-/// either case nothing has been written: the previous generation and its manifest are
-/// untouched, and the checkpoint remains restorable by a job it does fit.
+/// Returns [`StoreError::Protocol`] if the recovery checkpoint is not the checkpoint its
+/// reference names, [`StoreError::IncompleteManifest`] if it does not describe exactly the
+/// operators the job's workers will build, or [`StoreError::StateBackend`] if it was written by
+/// a different backend than the job selects or names an unknown one. In every case nothing has
+/// been written: the previous generation and its manifest are untouched, the epoch the rejected
+/// candidate would have taken is still there for a checkpoint that can be restored, and the
+/// checkpoint remains restorable by a job it does fit.
 pub async fn initialize_generation<S>(
     store: &S,
     request: InitializeGenerationRequest,
@@ -310,20 +306,95 @@ where
         });
     }
 
-    // Resolve, read and validate before publishing anything. The search and the read are
-    // the reads this function would have done anyway; only their position has moved.
+    // Whole-object check, before every persistent effect. `find_recovery_checkpoint` and
+    // everything under it only read — that is what the `recovery` module is for, and
+    // `the_recovery_resolution_module_reaches_no_persistent_write` is what keeps it true — so
+    // a candidate whose epoch nothing owns arrives here as `RecoverySearch::Unclaimed` rather
+    // than already made canonical.
+    let restoring: HashSet<&str> = request
+        .program_operators
+        .iter()
+        .map(String::as_str)
+        .collect();
     let recovery = find_recovery_checkpoint(store, &paths, request.generation).await?;
-    let base_checkpoint_ref = match &recovery {
-        RecoverySearch::Found(recovery) => match recovery {
-            GenerationRecovery::NoCheckpoint => None,
-            GenerationRecovery::Ready { checkpoint_ref }
-            | GenerationRecovery::ReplayCommit { checkpoint_ref, .. } => {
-                Some(checkpoint_ref.clone())
+    let mut publication = validate_publication(store, &request, &restoring, &recovery).await?;
+
+    // Taking the epoch is the third of this function's persistent effects and the only
+    // irreversible one, so it takes the token and nothing else, exactly as the other two do.
+    let recovery = match recovery {
+        RecoverySearch::Unclaimed { .. } => {
+            match claim_recovery_epoch(store, &publication).await? {
+                RecoveryClaim::Claimed(recovery) => RecoverySearch::Found(recovery),
+                RecoveryClaim::Orphaned { canonical_ref } => {
+                    // Another checkpoint already owned the epoch, so recovery follows it to the
+                    // canonical one — exactly as it did when the claim was made inside the search.
+                    // That is a different checkpoint from the one the token above certifies, so it
+                    // is read and checked in its own right before anything is published for it.
+                    // `CanonicalRecovery` carries no unclaimed candidate, so there is no second
+                    // claim to make and no loop here.
+                    let redirected: RecoverySearch =
+                        resolve_canonical_recovery_ref(store, &paths, &canonical_ref)
+                            .await?
+                            .into();
+                    publication =
+                        validate_publication(store, &request, &restoring, &redirected).await?;
+                    redirected
+                }
             }
-        },
-        RecoverySearch::StopOrphaned { .. } | RecoverySearch::Failed(_) => None,
+        }
+        resolved => resolved,
     };
 
+    if update_current_generation {
+        publish_current_generation(store, &publication).await?;
+    }
+
+    // Reported only after the current generation has been claimed, as before: an orphaned
+    // or unresolvable history is a state this generation still owns.
+    let recovery = match recovery {
+        RecoverySearch::Found(recovery) => recovery,
+        RecoverySearch::StopOrphaned { canonical_ref } => {
+            return Ok(GenerationInitialization::StopOrphaned { canonical_ref });
+        }
+        RecoverySearch::Failed(failure) => {
+            return Ok(GenerationInitialization::Failed(failure));
+        }
+        // The claim step above replaces every unclaimed candidate with one of the three
+        // outcomes claiming it produces, so this is unreachable by construction. It is
+        // answered rather than asserted: a future path that reached it would publish no
+        // generation manifest instead of panicking inside a controller.
+        RecoverySearch::Unclaimed { .. } => {
+            return Ok(GenerationInitialization::Failed(
+                ResolveFailure::UnclaimedBase,
+            ));
+        }
+    };
+
+    let generation_manifest = publish_generation_manifest(store, &publication).await?;
+
+    Ok(GenerationInitialization::Initialized {
+        generation_manifest,
+        recovery,
+        recovery_checkpoint: publication.into_inner().into_recovery_checkpoint(),
+    })
+}
+
+/// Reads the checkpoint a recovery search resolved and checks the publication it would commit
+/// this job to, producing the token every persistent effect in [`initialize_generation`] takes.
+///
+/// The read is here rather than at the call site so that the object the token carries is the
+/// object that was checked: a second read of the same reference could return different bytes,
+/// and then the manifest handed back to the caller would not be the one validation saw.
+async fn validate_publication<S>(
+    store: &S,
+    request: &InitializeGenerationRequest,
+    program_operators: &HashSet<&str>,
+    recovery: &RecoverySearch,
+) -> Result<Validated<GenerationPublication>, StoreError>
+where
+    S: ProtocolStore + ?Sized,
+{
+    let base_checkpoint_ref = recovery.resolved_checkpoint_ref().cloned();
     let recovery_checkpoint = match &base_checkpoint_ref {
         Some(checkpoint_ref) => Some(
             read_protobuf::<_, CheckpointManifest>(store, checkpoint_ref)
@@ -337,15 +408,7 @@ where
         None => None,
     };
 
-    // Whole-object check, before either publication. Both writes below take the token and
-    // nothing else, so neither can be reached with a manifest that was not read or that this
-    // job's workers cannot restore.
-    let restoring: HashSet<&str> = request
-        .program_operators
-        .iter()
-        .map(String::as_str)
-        .collect();
-    let publication = Validated::validate(
+    Validated::validate(
         GenerationPublication::new(
             request.pipeline_id.clone(),
             request.job_id.clone(),
@@ -356,49 +419,92 @@ where
         ),
         PublishingJob {
             state_backend: request.state_backend,
-            program_operators: &restoring,
+            program_operators,
         },
-    )?;
+    )
+}
 
-    if update_current_generation {
-        publish_current_generation(store, &paths, &publication).await?;
-    }
+/// Outcome of claiming the epoch of the checkpoint a validated publication commits to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RecoveryClaim {
+    /// This checkpoint owns its epoch, and this is how the generation recovers from it.
+    Claimed(GenerationRecovery),
+    /// Another checkpoint owns the epoch; recovery has to follow that one instead.
+    Orphaned { canonical_ref: CheckpointRef },
+}
 
-    // Reported only after the current generation has been claimed, as before: an orphaned
-    // or unresolvable history is a state this generation still owns.
-    match &recovery {
-        RecoverySearch::StopOrphaned { canonical_ref } => {
-            return Ok(GenerationInitialization::StopOrphaned {
-                canonical_ref: canonical_ref.clone(),
-            });
-        }
-        RecoverySearch::Failed(failure) => {
-            return Ok(GenerationInitialization::Failed(failure.clone()));
-        }
-        RecoverySearch::Found(_) => {}
-    }
-
-    let generation_manifest = publish_generation_manifest(store, &paths, &publication).await?;
-
-    let RecoverySearch::Found(recovery) = recovery else {
-        unreachable!("handled non-found recovery results above")
+/// Claims the epoch record of the checkpoint a validated publication commits to.
+///
+/// Takes only the [`Validated<GenerationPublication>`], for the reason
+/// [`publish_current_generation`] and [`publish_generation_manifest`] do and for a sharper one:
+/// an epoch record is immutable. Writing one names the canonical checkpoint of that epoch for
+/// good, so a claim made for a candidate that then fails validation leaves a rejected
+/// checkpoint canonical and can orphan a valid checkpoint for the same epoch — which no later
+/// fence can undo. That is why this is here and not inside the search that found the candidate
+/// (design item M11.D39c; PR #160 review round 8).
+///
+/// Everything it writes and reads is addressed out of the token, the path builder included, so
+/// the objects it touches are the ones the identity check bound the manifest to. A publication
+/// with nothing to recover from has no epoch to claim and recovers from no checkpoint, which is
+/// the same statement as [`GenerationRecovery::NoCheckpoint`].
+async fn claim_recovery_epoch<S>(
+    store: &S,
+    publication: &Validated<GenerationPublication>,
+) -> Result<RecoveryClaim, StoreError>
+where
+    S: ProtocolStore + ?Sized,
+{
+    let Some((checkpoint_ref, checkpoint)) = publication.get().recovery_checkpoint() else {
+        return Ok(RecoveryClaim::Claimed(GenerationRecovery::NoCheckpoint));
     };
+    let paths = publication.get().paths();
 
-    Ok(GenerationInitialization::Initialized {
-        generation_manifest,
-        recovery,
-        recovery_checkpoint: publication.into_inner().into_recovery_checkpoint(),
-    })
+    let outcome = claim_epoch_record(
+        store,
+        ClaimEpochRecordRequest {
+            epoch_record_path: &paths.epoch_record(Epoch(checkpoint.epoch)),
+            pipeline_id: publication.get().pipeline_id(),
+            generation: Generation(checkpoint.generation),
+            checkpoint_ref,
+            checkpoint,
+            created_at: SystemTime::now(),
+        },
+    )
+    .await?;
+
+    match outcome {
+        EpochClaimOutcome::Owned { record } if checkpoint.needs_commit => {
+            let committed_marker: Option<CommittedMarker> =
+                read_json(store, &committed_marker_path(&paths, checkpoint)).await?;
+
+            if committed_marker.is_some() {
+                Ok(RecoveryClaim::Claimed(GenerationRecovery::Ready {
+                    checkpoint_ref: checkpoint_ref.clone(),
+                }))
+            } else {
+                Ok(RecoveryClaim::Claimed(GenerationRecovery::ReplayCommit {
+                    checkpoint_ref: checkpoint_ref.clone(),
+                    commit_permit: CommitPermit::new(checkpoint_ref.clone(), checkpoint, record)?,
+                }))
+            }
+        }
+        EpochClaimOutcome::Owned { .. } => Ok(RecoveryClaim::Claimed(GenerationRecovery::Ready {
+            checkpoint_ref: checkpoint_ref.clone(),
+        })),
+        EpochClaimOutcome::Orphaned { canonical_ref } => {
+            Ok(RecoveryClaim::Orphaned { canonical_ref })
+        }
+    }
 }
 
 /// Writes the current-generation fence.
 ///
-/// Takes only the [`Validated<GenerationPublication>`]: this is the first of the two objects
+/// Takes only the [`Validated<GenerationPublication>`]: this is the first of the three objects
 /// that commit the job to a recovery checkpoint, so it may not be written for a checkpoint
-/// nothing checked (design item M11.D39c).
+/// nothing checked (design item M11.D39c). The path it writes to is derived from the token as
+/// well, so the object cannot be addressed out of an identity the check never saw.
 async fn publish_current_generation<S>(
     store: &S,
-    paths: &ProtocolPaths,
     publication: &Validated<GenerationPublication>,
 ) -> Result<(), StoreError>
 where
@@ -406,7 +512,7 @@ where
 {
     put_json(
         store,
-        &paths.current_generation(),
+        &publication.get().paths().current_generation(),
         &publication.get().current_generation(SystemTime::now()),
     )
     .await
@@ -419,7 +525,6 @@ where
 /// generation will restore from, which is the commitment the check exists to gate.
 async fn publish_generation_manifest<S>(
     store: &S,
-    paths: &ProtocolPaths,
     publication: &Validated<GenerationPublication>,
 ) -> Result<GenerationManifest, StoreError>
 where
@@ -428,124 +533,14 @@ where
     let generation_manifest = publication.get().generation_manifest();
     put_json(
         store,
-        &paths.generation_manifest(publication.get().generation()),
+        &publication
+            .get()
+            .paths()
+            .generation_manifest(publication.get().generation()),
         &generation_manifest,
     )
     .await?;
     Ok(generation_manifest)
-}
-
-async fn find_recovery_checkpoint<S>(
-    store: &S,
-    paths: &ProtocolPaths,
-    generation: Generation,
-) -> Result<RecoverySearch, StoreError>
-where
-    S: ProtocolStore + ?Sized,
-{
-    let Some(previous_generation) = generation.0.checked_sub(1) else {
-        return Ok(RecoverySearch::Found(GenerationRecovery::NoCheckpoint));
-    };
-
-    for previous_generation in (0..=previous_generation).rev() {
-        let manifest_ref = paths.generation_manifest(Generation(previous_generation));
-        let Some(manifest): Option<GenerationManifest> = read_json(store, &manifest_ref).await?
-        else {
-            continue;
-        };
-
-        match resolve_generation_manifest(store, &manifest, generation).await? {
-            GenerationResolution::Ready { checkpoint_ref } => {
-                return Ok(RecoverySearch::Found(GenerationRecovery::Ready {
-                    checkpoint_ref,
-                }));
-            }
-            GenerationResolution::ReplayCommit {
-                checkpoint_ref,
-                commit_permit,
-            } => {
-                return Ok(RecoverySearch::Found(GenerationRecovery::ReplayCommit {
-                    checkpoint_ref,
-                    commit_permit,
-                }));
-            }
-            GenerationResolution::StopOrphaned { canonical_ref } => {
-                return resolve_canonical_recovery_ref(store, paths, &canonical_ref).await;
-            }
-            GenerationResolution::Failed(
-                ResolveFailure::NoCandidate
-                | ResolveFailure::InvisibleBase
-                | ResolveFailure::UnclaimedBase,
-            ) => continue,
-            GenerationResolution::Failed(failure) => {
-                return Ok(RecoverySearch::Failed(failure));
-            }
-        }
-    }
-
-    Ok(RecoverySearch::Found(GenerationRecovery::NoCheckpoint))
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum RecoverySearch {
-    Found(GenerationRecovery),
-    StopOrphaned { canonical_ref: CheckpointRef },
-    Failed(ResolveFailure),
-}
-
-async fn resolve_canonical_recovery_ref<S>(
-    store: &S,
-    paths: &ProtocolPaths,
-    checkpoint_ref: &CheckpointRef,
-) -> Result<RecoverySearch, StoreError>
-where
-    S: ProtocolStore + ?Sized,
-{
-    let Some(checkpoint): Option<CheckpointManifest> = read_protobuf(store, checkpoint_ref).await?
-    else {
-        return Ok(RecoverySearch::Failed(ResolveFailure::InvisibleBase));
-    };
-
-    if parent_status(store, paths, Some(&checkpoint)).await?
-        == ParentCheckpointStatus::NotReadyCanonical
-    {
-        return Ok(RecoverySearch::Failed(
-            ResolveFailure::ParentNotReadyCanonical,
-        ));
-    }
-
-    let epoch_record: Option<EpochRecord> =
-        read_json(store, &paths.epoch_record(Epoch(checkpoint.epoch))).await?;
-    let committed_marker = if checkpoint.needs_commit {
-        let committed_marker_path = committed_marker_path(paths, &checkpoint);
-        read_json(store, &committed_marker_path).await?
-    } else {
-        None
-    };
-
-    match derive_checkpoint_state(
-        checkpoint_ref,
-        Some(&checkpoint),
-        epoch_record,
-        committed_marker.as_ref(),
-    )? {
-        CheckpointState::Ready => Ok(RecoverySearch::Found(GenerationRecovery::Ready {
-            checkpoint_ref: checkpoint_ref.clone(),
-        })),
-        CheckpointState::Committing { epoch_record } => {
-            let commit_permit =
-                CommitPermit::new(checkpoint_ref.clone(), &checkpoint, epoch_record)?;
-            Ok(RecoverySearch::Found(GenerationRecovery::ReplayCommit {
-                checkpoint_ref: checkpoint_ref.clone(),
-                commit_permit,
-            }))
-        }
-        CheckpointState::Orphaned { canonical_ref } => {
-            Ok(RecoverySearch::StopOrphaned { canonical_ref })
-        }
-        CheckpointState::Invisible => unreachable!("checkpoint was read above"),
-        CheckpointState::Unclaimed => Ok(RecoverySearch::Failed(ResolveFailure::UnclaimedBase)),
-    }
 }
 
 /// Checks whether a checkpoint is allowed to perform external commit.
@@ -696,6 +691,20 @@ where
         return Ok(CheckpointPublication::StaleGeneration);
     }
 
+    // Ahead of the first write, not behind it. Parent readiness is the last thing that can
+    // refuse this publication, and every check belongs on this side of the first persistent
+    // effect: publishing under an unready parent used to create the manifest object and only
+    // then refuse, leaving an object behind for a publication that never happened (PR #160
+    // review round 8). The check reads the *parent*, so nothing about it needs the object that
+    // is about to be written.
+    if recovery::parent_status(store, &paths, Some(request.checkpoint)).await?
+        == ParentCheckpointStatus::NotReadyCanonical
+    {
+        return Ok(CheckpointPublication::Failed(
+            ResolveFailure::ParentNotReadyCanonical,
+        ));
+    }
+
     match create_protobuf(store, request.checkpoint_ref, request.checkpoint).await? {
         CreateResult::Created => {}
         CreateResult::AlreadyExists(existing) if existing == *request.checkpoint => {}
@@ -704,14 +713,6 @@ where
                 ProtocolError::CheckpointManifestMismatch,
             ));
         }
-    }
-
-    if parent_status(store, &paths, Some(request.checkpoint)).await?
-        == ParentCheckpointStatus::NotReadyCanonical
-    {
-        return Ok(CheckpointPublication::Failed(
-            ResolveFailure::ParentNotReadyCanonical,
-        ));
     }
 
     let mut updated_generation_manifest = request.generation_manifest.clone();
@@ -754,226 +755,16 @@ where
     }
 }
 
-/// Resolves a generation manifest into a safe recovery action.
-///
-/// `latest_checkpoint_ref` and `base_checkpoint_ref` are candidate pointers, not
-/// proof of recoverability. This workflow reads the candidate checkpoint,
-/// validates epoch ownership and parent readiness, and may claim an unclaimed
-/// candidate if `runner_generation` is still current.
-pub async fn resolve_generation_manifest<S>(
-    store: &S,
-    manifest: &GenerationManifest,
-    runner_generation: Generation,
-) -> Result<GenerationResolution, StoreError>
-where
-    S: ProtocolStore + ?Sized,
-{
-    let Some(candidate_ref) = manifest.candidate_checkpoint_ref().cloned() else {
-        return Ok(GenerationResolution::Failed(ResolveFailure::NoCandidate));
-    };
-
-    let paths = ProtocolPaths::new(manifest.pipeline_id.clone(), manifest.job_id.clone());
-    let is_current_generation =
-        read_json::<_, CurrentGeneration>(store, &paths.current_generation())
-            .await?
-            .is_some_and(|current_generation| current_generation.generation == runner_generation);
-
-    let mut candidate_ref = candidate_ref;
-
-    loop {
-        match resolve_candidate_from_store(
-            store,
-            &paths,
-            manifest,
-            &candidate_ref,
-            is_current_generation,
-        )
-        .await?
-        {
-            CandidateResolution::Done(resolution) => return Ok(resolution),
-            CandidateResolution::FallbackToBase => {
-                let Some(base_checkpoint_ref) = &manifest.base_checkpoint_ref else {
-                    return Ok(GenerationResolution::Failed(ResolveFailure::NoCandidate));
-                };
-
-                candidate_ref = base_checkpoint_ref.clone();
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum CandidateResolution {
-    Done(GenerationResolution),
-    FallbackToBase,
-}
-
-async fn resolve_candidate_from_store<S>(
-    store: &S,
-    paths: &ProtocolPaths,
-    manifest: &GenerationManifest,
-    candidate_ref: &CheckpointRef,
-    is_current_generation: bool,
-) -> Result<CandidateResolution, StoreError>
-where
-    S: ProtocolStore + ?Sized,
-{
-    let checkpoint: Option<CheckpointManifest> = read_protobuf(store, candidate_ref).await?;
-    let parent_status = parent_status(store, paths, checkpoint.as_ref()).await?;
-    let epoch_record = match &checkpoint {
-        Some(checkpoint) => read_json(store, &paths.epoch_record(Epoch(checkpoint.epoch))).await?,
-        None => None,
-    };
-    let committed_marker = match (&checkpoint, &epoch_record) {
-        (Some(checkpoint), Some(_)) if checkpoint.needs_commit => {
-            let path =
-                paths.committed_marker(Generation(checkpoint.generation), Epoch(checkpoint.epoch));
-            read_json(store, &path).await?
-        }
-        _ => None,
-    };
-
-    let decision = resolve_candidate(
-        manifest,
-        candidate_ref,
-        checkpoint.as_ref(),
-        epoch_record,
-        committed_marker.as_ref(),
-        parent_status,
-        is_current_generation,
-    )?;
-
-    match decision {
-        ResolveDecision::Ready { checkpoint_ref } => {
-            Ok(CandidateResolution::Done(GenerationResolution::Ready {
-                checkpoint_ref,
-            }))
-        }
-        ResolveDecision::ReplayCommit {
-            checkpoint_ref,
-            epoch_record,
-        } => Ok(CandidateResolution::Done(
-            GenerationResolution::ReplayCommit {
-                checkpoint_ref: checkpoint_ref.clone(),
-                commit_permit: CommitPermit::new(
-                    checkpoint_ref,
-                    checkpoint
-                        .as_ref()
-                        .expect("replay commits must have a manifest"),
-                    epoch_record,
-                )?,
-            },
-        )),
-        ResolveDecision::StopOrphaned { canonical_ref } => Ok(CandidateResolution::Done(
-            GenerationResolution::StopOrphaned { canonical_ref },
-        )),
-        ResolveDecision::Failed(failure) => Ok(CandidateResolution::Done(
-            GenerationResolution::Failed(failure),
-        )),
-        ResolveDecision::FallbackToBase => Ok(CandidateResolution::FallbackToBase),
-        ResolveDecision::ClaimUnclaimed { checkpoint_ref } => {
-            let checkpoint = checkpoint.expect("unclaimed checkpoints must have a manifest");
-            let outcome = claim_epoch_record(
-                store,
-                ClaimEpochRecordRequest {
-                    epoch_record_path: &paths.epoch_record(Epoch(checkpoint.epoch)),
-                    pipeline_id: &manifest.pipeline_id,
-                    generation: Generation(checkpoint.generation),
-                    checkpoint_ref: &checkpoint_ref,
-                    checkpoint: &checkpoint,
-                    created_at: SystemTime::now(),
-                },
-            )
-            .await?;
-
-            match outcome {
-                EpochClaimOutcome::Owned { record } if checkpoint.needs_commit => {
-                    let committed_marker_path = paths.committed_marker(
-                        Generation(checkpoint.generation),
-                        Epoch(checkpoint.epoch),
-                    );
-                    let committed_marker: Option<CommittedMarker> =
-                        read_json(store, &committed_marker_path).await?;
-
-                    if committed_marker.is_some() {
-                        Ok(CandidateResolution::Done(GenerationResolution::Ready {
-                            checkpoint_ref,
-                        }))
-                    } else {
-                        let commit_permit =
-                            CommitPermit::new(checkpoint_ref.clone(), &checkpoint, record)?;
-                        Ok(CandidateResolution::Done(
-                            GenerationResolution::ReplayCommit {
-                                checkpoint_ref,
-                                commit_permit,
-                            },
-                        ))
-                    }
-                }
-                EpochClaimOutcome::Owned { .. } => {
-                    Ok(CandidateResolution::Done(GenerationResolution::Ready {
-                        checkpoint_ref,
-                    }))
-                }
-                EpochClaimOutcome::Orphaned { canonical_ref } => Ok(CandidateResolution::Done(
-                    GenerationResolution::StopOrphaned { canonical_ref },
-                )),
-            }
-        }
-    }
-}
-
-async fn parent_status<S>(
-    store: &S,
-    paths: &ProtocolPaths,
-    checkpoint: Option<&CheckpointManifest>,
-) -> Result<ParentCheckpointStatus, StoreError>
-where
-    S: ProtocolStore + ?Sized,
-{
-    let Some(checkpoint) = checkpoint else {
-        return Ok(ParentCheckpointStatus::NoParent);
-    };
-    let Some(parent_checkpoint_ref) = checkpoint_parent_checkpoint_ref(checkpoint)? else {
-        return Ok(ParentCheckpointStatus::NoParent);
-    };
-
-    let Some(parent_checkpoint): Option<CheckpointManifest> =
-        read_protobuf(store, &parent_checkpoint_ref).await?
-    else {
-        return Ok(ParentCheckpointStatus::NotReadyCanonical);
-    };
-    let parent_epoch_record: Option<EpochRecord> =
-        read_json(store, &paths.epoch_record(Epoch(parent_checkpoint.epoch))).await?;
-    let parent_committed_marker = if parent_checkpoint.needs_commit {
-        let marker_path = paths.committed_marker(
-            Generation(parent_checkpoint.generation),
-            Epoch(parent_checkpoint.epoch),
-        );
-        read_json(store, &marker_path).await?
-    } else {
-        None
-    };
-
-    let state = derive_checkpoint_state(
-        &parent_checkpoint_ref,
-        Some(&parent_checkpoint),
-        parent_epoch_record,
-        parent_committed_marker.as_ref(),
-    )?;
-
-    match state {
-        CheckpointState::Ready => Ok(ParentCheckpointStatus::ReadyCanonical),
-        _ => Ok(ParentCheckpointStatus::NotReadyCanonical),
-    }
-}
-
 /// Claims an epoch record for a published checkpoint.
 ///
 /// A successful conditional create and an existing record for the same
 /// checkpoint both return `Owned`. An existing record for a different checkpoint
 /// returns `Orphaned`; callers must stop using the losing checkpoint.
-pub async fn claim_epoch_record<S>(
+///
+/// Crate-internal for the reason [`ClaimEpochRecordRequest`] is: the record is immutable, so
+/// the only two callers are the ones that have already established that the manifest is the
+/// checkpoint the reference names and that this job may act on it.
+pub(crate) async fn claim_epoch_record<S>(
     store: &S,
     request: ClaimEpochRecordRequest<'_>,
 ) -> Result<EpochClaimOutcome, StoreError>
