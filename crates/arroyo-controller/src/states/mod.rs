@@ -1832,6 +1832,24 @@ fn adopt_refreshed_config(
     None
 }
 
+/// Whether the job's state task has taken up the poll's latest word about the job.
+///
+/// [`AppliedStatus::NotApplied`] is what makes [`StateMachine::restart_if_needed`] start a job
+/// whose status does not otherwise say it should be running: there is something for a state
+/// task to take up and no task to take it. [`run_to_completion`] clears it at the head of
+/// every state, so a task that has come up has by definition taken up whatever was there —
+/// which is also why a start that could not load the job's program leaves this untouched and
+/// is retried by the next poll.
+///
+/// The two lifecycle mechanisms differ in *what* the poll's word is, and therefore in what
+/// records it untaken, but not in what this means. Under
+/// [`LifecycleMode::LegacyT08`](lifecycle::LifecycleMode::LegacyT08) the word is the
+/// [`JobConfig`] in the cell beside this flag, and storing a changed one records it. Under the
+/// D39a mechanism the poll writes no configuration at all — its word is the
+/// [`LifecycleIntent`] it leaves in the job's [`IntentMailbox`](lifecycle::IntentMailbox) — so
+/// a submission that needs a state task records it here instead. On neither path is
+/// this a configuration write: the flag says whether a task has the poll's word, never what
+/// the word is.
 #[derive(Copy, Clone)]
 enum AppliedStatus {
     Applied,
@@ -2426,6 +2444,11 @@ impl StateMachine {
         // `both_paths_that_start_a_job_are_written_to_record_the_refusal_first` pins it for
         // the selected mechanism.
         if let Some(intents) = &fenced {
+            // The submission's answer to "does this job need a state task" is not read here,
+            // and does not have to be: the start below is unconditional. `StateMachine::update`
+            // is where it is read, because that is where a job may already have had its task
+            // and lost it. `every_mailbox_submission_path_can_get_the_job_a_state_task` pins
+            // both halves of that.
             intents.submit(LifecycleIntent::classify(
                 execution_selector,
                 PolledJob {
@@ -2690,18 +2713,57 @@ impl StateMachine {
         // from the poll thread, which is the whole of "classify before adopting".
         //
         // The job's *task* is still supervised from here, because a job with no task has no
-        // writer at all: an intent left while the program could not be loaded stays in the
-        // mailbox, and is decided by the actor of whichever poll finally gets a task up.
-        // `restart_if_needed` starts the job only if it should be running or has never
-        // applied a configuration, and it starts it under `Self::execution_selector` and
-        // the shared configuration a refused row was never allowed into — so this cannot
-        // restart the job under a value that is being refused.
+        // writer at all: an intent left for a job whose state task has ended — or was never
+        // started, because the program could not be loaded — is decided by nobody until one
+        // exists, and this thread is the only thing that can start one. It used to be said
+        // here that such an intent "is decided by the actor of whichever poll finally gets a
+        // task up", which asserted a later poll that nothing arranged: a job that reached
+        // `Failed` or `Stopped` is not one `restart_if_needed` starts on its own account, so
+        // an accepted restart of one was stranded in the mailbox forever — PR #160 review
+        // comment `5368132947`.
+        //
+        // `restart_if_needed` starts a job whose status says it should be running, and a job
+        // that has not taken up the poll's latest word about it. What that word *is* differs
+        // between the two mechanisms and what recording it untaken means does not: under
+        // `LegacyT08` the word is the configuration in the shared cell and storing it is what
+        // records it, and under `FencedV2` the word is the intent submitted above, so a
+        // submission that needs a state task records the same thing on the same flag.
+        //
+        // Which submissions those are is `LifecycleIntent::needs_a_state_task`, and its three
+        // answers are this branch's own three, read off the code below rather than invented:
+        // an accepted row is stored and started for, a refused row that also asks the job to
+        // stop is stored and started for by `request_stop`, and a refused row that asks for
+        // nothing else is left to `restart_if_needed` — which does not wake a job that has
+        // legitimately reached a terminal state.
+        //
+        // Only that flag is written, never the configuration beside it. The actor remains the
+        // only thing that adopts a row — `AppliedStatus` is a delivery watermark and not a
+        // baseline, and asking whether an intent needs a task is a question about the mailbox
+        // rather than a decision about the job. What a started task then does is the state's:
+        // a stop cannot make a job run, so a terminal job given a task for one re-terminates
+        // rather than resurrects, exactly as it does on the landed path.
+        //
+        // And what the started task may do is otherwise unchanged: `start` runs it under
+        // `Self::execution_selector` and the shared configuration a refused row was never
+        // allowed into, so this cannot restart the job under a value that is being refused.
         //
         // The state mirror above is not a lifecycle publication: it is this controller's
         // cached view of what the database already says, read by the API, and it is
         // deliberately still refreshed on both paths.
         if let Some(intents) = self.lifecycle.intents().map(Arc::clone) {
-            intents.submit(LifecycleIntent::classify(self.execution_selector, polled));
+            let submitted =
+                intents.submit(LifecycleIntent::classify(self.execution_selector, polled));
+
+            if submitted.needs_a_state_task() {
+                debug!(
+                    job_id = %self.config.read().unwrap().0.id,
+                    version = submitted.version().as_u64(),
+                    "the job's configuration poll left an intent that needs a state task; \
+                     recording it as one no state task has taken up"
+                );
+                self.config.write().unwrap().1 = AppliedStatus::NotApplied;
+            }
+
             let applied = self.config.read().unwrap().1;
             self.restart_if_needed(applied, status, shutdown_guard)
                 .await;
@@ -12178,5 +12240,644 @@ mod tests {
             1,
             "which is the visibility this rests on"
         );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // An inactive job whose pending intent needs a state task — PR #160 review comment
+    // `5368132947`.
+    //
+    // Under the D39a mechanism the configuration poll decides nothing: it classifies the row,
+    // leaves an intent, and the job's own state task decides it. A job with no state task has
+    // no actor, so an intent left for one is decided by nobody — and `restart_if_needed` starts
+    // a job that has reached a terminal state only when the shared cell says the poll's latest
+    // word about it has not been taken up. The poll left that cell alone, so an accepted
+    // restart of a `Failed` or `Stopped` job was stranded in the mailbox forever.
+    //
+    // The fix asks the mailbox one question — is this a new intent that needs a state task —
+    // and records the answer on the same delivery watermark the landed mechanism already uses.
+    // The three answers are the landed path's own three, one per classification, so the two
+    // mechanisms start a task for the same rows. It decides nothing further: which field of an
+    // adopted configuration matters, and whether the job actually restarts, stay the state's,
+    // which is what the rows below separate.
+    // ---------------------------------------------------------------------------------------
+
+    /// The status of a job that has reached a terminal state.
+    fn terminal_status(state: &str, restart_nonce: i32) -> JobStatus {
+        JobStatus {
+            state: state.to_string(),
+            ..job_status(restart_nonce)
+        }
+    }
+
+    /// The configuration a job an operator stopped is left running under.
+    fn a_stopped_jobs_config() -> JobConfig {
+        let mut config = running_config(StateBackendSelector::Parquet);
+        config.stop_mode = StopMode::checkpoint;
+        config
+    }
+
+    /// A job this controller is already administering, whose state task has ended.
+    ///
+    /// `tx: None` is the task having gone, and [`state_machine_in_mode`] leaves the shared cell
+    /// `AppliedStatus::Applied` — which is exactly what a task that ran leaves behind, because
+    /// [`run_to_completion`] clears the flag at the head of every state. So this is the job the
+    /// finding is about: one `restart_if_needed` will not start on its own account, whose only
+    /// remaining prompt is the poll's own word about it.
+    ///
+    /// **Selects `FencedV2` by name**, here rather than in each row. Under `LegacyT08` there is
+    /// no mailbox at all and every path below is inert, so a row that forgot to select the mode
+    /// would pass while proving nothing.
+    ///
+    /// The scheduler panics instead of starting a cluster. That is what lets a job which really
+    /// does restart end its own state task, so [`drive_to_completion`] can read back everything
+    /// it wrote on the way; the panic is expected, is printed by the runtime, and happens
+    /// strictly after the generation advance every positive row asserts.
+    fn an_inactive_fenced_job(
+        state: &str,
+        current: JobConfig,
+    ) -> (StateMachine, DatabaseSource, Arc<RecordingScheduler>) {
+        let db = sqlite_startable_job(state, 2);
+        let scheduler = Arc::new(RecordingScheduler::panicking());
+        let sm = state_machine_in_mode(
+            LifecycleMode::FencedV2,
+            current,
+            StateBackendSelector::Parquet,
+            None,
+            db.clone(),
+            scheduler.clone(),
+        );
+        (sm, db, scheduler)
+    }
+
+    /// What a job that was really brought back up writes, and what it asks of its cluster.
+    ///
+    /// The generation advance and the `None` teardown are the two things only a job that
+    /// reached [`Scheduling`] can produce: `run_id` is written by nothing but
+    /// [`JobStatus::update_db`] and advanced by nothing but `Scheduling`, and a teardown under
+    /// no generation is `Scheduling`'s destructive pre-scheduling one rather than
+    /// `handle_terminal`'s. So "a task was started" and "the job restarted" are different
+    /// assertions here, which is what the negative rows below rest on.
+    fn assert_the_job_was_brought_back_up(
+        from: &str,
+        writes: &[(String, u64)],
+        scheduler: &RecordingScheduler,
+    ) {
+        assert_eq!(
+            writes,
+            [
+                (from.to_string(), 1),
+                ("Compiling".to_string(), 1),
+                ("Scheduling".to_string(), 1),
+                ("Scheduling".to_string(), 2),
+            ],
+            "the job left its terminal state, compiled, and advanced the generation it \
+             reschedules under — none of which happens without a state task to decide the \
+             intent the poll left"
+        );
+        assert_eq!(
+            scheduler.stopped.lock().unwrap().as_slice(),
+            [
+                ("job_abc".to_string(), Some(1)),
+                ("job_abc".to_string(), None)
+            ],
+            "the terminal state's teardown of the generation it knew, and then `Scheduling`'s \
+             own teardown of whatever cluster was there — the second is the one only a job \
+             that is really being scheduled makes"
+        );
+    }
+
+    /// A `Stopped` job whose stop an operator cleared is started, and runs.
+    ///
+    /// The first of the two cases the finding names. The shared cell is `Applied` and the
+    /// job's status says `Stopped`, so neither arm of `restart_if_needed` fires on its own
+    /// account; the accepted intent is the only thing that says this job has somewhere to be.
+    #[tokio::test]
+    async fn an_inactive_stopped_job_is_started_for_a_cleared_stop_mode() {
+        // Held for the whole test: the started task has to run, not merely exist.
+        let shutdown = LiveShutdown::new();
+        let (mut sm, db, scheduler) = an_inactive_fenced_job("Stopped", a_stopped_jobs_config());
+        assert!(sm.done(), "the job's state task ended when the job stopped");
+
+        // The operator's restart: the same row with the stop taken off it.
+        let restarted = running_config(StateBackendSelector::Parquet);
+        assert_eq!(
+            restarted.stop_mode,
+            StopMode::none,
+            "the fixture's precondition: what changed is the stop, and only the stop"
+        );
+
+        sm.update(
+            polled(StateBackendSelector::Parquet, restarted, None),
+            terminal_status("Stopped", 3),
+            shutdown.guard(),
+        )
+        .await;
+
+        assert!(
+            !sm.done(),
+            "a job whose pending intent can make it runnable must be given a state task: \
+             without one there is no actor, and an intent no actor ever reads is a restart \
+             that never happens"
+        );
+        let writes = drive_to_completion(&sm, &db).await;
+        assert_the_job_was_brought_back_up("Stopped", &writes, &scheduler);
+    }
+
+    /// A `Failed` job whose restart nonce the poll accepted is started, and runs.
+    ///
+    /// The other case, and the reason the condition is not "the stop mode was cleared": what a
+    /// terminal state reads to decide whether it restarts differs per state — `Stopped` reads
+    /// `stop_mode` and `ttl`, `Failed` reads `restart_nonce` against the one its own status
+    /// records — and the poll asks about none of them.
+    #[tokio::test]
+    async fn an_inactive_failed_job_is_started_for_a_bumped_restart_nonce() {
+        let shutdown = LiveShutdown::new();
+        let failed = running_config(StateBackendSelector::Parquet);
+        let (mut sm, db, scheduler) = an_inactive_fenced_job("Failed", failed.clone());
+        assert!(sm.done(), "the job's state task ended when the job failed");
+
+        let mut restarted = failed.clone();
+        restarted.restart_nonce = failed.restart_nonce + 1;
+        assert_eq!(
+            restarted.stop_mode,
+            StopMode::none,
+            "and this row's stop mode is what it always was, so the two rows above cannot both \
+             be passing for the same reason"
+        );
+
+        sm.update(
+            polled(StateBackendSelector::Parquet, restarted, None),
+            terminal_status("Failed", failed.restart_nonce),
+            shutdown.guard(),
+        )
+        .await;
+
+        assert!(
+            !sm.done(),
+            "the same liveness property, for the other terminal state"
+        );
+        let writes = drive_to_completion(&sm, &db).await;
+        assert_the_job_was_brought_back_up("Failed", &writes, &scheduler);
+    }
+
+    /// Being started for an intent is not being restarted by it, and being started once is not
+    /// being started every 500ms.
+    ///
+    /// A row an operator changed while the job stays stopped — a bumped restart nonce with the
+    /// stop still on it — is an accepted configuration, so the job is given a task to decide
+    /// it. `Stopped` then reads the published configuration and stays stopped, which is the
+    /// division this fix rests on: the poll asks whether an intent needs a state task, and the
+    /// state decides what the intent means. If the poll answered the second question it would
+    /// have to reimplement `Stopped::next`, and would be wrong the moment a state read one more
+    /// field.
+    ///
+    /// The second half is what stops that being a 2Hz resurrection loop. The row is polled
+    /// nine more times; each is the same intent, so it is coalesced, so it asks for nothing —
+    /// and the job's cluster is torn down once, not once per poll.
+    #[tokio::test]
+    async fn a_stopped_job_started_for_an_intent_that_leaves_its_stop_standing_stays_stopped() {
+        let shutdown = LiveShutdown::new();
+        let stopped = a_stopped_jobs_config();
+        let (mut sm, db, scheduler) = an_inactive_fenced_job("Stopped", stopped.clone());
+
+        let mut edited = stopped.clone();
+        edited.restart_nonce = stopped.restart_nonce + 1;
+        let poll = || polled(StateBackendSelector::Parquet, edited.clone(), None);
+
+        sm.update(poll(), terminal_status("Stopped", 3), shutdown.guard())
+            .await;
+        assert!(
+            !sm.done(),
+            "the row was accepted, so a task exists to decide it — deciding is not the poll's"
+        );
+        let writes = drive_to_completion(&sm, &db).await;
+        assert_eq!(
+            writes,
+            [("Stopped".to_string(), 1)],
+            "and the state decided it stays: the job never left `Stopped`, never compiled, and \
+             never advanced the generation it would reschedule under"
+        );
+
+        for repoll in 1..10 {
+            sm.update(poll(), terminal_status("Stopped", 3), shutdown.guard())
+                .await;
+            assert!(
+                sm.done(),
+                "poll {repoll}: the row has not changed since the poll that was already acted \
+                 on, so it is the same intent and asks for no second task. A start per poll \
+                 would be a stopped job's cluster torn down every 500ms forever"
+            );
+        }
+        assert_eq!(
+            state_writes(&db),
+            [("Stopped".to_string(), 1)],
+            "ten polls, one state task"
+        );
+        assert_eq!(
+            scheduler.stopped.lock().unwrap().as_slice(),
+            [("job_abc".to_string(), Some(1))],
+            "and one terminal teardown, under the generation the job already had"
+        );
+    }
+
+    /// A terminal job is not woken up by a refusal that asks for nothing else.
+    ///
+    /// The anti-resurrection half, and the reason the condition is a property of the intent
+    /// rather than "there is something in the mailbox". A refused row that asks for nothing but
+    /// the refusal fails the job, and a task started for one would take a job that had
+    /// legitimately reached `Stopped` and fail it, or one that had reached `Failed` and fail it
+    /// again. The landed mechanism does not do that — `apply_refused_row` reaches
+    /// `restart_if_needed` for exactly this row, and it starts nothing for a terminal job — so
+    /// neither may this.
+    #[tokio::test]
+    async fn a_terminal_job_is_not_started_for_a_refusal_that_asks_for_nothing_else() {
+        for job_state in ["Stopped", "Failed"] {
+            let shutdown = LiveShutdown::new();
+            let (mut sm, db, scheduler) =
+                an_inactive_fenced_job(job_state, a_stopped_jobs_config());
+
+            let refused = running_config(StateBackendSelector::Parquet);
+            assert_eq!(
+                refused.stop_mode,
+                StopMode::none,
+                "the row asks for nothing but the refusal, which is what separates this row \
+                 from the one below"
+            );
+
+            sm.update(
+                polled(
+                    StateBackendSelector::Parquet,
+                    refused,
+                    Some(selector_changed()),
+                ),
+                terminal_status(job_state, 3),
+                shutdown.guard(),
+            )
+            .await;
+
+            assert!(
+                sm.done(),
+                "{job_state}: no state task. Starting one would resurrect a job that has \
+                 legitimately ended, only to fail it"
+            );
+            assert_eq!(
+                state_writes(&db),
+                [],
+                "{job_state}: and nothing was written about it at all — not the status write \
+                 `start` makes before it spawns, and not a second failure"
+            );
+            assert_eq!(
+                scheduler.stopped.lock().unwrap().as_slice(),
+                [],
+                "{job_state}: and its cluster was not touched"
+            );
+            assert_eq!(scheduler.started.lock().unwrap().as_slice(), []);
+            assert!(
+                standing_intent(&mailbox_of(&sm)).is_some(),
+                "{job_state}: the intent is still there, for the actor of a task started for \
+                 some later reason — not started for is not discarded"
+            );
+        }
+    }
+
+    /// A refused row's stop reaches a job with no state task, and does not resurrect it.
+    ///
+    /// The other stranding this sweep found, and the reason the condition is "needs a state
+    /// task" rather than "could make the job runnable". Refusing a row's selector must not
+    /// discard the row's lifecycle control: the refusal's whole remedy is "stop this job and
+    /// create a new one under the other backend", and the landed path starts a task for
+    /// precisely this row — `apply_refused_row` reaches `request_stop`, whose `Inactive` arm
+    /// stores the stop and restarts the job's state machine. A fenced path that started nothing
+    /// here would have quietly dropped that.
+    ///
+    /// The second half is what makes it a delivery rather than a resurrection: a stop cannot
+    /// make a job run, so the task starts, is handed the stop by the boundary, and the terminal
+    /// state ends it again. The job never compiles and never advances the generation it would
+    /// reschedule under.
+    #[tokio::test]
+    async fn a_refused_rows_stop_reaches_a_terminal_job_without_restarting_it() {
+        for job_state in ["Stopped", "Failed"] {
+            let shutdown = LiveShutdown::new();
+            let (mut sm, db, scheduler) =
+                an_inactive_fenced_job(job_state, a_stopped_jobs_config());
+
+            let mut refused = running_config(StateBackendSelector::Parquet);
+            refused.stop_mode = StopMode::immediate;
+
+            sm.update(
+                polled(
+                    StateBackendSelector::Parquet,
+                    refused,
+                    Some(selector_changed()),
+                ),
+                terminal_status(job_state, 3),
+                shutdown.guard(),
+            )
+            .await;
+
+            assert!(
+                !sm.done(),
+                "{job_state}: a job with no state task can be told nothing, and the stop is the \
+                 refusal's remedy"
+            );
+            let writes = drive_to_completion(&sm, &db).await;
+            assert_eq!(
+                writes,
+                [(job_state.to_string(), 1)],
+                "{job_state}: and the task it was given ends it again where it was. A stop \
+                 cannot make a job run, so this is delivery, not resurrection: no `Compiling`, \
+                 and no generation advance"
+            );
+            assert_eq!(
+                scheduler.started.lock().unwrap().as_slice(),
+                [],
+                "{job_state}: and no cluster was started for a row the controller refused"
+            );
+            assert_eq!(
+                scheduler.stopped.lock().unwrap().as_slice(),
+                [("job_abc".to_string(), Some(1))],
+                "{job_state}: the terminal teardown, under the generation the job already had — \
+                 never `Scheduling`'s destructive one"
+            );
+        }
+    }
+
+    /// The control: the landed mechanism still starts an inactive job for an accepted update,
+    /// exactly as it did.
+    ///
+    /// Selects `LifecycleMode::SELECTED`, which is `LegacyT08` and is what production runs.
+    /// There is no mailbox on this path — the accepted row is stored into the shared cell and
+    /// `AppliedStatus::NotApplied` is stored with it — and nothing above may change that. The
+    /// row is the same operator action as
+    /// `an_inactive_stopped_job_is_started_for_a_cleared_stop_mode`, against the same fixture,
+    /// so the two together say the fix added a path rather than altering one.
+    #[tokio::test]
+    async fn the_legacy_lifecycle_still_starts_an_inactive_job_for_an_accepted_update() {
+        let shutdown = LiveShutdown::new();
+        let db = sqlite_startable_job("Stopped", 2);
+        let scheduler = Arc::new(RecordingScheduler::panicking());
+        let mut sm = state_machine_in_mode(
+            LifecycleMode::SELECTED,
+            a_stopped_jobs_config(),
+            StateBackendSelector::Parquet,
+            None,
+            db.clone(),
+            scheduler.clone(),
+        );
+        assert!(
+            sm.lifecycle.intents().is_none(),
+            "the control's own precondition: the selected mechanism has no intent mailbox, so \
+             this row cannot be passing through the path the rows above exercise"
+        );
+
+        sm.update(
+            polled(
+                StateBackendSelector::Parquet,
+                running_config(StateBackendSelector::Parquet),
+                None,
+            ),
+            terminal_status("Stopped", 3),
+            shutdown.guard(),
+        )
+        .await;
+
+        assert!(
+            !sm.done(),
+            "unchanged: the accepted update starts the job's task"
+        );
+        let writes = drive_to_completion(&sm, &db).await;
+        assert_the_job_was_brought_back_up("Stopped", &writes, &scheduler);
+    }
+
+    /// Every shape [`LifecycleIntent::classify`] can produce, as the polled row that produces
+    /// it.
+    ///
+    /// The list is the fixture, not the domain: the domain is the enum, and
+    /// `every_mailbox_submission_path_can_get_the_job_a_state_task` checks this against it.
+    fn every_classified_intent() -> Vec<(&'static str, JobConfig, Option<StateBackendError>)> {
+        let mut accepted = running_config(StateBackendSelector::Parquet);
+        accepted.restart_nonce += 1;
+
+        let mut refused_and_stopping = running_config(StateBackendSelector::Parquet);
+        refused_and_stopping.stop_mode = StopMode::immediate;
+
+        vec![
+            ("Adopt", accepted, None),
+            (
+                "RefusedButStopping",
+                refused_and_stopping,
+                Some(selector_changed()),
+            ),
+            (
+                "Refused",
+                running_config(StateBackendSelector::Parquet),
+                Some(selector_changed()),
+            ),
+        ]
+    }
+
+    /// No production path can leave an intent for a job that will never have a task to decide
+    /// it.
+    ///
+    /// The quantified row, and the one that would have found this finding before a reviewer
+    /// did. Four findings on this PR have had the same shape — the fenced path records a
+    /// decision and the machinery that acts on it does not run — and every one of them got
+    /// through because the sites were enumerated by hand. So both domains here are taken from
+    /// the source: the submission sites are counted off `states/mod.rs`, and the intent shapes
+    /// off `LifecycleIntent`'s own declaration. Quantifying over the second is what found the
+    /// refused-row stop that `a_refused_rows_stop_reaches_a_terminal_job_without_restarting_it`
+    /// covers, which the finding did not name.
+    ///
+    /// The two submission paths do not have the same answer, and saying so is the point.
+    /// `StateMachine::new` is a job the controller has just picked up: it has to be adopted
+    /// before anything about it can be decided, so its task is started unconditionally, on
+    /// both mechanisms. `StateMachine::update` is a job the controller already administers,
+    /// whose task may have ended for a perfectly good reason, so it starts one only for an
+    /// intent that could make the job runnable.
+    ///
+    /// `new`'s half is a source pin rather than a driven row because `new` is the *single*
+    /// production site that chooses a lifecycle mechanism — `no_production_path_selects_the_
+    /// fenced_v2_lifecycle` pins that — so it cannot be driven in the fenced mode at all. What
+    /// is pinned instead is the thing that makes its answer `Always`: the start is a statement
+    /// of the function's own body, not of either mechanism's branch.
+    #[tokio::test]
+    async fn every_mailbox_submission_path_can_get_the_job_a_state_task() {
+        /// Everything in a file before its test module: a submission in a test is not a
+        /// production path.
+        fn production_half(source: &str) -> &str {
+            match source.find("\n#[cfg(test)]") {
+                Some(at) => &source[..at],
+                None => source,
+            }
+        }
+
+        // ---- the domain of submission sites, from the source -------------------------------
+        let states = include_str!("mod.rs");
+        let production = production_half(states);
+        let (in_new, in_update) = production
+            .split_once("    pub async fn update(")
+            .expect("`StateMachine::update` is declared in this file");
+
+        assert_eq!(
+            in_new.matches("intents.submit(").count(),
+            1,
+            "`StateMachine::new` leaves exactly one intent, and nothing before it does"
+        );
+        assert_eq!(
+            in_update.matches("intents.submit(").count(),
+            1,
+            "and `StateMachine::update` exactly one. A third submission site is a third thing \
+             that would have to answer this question, and it would not be found by a list"
+        );
+        assert!(
+            in_new.contains(
+                "\n        this.start(status.clone(), shutdown_guard.clone_temporary())\n"
+            ),
+            "`new`'s answer is `always`, and this is what makes it one: the start is a \
+             statement of the constructor's own body, at its top level, so it happens whichever \
+             mechanism the job was built with"
+        );
+
+        // A whole file that is a `#[cfg(test)]` module has no production half at all, and
+        // `production_half` cannot see that from inside it — the marker is on the `mod`
+        // declaration in its parent. So the set is read off the declarations, not guessed
+        // from file names.
+        let mut test_modules = std::collections::BTreeSet::new();
+        walk_crate_sources(&mut |_, source| {
+            for declaration in source.split("#[cfg(test)]\n").skip(1) {
+                let declaration = declaration.trim_start_matches("pub(crate) ");
+                if let Some(rest) = declaration.strip_prefix("mod ")
+                    && let Some(name) = rest.split(';').next()
+                    && !name.contains(char::is_whitespace)
+                {
+                    test_modules.insert(name.to_string());
+                }
+            }
+        });
+        assert!(
+            test_modules.contains("tests"),
+            "the sweep below rests on finding these; `states/lifecycle/tests.rs` alone would \
+             otherwise be read as a production submission path"
+        );
+
+        let mut elsewhere = std::collections::BTreeSet::new();
+        walk_crate_sources(&mut |path, source| {
+            let under_test = path
+                .trim_end_matches(".rs")
+                .split('/')
+                .any(|part| test_modules.contains(part));
+            if !under_test && production_half(source).contains(".submit(") {
+                elsewhere.insert(path.to_string());
+            }
+        });
+        assert_eq!(
+            elsewhere,
+            ["states/mod.rs".to_string()].into_iter().collect(),
+            "and `states/mod.rs` is the only file that submits at all: a mailbox handed to \
+             anything else would be a submission path this row never asked about"
+        );
+
+        // ---- the domain of intent shapes, from the source ----------------------------------
+        let intent_source = include_str!("lifecycle/intent.rs");
+        let declaration = {
+            let at = intent_source
+                .find("pub(crate) enum LifecycleIntent {")
+                .expect("the enum this row quantifies over");
+            let rest = &intent_source[at..];
+            &rest[..rest.find("\n}\n").expect("a closed declaration")]
+        };
+        let declared = declaration
+            .lines()
+            .filter(|line| {
+                line.starts_with("    ")
+                    && !line.starts_with("     ")
+                    && line[4..].starts_with(|c: char| c.is_ascii_uppercase())
+            })
+            .count();
+        assert_eq!(
+            declared,
+            every_classified_intent().len(),
+            "every variant of `LifecycleIntent` is a shape the poll can leave behind, so every \
+             one of them needs a row in `every_classified_intent`"
+        );
+
+        // ---- `update`'s answer, driven, for every shape ------------------------------------
+        for (shape, config, refusal) in every_classified_intent() {
+            let row = || {
+                polled(
+                    StateBackendSelector::Parquet,
+                    config.clone(),
+                    refusal.clone(),
+                )
+            };
+            let intent = LifecycleIntent::classify(StateBackendSelector::Parquet, row());
+            let produced = match &intent {
+                LifecycleIntent::Adopt(_) => "Adopt",
+                LifecycleIntent::RefusedButStopping { .. } => "RefusedButStopping",
+                LifecycleIntent::Refused(_) => "Refused",
+            };
+            assert_eq!(
+                produced, shape,
+                "the fixture really produces the shape it is filed under; the match above is \
+                 exhaustive, so a new variant does not compile until it is answered here too"
+            );
+
+            // Read off the production predicate rather than restated. What that predicate
+            // *should* say is settled by the closed-form rows above; what this row settles is
+            // that the submission path is wired to it.
+            let needs_a_task = intent.needs_a_state_task();
+
+            for job_state in ["Stopped", "Failed"] {
+                let shutdown = LiveShutdown::new();
+                let (mut sm, db, _scheduler) =
+                    an_inactive_fenced_job(job_state, a_stopped_jobs_config());
+
+                sm.update(row(), terminal_status(job_state, 3), shutdown.guard())
+                    .await;
+
+                assert_eq!(
+                    !sm.done(),
+                    needs_a_task,
+                    "{job_state}/{shape}: a job with no state task gets one exactly when its \
+                     pending intent needs one"
+                );
+                if needs_a_task {
+                    // Let it end, so the panicking scheduler's task does not outlive the row.
+                    drive_to_completion(&sm, &db).await;
+                } else {
+                    assert_eq!(
+                        state_writes(&db),
+                        [],
+                        "{job_state}/{shape}: and a job that was not started wrote nothing"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every `.rs` file under this crate's `src`, as `(path relative to src, contents)`.
+    fn walk_crate_sources(visit: &mut dyn FnMut(&str, &str)) {
+        fn walk(dir: &std::path::Path, root: &std::path::Path, visit: &mut dyn FnMut(&str, &str)) {
+            for entry in std::fs::read_dir(dir).expect("this crate's own source") {
+                let path = entry.expect("a readable directory entry").path();
+                if path.is_dir() {
+                    walk(&path, root, visit);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).expect("a readable source file");
+                let relative = path
+                    .strip_prefix(root)
+                    .expect("a path under the crate's source root")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                visit(&relative, &source);
+            }
+        }
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        walk(&root, &root, visit);
     }
 }

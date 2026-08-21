@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use arroyo_rpc::state_backend::{StateBackendError, StateBackendSelector};
 
 use super::actor::{ConsumptionPoint, LifecycleActor, LifecycleDecision};
-use super::intent::{IntentMailbox, IntentVersion, IntentWakeup, LifecycleIntent};
+use super::intent::{IntentMailbox, IntentVersion, IntentWakeup, LifecycleIntent, Submission};
 use super::mode::LifecycleMode;
 use crate::types::public::{RestartMode, StopMode};
 use crate::{JobConfig, PolledJob};
@@ -219,8 +219,8 @@ fn stop_wins_over_refusal() {
 ///
 /// 1. **Submission cannot wait.** The coercion below is a compile-time fact:
 ///    [`IntentMailbox::submit`] is a plain `fn`, so it has no await point at which the poll
-///    thread could be parked, and it returns a version rather than a `Result`, so there is
-///    no capacity for it to find full.
+///    thread could be parked, and it returns a plain value rather than a `Result`, so there
+///    is no capacity for it to find full.
 /// 2. **Repeated polls of an unchanged row create nothing.** Ten thousand polls of the same
 ///    row leave the job standing at the same version, with no consumer having run at all.
 /// 3. **Changed rows coalesce rather than queue.** A thousand distinct rows leave exactly
@@ -235,7 +235,7 @@ fn stop_wins_over_refusal() {
 fn intent_coalescing_never_backpressures_config_polling() {
     // (1) A compile-time fact, not an observation: `submit` is not `async` and cannot fail,
     // so there is no state of the world in which the poll thread waits here.
-    let _: fn(&IntentMailbox, LifecycleIntent) -> IntentVersion = IntentMailbox::submit;
+    let _: fn(&IntentMailbox, LifecycleIntent) -> Submission = IntentMailbox::submit;
 
     const UNCHANGED_POLLS: usize = 10_000;
     const CHANGED_POLLS: u64 = 1_000;
@@ -251,10 +251,10 @@ fn intent_coalescing_never_backpressures_config_polling() {
         StateBackendSelector::Parquet,
         polled(running_config(), Some(selector_changed())),
     );
-    let first = mailbox.submit(unchanged.clone());
+    let first = mailbox.submit(unchanged.clone()).version();
     for poll in 1..UNCHANGED_POLLS {
         assert_eq!(
-            mailbox.submit(unchanged.clone()),
+            mailbox.submit(unchanged.clone()).version(),
             first,
             "poll {poll}: the row has not changed, so the job stands where it stood. A \
              version per poll would be state proportional to the poll count, and would make \
@@ -307,10 +307,12 @@ fn intent_coalescing_never_backpressures_config_polling() {
     for nonce in 0..CHANGED_POLLS {
         let mut changed = running_config();
         changed.restart_nonce = nonce as i32 + 1000;
-        let version = mailbox.submit(LifecycleIntent::classify(
-            StateBackendSelector::Parquet,
-            polled(changed, None),
-        ));
+        let version = mailbox
+            .submit(LifecycleIntent::classify(
+                StateBackendSelector::Parquet,
+                polled(changed, None),
+            ))
+            .version();
         assert_eq!(
             version.as_u64(),
             previous.as_u64() + 1,
@@ -517,13 +519,17 @@ async fn a_re_polled_row_does_not_wake_the_job_once_per_poll() {
         StateBackendSelector::Parquet,
         polled(running_config(), Some(selector_changed())),
     );
-    let first = mailbox.submit(refused.clone());
+    let first = mailbox.submit(refused.clone()).version();
     tokio::time::timeout(QUIET, wake.notified())
         .await
         .expect("the first classification of the row is something new to look at");
 
     for poll in 1..100 {
-        assert_eq!(mailbox.submit(refused.clone()), first, "poll {poll}");
+        assert_eq!(
+            mailbox.submit(refused.clone()).version(),
+            first,
+            "poll {poll}"
+        );
     }
     assert!(
         tokio::time::timeout(QUIET, wake.notified()).await.is_err(),

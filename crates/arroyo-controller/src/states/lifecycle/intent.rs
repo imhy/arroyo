@@ -124,6 +124,96 @@ impl LifecycleIntent {
             Some(error) => LifecycleIntent::Refused(error),
         }
     }
+
+    /// Whether a job with no state task has to be given one before anything can act on this.
+    ///
+    /// Asked by the configuration poll, and it is a question about the mailbox rather than a
+    /// decision about the job: what the intent *means* is still the actor's, and nothing here
+    /// reads a field of a configuration or names a state. A job with no task has no actor, so
+    /// an intent left for one is decided by nobody until a task exists — and the poll thread
+    /// is the only thing that can arrange for one.
+    ///
+    /// # The answers are the landed mechanism's, one per classification
+    ///
+    /// This enum *is* the branch M11.T08's
+    /// [`StateMachine::update`](crate::states::StateMachine) takes on the same row, so the two
+    /// paths cannot be allowed to answer it differently, and the answers below are read off
+    /// that one rather than invented:
+    ///
+    /// | classification | what the landed path does with a job that has no task |
+    /// |---|---|
+    /// | [`Self::Adopt`] | stores the row and starts a task for it — an accepted row is what a job's next transition is decided from |
+    /// | [`Self::RefusedButStopping`] | `request_stop` stores the stop and starts a task for it — a job with no task can be told nothing, and the stop is the refusal's whole remedy |
+    /// | [`Self::Refused`] | `restart_if_needed`, and nothing more: a job that has legitimately reached a terminal state is not woken up to be failed again |
+    ///
+    /// So the `false` side is exactly [`Self::Refused`], and dropping either of the other two
+    /// would take a landed behaviour away from the mechanism that replaces it. In particular
+    /// this is deliberately *wider* than "could make the job runnable", which only
+    /// [`Self::Adopt`] can: a stop cannot start a job, but it still has to reach one.
+    ///
+    /// # What a task started here may then do
+    ///
+    /// Nothing this decides. A job's configuration is the only input any state consults to
+    /// decide whether it runs — [`Stopped`](crate::states::Stopped) restarts when `stop_mode`
+    /// is [`StopMode::none`] and no `ttl` is set, [`Failed`](crate::states::Failed) when
+    /// `restart_nonce` has moved past the one its status records, and a running state restarts
+    /// or rescales by comparing an adopted configuration with the one it replaced — and only
+    /// [`Self::Adopt`] replaces that configuration. *Which* of those fields matters is the
+    /// state's question and deliberately not asked here: a poll that re-implemented
+    /// `Stopped::next` would be deciding, and would be wrong the moment a state read one more
+    /// field. A task started for a stop therefore re-terminates rather than resurrects, which
+    /// is the same thing `request_stop`'s restart has always done.
+    pub(crate) fn needs_a_state_task(&self) -> bool {
+        match self {
+            LifecycleIntent::Adopt(_) | LifecycleIntent::RefusedButStopping { .. } => true,
+            LifecycleIntent::Refused(_) => false,
+        }
+    }
+}
+
+/// What one [`IntentMailbox::submit`] leaves the configuration poll to do.
+///
+/// The poll's whole contribution under
+/// [`LifecycleMode::FencedV2`](super::LifecycleMode::FencedV2) is to leave a value and, when
+/// the job has no state task, to start one so that something exists to decide it. Both halves
+/// of the second question — is this intent new, and does it need a state task at all — are
+/// answered here rather than at the call site, and the first of them is answered *inside* the
+/// mailbox's lock, so there is no window in which the poll could read a version that a later
+/// submission has already superseded.
+///
+/// Deliberately not `#[must_use]`. [`StateMachine::new`](crate::states::StateMachine) has no
+/// use for the answer — it starts the job's task whatever the row said — and the thing that
+/// stops a *third* submission path forgetting to ask is not an attribute a call site can
+/// silence with `let _`, it is
+/// `every_mailbox_submission_path_can_get_the_job_a_state_task`, which counts the sites in the
+/// source and makes each declare what it does.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Submission {
+    version: IntentVersion,
+    needs_a_state_task: bool,
+}
+
+impl Submission {
+    /// The version the job now stands at — the newest one the mailbox has used, whether this
+    /// submission stamped it or found it already there.
+    pub(crate) fn version(self) -> IntentVersion {
+        self.version
+    }
+
+    /// Whether a job with no state task has to be given one before anything can decide this.
+    ///
+    /// True exactly when this submission stamped a version the mailbox had not used before
+    /// **and** the intent it stamped
+    /// [needs a state task](LifecycleIntent::needs_a_state_task).
+    ///
+    /// The first conjunct is what keeps a job that is polled every 500ms from being started
+    /// every 500ms: a row that has not changed is the *same* intent, so it is coalesced, so it
+    /// asks for nothing. A task started for an intent and then ended by the state that read it
+    /// — a `Stopped` job whose new configuration still asks it to stay stopped — is therefore
+    /// started once, not once per poll.
+    pub(crate) fn needs_a_state_task(self) -> bool {
+        self.needs_a_state_task
+    }
 }
 
 /// A [`LifecycleIntent`] together with the version the mailbox stamped it at.
@@ -194,8 +284,9 @@ pub(crate) struct IntentMailbox {
     slot: Mutex<Option<VersionedIntent>>,
     /// The version of the newest intent ever submitted. Monotone, never reset.
     ///
-    /// Read outside the lock by [`Self::published`], which is why it is an atomic rather
-    /// than a field of the slot.
+    /// Advanced by [`Self::submit`], under the slot lock, so its ordering against the slot's
+    /// contents is the lock's. It is an atomic rather than a plain `u64` because it lives
+    /// outside the [`Mutex`] and `submit` takes `&self`.
     published: AtomicU64,
     /// Raised whenever [`Self::submit`] stamps a *new* version.
     ///
@@ -227,23 +318,28 @@ impl IntentMailbox {
         }
     }
 
-    /// Leaves a classified intent for the job's state task, and returns the version the job
-    /// now stands at.
+    /// Leaves a classified intent for the job's state task, and says what the poll still has
+    /// to do about it.
     ///
     /// Never waits, never fails, and never grows: see the type documentation. An intent
     /// equal to the one already held is *not* a new intent — it is the same row, polled
     /// again — so the version is left alone and the job's writer does not decide on it a
-    /// second time. The returned version is therefore also the answer to "how many distinct
+    /// second time. [`Submission::version`] is therefore also the answer to "how many distinct
     /// things has the poll said about this job", which is the quantity that must stay
     /// bounded however many times the row is polled.
+    ///
+    /// [`Submission::needs_a_state_task`] is the other half, and it is answered here because
+    /// both of its conjuncts are: whether the version advanced is known only under this lock,
+    /// and whether the intent needs a task at all is the intent's own. A caller that had to
+    /// combine them would be a caller that could combine them wrongly.
     ///
     /// A submission that stamps a new version also *wakes* the job's writer — see
     /// [`wake`](Self::wake). The wake is raised outside the lock, so the critical section
     /// stays exactly what the type documentation claims it is: an equality comparison and a
     /// move. A coalesced re-submission raises nothing, because there is nothing new for a
     /// woken consumer to find and a wake per poll would be a wake per 500ms forever.
-    pub(crate) fn submit(&self, intent: LifecycleIntent) -> IntentVersion {
-        let version = {
+    pub(crate) fn submit(&self, intent: LifecycleIntent) -> Submission {
+        let submission = {
             let mut slot = self.slot.lock().unwrap();
 
             if let Some(held) = slot.as_ref()
@@ -252,7 +348,15 @@ impl IntentMailbox {
                 // The row has not changed since the last poll. Re-stamping it would
                 // supersede an intent the writer has already decided on and make it decide
                 // again — which for a refused row means failing the job once per 500ms poll.
-                return held.version;
+                // It asks for no state task either, for the same reason: a job started for
+                // this intent once must not be started for it again on the next poll. This is
+                // the mailbox's version of the two guards the landed path uses for the same
+                // purpose — an unchanged row takes `update`'s `restart_if_needed` branch, and
+                // an already-stored stop returns at `request_stop`'s head.
+                return Submission {
+                    version: held.version,
+                    needs_a_state_task: false,
+                };
             }
 
             let version = IntentVersion(self.published.fetch_add(1, Ordering::SeqCst) + 1);
@@ -262,13 +366,17 @@ impl IntentMailbox {
                 intent = ?intent,
                 "the job's configuration poll left a lifecycle intent for its state task"
             );
+            let needs_a_state_task = intent.needs_a_state_task();
             // Replaces rather than appends. Whatever the previous poll said is dropped here,
             // which is the coalescing this type exists for.
             *slot = Some(VersionedIntent { version, intent });
-            version
+            Submission {
+                version,
+                needs_a_state_task,
+            }
         };
         self.wake.notify_one();
-        version
+        submission
     }
 
     /// Completes when the poll has submitted something at a version it had not used before.
