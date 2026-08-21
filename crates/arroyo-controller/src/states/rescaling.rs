@@ -1,5 +1,5 @@
 use crate::states::LeavingForStop;
-use crate::states::lifecycle::{ConsumptionPoint, leaving};
+use crate::states::lifecycle::{ConsumptionPoint, ObservedIntent, leaving};
 use crate::{JobConfig, JobMessage, states::stop_if_desired_non_running};
 
 use super::{
@@ -41,11 +41,17 @@ impl State for Rescaling {
             // a replacement cluster, so a stop decided while this waits must be read here
             // rather than after that. The job controller is borrowed one turn at a time so that
             // this read — which needs the whole context — can happen at all.
-            if ctx
-                .observe_lifecycle_intent(ConsumptionPoint::InsideInterruptibleWait)?
-                .stops()
-            {
-                stop_if_desired_non_running!(self, &ctx.config);
+            match ctx.observe_lifecycle_intent(ConsumptionPoint::InsideInterruptibleWait)? {
+                ObservedIntent::Stop => {
+                    stop_if_desired_non_running!(self, &ctx.config);
+                }
+                // Nothing further. Besides its stop, all this state's `ConfigUpdate` arm does
+                // with an update is `check_config_update` — and a configuration that changes
+                // the job's state backend is refused by the job's writer rather than adopted,
+                // so an adopted configuration arrives here with that check already made. It is
+                // published into `ctx.config`, which is what `Scheduling` starts the resized
+                // cluster from.
+                ObservedIntent::Adopted(_) | ObservedIntent::Continue => {}
             }
 
             match ctx

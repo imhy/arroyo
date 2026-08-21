@@ -15,7 +15,7 @@ use arroyo_types::{JobId, PipelineId, WorkerId};
 use rand::{Rng, rng};
 
 use crate::states::StateError;
-use crate::states::lifecycle::{ConsumptionPoint, JobWait, Waited};
+use crate::states::lifecycle::{ConsumptionPoint, JobWait, ObservedIntent, Waited};
 use crate::{JobConfig, JobMessage};
 use arroyo_datastream::logical::LogicalProgram;
 use arroyo_rpc::worker_types::{RunningMessage, TaskFailedEvent};
@@ -186,6 +186,18 @@ impl JobController {
 
     pub fn update_config(&mut self, config: JobConfig) {
         self.config = config;
+    }
+
+    /// The configuration this controller is running the job under.
+    ///
+    /// Its own copy, and not the same value as
+    /// [`JobContext::config`](crate::states::JobContext::config): [`Self::progress`] reads the
+    /// checkpoint interval out of this on every turn, so a running state that classifies a
+    /// configuration as applicable and does not call [`Self::update_config`] leaves the
+    /// controller making progress under the configuration the job has replaced. That is PR
+    /// #160 review comment `5365261487`, read from this end.
+    pub fn config(&self) -> &JobConfig {
+        &self.config
     }
 
     pub async fn handle_message(&mut self, msg: RunningMessage) -> anyhow::Result<()> {
@@ -403,7 +415,7 @@ impl JobController {
                 Waited::Message(_) => {
                     // ignore other messages
                 }
-                Waited::Decided(observed) if observed.stops() => {
+                Waited::Decided(ObservedIntent::Stop) => {
                     info!(
                         message = "ending the wait for this job's workers: its lifecycle writer \
                                    decided the job stops",
@@ -412,9 +424,13 @@ impl JobController {
                     );
                     return Ok(FinishOutcome::StopDecided);
                 }
-                // A configuration this job's writer adopted that does not ask it to stop. The
-                // job carries on finishing under it, which is what adopting it meant.
-                Waited::Decided(_) => {}
+                // A configuration this job's writer adopted that does not ask it to stop.
+                // Nothing further: what a running job does about a new configuration —
+                // restart, rescale, or apply it to this controller — is decided by
+                // `Running`/`LeaderRunning` through `decide_running_config`, and a job whose
+                // workers are finishing is past the point of being rescheduled. The job
+                // carries on finishing under it, which is what adopting it meant.
+                Waited::Decided(ObservedIntent::Adopted(_) | ObservedIntent::Continue) => {}
                 // A submission an earlier turn already decided on.
                 Waited::Woken => {}
                 Waited::Closed => {

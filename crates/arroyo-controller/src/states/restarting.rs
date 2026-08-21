@@ -1,5 +1,5 @@
 use crate::states::LeavingForStop;
-use crate::states::lifecycle::{ConsumptionPoint, leaving};
+use crate::states::lifecycle::{ConsumptionPoint, ObservedIntent, leaving};
 use crate::states::recovering::{CleanupFailure, Recovering};
 use crate::states::scheduling::Scheduling;
 use crate::states::stop_if_desired_non_running;
@@ -50,14 +50,32 @@ impl State for Restarting {
                     // M11.D39a's second consumption point. The job controller is borrowed one
                     // turn at a time rather than across the loop so that this read — which
                     // needs the whole context — can happen at all.
-                    if ctx
-                        .observe_lifecycle_intent(ConsumptionPoint::InsideInterruptibleWait)?
-                        .stops()
-                    {
+                    match ctx.observe_lifecycle_intent(ConsumptionPoint::InsideInterruptibleWait)? {
                         // A restart ends in `Scheduling`, which starts a replacement cluster.
                         // A stop decided while the final checkpoint is in flight must not be
                         // read on the far side of that.
-                        stop_if_desired_non_running!(self, &ctx.config);
+                        ObservedIntent::Stop => {
+                            stop_if_desired_non_running!(self, &ctx.config);
+                        }
+                        // The escalation the `ConfigUpdate` arm below makes, by the same rule
+                        // and against the configuration the writer has just published: an
+                        // operator who asks for a force restart while the safe one's final
+                        // checkpoint is in flight is asking not to wait for it, and an adopted
+                        // configuration used to reach this wait carrying nothing but whether
+                        // the job stopped (PR #160 review comment `5365261487`). The selector
+                        // guard that arm makes first is already made here — a configuration
+                        // that changes the backend is refused rather than adopted.
+                        ObservedIntent::Adopted(_) => {
+                            if ctx.config.restart_mode == RestartMode::force {
+                                return Ok(Transition::next(
+                                    *self,
+                                    Restarting {
+                                        mode: RestartMode::force,
+                                    },
+                                ));
+                            }
+                        }
+                        ObservedIntent::Continue => {}
                     }
 
                     match ctx

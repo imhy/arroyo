@@ -74,20 +74,49 @@ impl ConsumptionPoint {
 /// `stop_if_desired*` macro reads. The caller then invokes its own macro rather than
 /// reimplementing the mapping from stop mode to state, so a stop that arrives through the
 /// mailbox and a stop that arrives as a `ConfigUpdate` cannot come to mean different things.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 #[must_use = "a consumed intent is consumed once: whatever discards this outcome is the last \
               thing that could act on it"]
 pub(crate) enum ObservedIntent {
-    /// Nothing was decided, or what was decided leaves the job doing what it was doing.
+    /// Nothing was decided, or what was decided leaves the job running under the
+    /// configuration it already had.
     ///
     /// This is the *only* outcome under
     /// [`LifecycleMode::LegacyT08`](super::LifecycleMode::LegacyT08), because a job on the
     /// landed mechanism has no actor to decide anything — which is what makes every guard
-    /// built on [`Self::Stop`] unreachable in production and the selected path unchanged.
+    /// built on [`Self::Stop`] and [`Self::Adopted`] unreachable in production and the
+    /// selected path unchanged.
     Continue,
+    /// The job's writer replaced the job's configuration, and the new one does not ask the
+    /// job to stop. The new configuration is already published into
+    /// [`JobContext::config`](crate::states::JobContext::config); this carries the one it
+    /// *replaced*.
+    ///
+    /// # Why the superseded configuration and not the adopted one
+    ///
+    /// What a running job must **do** about a configuration is not a property of that
+    /// configuration: it is the difference between it and the one the job's workers were
+    /// started from. `restart_nonce`, `scheduler_config`, `env_vars` and
+    /// `parallelism_overrides` each decide a *transition* —
+    /// [`Restarting`](crate::states::restarting::Restarting),
+    /// [`Rescaling`](crate::states::rescaling::Rescaling) — and
+    /// [`classify_running_config_update`](crate::states::classify_running_config_update)
+    /// answers that question from both sides. A consumption point that were handed only the
+    /// new configuration could not ask it.
+    ///
+    /// This is PR #160 review comment `5365261487`: adoption used to report nothing but
+    /// whether the job stopped, so a configuration change that arrived through the mailbox
+    /// bypassed the restart and rescale classification the `JobMessage::ConfigUpdate` arm
+    /// makes, and never reached
+    /// [`JobController::update_config`](crate::job_controller::JobController::update_config).
+    Adopted(Box<JobConfig>),
     /// The job's writer decided it stops, and has published the stop into the job's
     /// configuration. The caller must leave for its own stop state before its next
     /// irreversible effect.
+    ///
+    /// Outranks [`Self::Adopted`]: an adopted configuration that asks the job to stop is
+    /// reported here and not there, because a job that is leaving does not restart, rescale
+    /// or hand a configuration to workers it is about to stop.
     Stop,
 }
 
@@ -98,6 +127,9 @@ impl ObservedIntent {
     /// because a stop can arrive either way: [`LifecycleDecision::StopUnderRunningConfig`] is
     /// a refused row keeping its stop, and [`LifecycleDecision::Adopt`] is an accepted row
     /// that may itself be asking the job to stop. Reading the result closes both.
+    ///
+    /// Never answers [`Self::Adopted`]: nothing here knows what was replaced. That is
+    /// [`Self::of_adopted`]'s, and it is the only constructor of that variant.
     fn of(config: &JobConfig) -> Self {
         match config.stop_mode {
             StopMode::none => ObservedIntent::Continue,
@@ -105,9 +137,20 @@ impl ObservedIntent {
         }
     }
 
-    /// Whether the caller must leave for its stop state.
-    pub(crate) fn stops(self) -> bool {
-        matches!(self, ObservedIntent::Stop)
+    /// The same, for a decision that replaced the job's configuration.
+    ///
+    /// `superseded` is what the job ran under until this observation and `published` is what
+    /// it runs under now — already written, by [`LifecycleDecision::apply`], into the job's
+    /// own configuration.
+    fn of_adopted(superseded: JobConfig, published: &JobConfig) -> Self {
+        match Self::of(published) {
+            // The stop outranks the adoption; see [`Self::Stop`].
+            ObservedIntent::Stop => ObservedIntent::Stop,
+            // `of` answers only those two, and this is the one place `Adopted` is built.
+            ObservedIntent::Continue | ObservedIntent::Adopted(_) => {
+                ObservedIntent::Adopted(Box::new(superseded))
+            }
+        }
     }
 }
 
@@ -125,6 +168,18 @@ pub(crate) enum LifecycleDecision {
     /// which this decision is derived from: the configuration is by far the largest thing
     /// any variant carries, and the refusal a failing job produces should not be sized for it.
     Adopt(Box<JobConfig>),
+    /// A configuration this actor has already adopted and published, offered again to a
+    /// consumption point that has not yet acted on it.
+    ///
+    /// Carries the configuration the adoption *replaced*, and nothing else: publication has
+    /// already happened, so there is nothing left to write. It exists for the same reason
+    /// [`Self::StopUnderRunningConfig`] is re-offered out of
+    /// [`LifecycleActor::standing`] — a state boundary consumes an intent that the state's
+    /// own consumption points can then never report, and an adopted configuration a running
+    /// state never sees is a configuration its workers never get.
+    ///
+    /// See [`LifecycleActor::leave_adoption_standing`].
+    ReofferAdopted(Box<JobConfig>),
     /// Stop the job, under the configuration it is already running with.
     ///
     /// Carries a stop mode and nothing else, which is what makes "a refused row keeps its
@@ -166,12 +221,21 @@ impl LifecycleDecision {
     ) -> Result<ObservedIntent, StateError> {
         match self {
             LifecycleDecision::Adopt(adopted) => {
-                *config = *adopted;
+                // Replaced rather than assigned over, because what the job was running under
+                // is the other half of the answer: a running state decides what an adopted
+                // configuration *means* by comparing the two, and after the write there is
+                // nowhere else the old one exists.
+                let superseded = std::mem::replace(config, *adopted);
                 // The adopted row may itself be the row that asks the job to stop, which is
                 // the ordinary way an operator stops a job whose configuration is fine. So
                 // the answer is read off what was just published, not off which arm reached
                 // it.
-                Ok(ObservedIntent::of(config))
+                Ok(ObservedIntent::of_adopted(superseded, config))
+            }
+            LifecycleDecision::ReofferAdopted(superseded) => {
+                // Nothing to publish: this *is* the publication, made at a consumption point
+                // that could not act on it, offered to one that can.
+                Ok(ObservedIntent::of_adopted(*superseded, config))
             }
             LifecycleDecision::StopUnderRunningConfig(stop_mode) => {
                 // Only the stop mode. The configuration this is written onto is the one the
@@ -262,6 +326,21 @@ pub(crate) struct LifecycleActor {
     /// Never [`StopMode::none`]: it is set only where an observation reported
     /// [`ObservedIntent::Stop`], which is exactly `stop_mode != none`.
     standing: Option<StopMode>,
+    /// A configuration this actor adopted and published at a state boundary, which the state
+    /// it was published to has not yet been given the chance to act on. Holds the
+    /// configuration the adoption *replaced*.
+    ///
+    /// The same argument as [`Self::standing`], for the other decision a state has to answer.
+    /// [`execute_state`](crate::states::execute_state) reads the writer before every state
+    /// body, and an adoption read there is one the state's own consumption points can never
+    /// report — so a running state entered across an adoption would go on running its workers
+    /// under the configuration that adoption replaced, which is exactly the gap PR #160 review
+    /// comment `5365261487` names one level down.
+    ///
+    /// Offered ahead of the mailbox, because it is older than anything in it, and because
+    /// offering it first is what keeps the pair of comparisons exact: the state answers
+    /// "superseded against published" and only then reads whatever the poll has said since.
+    standing_adoption: Option<Box<JobConfig>>,
 }
 
 impl LifecycleActor {
@@ -283,6 +362,7 @@ impl LifecycleActor {
             // the case a job whose program could not be loaded spends its retries in.
             decided: IntentVersion::NONE,
             standing: None,
+            standing_adoption: None,
             mailbox,
         }
     }
@@ -315,6 +395,18 @@ impl LifecycleActor {
             return Some(LifecycleDecision::StopUnderRunningConfig(stop_mode));
         }
 
+        // Then the adoption a boundary made and handed on, for the same reason and ahead of
+        // the mailbox for the reason given on the field.
+        if let Some(superseded) = self.standing_adoption.take() {
+            info!(
+                job_id = %self.job_id,
+                at = at.as_str(),
+                "re-offering the configuration the job's writer adopted before the running \
+                 state began"
+            );
+            return Some(LifecycleDecision::ReofferAdopted(superseded));
+        }
+
         let intent = self.mailbox.newer_than(self.decided)?;
         self.decided = intent.version();
 
@@ -340,6 +432,21 @@ impl LifecycleActor {
     /// Idempotent by construction: the field holds one stop, and offering it takes it.
     pub(crate) fn leave_stop_standing(&mut self, stop_mode: StopMode) {
         self.standing = Some(stop_mode);
+    }
+
+    /// Records that a configuration this actor adopted has not been acted on yet.
+    ///
+    /// Called by [`execute_state`](crate::states::execute_state) for the adoption it reads at
+    /// a state boundary. The boundary holds a `Box<dyn State>` and could not classify a
+    /// configuration change if it wanted to — what an adopted configuration *means* is
+    /// [`Running`](crate::states::running::Running)'s and
+    /// [`LeaderRunning`](crate::states::leader_running::LeaderRunning)'s, and they decide it
+    /// with a job controller the boundary does not have. So the boundary publishes and hands
+    /// on, and [`Self::observe`] offers it again at the state's own consumption points.
+    ///
+    /// Idempotent by construction: the field holds one adoption, and offering it takes it.
+    pub(crate) fn leave_adoption_standing(&mut self, superseded: Box<JobConfig>) {
+        self.standing_adoption = Some(superseded);
     }
 
     /// Turns one classified intent into the transition this job is to make.

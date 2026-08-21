@@ -159,7 +159,9 @@ impl PhaseContext<'_, '_> {
             // A decision that leaves the job running is still a decision: it is the writer
             // saying that *this* is the job's configuration now, which is exactly what a
             // standing refusal claims it is not.
-            Some(ObservedIntent::Continue | ObservedIntent::Stop) => FencedIntent::Superseded,
+            Some(ObservedIntent::Continue | ObservedIntent::Adopted(_) | ObservedIntent::Stop) => {
+                FencedIntent::Superseded
+            }
             None => FencedIntent::Unchanged,
         })
     }
@@ -185,7 +187,20 @@ impl PhaseContext<'_, '_> {
             // a transition, so reaching here means both readings say the job carries on. The
             // observation is matched rather than dropped because what a phase does with
             // `Continue` is enter the fan-out.
-            (ObservedIntent::Continue | ObservedIntent::Stop, None) => PhaseWait::Continue,
+            //
+            // `Adopted` carries nothing further for a phase, and that is a property of what a
+            // phase does rather than a convenience: `Scheduling` is where a cluster is
+            // *started*, from `ctx.config` — which is what the writer published the adopted
+            // configuration into — so a phase reads the new value by reading the field it was
+            // always going to read. The restart and rescale classification an adopted
+            // configuration also needs belongs to a job whose workers are already running, and
+            // that is `Running`/`LeaderRunning`'s (PR #160 review comment `5365261487`). The
+            // selector guard the landed loops make with `check_config_update` is made by the
+            // writer, which refuses a selector change rather than adopting it.
+            (
+                ObservedIntent::Continue | ObservedIntent::Adopted(_) | ObservedIntent::Stop,
+                None,
+            ) => PhaseWait::Continue,
         })
     }
 }

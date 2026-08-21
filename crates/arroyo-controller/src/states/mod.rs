@@ -696,6 +696,94 @@ pub(crate) fn classify_running_config_update(
     Ok(RunningConfigUpdate::Apply)
 }
 
+/// What a running job does about a configuration it has just been given.
+///
+/// [`RunningConfigUpdate`] answers the half of that question that does not depend on how the
+/// job's workers are laid out; this is the whole of it, and it is what both running modes and
+/// both delivery routes decide with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunningConfigAction {
+    /// Nothing in the configuration requires the workers to be rescheduled: it is applied to
+    /// the running job in place.
+    Apply,
+    /// The configuration changes something that is only read when workers are (re)scheduled,
+    /// so it takes effect only after a restart in this mode's restarting state.
+    Restart(RestartMode),
+    /// An operator's parallelism override no longer matches the parallelism its running
+    /// operator has, so the job is rescheduled at the new width in this mode's rescaling
+    /// state.
+    Rescale,
+}
+
+/// Decides what a running job must do about a configuration it has just been given, in either
+/// running mode and by either delivery route.
+///
+/// # Why this exists rather than three steps written out at each site
+///
+/// A configuration reaches a running job two ways: as a [`JobMessage::ConfigUpdate`] on the
+/// landed M11.T08 path — which is what production runs — and, for a job whose lifecycle the
+/// M11.D39a single writer decides, as an [`ObservedIntent::Adopted`] that writer published.
+/// The two must not come to mean different things, and "must not" is not a property of anyone
+/// remembering: it is a property of there being one function. PR #160 review comment
+/// `5365261487` is what the other arrangement produced — the adopted route reported only
+/// whether the job stopped, so a `restart_nonce`, scheduler, environment or parallelism change
+/// published through the mailbox reached neither the restart classification nor the rescale
+/// comparison, and left the job's workers on the configuration it replaced.
+///
+/// `operator_parallelism` is the one thing the two modes genuinely differ on: controller mode
+/// asks the [`JobController`] what an operator is actually running at, and leader mode reads
+/// the program's own task counts. Everything else — including the selector refusal that
+/// [`classify_running_config_update`] makes first — is shared.
+///
+/// `current` is the configuration the job was running under and `updated` the one it has been
+/// given; on the adopted route those are [`ObservedIntent::Adopted`]'s payload and
+/// [`JobContext::config`] respectively, because publication has already happened by the time a
+/// consumption point sees it.
+///
+/// # Errors
+///
+/// The fatal [`StateError`] [`classify_running_config_update`] produces for a configuration
+/// that changes the job's state backend. Unreachable on the adopted route —
+/// [`LifecycleActor::decide`](lifecycle::LifecycleActor) refuses such a row rather than
+/// adopting it — and reached here anyway, because a check that is skipped where it is believed
+/// to be redundant is a check that is missing when the belief stops being true.
+pub(crate) fn decide_running_config(
+    execution_selector: StateBackendSelector,
+    current: &JobConfig,
+    updated: &JobConfig,
+    restart_nonce: i32,
+    operator_parallelism: impl Fn(u32) -> Option<usize>,
+) -> Result<RunningConfigAction, StateError> {
+    match classify_running_config_update(execution_selector, current, updated, restart_nonce)? {
+        RunningConfigUpdate::Restart(mode) => return Ok(RunningConfigAction::Restart(mode)),
+        RunningConfigUpdate::Apply => {}
+    }
+
+    // Deliberately after the restart classification: a job that is being rescheduled anyway
+    // picks the new width up from the configuration it is rescheduled with.
+    for (node_id, requested) in &updated.parallelism_overrides {
+        if let Some(actual) = operator_parallelism(*node_id)
+            && actual != *requested
+        {
+            return Ok(RunningConfigAction::Rescale);
+        }
+    }
+
+    Ok(RunningConfigAction::Apply)
+}
+
+/// What a running state did with a configuration it was given.
+///
+/// The state comes back out when it is applied in place, because applying is not leaving and
+/// the state has more running to do. One type for both modes: `Running` and `LeaderRunning`
+/// differ in *which* states they name, not in the shape of the answer.
+pub(crate) enum ConfigApplied<S> {
+    /// Applied to the running job; carry on in this state.
+    Applied(Box<S>),
+    /// The configuration reschedules the job, in this mode's restarting or rescaling state.
+    Leaves(Transition),
+}
+
 pub fn controller_job_failure(
     message: impl Into<String>,
     error_domain: rpc::ErrorDomain,
@@ -1042,6 +1130,26 @@ impl JobContext<'_> {
                 }
                 LeavingForStop::Stays(state)
             }
+        }
+    }
+
+    /// Hands a configuration adopted before a state ran to that state's own consumption
+    /// points.
+    ///
+    /// The counterpart of [`Self::hand_stop_to`], for the other decision a state has to
+    /// answer, and for the same reason: an intent is decided once, so an adoption read at the
+    /// state boundary is one the state's own reads can never report. The boundary holds a
+    /// `Box<dyn State>` and has no job controller, so it cannot classify the change itself —
+    /// what a new configuration means for a running job is decided by
+    /// [`decide_running_config`], against the workers the job actually has. So it publishes,
+    /// records, and hands on.
+    ///
+    /// PR #160 review comment `5365261487` is the finding one level down: the same adoption,
+    /// read inside `Running`'s own wait, reached neither the restart classification nor
+    /// [`JobController::update_config`].
+    fn hand_adoption_to(&mut self, superseded: Box<JobConfig>) {
+        if let Some(actor) = self.lifecycle_actor.as_mut() {
+            actor.leave_adoption_standing(superseded);
         }
     }
 
@@ -1404,6 +1512,16 @@ async fn execute_state<'a>(
         Err(refused) => Err(refused),
         // Nothing was decided, or what was decided leaves the job doing what it was doing.
         Ok(ObservedIntent::Continue) => Ok(LeavingForStop::Stays(state)),
+        // A configuration adopted between states. Publishing it is not the whole of adopting
+        // it — a running job's workers, its restart nonce and its parallelism are decided by
+        // comparing it with the one it replaced — and this boundary is not where that
+        // comparison can be made. So it is left standing for the state's own consumption
+        // points, exactly as a stop a state declines to leave for is: PR #160 review comment
+        // `5365261487`.
+        Ok(ObservedIntent::Adopted(superseded)) => {
+            ctx.hand_adoption_to(superseded);
+            Ok(LeavingForStop::Stays(state))
+        }
         Ok(ObservedIntent::Stop) => Ok(ctx.hand_stop_to(state)),
     };
 
@@ -3299,11 +3417,17 @@ mod tests {
                 CREATE TABLE checkpoints (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     pub_id TEXT NOT NULL,
+                    organization_id TEXT NOT NULL DEFAULT '',
                     job_id TEXT NOT NULL,
                     epoch INTEGER NOT NULL,
                     min_epoch INTEGER NOT NULL,
-                    state TEXT NOT NULL,
-                    state_backend TEXT NOT NULL DEFAULT ''
+                    state TEXT NOT NULL DEFAULT 'inprogress',
+                    state_backend TEXT NOT NULL DEFAULT '',
+                    start_time TIMESTAMP,
+                    finish_time TIMESTAMP,
+                    is_stopping BOOLEAN NOT NULL DEFAULT 0,
+                    operators TEXT,
+                    event_spans TEXT
                 );
                 CREATE TABLE state_writes (
                     seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3923,28 +4047,232 @@ mod tests {
         );
     }
 
-    /// Both running modes must route their config updates through the one classifier, and
-    /// must hand it the execution's own selector rather than the refreshable `ctx.config`;
-    /// neither may keep a private copy of the restart rules that would then not carry the
-    /// selector guard. This is a structural pin rather than a behavioural one — driving
-    /// either state's `next` needs a live scheduler, database, and worker set.
+    /// Both running modes must route every configuration they are given through the one
+    /// decision function, and must hand it the execution's own selector rather than the
+    /// refreshable `ctx.config`; neither may keep a private copy of the restart rules that
+    /// would then not carry the selector guard. This is a structural pin rather than a
+    /// behavioural one — driving either state's `next` needs a live scheduler, database, and
+    /// worker set.
+    ///
+    /// Its domain grew with PR #160 review comment `5365261487`. "One rule" was a claim about
+    /// two sites, one per mode; a configuration reaches a running job by **two** routes — as a
+    /// `JobMessage::ConfigUpdate`, and, for a job whose lifecycle the M11.D39a single writer
+    /// decides, as an `ObservedIntent::Adopted` — so it is a claim about four. Each file
+    /// therefore consults the rules in exactly one place and reaches it from exactly two.
     #[test]
     fn both_running_modes_classify_config_updates_through_one_rule() {
         for (name, source) in [
             ("running.rs", include_str!("running.rs")),
             ("leader_running.rs", include_str!("leader_running.rs")),
         ] {
+            assert_eq!(
+                source.matches("decide_running_config(").count(),
+                1,
+                "{name} must decide what a configuration means for a running job in exactly \
+                 one place; a second is a second thing that can be changed alone"
+            );
             assert!(
-                source.contains(
-                    "classify_running_config_update(ctx.execution_selector, &ctx.config, &c, \
-                     ctx.status.restart_nonce)?"
-                ),
-                "{name} must classify config updates through classify_running_config_update, \
-                 against the execution's selector"
+                source.contains("ctx.execution_selector,"),
+                "{name} must decide against the execution's own selector, not against \
+                 `ctx.config`, which is refreshed from shared state after every transition"
+            );
+            assert_eq!(
+                source.matches("apply_new_config(").count(),
+                3,
+                "{name} must reach that one place from exactly two routes — the \
+                 `JobMessage::ConfigUpdate` arm and the adopted-intent arm — plus the \
+                 declaration itself. A route that grew its own copy, or one that stopped \
+                 routing at all, changes this count"
+            );
+            assert!(
+                source.contains("ObservedIntent::Adopted("),
+                "{name} must answer an adopted configuration at all: reading only whether the \
+                 job stopped is the finding this pin was widened for"
+            );
+            assert!(
+                !source.contains("classify_running_config_update("),
+                "{name} must not reach past `decide_running_config` to the half of the rules \
+                 that omits the parallelism comparison — that half answers `Apply` for a \
+                 rescale"
             );
             assert!(
                 !source.contains("c.restart_nonce != ctx.status.restart_nonce"),
                 "{name} must not keep its own copy of the restart-nonce rule"
+            );
+        }
+    }
+
+    /// What each consumption point does with a configuration the job's writer adopted.
+    ///
+    /// Recorded per file rather than per call, because a file is what a reviewer opens and
+    /// because the answer is a property of what that file's landed `JobMessage::ConfigUpdate`
+    /// arm does — an adopted configuration and a delivered one have to mean the same thing.
+    #[derive(Debug, Clone, Copy)]
+    enum AdoptedAnswer {
+        /// Decides what it means for a running job, through `decide_running_config`.
+        Routes,
+        /// Acts on it with this state's own rule, whose source marker is named here.
+        Acts(&'static str),
+        /// Nothing further, and for one reason in every case: besides the stop it answers, all
+        /// that file's `ConfigUpdate` arm does with an update is `check_config_update`, and the
+        /// job's writer refuses a configuration that changes the state backend rather than
+        /// adopting it. The new configuration is published into `JobContext::config`, which is
+        /// the field those states already read.
+        NothingFurther,
+        /// Carries the outcome to its caller without reading it. `JobWait` is the wait, not a
+        /// decider; what a decision means belongs to the state that owns the wait.
+        Reports,
+    }
+
+    /// Every consumption point in this crate, and what it does with an adopted configuration.
+    ///
+    /// The registry half of `every_consumption_point_answers_an_adopted_configuration`. A
+    /// hard-coded list of sites is what let PR #160 review comments `5358055190`,
+    /// `5362488017` and `5365261487` through in succession, so this list is not the domain —
+    /// the source is, and this is checked against it.
+    fn every_consumption_point_and_its_answer() -> Vec<(&'static str, AdoptedAnswer)> {
+        vec![
+            // The state boundary. It holds a `Box<dyn State>` and no job controller, so it
+            // cannot classify; it publishes and leaves the adoption standing for the state's
+            // own consumption points, exactly as it does a stop a state declines to leave for.
+            ("states/mod.rs", AdoptedAnswer::Acts("hand_adoption_to")),
+            ("states/running.rs", AdoptedAnswer::Routes),
+            ("states/leader_running.rs", AdoptedAnswer::Routes),
+            // A safe restart escalates to a force one, which is what its `ConfigUpdate` arm
+            // does with a configuration that changes `restart_mode`.
+            (
+                "states/restarting.rs",
+                AdoptedAnswer::Acts("ctx.config.restart_mode == RestartMode::force"),
+            ),
+            ("states/leader_restarting.rs", AdoptedAnswer::NothingFurther),
+            ("states/rescaling.rs", AdoptedAnswer::NothingFurther),
+            (
+                "states/checkpoint_stopping.rs",
+                AdoptedAnswer::NothingFurther,
+            ),
+            ("states/scheduling.rs", AdoptedAnswer::NothingFurther),
+            (
+                "states/scheduling/admission/observation.rs",
+                AdoptedAnswer::NothingFurther,
+            ),
+            ("job_controller/mod.rs", AdoptedAnswer::NothingFurther),
+            (
+                "job_controller/leader_manager.rs",
+                AdoptedAnswer::NothingFurther,
+            ),
+            ("states/lifecycle/waiting.rs", AdoptedAnswer::Reports),
+        ]
+    }
+
+    /// No consumption point can silently drop a configuration the job's writer adopted.
+    ///
+    /// The quantified row, and the one that would have found PR #160 review comment
+    /// `5365261487` before a reviewer did. Its domain is every file in this crate that reads
+    /// the job's single writer — taken from the source, not from a list — and each has to
+    /// appear in `every_consumption_point_and_its_answer` with an answer the source then has
+    /// to bear out. A file that starts observing, or one that stops answering, fails here.
+    ///
+    /// It is a source pin because most of these sites cannot be driven: `Scheduling`'s two
+    /// loops need a live worker set, `handle_leader_stopping` a live leader. The behavioural
+    /// rows for the sites that *can* be driven are below.
+    #[test]
+    fn every_consumption_point_answers_an_adopted_configuration() {
+        /// Everything in a file before its test module: a test that observes answers for
+        /// itself.
+        fn production_half(source: &str) -> &str {
+            match source.find("\n#[cfg(test)]") {
+                Some(at) => &source[..at],
+                None => source,
+            }
+        }
+
+        /// What makes a file a consumption point: it reads the writer, or it consumes what a
+        /// read produced.
+        const OBSERVES: [&str; 3] = [
+            "observe_lifecycle_intent(",
+            "observe_lifecycle_decision(",
+            "Waited::Decided(",
+        ];
+
+        fn walk(
+            dir: &std::path::Path,
+            root: &std::path::Path,
+            found: &mut std::collections::BTreeSet<String>,
+        ) {
+            for entry in std::fs::read_dir(dir).expect("this crate's own source") {
+                let path = entry.expect("a readable directory entry").path();
+                if path.is_dir() {
+                    walk(&path, root, found);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).expect("a readable source file");
+                if OBSERVES
+                    .iter()
+                    .any(|marker| production_half(&source).contains(marker))
+                {
+                    found.insert(
+                        path.strip_prefix(root)
+                            .expect("a path under the crate's source root")
+                            .to_string_lossy()
+                            .replace('\\', "/"),
+                    );
+                }
+            }
+        }
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut found = std::collections::BTreeSet::new();
+        walk(&root, &root, &mut found);
+
+        let declared: std::collections::BTreeSet<String> = every_consumption_point_and_its_answer()
+            .into_iter()
+            .map(|(file, _)| file.to_string())
+            .collect();
+        assert_eq!(
+            found, declared,
+            "every file that reads the job's single writer has to say what it does with a \
+             configuration that writer adopted. The left side is the source; the right side \
+             is `every_consumption_point_and_its_answer`"
+        );
+
+        for (file, answer) in every_consumption_point_and_its_answer() {
+            let source = std::fs::read_to_string(root.join(file)).expect("a declared file");
+            let source = production_half(&source);
+
+            match answer {
+                AdoptedAnswer::Reports => {
+                    assert!(
+                        !source.contains("ObservedIntent::Adopted"),
+                        "{file} is declared as carrying the outcome to its caller, so it must \
+                         not decide anything about an adopted configuration itself"
+                    );
+                    continue;
+                }
+                AdoptedAnswer::Routes => assert!(
+                    source.contains("decide_running_config("),
+                    "{file} is declared as routing an adopted configuration through the one \
+                     rule a running job decides with"
+                ),
+                AdoptedAnswer::Acts(marker) => assert!(
+                    source.contains(marker),
+                    "{file} is declared as acting on an adopted configuration with `{marker}`, \
+                     and that is no longer in its source"
+                ),
+                AdoptedAnswer::NothingFurther => assert!(
+                    !source.contains("decide_running_config("),
+                    "{file} is declared as having nothing further to do with an adopted \
+                     configuration, but it now decides one — the declaration is stale"
+                ),
+            }
+
+            assert!(
+                source.contains("ObservedIntent::Adopted"),
+                "{file} must name `ObservedIntent::Adopted` — an adopted configuration folded \
+                 into a wildcard or read only through a stop test is one this file drops \
+                 without saying so, which is PR #160 review comment `5365261487`"
             );
         }
     }
@@ -8261,9 +8589,10 @@ mod tests {
         assert_eq!(
             ctx.observe_lifecycle_intent(ConsumptionPoint::BeforeIrreversiblePhase)
                 .expect("an accepted row is adopted, not refused"),
-            ObservedIntent::Continue,
-            "and the row asks for no stop, so the boundary leaves the job doing what it was \
-             doing"
+            ObservedIntent::Adopted(Box::new(current.clone())),
+            "the row asks for no stop, so the boundary does not leave — and it reports the \
+             adoption carrying the configuration it replaced, which is what a running state \
+             classifies the change against (PR #160 review comment `5365261487`)"
         );
         assert_eq!(
             ctx.config, accepted,
@@ -8803,8 +9132,10 @@ mod tests {
         assert_eq!(
             ctx.observe_lifecycle_intent(ConsumptionPoint::BeforeIrreversiblePhase)
                 .expect("an unchanged selector is adopted, not refused"),
-            ObservedIntent::Continue,
-            "and an edit that only changes the checkpoint interval is not a stop"
+            ObservedIntent::Adopted(Box::new(current.clone())),
+            "an edit that only changes the restart nonce and the checkpoint interval is not a \
+             stop — it is an adoption, reported with the configuration it replaced so that a \
+             running state can tell a restart from an in-place update"
         );
         assert_eq!(
             ctx.config, unchanged_selector,
@@ -10936,6 +11267,20 @@ mod tests {
     async fn controller_over_a_worker(
         program: LogicalProgram,
     ) -> (Arc<WorkerCalls>, JobController) {
+        controller_over_a_worker_storing_checkpoints_in(program, unused_db()).await
+    }
+
+    /// The same, with the database its checkpoint metadata store writes to.
+    ///
+    /// [`controller_over_a_worker`] hands it one with no schema, which is enough for every row
+    /// that never takes a checkpoint. A row that drives a state whose *first* statement is
+    /// `checkpoint(true)` — `Restarting` in `RestartMode::safe`, `Rescaling` — needs the
+    /// `checkpoints` table [`sqlite_startable_job`] creates, or the state retries on the
+    /// missing table before it ever reaches its consumption point.
+    async fn controller_over_a_worker_storing_checkpoints_in(
+        program: LogicalProgram,
+        db: DatabaseSource,
+    ) -> (Arc<WorkerCalls>, JobController) {
         let calls = Arc::new(WorkerCalls::default());
         let address = fake_worker(
             calls.clone(),
@@ -10952,7 +11297,7 @@ mod tests {
             Arc::new(DbCheckpointMetadataStore {
                 organization_id: "org".to_string(),
                 job_id: Arc::new("job_abc".to_string()),
-                db: unused_db(),
+                db,
                 state_backend: StateBackendSelector::Parquet,
             }),
             running_config(StateBackendSelector::Parquet),
@@ -11350,6 +11695,442 @@ mod tests {
             "this row ran {ran} of the states recorded as staying, which is fewer than \
              `every_state_and_its_answer` held when it was written — it has stopped \
              quantifying over the set it exists to quantify over"
+        );
+    }
+
+    // ------------------------------------------------------------------------------------
+    // A configuration a running job's own writer adopted — PR #160 review comment
+    // `5365261487`.
+    //
+    // Under `FencedV2` a configuration change is not a message. The poll's whole contribution
+    // is `IntentMailbox::submit`, and what reaches a running state is an adoption its own
+    // writer published into `ctx.config`. That adoption used to report one bit — whether the
+    // job stopped — so a `restart_nonce`, scheduler, environment or parallelism change
+    // reached neither the restart classification nor the rescale comparison, and a
+    // `checkpoint_interval` change never reached `JobController::update_config`: the
+    // controller went on making progress under its own private copy of the configuration the
+    // job had replaced.
+    //
+    // The rows below are parity rows rather than fenced-only rows, deliberately. The claim is
+    // not "the adopted route does something" but "the two routes cannot come to mean
+    // different things", so each change is delivered both ways and the answers are compared
+    // against the same closed-form expectation. Every fenced row selects `FencedV2` by
+    // building its context with `Harness::with_actor(&mailbox)` — the actor's existence *is*
+    // `runs_fenced_lifecycle()` — and `running_given`/`leader_running_given` assert that
+    // selection on every run rather than assuming it.
+    // ------------------------------------------------------------------------------------
+
+    /// How a configuration reaches a running job.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    enum ConfigRoute {
+        /// `JobMessage::ConfigUpdate` on the job's channel: the landed M11.T08 delivery, and
+        /// the only one production uses.
+        Message,
+        /// An intent the job's own single writer adopted and published — reached only by a
+        /// context built with `Harness::with_actor`.
+        AdoptedIntent,
+    }
+
+    /// What a running job does about one configuration change.
+    #[derive(Copy, Clone, Debug)]
+    enum RunningConfigOutcome {
+        /// It leaves `Running` for this state, named by the whole `Debug` of the state.
+        Leaves(&'static str),
+        /// It applies the change and carries on. The row then stops the job so its body ends,
+        /// and asserts the state it leaves for — plus, in controller mode, that the live
+        /// `JobController` is running under the new configuration.
+        AppliedInPlace(&'static str),
+    }
+
+    /// Every dimension of a job's configuration a *running* job has to do something about,
+    /// and what each of the two running modes does about it.
+    ///
+    /// This is the domain both routes are quantified over, and it is the whole of what the
+    /// landed `JobMessage::ConfigUpdate` arms decide: the restart nonce and the restart mode
+    /// it carries, the two fields that are only read when workers are scheduled, the
+    /// parallelism override that is compared against a running operator, and a field that is
+    /// simply applied. A change that is none of these is applied by the configuration having
+    /// been replaced, which every state reads through `ctx.config`.
+    fn every_running_config_change() -> Vec<(
+        &'static str,
+        fn(&mut JobConfig),
+        RunningConfigOutcome,
+        RunningConfigOutcome,
+    )> {
+        vec![
+            (
+                "a restart nonce bump",
+                |c| c.restart_nonce = 4,
+                RunningConfigOutcome::Leaves("Restarting { mode: safe }"),
+                RunningConfigOutcome::Leaves("LeaderRestarting { mode: safe }"),
+            ),
+            (
+                "a restart nonce bump that asks for a force restart",
+                |c| {
+                    c.restart_nonce = 4;
+                    c.restart_mode = RestartMode::force;
+                },
+                RunningConfigOutcome::Leaves("Restarting { mode: force }"),
+                RunningConfigOutcome::Leaves("LeaderRestarting { mode: force }"),
+            ),
+            (
+                "a scheduler config change",
+                |c| c.scheduler_config = serde_json::json!({ "slots": 4 }),
+                RunningConfigOutcome::Leaves("Restarting { mode: safe }"),
+                RunningConfigOutcome::Leaves("LeaderRestarting { mode: safe }"),
+            ),
+            (
+                "an environment variable change",
+                |c| c.env_vars = serde_json::json!({ "RUST_LOG": "debug" }),
+                RunningConfigOutcome::Leaves("Restarting { mode: safe }"),
+                RunningConfigOutcome::Leaves("LeaderRestarting { mode: safe }"),
+            ),
+            (
+                "a parallelism override the running operator does not match",
+                |c| c.parallelism_overrides = HashMap::from([(1, 2)]),
+                RunningConfigOutcome::Leaves("Rescaling"),
+                RunningConfigOutcome::Leaves("LeaderRescaling"),
+            ),
+            (
+                "a checkpoint interval change",
+                |c| c.checkpoint_interval = Duration::from_secs(45),
+                RunningConfigOutcome::AppliedInPlace("Stopping { stop_mode: StopJob(Immediate) }"),
+                RunningConfigOutcome::AppliedInPlace(
+                    "LeaderStopping { stop_behavior: StopJob(JobStopImmediate) }",
+                ),
+            ),
+        ]
+    }
+
+    /// The state a transition leaves the job in, by its whole `Debug`.
+    ///
+    /// Read off the transition rather than out of `execute_state`, so the job's controller is
+    /// still in the context afterwards to be asked what configuration it is running under.
+    fn left_for(transition: Transition) -> String {
+        match transition {
+            Transition::Advance(holder) => format!("{:?}", holder.state),
+            Transition::Stop => "Stop".to_string(),
+        }
+    }
+
+    /// The stop each row ends an in-place change with, so the state's body finishes.
+    ///
+    /// The same configuration the row just delivered, plus the stop, so that what ends the
+    /// state is a stop and never a second unrelated change.
+    fn stopping(updated: &JobConfig) -> JobConfig {
+        let mut stopped = updated.clone();
+        stopped.stop_mode = StopMode::immediate;
+        stopped
+    }
+
+    /// Runs `Running`'s body under one configuration change delivered by one route, and
+    /// returns the state it left for and what its job controller ended up running under.
+    async fn running_given(
+        route: ConfigRoute,
+        change: fn(&mut JobConfig),
+        stop_after: bool,
+    ) -> (String, JobConfig) {
+        let current = running_config(StateBackendSelector::Parquet);
+        let mut updated = current.clone();
+        change(&mut updated);
+
+        let mailbox = intent_mailbox();
+        let (_calls, job_controller) = controller_over_a_worker(one_operator_program_at(1)).await;
+        let mut harness = Harness::new(current.restart_nonce)
+            .with_db(sqlite_startable_job("Running", 2))
+            .with_program(one_operator_program_at(1))
+            .with_job_controller(job_controller);
+        if route == ConfigRoute::AdoptedIntent {
+            harness = harness.with_actor(&mailbox);
+        }
+        let queue = harness.queue();
+        let mut ctx = harness.ctx(current, StateBackendSelector::Parquet);
+        assert_eq!(
+            ctx.runs_fenced_lifecycle(),
+            route == ConfigRoute::AdoptedIntent,
+            "{route:?}: the route is the context's lifecycle mechanism and nothing else. \
+             Under `LegacyT08` there is no actor, so the adopted path is structurally absent \
+             and a row that forgot `with_actor` would pass while proving nothing"
+        );
+
+        let stopped = stopping(&updated);
+        match route {
+            ConfigRoute::Message => {
+                queue.send(JobMessage::ConfigUpdate(updated)).await.unwrap();
+            }
+            ConfigRoute::AdoptedIntent => {
+                mailbox.submit(LifecycleIntent::Adopt(Box::new(updated)));
+            }
+        }
+
+        // Nothing else is ever put on the job's channel for the adopted route: the mailbox
+        // holds one intent, so the stop can only be submitted once the change has been
+        // observed, which is the first turn of the loop.
+        let deliver_stop = {
+            let mailbox = Arc::clone(&mailbox);
+            async move {
+                if !stop_after {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                match route {
+                    ConfigRoute::Message => {
+                        queue.send(JobMessage::ConfigUpdate(stopped)).await.unwrap();
+                    }
+                    ConfigRoute::AdoptedIntent => {
+                        mailbox.submit(LifecycleIntent::Adopt(Box::new(stopped)));
+                    }
+                }
+            }
+        };
+
+        let (transition, ()) = tokio::time::timeout(STOP_REACHES_THE_WAIT, async {
+            tokio::join!(Box::new(Running {}).next(&mut ctx), deliver_stop)
+        })
+        .await
+        .expect("`Running` answers a configuration change on the turn it reads it");
+
+        let left = left_for(transition.expect("a configuration change is not a job failure"));
+        let controller_config = ctx
+            .job_controller
+            .as_ref()
+            .expect("the controller is still the context's; no transition was applied")
+            .config()
+            .clone();
+        (left, controller_config)
+    }
+
+    /// A running job answers a configuration its writer adopted exactly as it answers one
+    /// delivered as a message.
+    ///
+    /// The finding, quantified over every dimension a running job has to act on. Before this
+    /// change the adopted column of the table read `Stopping`/never-returns for every row but
+    /// the last, because the adopted route replaced `ctx.config` and reported `Continue`.
+    #[tokio::test]
+    async fn a_running_job_answers_an_adopted_configuration_as_it_answers_a_config_update() {
+        for (name, change, outcome, _) in every_running_config_change() {
+            let (expected, stop_after) = match outcome {
+                RunningConfigOutcome::Leaves(state) => (state, false),
+                RunningConfigOutcome::AppliedInPlace(state) => (state, true),
+            };
+
+            for route in [ConfigRoute::Message, ConfigRoute::AdoptedIntent] {
+                let (left, controller_config) = running_given(route, change, stop_after).await;
+                assert_eq!(
+                    left, expected,
+                    "{name}, delivered as {route:?}: both routes decide what a configuration \
+                     means for a running job through `decide_running_config`, so both name \
+                     the same state"
+                );
+
+                if let RunningConfigOutcome::AppliedInPlace(_) = outcome {
+                    let mut applied = running_config(StateBackendSelector::Parquet);
+                    change(&mut applied);
+                    assert_eq!(
+                        controller_config.checkpoint_interval, applied.checkpoint_interval,
+                        "{name}, delivered as {route:?}: an in-place change is only applied \
+                         once `JobController::update_config` has run. This asserts the \
+                         controller's own configuration — the one `progress` reads its \
+                         checkpoint interval out of — and not that a function returned"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The same, in leader mode.
+    async fn leader_running_given(
+        route: ConfigRoute,
+        change: fn(&mut JobConfig),
+        stop_after: bool,
+    ) -> String {
+        let current = running_config(StateBackendSelector::Parquet);
+        let mut updated = current.clone();
+        change(&mut updated);
+
+        let mailbox = intent_mailbox();
+        let mut harness = Harness::new(current.restart_nonce)
+            .with_db(sqlite_startable_job("Running", 2))
+            .with_program(one_operator_program_at(1))
+            .with_leader_manager(leader_manager_reporting(JobState::JobRunning).await);
+        if route == ConfigRoute::AdoptedIntent {
+            harness = harness.with_actor(&mailbox);
+        }
+        // The leader this job has, and the generation the job's status records, have to agree
+        // or `LeaderRunning` fails the job before it reaches its loop.
+        harness.status.generation = LEADER_GENERATION;
+        let queue = harness.queue();
+        let mut ctx = harness.ctx(current, StateBackendSelector::Parquet);
+        assert_eq!(
+            ctx.runs_fenced_lifecycle(),
+            route == ConfigRoute::AdoptedIntent,
+            "{route:?}: as in controller mode, the route is the context's lifecycle mechanism"
+        );
+
+        let stopped = stopping(&updated);
+        match route {
+            ConfigRoute::Message => {
+                queue.send(JobMessage::ConfigUpdate(updated)).await.unwrap();
+            }
+            ConfigRoute::AdoptedIntent => {
+                mailbox.submit(LifecycleIntent::Adopt(Box::new(updated)));
+            }
+        }
+
+        let deliver_stop = {
+            let mailbox = Arc::clone(&mailbox);
+            async move {
+                if !stop_after {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                match route {
+                    ConfigRoute::Message => {
+                        queue.send(JobMessage::ConfigUpdate(stopped)).await.unwrap();
+                    }
+                    ConfigRoute::AdoptedIntent => {
+                        mailbox.submit(LifecycleIntent::Adopt(Box::new(stopped)));
+                    }
+                }
+            }
+        };
+
+        let (transition, ()) = tokio::time::timeout(STOP_REACHES_THE_WAIT, async {
+            tokio::join!(
+                Box::new(LeaderRunning {
+                    started: Instant::now()
+                })
+                .next(&mut ctx),
+                deliver_stop
+            )
+        })
+        .await
+        .expect("`LeaderRunning` answers a configuration change on the turn it reads it");
+
+        left_for(transition.expect("a configuration change is not a job failure"))
+    }
+
+    /// A leader-mode running job answers an adopted configuration exactly as it answers a
+    /// message.
+    ///
+    /// The sibling path. The finding named controller mode, but leader mode's
+    /// `JobMessage::ConfigUpdate` arm makes the same two decisions from the same classifier,
+    /// and its adopted route dropped them the same way.
+    #[tokio::test]
+    async fn a_leader_mode_job_answers_an_adopted_configuration_as_it_answers_a_config_update() {
+        for (name, change, _, outcome) in every_running_config_change() {
+            let (expected, stop_after) = match outcome {
+                RunningConfigOutcome::Leaves(state) => (state, false),
+                RunningConfigOutcome::AppliedInPlace(state) => (state, true),
+            };
+
+            for route in [ConfigRoute::Message, ConfigRoute::AdoptedIntent] {
+                assert_eq!(
+                    leader_running_given(route, change, stop_after).await,
+                    expected,
+                    "{name}, delivered as {route:?}: leader mode decides through the same \
+                     `decide_running_config` as controller mode, and names its own states"
+                );
+            }
+        }
+    }
+
+    /// A configuration adopted at the state boundary reaches the state that has to act on it.
+    ///
+    /// `execute_state` reads the job's writer before every state body, so an adoption made
+    /// there is one the state's own consumption points can never report — the same shape as
+    /// the stop of review comment `5362488017`, one decision along. Without
+    /// `leave_adoption_standing` the restart below is never classified at all: `Running` starts
+    /// with the new configuration already in `ctx.config` and nothing left to compare it with,
+    /// and its workers go on running the one it replaced.
+    #[tokio::test]
+    async fn a_configuration_adopted_at_the_state_boundary_reaches_the_running_state() {
+        let current = running_config(StateBackendSelector::Parquet);
+        let mut restarted = current.clone();
+        restarted.restart_nonce = 4;
+
+        let mailbox = intent_mailbox();
+        // Submitted before the state runs, so the boundary is what consumes it.
+        mailbox.submit(LifecycleIntent::Adopt(Box::new(restarted)));
+
+        let (_calls, job_controller) = controller_over_a_worker(one_operator_program_at(1)).await;
+        let mut harness = Harness::new(current.restart_nonce)
+            .with_db(sqlite_startable_job("Running", 2))
+            .with_program(one_operator_program_at(1))
+            .with_job_controller(job_controller)
+            .with_actor(&mailbox);
+        let mut ctx = harness.ctx(current, StateBackendSelector::Parquet);
+
+        let observed = ctx
+            .observe_lifecycle_intent(ConsumptionPoint::BeforeIrreversiblePhase)
+            .expect("an accepted row is adopted, not refused");
+        let ObservedIntent::Adopted(superseded) = observed else {
+            panic!("the boundary reads an adoption, not {observed:?}");
+        };
+        assert_eq!(
+            ctx.config.restart_nonce, 4,
+            "the boundary publishes it: `ctx.config` is the adopted configuration from here on"
+        );
+        ctx.hand_adoption_to(superseded);
+
+        let transition =
+            tokio::time::timeout(STOP_REACHES_THE_WAIT, Box::new(Running {}).next(&mut ctx))
+                .await
+                .expect("`Running` reads its writer on the first turn of its loop")
+                .expect("a restart nonce bump is not a job failure");
+
+        assert_eq!(
+            left_for(transition),
+            "Restarting { mode: safe }",
+            "the adoption the boundary took is offered again at the state's own consumption \
+             point, so the restart is classified there — against the configuration it \
+             replaced, which is the only place that configuration still exists"
+        );
+    }
+
+    /// A safe restart escalates to a force restart from a configuration its writer adopted.
+    ///
+    /// The third site of the same defect, which the review did not name. `Restarting`'s
+    /// `JobMessage::ConfigUpdate` arm escalates a safe restart to a force one when the update
+    /// asks for it — an operator saying they will not wait for the final checkpoint — and its
+    /// adopted route dropped that for the same reason `Running`'s dropped the restart
+    /// classification.
+    #[tokio::test]
+    async fn a_safe_restart_escalates_to_a_force_restart_from_an_adopted_configuration() {
+        let current = running_config(StateBackendSelector::Parquet);
+        let mut forced = current.clone();
+        forced.restart_mode = RestartMode::force;
+
+        let mailbox = intent_mailbox();
+        mailbox.submit(LifecycleIntent::Adopt(Box::new(forced)));
+
+        let db = sqlite_startable_job("Running", 2);
+        let (_calls, job_controller) =
+            controller_over_a_worker_storing_checkpoints_in(one_operator_program_at(1), db.clone())
+                .await;
+        let mut harness = Harness::new(current.restart_nonce)
+            .with_db(db)
+            .with_program(one_operator_program_at(1))
+            .with_job_controller(job_controller)
+            .with_actor(&mailbox);
+        let mut ctx = harness.ctx(current, StateBackendSelector::Parquet);
+
+        let transition = tokio::time::timeout(
+            STOP_REACHES_THE_WAIT,
+            Box::new(Restarting {
+                mode: RestartMode::safe,
+            })
+            .next(&mut ctx),
+        )
+        .await
+        .expect("`Restarting` reads its writer on every turn of its final-checkpoint wait")
+        .expect("an escalation is not a job failure");
+
+        assert_eq!(
+            left_for(transition),
+            "Restarting { mode: force }",
+            "the same escalation the `ConfigUpdate` arm makes, from the same rule, reached \
+             through the mailbox instead of the channel"
         );
     }
 

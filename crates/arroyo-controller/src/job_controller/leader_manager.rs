@@ -1,7 +1,7 @@
 use crate::JobConfig;
 use crate::JobMessage;
 use crate::states::leader_stopping::{LeaderStopBehavior, LeaderStopping};
-use crate::states::lifecycle::ConsumptionPoint;
+use crate::states::lifecycle::{ConsumptionPoint, ObservedIntent};
 use crate::states::recovering::Recovering;
 use crate::states::{
     JobContext, State, StateError, Transition, TransitionTo, check_config_update,
@@ -254,12 +254,20 @@ where
         // M11.D39a's second consumption point, in the wait three leader-mode states share.
         // `LeaderRescaling` reaches `Scheduling` through it, which starts a replacement cluster,
         // so the read is not merely for tidiness even though the other two are already ending.
-        if ctx
-            .observe_lifecycle_intent(ConsumptionPoint::InsideInterruptibleWait)?
-            .stops()
-            && let Some(stop_behavior) = leader_stop_escalation(&ctx.config)
-        {
-            return Ok(Transition::next(state, LeaderStopping { stop_behavior }));
+        match ctx.observe_lifecycle_intent(ConsumptionPoint::InsideInterruptibleWait)? {
+            ObservedIntent::Stop => {
+                if let Some(stop_behavior) = leader_stop_escalation(&ctx.config) {
+                    return Ok(Transition::next(state, LeaderStopping { stop_behavior }));
+                }
+            }
+            // Nothing further. Besides the escalation above — which this wait's `ConfigUpdate`
+            // arm makes through the same `leader_stop_escalation` rule — all that arm does
+            // with an update is `check_config_update`, and a configuration that changes the
+            // job's state backend is refused by the job's writer rather than adopted. A
+            // configuration that does not ask the job to stop escalates nothing by
+            // construction: `leader_stop_escalation` answers `None` for `StopMode::none`,
+            // which is exactly what `ObservedIntent::Adopted` means.
+            ObservedIntent::Adopted(_) | ObservedIntent::Continue => {}
         }
 
         let timeout = timeout

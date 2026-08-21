@@ -9,12 +9,12 @@ use crate::JobConfig;
 use crate::JobMessage;
 use crate::states::LeavingForStop;
 use crate::states::finishing::Finishing;
-use crate::states::lifecycle::{ConsumptionPoint, leaving};
+use crate::states::lifecycle::{ConsumptionPoint, ObservedIntent, leaving};
 use crate::states::recovering::Recovering;
 use crate::states::rescaling::Rescaling;
 use crate::states::restarting::Restarting;
 use crate::states::stop_if_desired_running;
-use crate::states::{RunningConfigUpdate, classify_running_config_update};
+use crate::states::{ConfigApplied, RunningConfigAction, decide_running_config};
 use crate::{job_controller::ControllerProgress, states::StateError};
 use arroyo_rpc::config::config;
 use arroyo_rpc::errors::ErrorDomain;
@@ -24,6 +24,66 @@ use super::{JobContext, State, Transition};
 
 #[derive(Debug)]
 pub struct Running {}
+
+/// Everything `Running` does about a configuration it has just been given, whichever route
+/// delivered it.
+///
+/// The two routes are [`JobMessage::ConfigUpdate`] on the landed M11.T08 path and
+/// [`ObservedIntent::Adopted`] under
+/// [`LifecycleMode::FencedV2`](crate::states::lifecycle::LifecycleMode::FencedV2), and they
+/// meet here — not in two places that happen to agree today. PR #160 review comment
+/// `5365261487` is what the other arrangement produced: the adopted route replaced
+/// `ctx.config` and returned, so a `restart_nonce`, scheduler, environment or parallelism
+/// change reached neither [`Restarting`] nor [`Rescaling`], and a `checkpoint_interval` change
+/// never reached the job controller, which went on making progress under its own private copy
+/// of the configuration the job had replaced.
+///
+/// `superseded` is what the job was running under and `updated` what it has been given. The
+/// stop is *not* decided here: what a stop means differs by state and by mode, and both
+/// callers answer it with the landed `stop_if_desired_running!` before they get here.
+///
+/// # Errors
+///
+/// The fatal [`StateError`] a configuration that changes the job's state backend produces.
+fn apply_new_config(
+    state: Box<Running>,
+    ctx: &mut JobContext<'_>,
+    superseded: &JobConfig,
+    updated: JobConfig,
+) -> Result<ConfigApplied<Running>, StateError> {
+    let action = {
+        let job_controller = ctx
+            .job_controller
+            .as_ref()
+            .expect("a running job has a job controller");
+        decide_running_config(
+            ctx.execution_selector,
+            superseded,
+            &updated,
+            ctx.status.restart_nonce,
+            |node_id| job_controller.operator_parallelism(node_id),
+        )?
+    };
+
+    Ok(match action {
+        RunningConfigAction::Restart(mode) => {
+            ConfigApplied::Leaves(Transition::next(*state, Restarting { mode }))
+        }
+        RunningConfigAction::Rescale => {
+            ConfigApplied::Leaves(Transition::next(*state, Rescaling {}))
+        }
+        RunningConfigAction::Apply => {
+            // The job controller keeps its own copy of the configuration —
+            // `JobController::progress` reads the checkpoint interval out of it on every turn
+            // — so an update classified as applicable is only applied once this has run.
+            ctx.job_controller
+                .as_mut()
+                .expect("a running job has a job controller")
+                .update_config(updated);
+            ConfigApplied::Applied(state)
+        }
+    })
+}
 
 #[async_trait::async_trait]
 impl State for Running {
@@ -62,14 +122,25 @@ impl State for Running {
             // channel when the poll decides something — so without this read a stop or a
             // refusal decided here would be observed at no point at all, for as long as the
             // job kept running well.
-            if ctx
-                .observe_lifecycle_intent(ConsumptionPoint::InsideInterruptibleWait)?
-                .stops()
-            {
+            match ctx.observe_lifecycle_intent(ConsumptionPoint::InsideInterruptibleWait)? {
                 // Through the same macro the `ConfigUpdate` arm below uses, on the
                 // configuration the writer has just published into: a stop that arrives as an
                 // intent and a stop that arrives as a message reach the same state.
-                stop_if_desired_running!(self, ctx.config);
+                ObservedIntent::Stop => {
+                    stop_if_desired_running!(self, ctx.config);
+                }
+                // And through the same function the `ConfigUpdate` arm below uses, for the
+                // same reason: the writer has published the new configuration into
+                // `ctx.config`, and what a running job *does* about it is the difference
+                // between that and the one it replaced.
+                ObservedIntent::Adopted(superseded) => {
+                    let updated = ctx.config.clone();
+                    match apply_new_config(self, ctx, &superseded, updated)? {
+                        ConfigApplied::Leaves(transition) => return Ok(transition),
+                        ConfigApplied::Applied(running) => self = running,
+                    }
+                }
+                ObservedIntent::Continue => {}
             }
 
             let ttl_end: Option<Duration> = ctx.config.ttl.map(|t| {
@@ -90,31 +161,17 @@ impl State for Running {
                         Some(JobMessage::ConfigUpdate(c)) => {
                             stop_if_desired_running!(self, &c);
 
-                            // Shared with leader mode: refuses a state-backend change and
-                            // decides whether the rest of the update needs a restart. The
-                            // comparison is against the execution's own selector, not
-                            // against `ctx.config`, which is refreshed from shared state
-                            // after every transition.
-                            match classify_running_config_update(ctx.execution_selector, &ctx.config, &c, ctx.status.restart_nonce)? {
-                                RunningConfigUpdate::Restart(mode) => {
-                                    return Ok(Transition::next(*self, Restarting { mode }));
-                                }
-                                RunningConfigUpdate::Apply => {}
+                            // Shared with leader mode and with the adopted route above:
+                            // refuses a state-backend change, decides whether the rest of
+                            // the update needs a restart or a rescale, and otherwise applies
+                            // it to the running job. The comparison is against the
+                            // execution's own selector, not against `ctx.config`, which is
+                            // refreshed from shared state after every transition.
+                            let superseded = ctx.config.clone();
+                            match apply_new_config(self, ctx, &superseded, c)? {
+                                ConfigApplied::Leaves(transition) => return Ok(transition),
+                                ConfigApplied::Applied(running) => self = running,
                             }
-
-                            let job_controller = ctx.job_controller.as_mut().unwrap();
-
-                            for (node_id, p) in &c.parallelism_overrides {
-                                if let Some(actual) = job_controller.operator_parallelism(*node_id)
-                                    && actual != *p {
-                                        return Ok(Transition::next(
-                                            *self,
-                                            Rescaling {}
-                                        ));
-                                    }
-                            }
-
-                            job_controller.update_config(c);
                         }
                         Some(JobMessage::RunningMessage(msg)) => {
                             if let Err(e) = ctx.job_controller.as_mut().unwrap().handle_message(msg).await {

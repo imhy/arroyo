@@ -2,7 +2,7 @@ use arroyo_rpc::grpc;
 use tracing::debug;
 
 use crate::states::LeavingForStop;
-use crate::states::lifecycle::ConsumptionPoint;
+use crate::states::lifecycle::{ConsumptionPoint, ObservedIntent};
 use crate::types::public::StopMode;
 use crate::{JobConfig, JobMessage, states::StateError};
 
@@ -84,12 +84,20 @@ impl State for CheckpointStopping {
             // for it, and under the single-writer mechanism that arrives here and nowhere else.
             // The job controller is borrowed one turn at a time so that this read, which needs
             // the whole context, can happen at all.
-            if ctx
-                .observe_lifecycle_intent(ConsumptionPoint::InsideInterruptibleWait)?
-                .stops()
-                && let Some(escalated) = escalation(&ctx.config)
-            {
-                return Ok(escalated);
+            match ctx.observe_lifecycle_intent(ConsumptionPoint::InsideInterruptibleWait)? {
+                ObservedIntent::Stop => {
+                    if let Some(escalated) = escalation(&ctx.config) {
+                        return Ok(escalated);
+                    }
+                }
+                // Nothing further. Besides the escalation above — which its `ConfigUpdate` arm
+                // makes through the same `escalation` rule — all that arm does with an update
+                // is `check_config_update`, and a configuration that changes the job's state
+                // backend is refused by the job's writer rather than adopted. A configuration
+                // that does not ask the job to stop escalates nothing here by construction:
+                // `escalation` answers `None` for `StopMode::none`, which is exactly what
+                // `ObservedIntent::Adopted` means.
+                ObservedIntent::Adopted(_) | ObservedIntent::Continue => {}
             }
 
             match ctx

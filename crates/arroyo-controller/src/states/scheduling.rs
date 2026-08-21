@@ -15,7 +15,7 @@ use tracing::{debug, error, info, warn};
 use super::{
     Admission, JobContext, State, Transition, check_config_update,
     leader_running::LeaderRunning,
-    lifecycle::{ConsumptionPoint, leaving},
+    lifecycle::{ConsumptionPoint, ObservedIntent, leaving},
     running::Running,
     settle_under_admission,
 };
@@ -1343,11 +1343,17 @@ impl State for Scheduling {
             // sends a job with a D39a writer to the phase graph — so the read can only
             // ever be the no-op above; it is written this way so that no consumption
             // point in the crate can answer "the job stops" and be read as "carry on".
-            if ctx
-                .observe_lifecycle_intent(ConsumptionPoint::InsideInterruptibleWait)?
-                .stops()
-            {
-                stop_if_desired_non_running!(self, &ctx.config);
+            match ctx.observe_lifecycle_intent(ConsumptionPoint::InsideInterruptibleWait)? {
+                ObservedIntent::Stop => {
+                    stop_if_desired_non_running!(self, &ctx.config);
+                }
+                // Nothing further. Besides its stop, all this loop's `ConfigUpdate` arm does
+                // with an update is `check_config_update` — and a configuration that changes
+                // the job's state backend is refused by the job's writer rather than adopted,
+                // so an adopted configuration arrives here with that check already made. The
+                // `StartExecutionReq` below stamps `ctx.config`'s selector into every worker,
+                // and `ctx.config` is what the writer published into.
+                ObservedIntent::Adopted(_) | ObservedIntent::Continue => {}
             }
 
             let timeout = pipeline_config
@@ -1559,11 +1565,14 @@ impl State for Scheduling {
             // The same consumption point, in the other interruptible wait, for the same
             // reason: this loop also breaks on the message that makes its count, and for
             // the same reason a stop it consumes leaves rather than being written down.
-            if ctx
-                .observe_lifecycle_intent(ConsumptionPoint::InsideInterruptibleWait)?
-                .stops()
-            {
-                stop_if_desired_non_running!(self, &ctx.config);
+            match ctx.observe_lifecycle_intent(ConsumptionPoint::InsideInterruptibleWait)? {
+                ObservedIntent::Stop => {
+                    stop_if_desired_non_running!(self, &ctx.config);
+                }
+                // Nothing further, for the same reason as the loop above: the selector guard
+                // is the whole of what its `ConfigUpdate` arm does besides its stop, and the
+                // writer refuses a selector change rather than adopting it.
+                ObservedIntent::Adopted(_) | ObservedIntent::Continue => {}
             }
 
             let timeout = pipeline_config

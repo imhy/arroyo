@@ -7,13 +7,14 @@ use crate::states::leader_finishing::LeaderFinishing;
 use crate::states::leader_rescaling::LeaderRescaling;
 use crate::states::leader_restarting::LeaderRestarting;
 use crate::states::leader_stop_if_desired_running;
-use crate::states::lifecycle::{ConsumptionPoint, leaving};
-use crate::states::{RunningConfigUpdate, classify_running_config_update};
+use crate::states::lifecycle::{ConsumptionPoint, ObservedIntent, leaving};
+use crate::states::{ConfigApplied, RunningConfigAction, decide_running_config};
 use anyhow::anyhow;
 use arroyo_rpc::config::config;
 use arroyo_rpc::grpc::rpc;
 use arroyo_rpc::grpc::rpc::{ErrorDomain, JobFailure, RetryHint};
 use arroyo_rpc::log_event;
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::time::MissedTickBehavior;
 use tracing::{error, warn};
@@ -21,6 +22,54 @@ use tracing::{error, warn};
 #[derive(Debug)]
 pub struct LeaderRunning {
     pub started: Instant,
+}
+
+/// Everything `LeaderRunning` does about a configuration it has just been given, whichever
+/// route delivered it.
+///
+/// The leader-mode half of [`running::apply_new_config`](crate::states::running), and it
+/// exists for the same reason: a configuration reaches a running job as a
+/// [`JobMessage::ConfigUpdate`] on the landed M11.T08 path and as an
+/// [`ObservedIntent::Adopted`] under
+/// [`LifecycleMode::FencedV2`](crate::states::lifecycle::LifecycleMode::FencedV2), and the two
+/// routes decide with one function rather than with two that agree today. PR #160 review
+/// comment `5365261487`.
+///
+/// `operator_parallelism` is the job's own program rather than a running controller's model:
+/// that is the one place the two modes differ, and [`decide_running_config`] takes it as an
+/// argument so that everything else is shared.
+///
+/// # Errors
+///
+/// The fatal [`StateError`] a configuration that changes the job's state backend produces.
+fn apply_new_config(
+    state: Box<LeaderRunning>,
+    ctx: &JobContext<'_>,
+    superseded: &JobConfig,
+    updated: &JobConfig,
+    operator_parallelism: &HashMap<u32, usize>,
+) -> Result<ConfigApplied<LeaderRunning>, StateError> {
+    let action = decide_running_config(
+        ctx.execution_selector,
+        superseded,
+        updated,
+        ctx.status.restart_nonce,
+        |node_id| operator_parallelism.get(&node_id).copied(),
+    )?;
+
+    Ok(match action {
+        RunningConfigAction::Restart(mode) => {
+            ConfigApplied::Leaves(Transition::next(*state, LeaderRestarting { mode }))
+        }
+        RunningConfigAction::Rescale => {
+            ConfigApplied::Leaves(Transition::next(*state, LeaderRescaling {}))
+        }
+        // Nothing further. Leader mode holds no second copy of the job's configuration to
+        // update — there is no `JobController` here — so an update that needs no rescheduling
+        // is applied by the job's configuration having been replaced, which is the landed
+        // `ConfigUpdate` arm's behaviour unchanged.
+        RunningConfigAction::Apply => ConfigApplied::Applied(state),
+    })
 }
 
 #[async_trait::async_trait]
@@ -85,11 +134,26 @@ impl State for LeaderRunning {
         loop {
             // M11.D39a's second consumption point, for the same reason as in controller mode:
             // a job whose leader is healthy has nothing else that would make this loop look.
-            if ctx
-                .observe_lifecycle_intent(ConsumptionPoint::InsideInterruptibleWait)?
-                .stops()
-            {
-                leader_stop_if_desired_running!(self, ctx.config);
+            match ctx.observe_lifecycle_intent(ConsumptionPoint::InsideInterruptibleWait)? {
+                ObservedIntent::Stop => {
+                    leader_stop_if_desired_running!(self, ctx.config);
+                }
+                // Through the same function the `ConfigUpdate` arm below uses: the writer has
+                // published the new configuration into `ctx.config`, and what a running job
+                // does about it is the difference between that and the one it replaced.
+                ObservedIntent::Adopted(superseded) => {
+                    match apply_new_config(
+                        self,
+                        ctx,
+                        &superseded,
+                        &ctx.config,
+                        &operator_parallelism,
+                    )? {
+                        ConfigApplied::Leaves(transition) => return Ok(transition),
+                        ConfigApplied::Applied(running) => self = running,
+                    }
+                }
+                ObservedIntent::Continue => {}
             }
 
             if ctx.leader_manager().last_heartbeat.elapsed()
@@ -130,31 +194,22 @@ impl State for LeaderRunning {
                         Some(JobMessage::ConfigUpdate(c)) => {
                             leader_stop_if_desired_running!(self, c);
 
-                            // Shared with legacy mode: refuses a state-backend change and
-                            // decides whether the rest of the update needs a restart. The
-                            // comparison is against the execution's own selector, not
-                            // against `ctx.config`, which is refreshed from shared state
-                            // after every transition.
-                            match classify_running_config_update(ctx.execution_selector, &ctx.config, &c, ctx.status.restart_nonce)? {
-                                RunningConfigUpdate::Restart(mode) => {
-                                    return Ok(Transition::next(
-                                        *self,
-                                        LeaderRestarting { mode },
-                                    ));
-                                }
-                                RunningConfigUpdate::Apply => {}
+                            // Shared with controller mode and with the adopted route above:
+                            // refuses a state-backend change and decides whether the rest of
+                            // the update needs a restart or a rescale. The comparison is
+                            // against the execution's own selector, not against
+                            // `ctx.config`, which is refreshed from shared state after every
+                            // transition.
+                            match apply_new_config(
+                                self,
+                                ctx,
+                                &ctx.config,
+                                &c,
+                                &operator_parallelism,
+                            )? {
+                                ConfigApplied::Leaves(transition) => return Ok(transition),
+                                ConfigApplied::Applied(running) => self = running,
                             }
-
-                            for (node_id, p) in &c.parallelism_overrides {
-                                if let Some(actual) = operator_parallelism.get(node_id)
-                                    && *actual != *p {
-                                    return Ok(Transition::next(
-                                        *self,
-                                        LeaderRescaling {},
-                                    ));
-                                }
-                            }
-
                         }
                         Some(msg) => {
                             // Routed rather than logged here so a refused configuration

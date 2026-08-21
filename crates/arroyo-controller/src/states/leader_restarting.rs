@@ -5,7 +5,7 @@ use super::{
 use crate::JobConfig;
 use crate::JobMessage;
 use crate::states::LeavingForStop;
-use crate::states::lifecycle::{ConsumptionPoint, leaving};
+use crate::states::lifecycle::{ConsumptionPoint, ObservedIntent, leaving};
 use crate::states::recovering::{CleanupFailure, Recovering};
 use crate::types::public::RestartMode;
 use arroyo_rpc::config::config;
@@ -61,11 +61,18 @@ impl State for LeaderRestarting {
                     // M11.D39a's second consumption point. This restart ends in `Scheduling`,
                     // which starts a replacement cluster, so a stop decided while the final
                     // checkpoint is in flight has to be read here rather than after it.
-                    if ctx
-                        .observe_lifecycle_intent(ConsumptionPoint::InsideInterruptibleWait)?
-                        .stops()
-                    {
-                        leader_stop_if_desired_running!(self, ctx.config);
+                    match ctx.observe_lifecycle_intent(ConsumptionPoint::InsideInterruptibleWait)? {
+                        ObservedIntent::Stop => {
+                            leader_stop_if_desired_running!(self, ctx.config);
+                        }
+                        // Nothing further. Besides its stop, all this state's `ConfigUpdate`
+                        // arm does with an update is `check_config_update` — and a
+                        // configuration that changes the job's state backend is refused by the
+                        // job's writer rather than adopted, so an adopted configuration
+                        // arrives here with that check already made. It is published into
+                        // `ctx.config`, which is what `Scheduling` starts the replacement
+                        // cluster from.
+                        ObservedIntent::Adopted(_) | ObservedIntent::Continue => {}
                     }
 
                     let timeout = config()
