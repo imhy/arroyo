@@ -27,7 +27,8 @@ use self::leader_restarting::LeaderRestarting;
 use self::leader_running::LeaderRunning;
 use self::leader_stopping::LeaderStopping;
 use self::lifecycle::{
-    ConsumptionPoint, IntentWakeup, JobLifecycle, LifecycleActor, LifecycleIntent, ObservedIntent,
+    ConsumptionPoint, IntentWakeup, JobLifecycle, JobWait, LifecycleActor, LifecycleIntent,
+    ObservedIntent,
 };
 use self::recovering::Recovering;
 use self::rescaling::Rescaling;
@@ -479,6 +480,11 @@ impl TransitionTo<Finished> for Finishing {
         Box::new(done_transition)
     }
 }
+// A job whose sources are exhausted still has workers, and a stop is the operator's answer to
+// workers that are not ending on their own. `Finishing` reaches this both from the state
+// boundary and from inside its own wait, through one mapping — `stop_if_desired_non_running!`.
+// `LeaderFinishing` has had the same edge since M11.T08.
+impl TransitionTo<Stopping> for Finishing {}
 
 impl TransitionTo<Restarting> for Running {
     fn update_status(&self) -> TransitionFn {
@@ -979,7 +985,64 @@ impl JobContext<'_> {
         else {
             return Ok(None);
         };
-        decision.apply(self).map(Some)
+        decision
+            .apply(&mut self.config, &self.pipeline_info.pipeline_id)
+            .map(Some)
+    }
+
+    /// The job's controller and the job's wait, as two borrows that can be held at once.
+    ///
+    /// This is the **only** place a [`JobWait`] is assembled, which is what makes "every
+    /// interruptible wait is a consumption point" a property of the type rather than of each
+    /// wait's author: `JobWait::new` is visible only inside this module tree, and
+    /// [`JobController::wait_for_finish`] takes the wait rather than a bare
+    /// [`Receiver`]. A caller cannot hand it half the sources a stop can arrive on, because a
+    /// caller cannot build a wait at all.
+    ///
+    /// Two borrows rather than one call, because a wait for a job's workers to finish needs the
+    /// controller *and* the job's channel *and* the job's configuration at the same time. They
+    /// are disjoint fields of this context, so the split is what the borrow checker already
+    /// permits — written once here so that no state has to write it.
+    ///
+    /// `None` when the job has no controller: a leader-mode job never gets one, and a job whose
+    /// last transition ran `done_transition` has had it taken away.
+    pub(crate) fn controller_and_wait(&mut self) -> Option<(&mut JobController, JobWait<'_>)> {
+        let controller = self.job_controller.as_mut()?;
+        Some((
+            controller,
+            JobWait::new(
+                self.rx,
+                self.lifecycle_actor.as_mut(),
+                &mut self.config,
+                &self.pipeline_info.pipeline_id,
+            ),
+        ))
+    }
+
+    /// Answers a stop this job's writer decided before the given state ran, and keeps it
+    /// standing if the state declines to leave for it.
+    ///
+    /// [`State::leave_for_stop`]'s two answers are not "act" and "ignore". A state that stays
+    /// says the stop is not answered *here* — because its own body is what answers it — and the
+    /// stop is therefore still the job's standing instruction when its body starts. Recording
+    /// that is what stops "stays" from meaning "discarded": the intent has been consumed from
+    /// the mailbox and the state's own [`Self::observe_lifecycle_intent`] can never report it
+    /// again, so a state that waits without it waits out a stop that was already decided.
+    ///
+    /// PR #160 review comment `5362488017` is that gap: `Finishing` waits with no deadline for
+    /// workers that may never finish, and a stop taken at its boundary reached nothing that
+    /// could end the wait.
+    fn hand_stop_to(&mut self, state: Box<dyn State>) -> LeavingForStop {
+        match state.leave_for_stop(&self.config) {
+            LeavingForStop::Leaves(transition) => LeavingForStop::Leaves(transition),
+            LeavingForStop::Stays(state) => {
+                if let Some(actor) = self.lifecycle_actor.as_mut() {
+                    // `ObservedIntent::Stop` is `stop_mode != none`, so this is never `none`.
+                    actor.leave_stop_standing(self.config.stop_mode);
+                }
+                LeavingForStop::Stays(state)
+            }
+        }
     }
 
     /// What an interruptible wait parks on so that a submitted intent ends it.
@@ -1201,6 +1264,14 @@ pub trait State: Sync + Send + 'static + Debug {
     /// outruns the stop, either because its body *is* the stop, or because it does nothing
     /// irreversible before handing to a state that answers the same question.
     ///
+    /// Staying is **not** discarding. The stop the boundary consumed is left standing on the
+    /// job's writer ([`JobContext::hand_stop_to`]) and offered again at this state's own
+    /// consumption points — every [`JobWait::recv`], and the boundary of whatever state this
+    /// one hands to. So a body that waits, waits on a source that already carries the stop,
+    /// and a body that hands on hands to a state that is asked afresh. Without that, a state
+    /// whose only content is an unbounded wait would wait out a stop that had already been
+    /// decided, which is PR #160 review comment `5362488017`.
+    ///
     /// Called only for a job whose lifecycle is M11.D39a's single writer, and only when that
     /// writer has decided the job stops. Under
     /// [`LifecycleMode::LegacyT08`](lifecycle::LifecycleMode::LegacyT08) — production through
@@ -1321,6 +1392,11 @@ async fn execute_state<'a>(
     // `Box<dyn State>` and could not name the transition itself: what leaving means is the
     // state's own, which is why it is the state that answers — but *whether* it is asked is
     // the loop's, which is why the question is here.
+    //
+    // And a state that answers "not here" has not answered it away: `hand_stop_to` leaves the
+    // stop standing on the job's writer, so the state's own waits and the next state's boundary
+    // are offered it again. That is what makes `Stays` a routing decision rather than a
+    // discard — PR #160 review comment `5362488017`.
     let observed = gated
         .and_then(|()| ctx.observe_lifecycle_intent(ConsumptionPoint::BeforeIrreversiblePhase));
 
@@ -1328,7 +1404,7 @@ async fn execute_state<'a>(
         Err(refused) => Err(refused),
         // Nothing was decided, or what was decided leaves the job doing what it was doing.
         Ok(ObservedIntent::Continue) => Ok(LeavingForStop::Stays(state)),
-        Ok(ObservedIntent::Stop) => Ok(state.leave_for_stop(&ctx.config)),
+        Ok(ObservedIntent::Stop) => Ok(ctx.hand_stop_to(state)),
     };
 
     // One place a state body is entered from, and everything that stands before a job's next
@@ -3005,6 +3081,9 @@ mod tests {
         controller_job_failure, errors, execute_state, fatal, fatal_refused_config,
         handle_unhandled_message, lifecycle,
     };
+    use crate::job_controller::JobController;
+    use crate::job_controller::checkpoint_store::DbCheckpointMetadataStore;
+    use crate::job_controller::leader_manager::LeaderManager;
     use crate::schedulers::{Scheduler, SchedulerError, StartPipelineReq};
     use crate::states::scheduling::admission::PhaseContext;
     use crate::states::scheduling::fanout::IssuedAttempts;
@@ -3016,6 +3095,7 @@ mod tests {
     };
     use arroyo_datastream::logical::{LogicalNode, LogicalProgram, OperatorName};
     use arroyo_rpc::grpc::api::ArrowProgram;
+    use arroyo_rpc::grpc::rpc;
     use arroyo_rpc::grpc::rpc::job_status_grpc_server::{JobStatusGrpc, JobStatusGrpcServer};
     use arroyo_rpc::grpc::rpc::worker_grpc_server::{WorkerGrpc, WorkerGrpcServer};
     use arroyo_rpc::grpc::rpc::{
@@ -3030,21 +3110,23 @@ mod tests {
         StopExecutionResp, StopJobReq, StopJobResp, TableCheckpointMetadata, TableConfig,
         TableEnum, WorkerFinishedReq,
     };
+    use arroyo_rpc::identity::worker_client;
     use arroyo_rpc::state_backend::validated::Validated;
     use arroyo_rpc::state_backend::{StateBackendError, StateBackendSelector};
+    use arroyo_rpc::worker_types::RunningMessage;
     use arroyo_server_common::shutdown::{Shutdown, SignalBehavior};
     use arroyo_state::validated::{
         CheckpointMetadataWrite, CompletedCheckpoint, CompletedOperator,
     };
     use arroyo_state::{BackingStore, StateBackend, StorageProviderFor};
-    use arroyo_types::{MachineId, PipelineId, WorkerId};
+    use arroyo_types::{JobId, MachineId, PipelineId, WorkerId};
     use cornucopia_async::DatabaseSource;
     use futures::FutureExt as _;
     use prost::Message as _;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex, RwLock};
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime};
     use tokio::sync::mpsc::{Receiver, Sender, channel};
 
     /// A running job's config. Only the fields the classifier reads vary between the
@@ -3419,6 +3501,12 @@ mod tests {
         /// `None` — the production selection — for every other test in this module, whose
         /// contexts therefore behave exactly as they did before M11.T25a.
         lifecycle_actor: Option<LifecycleActor>,
+        /// A live controller for the rows that run a state's *body* rather than its answer to
+        /// the boundary. `None` everywhere else, which is what makes a body that dereferences
+        /// it panic rather than run — the second half of every `leave_for_stop` row.
+        job_controller: Option<JobController>,
+        /// The same, for the leader-mode bodies.
+        leader_manager: Option<LeaderManager>,
     }
 
     impl Harness {
@@ -3434,6 +3522,8 @@ mod tests {
                 state_url: None,
                 refusal_gate: RefusalGate::default(),
                 lifecycle_actor: None,
+                job_controller: None,
+                leader_manager: None,
             }
         }
 
@@ -3456,6 +3546,18 @@ mod tests {
 
         fn with_scheduler(mut self, scheduler: RecordingScheduler) -> Self {
             self.scheduler = Arc::new(scheduler);
+            self
+        }
+
+        /// A harness whose context has a live job controller, talking to a real worker.
+        fn with_job_controller(mut self, job_controller: JobController) -> Self {
+            self.job_controller = Some(job_controller);
+            self
+        }
+
+        /// A harness whose context has a live leader manager, attached to a real leader.
+        fn with_leader_manager(mut self, leader_manager: LeaderManager) -> Self {
+            self.leader_manager = Some(leader_manager);
             self
         }
 
@@ -3519,8 +3621,8 @@ mod tests {
                 refusal_gate: self.refusal_gate.clone(),
                 lifecycle_actor: self.lifecycle_actor.take(),
                 retries_attempted: 0,
-                job_controller: None,
-                leader_manager: None,
+                job_controller: self.job_controller.take(),
+                leader_manager: self.leader_manager.take(),
                 last_transitioned_at: Instant::now(),
                 metrics: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             }
@@ -5350,6 +5452,10 @@ mod tests {
         start_execution: Mutex<Vec<String>>,
         /// One entry per `Commit`, carrying its epoch.
         commit: Mutex<Vec<u64>>,
+        /// One entry per `StopExecution`, carrying the mode it asked for. This is what "the
+        /// job was actually stopped" means for a controller-mode job: a request that arrived
+        /// at a worker, not a function that returned.
+        stop_execution: Mutex<Vec<i32>>,
     }
 
     impl WorkerCalls {
@@ -5359,6 +5465,15 @@ mod tests {
 
         fn committed(&self) -> Vec<u64> {
             self.commit.lock().unwrap().clone()
+        }
+
+        fn stopped(&self) -> Vec<rpc::StopMode> {
+            self.stop_execution
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|mode| rpc::StopMode::try_from(*mode).expect("a stop mode a worker was sent"))
+                .collect()
         }
     }
 
@@ -5842,8 +5957,13 @@ mod tests {
 
         async fn stop_execution(
             &self,
-            _: tonic::Request<StopExecutionReq>,
+            request: tonic::Request<StopExecutionReq>,
         ) -> Result<tonic::Response<StopExecutionResp>, tonic::Status> {
+            self.calls
+                .stop_execution
+                .lock()
+                .unwrap()
+                .push(request.into_inner().stop_mode);
             Ok(tonic::Response::new(StopExecutionResp {}))
         }
 
@@ -10234,12 +10354,19 @@ mod tests {
     }
 
     /// The mechanism itself: the boundary *consumes* the intent it acts on, so the state that
-    /// runs next cannot observe it for itself.
+    /// runs next cannot observe it for itself — and a state that answers "not here" therefore
+    /// has the stop left standing for it.
     ///
-    /// This is the row that would have found the finding, stated as the property rather than
-    /// as any state's behaviour. Publication is not enough on its own — that is what the
-    /// second assertion here says — so whatever the boundary does with the outcome is the last
-    /// chance the decision gets.
+    /// This is the row that would have found the previous finding, stated as the property
+    /// rather than as any state's behaviour. Publication is not enough on its own, which is
+    /// what the second assertion says.
+    ///
+    /// **Amended for PR #160 review comment `5362488017`.** Its third assertion used to read
+    /// that the state's own consumption point reports `Continue` — that the boundary had taken
+    /// the stop away from the state entirely. That is exactly what left `Finishing` and
+    /// `LeaderFinishing` waiting out a stop already decided, so the property is now the
+    /// stronger one: the *intent* is consumed once, and what a staying state's own consumption
+    /// point reports is the standing stop, once. The first two assertions are unchanged.
     #[tokio::test]
     async fn the_state_boundary_consumes_the_stop_it_publishes() {
         let mut stopped = running_config(StateBackendSelector::Parquet);
@@ -10271,10 +10398,52 @@ mod tests {
         assert_eq!(
             ctx.observe_lifecycle_intent(ConsumptionPoint::InsideInterruptibleWait)
                 .expect("an adopted configuration is not a refusal"),
+            ObservedIntent::Stop,
+            "`Created` answered `Stays`, which is `not here` and not `not at all`: the stop is \
+             left standing on the job's writer, so the state's own consumption points are \
+             offered it. Without this a body whose whole content is a wait waits the stop out"
+        );
+        assert_eq!(
+            ctx.observe_lifecycle_intent(ConsumptionPoint::InsideInterruptibleWait)
+                .expect("an adopted configuration is not a refusal"),
             ObservedIntent::Continue,
-            "and consumed it: the next state's own consumption point reports nothing, which \
-             is why publishing alone is not enough and the boundary has to route the outcome \
-             to the state it is about to run"
+            "and offered it once. The intent itself was consumed at the boundary — the \
+             writer's watermark moved past it — so this is the standing stop being spent, not \
+             the mailbox being re-read"
+        );
+    }
+
+    /// The other half: a state that *leaves* leaves nothing standing behind it.
+    ///
+    /// A stop answered by a transition is answered. If it also stayed standing, the state it
+    /// transitioned into would be asked about a stop that had already been acted on — and for
+    /// `Compiling`, whose answer is `Stopping`, a job would be routed to its stop state twice.
+    #[tokio::test]
+    async fn a_state_that_leaves_for_a_stop_leaves_none_standing() {
+        let mut stopped = running_config(StateBackendSelector::Parquet);
+        stopped.stop_mode = StopMode::immediate;
+        let mailbox = intent_mailbox();
+        mailbox.submit(LifecycleIntent::Adopt(Box::new(stopped)));
+
+        let running = running_config(StateBackendSelector::Parquet);
+        let mut harness = Harness::new(running.restart_nonce)
+            .with_db(sqlite_startable_job("Running", 2))
+            .with_actor(&mailbox);
+        let ctx = harness.ctx(running, StateBackendSelector::Parquet);
+
+        let (next, mut ctx) = execute_state(Box::new(Compiling), ctx).await;
+
+        assert_eq!(
+            next.as_ref().map(|s| s.name()),
+            Some("Stopping"),
+            "`Compiling` leaves, which is what `every_state_and_its_answer` records"
+        );
+        assert_eq!(
+            ctx.observe_lifecycle_intent(ConsumptionPoint::InsideInterruptibleWait)
+                .expect("an adopted configuration is not a refusal"),
+            ObservedIntent::Continue,
+            "and having left for it, there is nothing left standing: `Stopping` is not asked \
+             again about the stop that created it"
         );
     }
 
@@ -10541,7 +10710,9 @@ mod tests {
                 ),
             ),
             // The states that are already the stop, or already ending, or already failing.
-            // Each says why at its implementation site; the sweep records that it said so.
+            // Each says why at its implementation site; the sweep records that it said so, and
+            // `no_state_that_stays_waits_out_the_stop_it_was_handed` runs each of their bodies
+            // under one.
             (
                 "Stopping",
                 StopMode::force,
@@ -10558,11 +10729,13 @@ mod tests {
                 }),
                 ExpectedAnswer::Stays,
             ),
+            // Was `Stays` until PR #160 review comment `5362488017`: its body is an unbounded
+            // wait for workers that a stop is the operator's way of saying are not ending.
             (
                 "Finishing",
                 StopMode::immediate,
                 Box::new(Finishing {}),
-                ExpectedAnswer::Stays,
+                ExpectedAnswer::Leaves("Stopping { stop_mode: StopJob(Immediate) }"),
             ),
             (
                 "LeaderFinishing",
@@ -10724,6 +10897,505 @@ mod tests {
             ),
             "declared and not defined: a state that could inherit an answer is a state that \
              could forget to give one, which is the defect this closes"
+        );
+    }
+
+    // ------------------------------------------------------------------------------------
+    // A stop that only the job's mailbox carries, inside a state's own wait — PR #160 review
+    // comment `5362488017`.
+    //
+    // The state boundary is M11.D39a's *first* consumption point, and `leave_for_stop` makes
+    // it impossible for a state to skip. The second — "inside every interruptible wait" — had
+    // no such forcing function: a wait was a `recv` on the job's message channel, and under
+    // `FencedV2` nothing is ever sent to that channel for a lifecycle decision. `Finishing`
+    // waits there with no deadline, so a job whose workers never finish on their own could not
+    // be stopped at all; `LeaderFinishing`'s shared wait had a consumption point but read it
+    // only after the boundary had taken the stop away from it.
+    //
+    // Every row below selects `FencedV2` by building its context with
+    // `Harness::with_actor(&mailbox)`, which is what gives the context a `LifecycleActor` —
+    // `runs_fenced_lifecycle()` is that actor's existence. Under `LegacyT08` there is no actor
+    // and no mailbox, so a row that forgot would pass while proving nothing. The one row that
+    // deliberately does not is the legacy control, which asserts the absence.
+    // ------------------------------------------------------------------------------------
+
+    /// How long a row waits before calling an unbounded wait unbounded.
+    ///
+    /// Every wait these rows drive is expected to end *because of the stop*, over loopback, in
+    /// microseconds. Reaching this deadline is the failure and never the pass, which is why it
+    /// is generous: no amount of slowness can turn the unfixed code's "never" into a pass, and
+    /// a slow machine cannot turn a pass into a failure.
+    const STOP_REACHES_THE_WAIT: Duration = Duration::from_secs(20);
+
+    /// A live [`JobController`] whose single worker is a real server on a real socket.
+    ///
+    /// The rows here are about what a state's *body* does, and every body that waits for a
+    /// job's workers dereferences this. `program` decides whether the job can finish on its
+    /// own: [`one_operator_program_at`] declares a task that stays `Running` until something
+    /// says otherwise, which is the job the finding is about.
+    async fn controller_over_a_worker(
+        program: LogicalProgram,
+    ) -> (Arc<WorkerCalls>, JobController) {
+        let calls = Arc::new(WorkerCalls::default());
+        let address = fake_worker(
+            calls.clone(),
+            Arc::new(SchedulingBarriers::default()),
+            StartsExecution::Accepting,
+        )
+        .await;
+        let channel = tonic::transport::Endpoint::from_shared(address)
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let controller = JobController::new(
+            Arc::new(DbCheckpointMetadataStore {
+                organization_id: "org".to_string(),
+                job_id: Arc::new("job_abc".to_string()),
+                db: unused_db(),
+                state_backend: StateBackendSelector::Parquet,
+            }),
+            running_config(StateBackendSelector::Parquet),
+            PipelineId("pipeline_1".to_string().into()),
+            None,
+            LEADER_GENERATION,
+            Arc::new(program),
+            1,
+            1,
+            HashMap::from([(WorkerId(7), worker_client(channel, WorkerId(7)))]),
+            None,
+            None,
+        );
+        (calls, controller)
+    }
+
+    /// The generation the fake leader and the fake controller both run the job at.
+    const LEADER_GENERATION: u64 = 2;
+
+    /// A live [`LeaderManager`] attached to a leader that reports `job_state` forever.
+    ///
+    /// `JobFinishing` is what makes the leader-mode wait unbounded in the same way the
+    /// controller-mode one is: `wait_for_state(JobFinished)` polls a non-terminal state that
+    /// never changes, so nothing but the job's writer can end the wait.
+    async fn leader_manager_reporting(job_state: JobState) -> LeaderManager {
+        let (_polls, address) = fake_leader_reporting(
+            LEADER_GENERATION,
+            "parquet",
+            LeaderJobStatus {
+                job_state: job_state as i32,
+                ..Default::default()
+            },
+        )
+        .await;
+        LeaderManager::connect(
+            JobId(Arc::new("job_abc".to_string())),
+            PipelineId("pipeline_1".to_string().into()),
+            LEADER_GENERATION,
+            WorkerId(7),
+            address,
+            Some(Duration::from_secs(5)),
+            StateBackendSelector::Parquet,
+        )
+        .await
+        .expect("the fake leader agrees about the job, its generation and its backend")
+    }
+
+    /// The `TaskFinished` the single task of [`one_operator_program_at`] reports.
+    fn task_finished() -> JobMessage {
+        JobMessage::RunningMessage(RunningMessage::TaskFinished {
+            worker_id: WorkerId(7),
+            time: SystemTime::now(),
+            task_id: 1,
+            subtask_idx: 0,
+        })
+    }
+
+    /// A job that is finishing is stopped by a stop nothing sent it a message about.
+    ///
+    /// The finding, driven end to end. The mailbox is empty when the wait starts and nothing is
+    /// ever put on the job's channel, so the submission below is the only thing in the process
+    /// that could end the wait — and before this change the wait was not watching it.
+    ///
+    /// It runs on to `Stopping`'s body so that "the job stops" is a `StopExecution` that
+    /// arrived at a real worker and a job that reached `Stopped`, rather than a function that
+    /// returned.
+    #[tokio::test]
+    async fn a_finishing_job_stops_when_the_stop_arrives_only_in_the_mailbox() {
+        let mailbox = intent_mailbox();
+        let (calls, job_controller) = controller_over_a_worker(one_operator_program_at(1)).await;
+
+        let mut harness = Harness::new(3)
+            .with_db(sqlite_startable_job("Running", 2))
+            .with_program(one_operator_program_at(1))
+            .with_job_controller(job_controller)
+            .with_actor(&mailbox);
+        let queue = harness.queue();
+        let ctx = harness.ctx(
+            running_config(StateBackendSelector::Parquet),
+            StateBackendSelector::Parquet,
+        );
+
+        let mut stopped = running_config(StateBackendSelector::Parquet);
+        stopped.stop_mode = StopMode::immediate;
+        let submit = async {
+            // Long enough that the wait is parked. Not load-bearing: submitting earlier only
+            // makes the wait read the stop before it parks, which is the same consumption
+            // point on the same turn.
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            mailbox.submit(LifecycleIntent::Adopt(Box::new(stopped)));
+        };
+
+        let (finishing, ()) = tokio::time::timeout(STOP_REACHES_THE_WAIT, async {
+            tokio::join!(execute_state(Box::new(Finishing {}), ctx), submit)
+        })
+        .await
+        .expect(
+            "`Finishing`'s wait has no deadline, so reaching this one is the finding: the stop \
+             was submitted to the job's writer and the wait was not watching it",
+        );
+        let (next, ctx) = finishing;
+
+        let left = next.expect("a job that is stopping transitions; it does not end here");
+        assert_eq!(
+            format!("{left:?}"),
+            "Stopping { stop_mode: StopJob(Immediate) }",
+            "the transition `stop_if_desired_non_running!` names for an immediate stop, which \
+             is the same mapping the state boundary above it answers with"
+        );
+        assert!(
+            calls.stopped().is_empty(),
+            "and the wait reported the decision rather than acting on it: what a stop means \
+             differs by state, and `Stopping` is what asks the workers"
+        );
+
+        // The task the program declares finishes while `Stopping` waits, which is how a real
+        // job reaches `Stopped`. Queued now rather than earlier so that `Finishing`'s own wait
+        // cannot consume it and finish the job before the stop lands.
+        queue.send(task_finished()).await.unwrap();
+
+        let (stopped_next, _ctx) =
+            tokio::time::timeout(STOP_REACHES_THE_WAIT, execute_state(left, ctx))
+                .await
+                .expect(
+                    "`Stopping` waits for workers that have been told to stop and have finished",
+                );
+
+        assert_eq!(
+            calls.stopped(),
+            vec![rpc::StopMode::Immediate],
+            "the job actually stops: one `StopExecution` arrived at the worker, asking for the \
+             mode the operator asked for"
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                stopped_next.expect("a stopped job reaches its terminal state")
+            ),
+            "Stopped",
+            "and the job ends where an operator who stopped it would look for it"
+        );
+    }
+
+    /// The legacy control: a `ConfigUpdate` still stops a finishing job exactly as M11.T08
+    /// landed it.
+    ///
+    /// No `with_actor`, so this context is `LifecycleMode::LegacyT08` — the selected production
+    /// path — and the assertion below says so rather than assuming it. The outcome is the
+    /// landed one and deliberately *not* the fenced one: the wait tells the workers to stop and
+    /// goes on waiting, so the job ends in `Finished`.
+    #[tokio::test]
+    async fn a_config_update_still_stops_a_finishing_job_on_the_landed_path() {
+        let (calls, job_controller) = controller_over_a_worker(one_operator_program_at(1)).await;
+
+        let mut harness = Harness::new(3)
+            .with_db(sqlite_startable_job("Running", 2))
+            .with_program(one_operator_program_at(1))
+            .with_job_controller(job_controller);
+        let queue = harness.queue();
+        let ctx = harness.ctx(
+            running_config(StateBackendSelector::Parquet),
+            StateBackendSelector::Parquet,
+        );
+        assert!(
+            !ctx.runs_fenced_lifecycle(),
+            "the control on this row: no actor, which is what `LegacyT08` *is* — so the \
+             mailbox path below is structurally absent and what runs is the landed one"
+        );
+
+        let mut stopping = running_config(StateBackendSelector::Parquet);
+        stopping.stop_mode = StopMode::immediate;
+        queue
+            .send(JobMessage::ConfigUpdate(stopping))
+            .await
+            .unwrap();
+        queue.send(task_finished()).await.unwrap();
+
+        let (next, _ctx) = tokio::time::timeout(
+            STOP_REACHES_THE_WAIT,
+            execute_state(Box::new(Finishing {}), ctx),
+        )
+        .await
+        .expect("the landed wait ends when its tasks report finished");
+
+        assert_eq!(
+            calls.stopped(),
+            vec![rpc::StopMode::Immediate],
+            "the landed `ConfigUpdate` arm, unchanged: an immediate stop tells the workers to \
+             stop now"
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                next.expect("a finishing job that finished transitions")
+            ),
+            "Finished",
+            "and unchanged in where it leaves the job: the legacy wait carries on after \
+             stopping the workers, so the job ends `Finished` rather than `Stopping`"
+        );
+    }
+
+    /// `LeaderFinishing` answers a stop that was taken at its own boundary.
+    ///
+    /// Its body is `handle_leader_stopping`, whose wait has read the job's writer on every turn
+    /// since M11.T25a — but the boundary had already consumed the stop, so the first turn read
+    /// nothing and every turn after it read nothing either. The wait is passed `None` for its
+    /// timeout, so what that reached was a job an operator could not stop.
+    #[tokio::test]
+    async fn leader_finishing_answers_a_stop_taken_at_its_own_boundary() {
+        let mut stopped = running_config(StateBackendSelector::Parquet);
+        stopped.stop_mode = StopMode::immediate;
+        let mailbox = intent_mailbox();
+        mailbox.submit(LifecycleIntent::Adopt(Box::new(stopped)));
+
+        let mut harness = Harness::new(3)
+            .with_db(sqlite_startable_job("Running", 2))
+            .with_leader_manager(leader_manager_reporting(JobState::JobFinishing).await)
+            .with_actor(&mailbox);
+        let ctx = harness.ctx(
+            running_config(StateBackendSelector::Parquet),
+            StateBackendSelector::Parquet,
+        );
+
+        let (next, _ctx) = tokio::time::timeout(
+            STOP_REACHES_THE_WAIT,
+            execute_state(Box::new(LeaderFinishing {}), ctx),
+        )
+        .await
+        .expect(
+            "`handle_leader_stopping(.., None)` has no deadline and this leader reports \
+             `JobFinishing` forever, so reaching this deadline is the finding",
+        );
+
+        assert_eq!(
+            format!(
+                "{:?}",
+                next.expect("a job that is stopping transitions; it does not end here")
+            ),
+            "LeaderStopping { stop_behavior: StopJob(JobStopImmediate) }",
+            "by `leader_stop_escalation`, on the first turn of the wait — the stop the \
+             boundary took is standing, so the turn that reads the writer reads it"
+        );
+    }
+
+    /// `Recovering` hands the stop it was given to the state that answers it, before anything
+    /// irreversible.
+    ///
+    /// Its justification for staying is that what it hands to answers the same stop before
+    /// `Scheduling` starts anything, and that was argued rather than executed. It is executed
+    /// here, and the chain is one state longer than the doc used to claim: the cleanup's own
+    /// wait is a consumption point, so it takes the standing stop — which is what ends that
+    /// wait early — and `Compiling`, which writes nothing and starts nothing, passes the job to
+    /// `Scheduling`, whose first statement reads `ctx.config.stop_mode`. The doc has been
+    /// corrected to say so.
+    #[tokio::test]
+    async fn recovering_hands_a_stop_it_was_given_to_the_state_that_answers_it() {
+        let mut stopped = running_config(StateBackendSelector::Parquet);
+        stopped.stop_mode = StopMode::immediate;
+        let mailbox = intent_mailbox();
+        mailbox.submit(LifecycleIntent::Adopt(Box::new(stopped)));
+
+        let (calls, job_controller) = controller_over_a_worker(one_operator_program_at(1)).await;
+        let mut harness = Harness::new(3)
+            .with_db(sqlite_startable_job("Running", 2))
+            .with_program(one_operator_program_at(1))
+            .with_job_controller(job_controller)
+            .with_actor(&mailbox);
+        let ctx = harness.ctx(
+            running_config(StateBackendSelector::Parquet),
+            StateBackendSelector::Parquet,
+        );
+
+        let (next, ctx) = tokio::time::timeout(
+            STOP_REACHES_THE_WAIT,
+            execute_state(
+                Box::new(Recovering {
+                    source: anyhow::anyhow!("a worker died"),
+                    reason: "a worker died".to_string(),
+                    domain: errors::ErrorDomain::Internal,
+                }),
+                ctx,
+            ),
+        )
+        .await
+        .expect("the cleanup's wait for workers is bounded at five seconds even unfixed");
+
+        let handed_to = next.expect("recovering hands the job on");
+        assert_eq!(
+            format!("{handed_to:?}"),
+            "Compiling",
+            "`Recovering` stays: everything it does is the tear-down a stop performs"
+        );
+        assert_eq!(
+            calls.stopped(),
+            vec![rpc::StopMode::Immediate],
+            "and the tear-down actually stopped the job's workers"
+        );
+        assert_eq!(
+            ctx.config.stop_mode,
+            StopMode::immediate,
+            "with the stop published into the job's configuration, where the states after it \
+             read one"
+        );
+
+        let (compiled, ctx) =
+            tokio::time::timeout(STOP_REACHES_THE_WAIT, execute_state(handed_to, ctx))
+                .await
+                .expect("`Compiling` waits on nothing");
+        let scheduling = compiled.expect("compiling hands the job on");
+        assert_eq!(
+            format!("{scheduling:?}"),
+            "Scheduling",
+            "`Compiling` writes nothing and starts nothing, so passing the stop through it \
+             costs the job one transition and nothing else"
+        );
+
+        let (after, _ctx) =
+            tokio::time::timeout(STOP_REACHES_THE_WAIT, execute_state(scheduling, ctx))
+                .await
+                .expect(
+                    "a scheduling attempt that reads a stop before its preamble waits on \
+                         nothing",
+                );
+        assert_eq!(
+            format!(
+                "{:?}",
+                after.expect("a job that is stopping transitions; it does not end here")
+            ),
+            "Stopping { stop_mode: StopJob(Immediate) }",
+            "and the replacement cluster is never started: `phases::schedule` reads \
+             `ctx.config.stop_mode` as its first statement, which is where a stop decided \
+             while the job was recovering is answered"
+        );
+    }
+
+    /// No state that stays can wait out the stop it was handed.
+    ///
+    /// The quantified row, and the one that would have found this finding. Its domain is
+    /// `every_state_and_its_answer`'s own `Stays` entries rather than the three states the
+    /// review named — a hard-coded list of three is what let the previous change through, and
+    /// the previous change's own report said as much: no staying state's *body* had ever been
+    /// run under a stop, so the claim was argued and not tested.
+    ///
+    /// Each body runs through `execute_state`, so the stop arrives the way the finding
+    /// describes: decided by the job's writer, consumed at the boundary, and never sent to the
+    /// job's channel at all. Reaching the deadline is the failure this row exists to report.
+    #[tokio::test]
+    async fn no_state_that_stays_waits_out_the_stop_it_was_handed() {
+        let mut ran = 0;
+        for (name, stop_mode, state, expected) in every_state_and_its_answer() {
+            let ExpectedAnswer::Stays = expected else {
+                continue;
+            };
+            ran += 1;
+
+            let mut stopped = running_config(StateBackendSelector::Parquet);
+            stopped.stop_mode = stop_mode;
+            let mailbox = intent_mailbox();
+            mailbox.submit(LifecycleIntent::Adopt(Box::new(stopped)));
+
+            let harness = Harness::new(3)
+                .with_db(sqlite_startable_job("Running", 2))
+                .with_program(one_operator_program_at(1))
+                .with_actor(&mailbox);
+            // A leader-mode body dereferences a leader manager and a controller-mode body a job
+            // controller, and `Recovering::cleanup` calls a context holding both `unreachable!`.
+            // The state's own name is the rule, so a state added later is placed by it rather
+            // than by being remembered.
+            let mut harness = if name.starts_with("Leader") {
+                harness.with_leader_manager(leader_manager_reporting(JobState::JobFinishing).await)
+            } else {
+                harness.with_job_controller(
+                    controller_over_a_worker(one_operator_program_at(1)).await.1,
+                )
+            };
+            let ctx = harness.ctx(
+                running_config(StateBackendSelector::Parquet),
+                StateBackendSelector::Parquet,
+            );
+
+            tokio::time::timeout(STOP_REACHES_THE_WAIT, execute_state(state, ctx))
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "{name}: its body did not finish under a stop that only the job's \
+                         mailbox carried. A state that stays is a state whose own body answers \
+                         the stop, and a body that blocks on a source the job's writer never \
+                         writes to answers nothing"
+                    )
+                });
+        }
+
+        assert!(
+            ran >= 9,
+            "this row ran {ran} of the states recorded as staying, which is fewer than \
+             `every_state_and_its_answer` held when it was written — it has stopped \
+             quantifying over the set it exists to quantify over"
+        );
+    }
+
+    /// The job's wait is assembled in one place, out of every source a stop can arrive on.
+    ///
+    /// This is the forcing function, and the reason the fix is one wait rather than three local
+    /// repairs. A wait is a `JobWait`; `JobWait::new` is visible only inside `crate::states`;
+    /// `JobController::wait_for_finish` takes the wait and can no longer take a bare channel.
+    /// So a wait written later cannot watch half the sources, because it cannot build a
+    /// half-blind wait — the same argument `leave_for_stop` makes one level up.
+    #[test]
+    fn the_jobs_wait_is_assembled_in_one_place() {
+        let states = include_str!("mod.rs");
+        let production = &states[..states
+            .find("\n#[cfg(test)]")
+            .expect("this module has a test module")];
+        assert_eq!(
+            production.matches("JobWait::new(").count(),
+            1,
+            "one place assembles the job's wait, and it takes every field a decision can \
+             arrive on. A second would be a second thing that could be given a subset"
+        );
+        assert!(
+            production.contains("pub(crate) fn controller_and_wait("),
+            "and it is the split that hands a state its controller and its wait together, \
+             which is what makes assembling one by hand unnecessary"
+        );
+
+        let controller = include_str!("../job_controller/mod.rs");
+        assert!(
+            controller.contains("wait: &mut JobWait<'_>,"),
+            "`wait_for_finish` takes the job's wait. Taking a `&mut Receiver<JobMessage>` is \
+             what let it watch a source no lifecycle decision is ever sent to"
+        );
+        assert_eq!(
+            controller.matches("JobWait::new(").count(),
+            0,
+            "and cannot build one: `JobWait::new` is `pub(in crate::states)`, so the module \
+             that waits is not the module that decides what a wait observes"
+        );
+        assert_eq!(
+            include_str!("lifecycle/waiting.rs")
+                .matches("pub(in crate::states) fn new(")
+                .count(),
+            1,
+            "which is the visibility this rests on"
         );
     }
 }

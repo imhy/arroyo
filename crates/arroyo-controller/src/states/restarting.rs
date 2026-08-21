@@ -1,6 +1,6 @@
 use crate::states::LeavingForStop;
 use crate::states::lifecycle::{ConsumptionPoint, leaving};
-use crate::states::recovering::Recovering;
+use crate::states::recovering::{CleanupFailure, Recovering};
 use crate::states::scheduling::Scheduling;
 use crate::states::stop_if_desired_non_running;
 use crate::types::public::RestartMode;
@@ -124,8 +124,20 @@ impl State for Restarting {
                 }
             }
             RestartMode::force => {
-                if let Err(e) = Recovering::cleanup(ctx).await {
-                    return Err(ctx.retryable(self, "failed to tear down existing cluster", e, 20));
+                match Recovering::cleanup(ctx).await {
+                    Ok(()) => {}
+                    // A refusal decided while the teardown waited fails the job from here, as
+                    // it would from any other consumption point; the teardown failing is what
+                    // this state retries.
+                    Err(CleanupFailure::Refused(refusal)) => return Err(refusal),
+                    Err(CleanupFailure::Failed(e)) => {
+                        return Err(ctx.retryable(
+                            self,
+                            "failed to tear down existing cluster",
+                            e,
+                            20,
+                        ));
+                    }
                 }
 
                 Ok(Transition::next(*self, Scheduling {}))

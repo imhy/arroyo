@@ -9,10 +9,16 @@
 //! [`LifecycleActor`] in the job's own state task that is the only thing which decides and
 //! publishes.
 //!
+//! [`waiting`] holds D39a's second consumption point: the one wait a job's state task parks
+//! on, which reads the writer beside the job's message channel so that a stop nobody sent a
+//! message for still ends the wait.
+//!
 //! [`leaving`] holds the other half of a decision: what the state that runs next does about a
 //! stop the writer decided while the previous one was running. The boundary consumes such an
 //! intent, so the state can no longer observe it for itself, and routing it is what keeps a
-//! consumed stop from being a lost one.
+//! consumed stop from being a lost one. A state that answers "not here" does not thereby
+//! discard it: the stop is left standing on the job's writer and re-offered at that state's own
+//! consumption points, which are [`waiting`]'s.
 //!
 //! [`classification`] holds the rules that run before either of them: a job's selector is
 //! fixed at its first execution, a row that disagrees with it earns a typed refusal, and a
@@ -30,6 +36,7 @@ pub(crate) mod classification;
 pub(crate) mod intent;
 pub(crate) mod leaving;
 pub(crate) mod mode;
+pub(crate) mod waiting;
 
 #[cfg(test)]
 mod tests;
@@ -41,6 +48,7 @@ use arroyo_rpc::state_backend::StateBackendSelector;
 pub(crate) use actor::{ConsumptionPoint, LifecycleActor, ObservedIntent};
 pub(crate) use intent::{IntentMailbox, IntentWakeup, LifecycleIntent};
 pub(crate) use mode::LifecycleMode;
+pub(crate) use waiting::{JobWait, Waited};
 
 /// One job's lifecycle mechanism, as its state machine holds it.
 ///

@@ -13,7 +13,7 @@ use tracing::{error, info};
 
 use super::intent::{IntentMailbox, IntentVersion, IntentWakeup, LifecycleIntent};
 use crate::JobConfig;
-use crate::states::{JobContext, StateError, fatal_refused_config};
+use crate::states::{StateError, fatal_refused_config};
 use crate::types::public::StopMode;
 
 /// A point at which the job's single writer reads its intent mailbox.
@@ -140,7 +140,10 @@ impl LifecycleDecision {
     /// Publishes the decision into the job's running context.
     ///
     /// This is the *only* place the D39a path replaces a job's configuration, and it runs
-    /// on the job's own state task. Nothing on the configuration-update thread writes a
+    /// on the job's own state task. It takes the configuration and the job's pipeline rather
+    /// than the whole [`JobContext`](crate::states::JobContext) so that it can also be reached from inside an
+    /// interruptible wait, which holds the job's channel and its controller at the same time
+    /// and therefore cannot borrow the context whole. Nothing on the configuration-update thread writes a
     /// baseline or a lifecycle status under [`LifecycleMode::FencedV2`](super::LifecycleMode::FencedV2),
     /// which is the whole of "decision and delivery have one owner".
     ///
@@ -156,27 +159,31 @@ impl LifecycleDecision {
     /// an interruptible wait, so the job fails from whatever state it is in — exactly as
     /// the M11.T08 path fails it through
     /// [`handle_unhandled_message`](crate::states::handle_unhandled_message).
-    pub(crate) fn apply(self, ctx: &mut JobContext<'_>) -> Result<ObservedIntent, StateError> {
+    pub(crate) fn apply(
+        self,
+        config: &mut JobConfig,
+        pipeline_id: &str,
+    ) -> Result<ObservedIntent, StateError> {
         match self {
-            LifecycleDecision::Adopt(config) => {
-                ctx.config = *config;
+            LifecycleDecision::Adopt(adopted) => {
+                *config = *adopted;
                 // The adopted row may itself be the row that asks the job to stop, which is
                 // the ordinary way an operator stops a job whose configuration is fine. So
                 // the answer is read off what was just published, not off which arm reached
                 // it.
-                Ok(ObservedIntent::of(&ctx.config))
+                Ok(ObservedIntent::of(config))
             }
             LifecycleDecision::StopUnderRunningConfig(stop_mode) => {
                 // Only the stop mode. The configuration this is written onto is the one the
                 // job's workers, table configs and checkpoints were built from, so the
                 // refused selector and the refused restart nonce are in neither.
-                ctx.config.stop_mode = stop_mode;
-                Ok(ObservedIntent::of(&ctx.config))
+                config.stop_mode = stop_mode;
+                Ok(ObservedIntent::of(config))
             }
             LifecycleDecision::Refuse(error) => {
                 error!(
-                    job_id = %ctx.config.id,
-                    pipeline_id = *ctx.pipeline_info.pipeline_id,
+                    job_id = %config.id,
+                    pipeline_id,
                     error = %error,
                     "failing job whose persisted configuration was refused"
                 );
@@ -237,6 +244,24 @@ pub(crate) struct LifecycleActor {
     mailbox: Arc<IntentMailbox>,
     /// The newest version this actor has already decided on.
     decided: IntentVersion,
+    /// A stop this actor has already decided and published, which the state it was published
+    /// to declined to leave for.
+    ///
+    /// [`State::leave_for_stop`](crate::states::State::leave_for_stop) has two answers, and
+    /// only one of them ends the state. A state that answers
+    /// [`LeavingForStop::Stays`](crate::states::LeavingForStop::Stays) is not saying the stop
+    /// does not apply — it is saying it does not leave *here*, because its own body is what
+    /// answers it. So the stop is not spent by having been offered: it stands until something
+    /// acts on it, and [`Self::observe`] re-offers it at the state's own consumption points.
+    ///
+    /// Without this, "stays" would mean "discarded". A stop consumed at the boundary is the one
+    /// a state's own [`IntentMailbox`] read can never report — the watermark has moved past it —
+    /// so a staying state that read only its mailbox would wait out a stop that had already been
+    /// decided, which is PR #160 review comment `5362488017`.
+    ///
+    /// Never [`StopMode::none`]: it is set only where an observation reported
+    /// [`ObservedIntent::Stop`], which is exactly `stop_mode != none`.
+    standing: Option<StopMode>,
 }
 
 impl LifecycleActor {
@@ -257,6 +282,7 @@ impl LifecycleActor {
             // poll left — including an intent submitted before this task existed, which is
             // the case a job whose program could not be loaded spends its retries in.
             decided: IntentVersion::NONE,
+            standing: None,
             mailbox,
         }
     }
@@ -275,6 +301,20 @@ impl LifecycleActor {
     /// already been decided on, so calling this on every turn of a wait costs a lock and a
     /// comparison rather than a decision.
     pub(crate) fn observe(&mut self, at: ConsumptionPoint) -> Option<LifecycleDecision> {
+        // Ahead of the mailbox, because it is older than anything in it: a stop the previous
+        // consumption point decided, published, and offered to a state that answered "not
+        // here". Re-offered as the decision it already was, so that publishing it a second
+        // time is the same idempotent write onto the same configuration — and so that every
+        // consumption point gets it without a second thing to remember to read.
+        if let Some(stop_mode) = self.standing.take() {
+            info!(
+                job_id = %self.job_id,
+                at = at.as_str(),
+                "re-offering the stop the job's writer decided before the running state began"
+            );
+            return Some(LifecycleDecision::StopUnderRunningConfig(stop_mode));
+        }
+
         let intent = self.mailbox.newer_than(self.decided)?;
         self.decided = intent.version();
 
@@ -287,6 +327,19 @@ impl LifecycleActor {
             "the job's lifecycle actor decided on a configuration intent"
         );
         Some(decision)
+    }
+
+    /// Records that a stop this actor decided has not been acted on yet.
+    ///
+    /// Called by [`execute_state`](crate::states::execute_state) for a state that answered
+    /// [`LeavingForStop::Stays`](crate::states::LeavingForStop::Stays): the boundary asked, the
+    /// state declined to leave, and the stop is therefore still the job's standing instruction.
+    /// [`Self::observe`] offers it again at the state's own consumption points — its
+    /// interruptible waits, and the boundary of whatever state it hands to.
+    ///
+    /// Idempotent by construction: the field holds one stop, and offering it takes it.
+    pub(crate) fn leave_stop_standing(&mut self, stop_mode: StopMode) {
+        self.standing = Some(stop_mode);
     }
 
     /// Turns one classified intent into the transition this job is to make.

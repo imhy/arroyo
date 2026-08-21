@@ -14,6 +14,8 @@ use arroyo_state::{BackingStore, StateBackend, StorageProviderFor};
 use arroyo_types::{JobId, PipelineId, WorkerId};
 use rand::{Rng, rng};
 
+use crate::states::StateError;
+use crate::states::lifecycle::{ConsumptionPoint, JobWait, Waited};
 use crate::{JobConfig, JobMessage};
 use arroyo_datastream::logical::LogicalProgram;
 use arroyo_rpc::worker_types::{RunningMessage, TaskFailedEvent};
@@ -26,7 +28,7 @@ use arroyo_worker::job_controller::model::{
     CheckpointingOrCommittingState, JobState, RunningJobModel, TaskState, TaskStatus, WorkerState,
     WorkerStatus,
 };
-use tokio::{sync::mpsc::Receiver, task::JoinHandle};
+use tokio::task::JoinHandle;
 use tracing::{error, info};
 
 pub mod checkpoint_store;
@@ -51,6 +53,48 @@ impl std::fmt::Debug for JobController {
             .field("model", &self.model)
             .field("cleaning", &self.cleanup_task.is_some())
             .finish()
+    }
+}
+
+/// How a wait for a job's workers to finish ended.
+///
+/// Two outcomes rather than `()`, because the second one is a decision the caller has to act
+/// on and a wait that returned `Ok(())` for it would read, at every call site, as "the job
+/// finished".
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[must_use = "a wait that ended because the job stops has not finished the job"]
+pub(crate) enum FinishOutcome {
+    /// Every task of the job reported finished.
+    Finished,
+    /// The job's M11.D39a writer decided the job stops, and has published that into the job's
+    /// configuration. Nothing has been stopped here: the caller leaves for its own stop state.
+    StopDecided,
+}
+
+/// Why a wait for a job's workers to finish ended badly.
+///
+/// The two are different outcomes and not one: a refusal is fatal from wherever the job is and
+/// carries the typed reason the M11.T08 path fails it with, while a channel or worker failure
+/// is what the calling state retries. Collapsing them into `anyhow::Error` would turn a refused
+/// configuration into a retry.
+#[derive(Debug)]
+pub(crate) enum WaitError {
+    /// The job's own machinery failed: its channel closed, or a running message could not be
+    /// applied.
+    Failed(anyhow::Error),
+    /// The job's persisted configuration was refused while this waited.
+    Refused(StateError),
+}
+
+impl From<anyhow::Error> for WaitError {
+    fn from(e: anyhow::Error) -> Self {
+        WaitError::Failed(e)
+    }
+}
+
+impl From<StateError> for WaitError {
+    fn from(e: StateError) -> Self {
+        WaitError::Refused(e)
     }
 }
 
@@ -297,23 +341,58 @@ impl JobController {
         Ok(())
     }
 
-    pub async fn wait_for_finish(&mut self, rx: &mut Receiver<JobMessage>) -> anyhow::Result<()> {
+    /// Waits for every task of this job to finish, or for the job's writer to say it stops.
+    ///
+    /// # Why this takes a [`JobWait`] and not the job's channel
+    ///
+    /// It used to take `&mut Receiver<JobMessage>`, and a stop reached it only as a
+    /// [`JobMessage::ConfigUpdate`] on that channel. Under M11.D39a's single-writer lifecycle
+    /// nothing is sent to that channel when a lifecycle decision is taken — the configuration
+    /// poll's whole contribution is a submission into the job's intent mailbox — so this wait
+    /// watched a source the decision never reaches, and [`Finishing`](crate::states::finishing::Finishing)
+    /// waits here with no deadline. A job whose workers never finish on their own was
+    /// therefore unstoppable (PR #160 review comment `5362488017`).
+    ///
+    /// [`JobWait`] carries both sources and is assembled in one place, so this signature is
+    /// what makes the fix structural: there is no longer a way to call this with only half of
+    /// what a stop can arrive on. D39a requires the state task to consume intents "before
+    /// entering any irreversible phase and inside every interruptible wait"; this is one of
+    /// those waits, and [`JobWait::recv`] is where it consumes.
+    ///
+    /// # What it does about a stop, and what it deliberately does not
+    ///
+    /// A [`JobMessage::ConfigUpdate`] asking for an immediate stop is answered here, exactly as
+    /// M11.T08 landed it: the workers are told to stop and the wait carries on until they have.
+    /// That is the selected production path and it is unchanged.
+    ///
+    /// A stop the job's *writer* decided is **reported**, not acted on:
+    /// [`FinishOutcome::StopDecided`] ends the wait so the caller can answer it with its own
+    /// family's landed `stop_if_desired*` mapping. `Finishing` and `Stopping` mean different
+    /// things by the same stop, and neither meaning belongs to a job controller.
+    ///
+    /// # Errors
+    ///
+    /// [`WaitError::Refused`] if the job's persisted configuration was refused while this
+    /// waited — the job fails from wherever it is. [`WaitError::Failed`] if the job's channel
+    /// closed or a running message could not be applied.
+    pub(crate) async fn wait_for_finish(
+        &mut self,
+        wait: &mut JobWait<'_>,
+    ) -> Result<FinishOutcome, WaitError> {
         loop {
             if self.model.all_tasks_finished() {
-                return Ok(());
+                return Ok(FinishOutcome::Finished);
             }
 
-            match rx
-                .recv()
-                .await
-                .ok_or_else(|| anyhow::anyhow!("channel closed while receiving"))?
-            {
-                JobMessage::RunningMessage(msg) => {
+            match wait.recv(ConsumptionPoint::InsideInterruptibleWait).await? {
+                Waited::Message(JobMessage::RunningMessage(msg)) => {
                     self.model
                         .handle_message(msg, &*self.checkpoint_store)
                         .await?;
                 }
-                JobMessage::ConfigUpdate(c) if c.stop_mode == SqlStopMode::immediate => {
+                Waited::Message(JobMessage::ConfigUpdate(c))
+                    if c.stop_mode == SqlStopMode::immediate =>
+                {
                     info!(
                         message = "stopping job immediately",
                         job_id = %self.config.id,
@@ -321,8 +400,27 @@ impl JobController {
                     );
                     self.stop_job(StopMode::Immediate).await?;
                 }
-                _ => {
+                Waited::Message(_) => {
                     // ignore other messages
+                }
+                Waited::Decided(observed) if observed.stops() => {
+                    info!(
+                        message = "ending the wait for this job's workers: its lifecycle writer \
+                                   decided the job stops",
+                        job_id = %self.config.id,
+                        pipeline_id = *self.model.pipeline_id
+                    );
+                    return Ok(FinishOutcome::StopDecided);
+                }
+                // A configuration this job's writer adopted that does not ask it to stop. The
+                // job carries on finishing under it, which is what adopting it meant.
+                Waited::Decided(_) => {}
+                // A submission an earlier turn already decided on.
+                Waited::Woken => {}
+                Waited::Closed => {
+                    return Err(WaitError::Failed(anyhow::anyhow!(
+                        "channel closed while receiving"
+                    )));
                 }
             }
         }
