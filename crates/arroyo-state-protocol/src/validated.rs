@@ -223,16 +223,14 @@ impl WholeObject for GenerationPublication {
 
 /// The job a garbage-collection pass is collecting for.
 ///
-/// `paths` is not decoration: the check below asks whether each reached manifest is the
-/// checkpoint the reference it was read from names, and the only way to ask that is against
-/// the path builder the job's own pipeline and job ids produce. Handing it in is also what
-/// keeps the answer out of the manifest's own hands.
+/// The selector, and nothing else. The namespace the pass reads and deletes in is
+/// deliberately *not* here: it is recorded on the [`CheckpointHistory`] by the traversal that
+/// used it, so the check below and the deletion it authorizes address one value rather than
+/// two the caller states separately. See [`CheckpointHistory::paths`] for why that matters.
 #[derive(Debug, Clone, Copy)]
-pub struct CollectingJob<'a> {
+pub struct CollectingJob {
     /// The state backend the job selected.
     pub state_backend: StateBackendSelector,
-    /// The path builder for this job's protocol objects.
-    pub paths: &'a ProtocolPaths,
 }
 
 /// One checkpoint the history traversal reached: where it was read from, and what it says
@@ -262,14 +260,45 @@ struct ReachedCheckpoint {
 /// deletion depends on is about the whole chain — retained links included, because a
 /// retained checkpoint's files are what protect them from an older link that also
 /// references them.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct CheckpointHistory {
+    paths: ProtocolPaths,
     reached: Vec<ReachedCheckpoint>,
     old_checkpoints: Vec<CheckpointOwner>,
     data_files: Vec<CheckpointRef>,
 }
 
 impl CheckpointHistory {
+    /// Opens a history for the namespace the traversal is about to read.
+    ///
+    /// `paths` is the caller's statement of which pipeline and job is being collected, and it
+    /// is taken once, here. There is no [`Default`]: a history that has not been told which
+    /// job it belongs to is not a thing this crate can produce, and a namespace supplied
+    /// later would be a second statement of the same identity.
+    pub(crate) fn new(paths: ProtocolPaths) -> Self {
+        Self {
+            paths,
+            reached: Vec::new(),
+            old_checkpoints: Vec::new(),
+            data_files: Vec::new(),
+        }
+    }
+
+    /// The namespace this history was traversed in, checked against, and is collected from.
+    ///
+    /// Derived from the history rather than handed to the deletion beside it, exactly as
+    /// [`GenerationPublication::paths`] is derived from the publication. Until PR #160's
+    /// GC-namespace review finding, [`crate::gc::delete_classified_history`] took a
+    /// `ProtocolPaths` argument of its own, and every object it removed except the data files
+    /// — the checkpoint manifest, the committed marker, the epoch record, the checkpoint
+    /// directory — was addressed out of it. Nothing related that argument to the paths the
+    /// token had been checked against, so a valid history for one job aimed the deletes at
+    /// another job's objects at the same generation and epoch coordinates. One value, used by
+    /// the check and by the effect, is what closes that; a second argument reopens it.
+    pub(crate) fn paths(&self) -> &ProtocolPaths {
+        &self.paths
+    }
+
     /// Records one checkpoint the traversal read: the reference it came from, and what it says
     /// about itself.
     ///
@@ -315,7 +344,7 @@ impl CheckpointHistory {
 }
 
 impl WholeObject for CheckpointHistory {
-    type Context<'a> = CollectingJob<'a>;
+    type Context<'a> = CollectingJob;
     type Error = StoreError;
 
     /// Every checkpoint the traversal reached is the checkpoint its own reference names,
@@ -349,10 +378,10 @@ impl WholeObject for CheckpointHistory {
     /// What this does *not* re-derive is which files belong to which checkpoint — that is
     /// the traversal's own job, and re-checking it would mean buffering the file lists the
     /// traversal exists to stream past.
-    fn check_whole(&self, job: CollectingJob<'_>) -> Result<(), StoreError> {
+    fn check_whole(&self, job: CollectingJob) -> Result<(), StoreError> {
         for checkpoint in &self.reached {
             let identity = identify_checkpoint_manifest(
-                job.paths,
+                &self.paths,
                 &checkpoint.checkpoint_ref,
                 &checkpoint.selectors,
             )?;
@@ -414,7 +443,7 @@ fn selector_evidence(manifest: &CheckpointManifest) -> CheckpointManifest {
 /// job's selector. In every case nothing has been deleted.
 pub(crate) fn validate_history(
     history: CheckpointHistory,
-    job: CollectingJob<'_>,
+    job: CollectingJob,
 ) -> Result<Validated<CheckpointHistory>, StoreError> {
     Validated::validate(history, job)
 }

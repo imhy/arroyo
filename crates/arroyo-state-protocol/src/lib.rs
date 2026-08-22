@@ -1352,14 +1352,13 @@ mod tests {
         };
         let collecting = CollectingJob {
             state_backend: StateBackendSelector::Parquet,
-            paths: &paths,
         };
         // A classified history as the traversal records one: the links it read, newest
         // first — each with the reference it was read from, which is what binds what a
         // manifest says about itself to where it actually was — and the plan it derived
         // from them.
         let history = |reached: Vec<(u64, OperatorCheckpointMetadata)>, deleting: Vec<u64>| {
-            let mut history = CheckpointHistory::default();
+            let mut history = CheckpointHistory::new(paths.clone());
             for (epoch, operator) in reached {
                 let manifest = describing(
                     checkpoint_for_generation(Generation(1), epoch, None, false),
@@ -1420,7 +1419,7 @@ mod tests {
         // A link that is not the checkpoint the reference it was read from names: no token
         // either, because every object the deletion removes is built from the generation and
         // epoch those bytes claim (PR #160 review round 7, finding 1).
-        let mut misplaced = CheckpointHistory::default();
+        let mut misplaced = CheckpointHistory::new(paths.clone());
         misplaced.reached(
             paths.checkpoint_manifest(Generation(1), Epoch(2)),
             &describing(
@@ -1451,12 +1450,261 @@ mod tests {
             collecting,
         )
         .expect("a whole, agreeing history is exactly what a token is for");
-        delete_classified_history(&store, &paths, &validated)
-            .await
-            .unwrap();
+        delete_classified_history(&store, &validated).await.unwrap();
 
         assert!(!exists(&store, &old_file).await);
         assert!(exists(&store, &kept_file).await);
+    }
+
+    /// A checked history collects from the namespace it was checked against, and from no
+    /// other.
+    ///
+    /// The token says *which chain* was checked. Until PR #160's GC-namespace review finding
+    /// the deletion took a `ProtocolPaths` of its own that said *where to delete*, and nothing
+    /// related the two: four of the five object kinds it removes — the checkpoint manifest,
+    /// the committed marker, the epoch record and the checkpoint directory — were addressed
+    /// out of that argument rather than out of the manifests the token covers. Only the data
+    /// files came from the checked bytes.
+    ///
+    /// So the arrangement below is the one a misdirected deletion cannot tell from its own: a
+    /// second job under the same pipeline, holding those same four objects at the same
+    /// generation and epoch the collected job's chain names. They are written as opaque bytes
+    /// on purpose — nothing traverses them, and what is under test is which paths the delete
+    /// builds, not what they contain.
+    #[tokio::test]
+    async fn cleanup_deletes_only_within_the_namespace_the_history_was_checked_against() {
+        let store = MemoryProtocolStore::default();
+        let collected = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J"));
+        let bystander = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J2"));
+
+        let old_file = data_ref(&collected, 1);
+        let kept_file = data_ref(&collected, 2);
+        store.put_bytes(&old_file, b"1".to_vec()).await.unwrap();
+        store.put_bytes(&kept_file, b"2".to_vec()).await.unwrap();
+        write_gc_checkpoint(
+            &store,
+            &collected,
+            1,
+            None,
+            vec![global_operator(vec![old_file.clone()])],
+        )
+        .await;
+        write_gc_checkpoint(
+            &store,
+            &collected,
+            2,
+            Some(1),
+            vec![global_operator(vec![kept_file.clone()])],
+        )
+        .await;
+
+        let untouchable = vec![
+            bystander.checkpoint_manifest(Generation(1), Epoch(1)),
+            bystander.committed_marker(Generation(1), Epoch(1)),
+            bystander.epoch_record(Epoch(1)),
+            data_ref(&bystander, 1),
+        ];
+        for object in &untouchable {
+            store
+                .put_bytes(object, b"another job's".to_vec())
+                .await
+                .unwrap();
+        }
+
+        cleanup_leader_checkpoints(
+            &store,
+            &collected,
+            StateBackendSelector::Parquet,
+            collected.checkpoint_manifest(Generation(1), Epoch(2)),
+            Epoch(2),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !exists(
+                &store,
+                &collected.checkpoint_manifest(Generation(1), Epoch(1))
+            )
+            .await
+        );
+        assert!(!exists(&store, &collected.committed_marker(Generation(1), Epoch(1))).await);
+        assert!(!exists(&store, &collected.epoch_record(Epoch(1))).await);
+        assert!(!exists(&store, &old_file).await);
+        assert!(exists(&store, &kept_file).await);
+
+        for object in &untouchable {
+            assert!(
+                exists(&store, object).await,
+                "the deletion reached outside the namespace its token was checked in: {object}"
+            );
+        }
+    }
+
+    /// A reached manifest claiming a job other than the one the history was opened for is
+    /// refused, and the same chain under a history opened for *that* job is not.
+    ///
+    /// `gc_requires_validated_manifest_set` varies the epoch a manifest claims and the backend
+    /// that wrote it. This varies the third identity, and the one a misdirected delete would
+    /// have been built from: the job. Both directions are pinned, so the row cannot be
+    /// satisfied by a check that simply refuses `"J2"`.
+    ///
+    /// What this row does **not** prove is that the namespace came from the history rather
+    /// than from a separately supplied argument — nothing can, because after PR #160's
+    /// GC-namespace review finding there is no second namespace to supply. That property is
+    /// carried by the types, and `no_protocol_effect_takes_a_namespace_beside_its_token`
+    /// keeps it. Worth recording from the mutation that established this row: pointing
+    /// `identify_checkpoint_manifest` at each manifest's own pipeline and job ids does *not*
+    /// flip it, because the reference rebuild then refuses the same fixture. The two halves of
+    /// that function are redundant on this input and only the id comparison isolates it; a
+    /// weakening that drops the id comparison and keeps the rebuild is what fails this row.
+    #[test]
+    fn a_history_is_checked_against_the_namespace_it_was_opened_for() {
+        let collecting = CollectingJob {
+            state_backend: StateBackendSelector::Parquet,
+        };
+        let owner = CheckpointOwner {
+            generation: Generation(1),
+            epoch: Epoch(1),
+        };
+        let claiming = |job: &str| {
+            describing(
+                CheckpointManifest {
+                    job_id: job.to_string(),
+                    ..checkpoint_for_generation(Generation(1), 1, None, false)
+                },
+                vec![global_operator(vec![])],
+            )
+        };
+        let history = |paths: &ProtocolPaths, job: &str| {
+            let mut history = CheckpointHistory::new(paths.clone());
+            history.reached(
+                paths.checkpoint_manifest(Generation(1), Epoch(1)),
+                &claiming(job),
+            );
+            history.classified(vec![owner], vec![]);
+            history
+        };
+
+        let collected = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J"));
+        let other = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J2"));
+
+        let err = Validated::validate(history(&collected, "J2"), collecting).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::Protocol(ProtocolError::CheckpointManifestMisplaced { .. })
+            ),
+            "{err:?}"
+        );
+
+        Validated::validate(history(&other, "J2"), collecting)
+            .expect("the same chain, under the history opened for the job that wrote it");
+    }
+
+    /// No effect in the protocol that acts on a validation token also receives a namespace or
+    /// an object reference beside it.
+    ///
+    /// This is the test that would have found the finding first. The rows above prove that
+    /// *these* effects address the objects their tokens name; this one asserts the shape, and
+    /// the shape is what recurred — review round 8 took the path builder off the two
+    /// generation-publishing writes and off the epoch claim, and leader GC, written earlier in
+    /// another module, kept its own. Reading either module tells you nothing about the other.
+    ///
+    /// It is a *signature-level* pin, and the gap is stated rather than discovered later: an
+    /// effect handed a namespace inside a request struct, or reaching for one out of ambient
+    /// state, would pass it. `workflow/recovery.rs` is not read here because it performs no
+    /// writes at all, which `the_recovery_resolution_module_reaches_no_persistent_write`
+    /// pins separately. The matched set is compared for equality rather than containment, so
+    /// an effect that is added or renamed fails this row instead of quietly leaving its scope.
+    #[test]
+    fn no_protocol_effect_takes_a_namespace_beside_its_token() {
+        /// Every `fn` in `source`, as `(name, parameter list)`, with line comments stripped.
+        ///
+        /// The parameter list alone: a function that *returns* a token — `validate_publication`
+        /// is the one — is a check rather than an effect, and is not what this row is about.
+        fn parameter_lists(source: &str) -> Vec<(String, String)> {
+            let code = source
+                .lines()
+                .map(|line| line.split("//").next().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            let mut lists = vec![];
+            let mut rest = code.as_str();
+            while let Some(at) = rest.find("fn ") {
+                let after = &rest[at + 3..];
+                let name: String = after
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                let Some(open) = after.find('(') else { break };
+                let mut depth = 0usize;
+                let mut end = None;
+                for (offset, character) in after[open..].char_indices() {
+                    match character {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = Some(open + offset);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let Some(end) = end else { break };
+                if !name.is_empty() {
+                    lists.push((name, after[open + 1..end].to_string()));
+                }
+                rest = &after[end..];
+            }
+            lists
+        }
+
+        let modules = [
+            ("gc.rs", include_str!("gc.rs")),
+            ("workflow.rs", include_str!("workflow.rs")),
+        ];
+
+        let mut acting_on_a_token = vec![];
+        for (module, source) in modules {
+            for (name, parameters) in parameter_lists(source) {
+                if !["Validated<", "CommitPermit"]
+                    .iter()
+                    .any(|token| parameters.contains(token))
+                {
+                    continue;
+                }
+
+                for namespace in ["ProtocolPaths", "CheckpointRef"] {
+                    assert!(
+                        !parameters.contains(namespace),
+                        "{module}: {name} takes a {namespace} beside its token; \
+                         derive it from the token instead ({parameters})"
+                    );
+                }
+
+                acting_on_a_token.push(format!("{module}:{name}"));
+            }
+        }
+
+        acting_on_a_token.sort();
+        assert_eq!(
+            acting_on_a_token,
+            [
+                "gc.rs:delete_classified_history",
+                "workflow.rs:claim_recovery_epoch",
+                "workflow.rs:complete_commit",
+                "workflow.rs:mark_committed",
+                "workflow.rs:publish_current_generation",
+                "workflow.rs:publish_generation_manifest",
+                "workflow.rs:validate_marker",
+            ],
+            "the token-taking surface changed; add the new function here after checking it \
+             derives its paths from its token"
+        );
     }
 
     #[tokio::test]
@@ -3277,6 +3525,31 @@ mod tests {
         );
     }
 
+    /// The commit marker is created where the permit's own epoch record says, and the
+    /// same-shaped path under another job is left alone.
+    ///
+    /// `validate_marker` has always required the marker's *contents* to be the permit's
+    /// checkpoint; its *location* was a free argument until PR #160's GC-namespace review
+    /// finding was swept across the class. A permit for one job could therefore create a
+    /// commit marker in another job's namespace, where the next `prepare_commit` there reads
+    /// it as that checkpoint's commit and skips a commit that never happened.
+    #[tokio::test]
+    async fn the_commit_marker_is_written_only_where_the_permit_names() {
+        let store = MemoryProtocolStore::default();
+        let paths = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J"));
+        let bystander = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J2"));
+        let checkpoint_ref = paths.checkpoint_manifest(Generation(1), Epoch(1));
+        let checkpoint = checkpoint(1, None, true);
+        let permit = commit_permit(checkpoint_ref.clone(), &checkpoint);
+        let marker = committed_marker(checkpoint_ref, 1);
+
+        let outcome = mark_committed(&store, &marker, &permit).await.unwrap();
+
+        assert_eq!(outcome, CommittedMarkerOutcome::Created);
+        assert!(exists(&store, &paths.committed_marker(Generation(1), Epoch(1))).await);
+        assert!(!exists(&store, &bystander.committed_marker(Generation(1), Epoch(1))).await);
+    }
+
     #[tokio::test]
     async fn mark_committed_is_idempotent_for_same_checkpoint() {
         let store = MemoryProtocolStore::default();
@@ -3287,14 +3560,11 @@ mod tests {
         let permit = commit_permit(checkpoint_ref.clone(), &checkpoint);
         let marker = committed_marker(checkpoint_ref, 1);
 
-        let outcome = mark_committed(&store, &committed_marker_path, &marker, &permit)
-            .await
-            .unwrap();
+        let outcome = mark_committed(&store, &marker, &permit).await.unwrap();
         assert_eq!(outcome, CommittedMarkerOutcome::Created);
+        assert!(exists(&store, &committed_marker_path).await);
 
-        let outcome = mark_committed(&store, &committed_marker_path, &marker, &permit)
-            .await
-            .unwrap();
+        let outcome = mark_committed(&store, &marker, &permit).await.unwrap();
         assert_eq!(outcome, CommittedMarkerOutcome::AlreadyCommitted);
     }
 
@@ -3310,11 +3580,12 @@ mod tests {
         let winner_marker = committed_marker(winner_ref, 1);
         let loser_marker = committed_marker(loser_ref, 1);
 
-        mark_committed(&store, &committed_marker_path, &winner_marker, &permit)
+        mark_committed(&store, &winner_marker, &permit)
             .await
             .unwrap();
+        assert!(exists(&store, &committed_marker_path).await);
 
-        let err = mark_committed(&store, &committed_marker_path, &loser_marker, &permit)
+        let err = mark_committed(&store, &loser_marker, &permit)
             .await
             .unwrap_err();
 

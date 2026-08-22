@@ -628,7 +628,6 @@ where
     S: ProtocolStore + ?Sized,
 {
     let epoch_record = commit_permit.epoch_record();
-    let committed_marker_path = commit_permit.committed_marker_path();
 
     let marker = CommittedMarker::new(
         epoch_record.pipeline_id.clone(),
@@ -639,7 +638,7 @@ where
         commit_permit.checkpoint_ref().clone(),
     );
 
-    mark_committed(store, &committed_marker_path, &marker, commit_permit).await
+    mark_committed(store, &marker, commit_permit).await
 }
 
 /// Publishes a completed checkpoint and claims its epoch record.
@@ -804,9 +803,16 @@ where
 /// Most callers should use [`complete_commit`] so canonical ownership is checked
 /// before the marker is written. Use this directly only when that check has
 /// already been performed.
+///
+/// The path is derived from `commit_permit`, not supplied beside it. [`validate_marker`]
+/// already requires the marker's contents to be the permit's checkpoint, but until PR #160's
+/// GC-namespace review finding swept this class the *location* was a free argument: a permit
+/// for one job could write a commit marker into another job's namespace, where the next
+/// [`prepare_commit`] there reads it as that checkpoint's commit. It is the same defect the
+/// finding named in leader GC — an effect addressed out of an identity nothing checked —
+/// under a creating write rather than a destructive one.
 pub async fn mark_committed<S>(
     store: &S,
-    committed_marker_path: &CheckpointRef,
     marker: &CommittedMarker,
     commit_permit: &CommitPermit,
 ) -> Result<CommittedMarkerOutcome, StoreError>
@@ -814,6 +820,8 @@ where
     S: ProtocolStore + ?Sized,
 {
     validate_marker(marker, commit_permit)?;
+
+    let committed_marker_path = &commit_permit.committed_marker_path();
 
     match create_json_if_not_exist(store, committed_marker_path, marker).await? {
         CreateResult::Created => Ok(CommittedMarkerOutcome::Created),

@@ -38,11 +38,13 @@ pub(crate) struct CheckpointOwner {
 /// arrive at the deletion with a chain that was only partly classified.
 ///
 /// Since review round 7 of PR #160 the token's check also binds each reached manifest to the
-/// reference it was read from. `paths` is what makes that possible and is why it is handed to
-/// [`validate_history`] rather than only to [`delete_classified_history`]: every object this
-/// function removes is built from a generation and an epoch that came out of the manifest's own
-/// bytes, so a misplaced or corrupt object would otherwise aim the deletes at a checkpoint
-/// nobody asked about.
+/// reference it was read from: every object this function removes is built from a generation
+/// and an epoch that came out of the manifest's own bytes, so a misplaced or corrupt object
+/// would otherwise aim the deletes at a checkpoint nobody asked about.
+///
+/// `paths` enters here and nowhere else. The traversal records it on the history, the check
+/// asks its questions against it, and the deletion builds every object it removes from it —
+/// one value, stated once by the caller who is asking for this job to be collected.
 ///
 /// # Errors
 ///
@@ -62,20 +64,23 @@ where
     S: ProtocolStore + ?Sized,
 {
     let cleanup = validate_history(
-        classify_checkpoint_history(store, job, head, new_min_epoch).await?,
-        CollectingJob {
-            state_backend: job,
-            paths,
-        },
+        classify_checkpoint_history(store, paths, job, head, new_min_epoch).await?,
+        CollectingJob { state_backend: job },
     )?;
 
-    delete_classified_history(store, paths, &cleanup).await
+    delete_classified_history(store, &cleanup).await
 }
 
 /// Deletes everything a checked history classified as collectable.
 ///
-/// Takes only the token: this is the irreversible half, and there is no spelling of it that
-/// names a checkpoint chain nothing validated.
+/// Takes only the token, and that is now literally true of the namespace as well: this is the
+/// irreversible half, so there is no spelling of it that names a checkpoint chain nothing
+/// validated, and none that names a *place* nothing validated either. The data files come out
+/// of the checked manifests; the manifests, committed markers, epoch records and checkpoint
+/// directories come out of [`CheckpointHistory::paths`], which is the same path builder the
+/// check used. A `ProtocolPaths` argument here would be an unchecked second identity aiming
+/// an irreversible effect — see [`CheckpointHistory::paths`] for the review finding that
+/// closed it.
 ///
 /// # Errors
 ///
@@ -83,13 +88,13 @@ where
 /// strand a still-reachable checkpoint if one of them fails part way.
 pub async fn delete_classified_history<S>(
     store: &S,
-    paths: &ProtocolPaths,
     cleanup: &Validated<CheckpointHistory>,
 ) -> Result<(), StoreError>
 where
     S: ProtocolStore + ?Sized,
 {
     let cleanup = cleanup.get();
+    let paths = cleanup.paths();
 
     let data_directories: HashSet<_> = cleanup
         .data_files()
@@ -167,8 +172,14 @@ where
 /// known before any of that is interpreted. The claim about the *chain* is separate, and is what
 /// [`CheckpointHistory`]'s own check makes; the reduced evidence collected here is what lets it
 /// be made without buffering the file lists a second time.
+///
+/// `paths` is recorded on the history as it opens rather than used to read: the traversal
+/// starts at `current` and then follows the parent links it finds. Recording it here is what
+/// makes the namespace the caller asked to collect the same namespace the check asks its
+/// questions against and the deletion removes objects from.
 async fn classify_checkpoint_history<S>(
     store: &S,
+    paths: &ProtocolPaths,
     job: StateBackendSelector,
     current: CheckpointRef,
     new_min_epoch: Epoch,
@@ -177,7 +188,7 @@ where
     S: ProtocolStore + ?Sized,
 {
     let mut head = true;
-    let mut history = CheckpointHistory::default();
+    let mut history = CheckpointHistory::new(paths.clone());
     let mut old_checkpoints = vec![];
     let mut candidate_files = HashSet::new();
     let mut protected_files = HashSet::new();
