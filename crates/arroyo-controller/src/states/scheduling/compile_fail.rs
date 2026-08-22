@@ -1,15 +1,17 @@
-//! The two M11.D39b compile-time restrictions, as tests that actually run (D96 rows 12 and
-//! 13).
+//! The M11.D39b compile-time restrictions, as tests that actually run (D96 rows 12 and 13),
+//! and the indivisible-obligation restriction beside them (review comment `5369004357`).
 //!
 //! # What is compiled, and why it is the real thing
 //!
-//! Each fixture is a tiny crate compiled by a plain `rustc`, and the phase graph it is
-//! compiled against is **`states/scheduling/phases.rs` itself**, included verbatim. That is
-//! what [`phases`](super::phases) has no crate dependencies for: everything it needs from the
-//! controller is an opaque type, so a stub environment ([`compile_fail/stub.rs`]) can supply
-//! those and the file compiles standalone. The restrictions being tested — which methods exist
-//! on which phase type, and whether an effect takes its receiver by value — are properties of
-//! that file and of nothing else, so a stub cannot make one hold or fail.
+//! Each fixture is a tiny crate compiled by a plain `rustc`, and what it is compiled against
+//! is **the real source file**, included verbatim: `states/scheduling/phases.rs` for the two
+//! phase rows, and `states/scheduling/fanout/settlement.rs` for the third. That is what those
+//! files have so few crate dependencies for: what they need from the controller is opaque, so
+//! a stub environment ([`compile_fail/stub.rs`] and [`compile_fail/settlement_stub.rs`]) can
+//! supply it and the file compiles standalone. The restrictions being tested — which methods
+//! exist on which type, whether an effect takes its receiver by value, and which operations
+//! are reachable from outside a module — are properties of those files and of nothing else, so
+//! a stub cannot make one hold or fail.
 //!
 //! No dependency is added for this. `trybuild` is not in this workspace, and could not be used
 //! here in any case: `states` is a private module, so an external fixture crate could not name
@@ -19,8 +21,9 @@
 //!
 //! 1. a **positive** fixture that compiles, using the permitted API;
 //! 2. a **negative** fixture that fails, and fails for the intended reason — matched on the
-//!    diagnostic *category* (`error[E0382]`, `error[E0599]`) rather than on message text; and
-//! 3. a **weakened-API mutation**, applied to a copy of `phases.rs` by exact textual
+//!    diagnostic *category* (`error[E0382]`, `error[E0599]`, `error[E0624]`) rather than on
+//!    message text; and
+//! 3. a **weakened-API mutation**, applied to a copy of the file under test by exact textual
 //!    replacement, under which the negative fixture *compiles* — which is what makes the
 //!    restriction load-bearing rather than incidental. Every replacement asserts that its
 //!    needle occurred exactly once, so a mutation cannot silently fail to apply and leave a
@@ -44,7 +47,17 @@ const PHASES: &str = include_str!("phases.rs");
 /// The stub environment it is compiled against.
 const STUB: &str = include_str!("compile_fail/stub.rs");
 
-/// One exact textual weakening of the phase graph.
+/// The transfer seam under test: the real source, verbatim.
+const SETTLEMENT: &str = include_str!("fanout/settlement.rs");
+
+/// The stub environment *it* is compiled against.
+///
+/// A second stub rather than a second use of the first: `stub.rs` supplies an opaque
+/// `SettlementBundle` so that `phases.rs` can be compiled without the seam, and the row below
+/// needs the opposite — the seam's real source, and stubs for what it stands on.
+const SETTLEMENT_STUB: &str = include_str!("compile_fail/settlement_stub.rs");
+
+/// One exact textual weakening of a file under test.
 ///
 /// Each edit must match exactly once. Applying a mutation that matched nothing — because the
 /// code it names has since been rewritten — would leave the negative fixture failing for the
@@ -63,8 +76,8 @@ impl Weakening {
                 out.matches(needle).count(),
                 1,
                 "the weakening `{}` expects to find exactly one occurrence of:\n{needle}\n\
-                 It found a different number, so `phases.rs` has been rewritten and this \
-                 mutation no longer says what it claims to. Re-derive it from the current \
+                 It found a different number, so the file under test has been rewritten and \
+                 this mutation no longer says what it claims to. Re-derive it from the current \
                  source rather than deleting it.",
                 self.what
             );
@@ -84,9 +97,9 @@ impl Compilation {
     fn assert_compiles(&self, what: &str) {
         assert!(
             self.succeeded,
-            "{what} was expected to compile, and did not. Either the permitted phase API has \
-             changed or the stub environment no longer matches it — both are real failures, \
-             because a stub that has drifted stops the negative fixtures covering anything.\n\
+            "{what} was expected to compile, and did not. Either the permitted API has changed \
+             or the stub environment no longer matches it — both are real failures, because a \
+             stub that has drifted stops the negative fixtures covering anything.\n\
              {}",
             self.stderr
         );
@@ -159,23 +172,39 @@ fn assert_pinned_toolchain() {
 }
 
 /// Compiles one fixture against `phases`, and reports what `rustc` said.
+fn compile(name: &str, phases: &str, fixture: &str) -> Compilation {
+    compile_against(name, STUB, "@PHASES@", phases, fixture)
+}
+
+/// Compiles one fixture against the transfer seam, and reports what `rustc` said.
+fn compile_settlement(name: &str, settlement: &str, fixture: &str) -> Compilation {
+    compile_against(name, SETTLEMENT_STUB, "@SETTLEMENT@", settlement, fixture)
+}
+
+/// Compiles `fixture` against `under_test` placed into `stub` at `placeholder`.
 ///
-/// `phases` is written to a file of its own and `include!`d, which is also why its leading
+/// `under_test` is written to a file of its own and `include!`d, which is also why its leading
 /// `//!` module documentation is stripped: an inner attribute is not permitted where an
 /// `include!` expands. Nothing else about the source is touched.
-fn compile(name: &str, phases: &str, fixture: &str) -> Compilation {
+fn compile_against(
+    name: &str,
+    stub: &str,
+    placeholder: &str,
+    under_test: &str,
+    fixture: &str,
+) -> Compilation {
     let dir = FixtureDir::new(name);
-    let phases_path = dir.path().join("phases_under_test.rs");
-    let body: String = phases
+    let under_test_path = dir.path().join("source_under_test.rs");
+    let body: String = under_test
         .lines()
         .filter(|line| !line.trim_start().starts_with("//!"))
         .collect::<Vec<_>>()
         .join("\n");
-    std::fs::write(&phases_path, body).unwrap();
+    std::fs::write(&under_test_path, body).unwrap();
 
     let source = format!(
         "{}\n{fixture}\n",
-        STUB.replace("@PHASES@", &phases_path.to_string_lossy())
+        stub.replace(placeholder, &under_test_path.to_string_lossy())
     );
     let fixture_path = dir.path().join("fixture.rs");
     std::fs::write(&fixture_path, source).unwrap();
@@ -357,5 +386,109 @@ fn token_owning_phase_cannot_recv() {
     .assert_compiles(
         "the waiting-preamble fixture, once the preamble is given a wait — which is what shows \
          the absence of one on a token-owning type is what rejects it",
+    );
+}
+
+/// The weakening that publishes the operation separating a bundle's two halves.
+const INTO_PARTS_IS_REACHABLE: Weakening = Weakening {
+    what: "an owner can take the obligation apart",
+    edits: &[(
+        "    fn into_parts(mut self) -> (Admission, IssuedAttempts) {",
+        "    pub fn into_parts(mut self) -> (Admission, IssuedAttempts) {",
+    )],
+};
+
+/// The same weakening under the sibling name, because closing one door and leaving the other
+/// open would have closed nothing.
+const KEEP_IS_REACHABLE: Weakening = Weakening {
+    what: "an owner can take the obligation apart under its second name",
+    edits: &[(
+        "    fn keep(self) -> (Admission, IssuedAttempts) {",
+        "    pub fn keep(self) -> (Admission, IssuedAttempts) {",
+    )],
+};
+
+/// An owner cannot keep one half of an obligation and be issued a receipt for it
+/// (review comment `5369004357`).
+///
+/// The finding: acceptance is observed through the bundle's `Drop`, and `into_parts` clears
+/// the field that `Drop` reads. So an owner could take the obligation apart, drop the
+/// `Admission` — opening the job's publication lock — or drop the `IssuedAttempts` — leaving
+/// nobody with a record of what was owed — return `Ok(())`, and be issued a
+/// `SettlementReceipt`. Fencing then counted those attempts as somebody's when they were
+/// nobody's.
+///
+/// The answer is that the halves are no longer separable outside the module that observes the
+/// separation, so this is a compile-time row rather than a behavioural one: the state the
+/// finding describes is not reachable at runtime for a test to assert about. The behavioural
+/// half is `phase_tests::a_receipt_is_issued_only_where_the_publication_lock_did_not_come_back`,
+/// which asserts the agreement across every way of parting with an obligation that is left.
+#[test]
+fn an_owner_cannot_keep_half_an_obligation() {
+    assert_pinned_toolchain();
+
+    compile_settlement(
+        "positive-settlement",
+        SETTLEMENT,
+        include_str!("compile_fail/positive_settlement.rs"),
+    )
+    .assert_compiles("an owner that keeps the whole obligation and reads what it lists");
+
+    compile_settlement(
+        "negative-settlement-into-parts",
+        SETTLEMENT,
+        include_str!("compile_fail/negative_settlement_into_parts.rs"),
+    )
+    .assert_fails_with(
+        "an owner that keeps the authority and drops the inventory",
+        "error[E0624]",
+        "into_parts",
+    );
+
+    compile_settlement(
+        "negative-settlement-keep",
+        SETTLEMENT,
+        include_str!("compile_fail/negative_settlement_keep.rs"),
+    )
+    .assert_fails_with(
+        "an owner that keeps the inventory and drops the authority",
+        "error[E0624]",
+        "keep",
+    );
+
+    // And each restriction is load-bearing on its own name: publish one separator and the
+    // fixture that used it stops proving anything, while the fixture that used the other still
+    // does. That is what makes this two closed doors rather than one.
+    compile_settlement(
+        "weakened-settlement-into-parts",
+        &INTO_PARTS_IS_REACHABLE.apply(SETTLEMENT),
+        include_str!("compile_fail/negative_settlement_into_parts.rs"),
+    )
+    .assert_compiles(
+        "the authority-only fixture, once `into_parts` is reachable from an owner — which is \
+         what shows its privacy is what rejects it",
+    );
+
+    compile_settlement(
+        "weakened-settlement-keep",
+        &KEEP_IS_REACHABLE.apply(SETTLEMENT),
+        include_str!("compile_fail/negative_settlement_keep.rs"),
+    )
+    .assert_compiles(
+        "the inventory-only fixture, once `keep` is reachable from an owner — which is what \
+         shows that closing `into_parts` alone would have left the same release available \
+         under another name",
+    );
+
+    compile_settlement(
+        "weakened-settlement-crossed",
+        &KEEP_IS_REACHABLE.apply(SETTLEMENT),
+        include_str!("compile_fail/negative_settlement_into_parts.rs"),
+    )
+    .assert_fails_with(
+        "the authority-only fixture under the *other* name's weakening, which must still be \
+         rejected — a weakening that made both fixtures compile would prove neither door",
+        "error[E0624]",
+        "into_parts",
     );
 }

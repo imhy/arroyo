@@ -94,23 +94,40 @@ fn fence_targets_reconcile_idempotently() {
 }
 
 /// An owner that keeps whatever it is handed, so a test can ask what moved.
+///
+/// It holds the *bundle*, which since review comment `5369004357` is the only thing it can
+/// hold: the obligation's halves are separable only inside `settlement.rs`, so an owner cannot
+/// keep the authority and release the inventory, or the reverse, and then report a transfer.
 #[derive(Default)]
 struct RecordingOwner {
-    /// The authority, held exactly as a real settlement owner would hold it.
-    held: Mutex<Option<Admission>>,
+    /// The obligation, whole, held exactly as a real settlement owner would hold it.
+    held: Mutex<Option<SettlementBundle>>,
     /// What the inventory said when it arrived.
     outstanding: Mutex<Option<usize>>,
 }
 
 impl SettlementOwner for RecordingOwner {
     fn take_over(&self, bundle: SettlementBundle) -> Result<(), SettlementBundle> {
-        // Taken apart rather than dropped: an owner that merely dropped what it was handed
-        // would release the job's publication lock without settling anything, which is what
+        // Read, not taken out: `issued()` borrows. Dropping what it was handed would release
+        // the job's publication lock without settling anything, which is what
         // `SettlementBundle`'s own `Drop` exists to report.
-        let (admission, issued) = bundle.into_parts();
-        *self.outstanding.lock().unwrap() = Some(issued.outstanding_count());
-        *self.held.lock().unwrap() = Some(admission);
+        *self.outstanding.lock().unwrap() = Some(bundle.issued().outstanding_count());
+        *self.held.lock().unwrap() = Some(bundle);
         Ok(())
+    }
+}
+
+impl RecordingOwner {
+    /// What the obligation this owner is holding still says it owes.
+    ///
+    /// Read back from the bundle itself rather than from the copy taken on arrival, so a row
+    /// can compare the receipt's count with what the owner actually retained.
+    fn retained_outstanding(&self) -> Option<usize> {
+        self.held
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|bundle| bundle.issued().outstanding_count())
     }
 }
 
@@ -141,12 +158,20 @@ async fn an_interrupted_fan_out_hands_over_inventory_and_authority_together() {
         "the receipt says how much of the obligation the new owner became responsible for"
     );
     assert_eq!(*owner.outstanding.lock().unwrap(), Some(1));
+    assert_eq!(
+        owner.retained_outstanding(),
+        Some(receipt.outstanding()),
+        "and the receipt agrees with what the owner is actually holding, read back out of the \
+         obligation itself rather than from the copy it took on arrival"
+    );
     assert!(
         gate.admit_publication().is_none(),
         "and the authority went with it: nothing can be published while the owner holds the \
          admission it was handed"
     );
 
+    // Dropping it now is the owner losing something it had accepted — its own failure, after
+    // the transfer point — and it is the only way to get the authority back out.
     drop(owner.held.lock().unwrap().take());
     assert!(
         gate.admit_publication().is_some(),
@@ -315,6 +340,224 @@ async fn a_fencing_record_distinguishes_a_transfer_from_a_loss() {
         SettlementOutcome::Abandoned { outstanding: 1 }.into_fencing_record();
     assert_eq!(nothing.outstanding_count(), 0);
     assert_eq!((abandoned.transferred(), abandoned.abandoned()), (0, 1));
+}
+
+/// What an owner does with the obligation it was offered.
+///
+/// The four are every way a `take_over` can end that is not a panic, and they are varied
+/// independently of what the owner *answers*, because the two are not the same thing — which
+/// is the whole of review comment `5369004357`.
+#[derive(Clone, Copy, Debug)]
+enum Parting {
+    /// Keeps the whole obligation, which is the only kind of keeping there is.
+    Holds,
+    /// Gives it back, whole and unreleased. The one correct way to say no.
+    GivesBack,
+    /// Drops it, releasing the job's publication lock inside the call.
+    Drops,
+    /// Puts it beyond `Drop`'s reach. Nobody holds it and nobody released it.
+    Forgets,
+}
+
+/// An owner parameterised by [`Parting`], so one row can vary that dimension alone.
+struct PartingOwner {
+    parting: Parting,
+    /// The obligation, when this owner is one that keeps it.
+    held: Mutex<Option<SettlementBundle>>,
+}
+
+impl PartingOwner {
+    fn new(parting: Parting) -> Self {
+        Self {
+            parting,
+            held: Mutex::new(None),
+        }
+    }
+
+    /// What the obligation this owner is holding still says it owes, if it is holding one.
+    fn retained_outstanding(&self) -> Option<usize> {
+        self.held
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|bundle| bundle.issued().outstanding_count())
+    }
+}
+
+impl SettlementOwner for PartingOwner {
+    fn take_over(&self, bundle: SettlementBundle) -> Result<(), SettlementBundle> {
+        match self.parting {
+            Parting::Holds => {
+                *self.held.lock().unwrap() = Some(bundle);
+                Ok(())
+            }
+            Parting::GivesBack => Err(bundle),
+            Parting::Drops => {
+                drop(bundle);
+                Ok(())
+            }
+            // The one escape from `Drop` that an owner can still write. It is deliberately in
+            // the row rather than out of it: the answer must be that the authority is
+            // *retained*, which is the conservative direction, and never that it is released
+            // under a receipt.
+            Parting::Forgets => {
+                std::mem::forget(bundle);
+                Ok(())
+            }
+        }
+    }
+}
+
+/// What one cell of the row expects, so the four are stated in one place.
+struct Expected {
+    /// The arm `hand_over` answers with, as a word.
+    outcome: &'static str,
+    /// The count that arm carries, where it carries one. `SettledInPlace` carries the
+    /// inventory itself rather than a number, so it carries none.
+    count: Option<usize>,
+    /// What the inventory that reaches fencing still says is outstanding.
+    carried: usize,
+    /// `(transferred, abandoned)` in the record the interrupted phase carries into fencing.
+    record: (usize, usize),
+    /// What the owner can still read out of the obligation, if it is holding one.
+    retained: Option<usize>,
+}
+
+/// A receipt is issued exactly when the job's publication lock did not come back
+/// (review comment `5369004357`).
+///
+/// **The row that could have found the finding**, rather than the one derived from it: the
+/// regression evidence is the compile-fail pair, because an owner that takes the obligation
+/// apart no longer compiles and "released one half and returned `Ok(())`" is not a runtime
+/// state anything can reach. What is varied here is what a runtime row *can* vary — what the
+/// owner does with the obligation, independently of what it answers — and what is asserted is
+/// the agreement between the seam's report and the world, not the mechanism that produces it.
+///
+/// The agreement is exact and holds in all four cells: **`Transferred` iff the job's
+/// publication lock is still closed after the outcome has been resolved into a fencing
+/// record.** That is the property the finding broke — `into_parts` plus a dropped `Admission`
+/// produced a receipt with the lock wide open — and it is the property no per-cell assertion
+/// about "a receipt was issued" would have caught, because the receipt was issued.
+///
+/// The `Forgets` cell is the residual, asserted rather than described: an owner can still put
+/// the obligation beyond `Drop`, and the seam issues a receipt for it. It is admissible only
+/// because the authority is then *retained* — the lock stays closed, exactly as
+/// `retain_without_a_phase` retains it — so the agreement above still holds and no refusal can
+/// be published behind the attempts. Nobody is speaking for them, which is the cost, and it is
+/// bounded by the same durable fence M11.T26 owes every other unaccounted attempt.
+#[tokio::test]
+async fn a_receipt_is_issued_only_where_the_publication_lock_did_not_come_back() {
+    // Two of three attempts outstanding, so no count in the row can be right by accident.
+    let mut issued = IssuedAttempts::default();
+    issued.issued(WorkerId(21), "j1".to_string());
+    issued.issued(WorkerId(22), "j2".to_string());
+    issued.issued(WorkerId(23), "j3".to_string());
+    issued.settled(WorkerId(21));
+
+    let cells = [
+        (
+            Parting::Holds,
+            Expected {
+                outcome: "transferred",
+                count: Some(2),
+                carried: 0,
+                record: (2, 0),
+                retained: Some(2),
+            },
+        ),
+        (
+            Parting::GivesBack,
+            Expected {
+                outcome: "settled in place",
+                count: None,
+                carried: 2,
+                record: (0, 0),
+                retained: None,
+            },
+        ),
+        (
+            Parting::Drops,
+            Expected {
+                outcome: "abandoned",
+                count: Some(2),
+                carried: 0,
+                record: (0, 2),
+                retained: None,
+            },
+        ),
+        (
+            Parting::Forgets,
+            Expected {
+                outcome: "transferred",
+                count: Some(2),
+                carried: 0,
+                record: (2, 0),
+                retained: None,
+            },
+        ),
+    ];
+
+    for (parting, expected) in cells {
+        let (gate, admission) = admitted().await;
+        let owner = PartingOwner::new(parting);
+        let outcome = hand_over(
+            SettlementBundle::new(admission, issued.clone()),
+            Some(&owner),
+        );
+
+        let (word, receipt) = match &outcome {
+            SettlementOutcome::Transferred(receipt) => ("transferred", Some(receipt.outstanding())),
+            SettlementOutcome::SettledInPlace(..) => ("settled in place", None),
+            SettlementOutcome::Abandoned { outstanding } => ("abandoned", Some(*outstanding)),
+        };
+        assert_eq!(
+            word, expected.outcome,
+            "{parting:?}: the seam names what the owner did, not what it said"
+        );
+        assert_eq!(
+            receipt, expected.count,
+            "{parting:?}: every arm that carries a count carries the same one — what the \
+             inventory said when the obligation was offered"
+        );
+        assert_eq!(
+            owner.retained_outstanding(),
+            expected.retained,
+            "{parting:?}: and what the owner is holding is either the whole obligation or none \
+             of it"
+        );
+
+        let (carried, record) = outcome.into_fencing_record();
+        assert_eq!(
+            carried.outstanding_count(),
+            expected.carried,
+            "{parting:?}: the phase carries the inventory into fencing only when it kept it"
+        );
+        assert_eq!(
+            (record.transferred(), record.abandoned()),
+            expected.record,
+            "{parting:?}: an attempt somebody is waiting for and an attempt nobody is waiting \
+             for are counted apart"
+        );
+
+        let publishable = gate.admit_publication().is_some();
+        assert_eq!(
+            word == "transferred",
+            !publishable,
+            "{parting:?}: THE agreement. A receipt says the job's lifecycle authority is \
+             somewhere other than here; the gate says whether it came back. The two disagreed \
+             exactly once — an owner that took the obligation apart, dropped the admission and \
+             returned `Ok(())` — and that is the state this row exists to make unreachable"
+        );
+        if let Some(retained) = owner.retained_outstanding() {
+            assert_eq!(
+                Some(retained),
+                receipt,
+                "{parting:?}: and where there is a holder, the receipt's count is what the \
+                 holder can still read out of the obligation, rather than a number the seam \
+                 remembered"
+            );
+        }
+    }
 }
 
 /// Everything in a source file before its first `#[cfg(test)]`.
@@ -525,4 +768,63 @@ fn the_source_of_fencing_exposes_no_admission_and_no_irreversible_effect() {
         "and no method of it takes one either, so a caller cannot lend it the authority it does \
          not hold"
     );
+}
+
+/// An obligation has no publicly separable halves (review comment `5369004357`).
+///
+/// **A structural source pin, and the name says so.** The compile-fail fixtures next door
+/// prove that the two operations which separate a bundle today are unreachable from an owner.
+/// What no fixture can notice is a *third* one added later — and `settlement.rs` is exactly
+/// where "the owner needs to get at the admission, so let us hand it back" is a tempting thing
+/// to write, because that is what M11.T26 will want and there is nowhere else to put it.
+///
+/// So the inventory of what a bundle exposes is pinned. Everything the crate outside this
+/// module may do with an obligation is on this list, and each entry hands over all of it or
+/// none of it: build one, read what it lists, or offer the whole of it to an owner. Anything
+/// added here has to answer the question the finding asked — what does the seam observe if the
+/// caller keeps only half of what this returns?
+#[test]
+fn the_source_of_a_settlement_bundle_exposes_no_way_to_part_with_half_of_it() {
+    let source = production_half(include_str!("fanout/settlement.rs"));
+    let impl_at = source
+        .find("impl SettlementBundle {")
+        .expect("the settlement bundle's impl has been renamed");
+    let body = &source[impl_at
+        ..source[impl_at..]
+            .find("\n}\n")
+            .map(|at| impl_at + at)
+            .expect("unterminated impl")];
+    let mut exposed: Vec<&str> = body
+        .match_indices("pub(crate) fn ")
+        .chain(body.match_indices("pub(crate) async fn "))
+        .map(|(i, m)| {
+            let rest = &body[i + m.len()..];
+            &rest[..rest.find(['(', '<']).expect("a method has arguments")]
+        })
+        .collect();
+    exposed.sort_unstable();
+    assert_eq!(
+        exposed,
+        ["issued", "new", "transfer_to"],
+        "a `SettlementBundle` may be built, read, and offered to an owner whole. It may not be \
+         taken apart by anything that could then be issued a receipt for half of it: \
+         `into_parts` and `keep` are private, which is what makes the coupling the type's \
+         rather than the caller's"
+    );
+    for separator in ["fn into_parts", "fn keep"] {
+        assert_eq!(
+            body.matches(&format!("pub(crate) {separator}")).count()
+                + body.matches(&format!("pub {separator}")).count(),
+            0,
+            "{separator} separates the two halves of an obligation and clears the field `Drop` \
+             reads. Publishing it is how an owner drops the admission, returns `Ok(())`, and is \
+             issued a `SettlementReceipt` for a job whose publication lock it has just opened"
+        );
+        assert_eq!(
+            body.matches(&format!("    {separator}(")).count(),
+            1,
+            "{separator} is still declared here — a pin over a method that has been renamed \
+             proves nothing"
+        );
+    }
 }

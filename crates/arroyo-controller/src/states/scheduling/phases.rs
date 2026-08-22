@@ -233,6 +233,10 @@ impl<'a, 'ctx> StartFanOut<'a, 'ctx> {
         let Self {
             admission,
             mut ctx,
+            // Empty, and that is caller-side rather than enforced here: the only constructor
+            // of this phase builds it with `IssuedAttempts::default()`, and `issue` is called
+            // once. A second call would discard a populated inventory, so a retry has to
+            // re-enter through the phase graph rather than re-issue from the same value.
             issued: _,
         } = self;
         let (admission, issued, outcome) = ctx.fan_out_start_execution(admission).await;

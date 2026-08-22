@@ -31,6 +31,11 @@
 //! releases the job's publication lock on the spot, and that is reported as
 //! [`SettlementRefusal::Abandoned`] rather than as a transfer.
 //!
+//! Nor can an owner be *half* wrong about it: "kept the authority, dropped the inventory" —
+//! or the reverse — is not a state a `take_over` can leave the world in. See
+//! [`SettlementBundle::into_parts`], which is private, and review comment `5369004357`, which
+//! is what happened while it was not.
+//!
 //! # A decline is not the same answer on both paths
 //!
 //! "The phase settles in place" is an answer only where there *is* a phase. On the rescued
@@ -61,8 +66,10 @@ use crate::states::Admission;
 /// The two travel together deliberately. Handing over the inventory without the
 /// [`Admission`] would leave a refusal publishable while the attempts were still live; handing
 /// over the authority without the inventory would leave the new owner unable to say what it
-/// was waiting for. M11.D39b requires them to move as one unit, and the only way to part with
-/// either is [`Self::into_parts`], which yields both.
+/// was waiting for. M11.D39b requires them to move as one unit, and this type *is* that unit:
+/// the fields and [`Self::into_parts`] are private, so an owner keeps the bundle whole or
+/// parts with all of it, and "it kept both halves" is not something an implementation can
+/// forget to do.
 pub(crate) struct SettlementBundle {
     /// `None` once the bundle has been taken apart, which is what tells [`Drop`] whether the
     /// authority left through the seam or merely fell out of scope.
@@ -118,7 +125,9 @@ pub(crate) enum SettlementRefusal {
 /// **M11.T25 defines this and implements it nowhere** — see the module documentation.
 ///
 /// An implementor takes the bundle by value: it receives the issued-attempt inventory and
-/// the lifecycle authority together, and there is no way to receive one without the other.
+/// the lifecycle authority together, and there is no way to receive one without the other —
+/// nor to *keep* one without the other. See [`SettlementBundle`]: the halves are separable
+/// only inside the module that observes the separation.
 ///
 /// `Send + Sync` because an owner has to be reachable from the rescue that runs when the job's
 /// state task has already been dropped, which is a detached task of its own. An owner that
@@ -131,6 +140,15 @@ pub(crate) trait SettlementOwner: Send + Sync {
     /// outstanding attempt has an authoritative outcome, an acknowledged fence or revoke that
     /// makes its identifier permanently inapplicable, or an observed termination of the
     /// worker generation it addressed.
+    ///
+    /// # Accepting
+    ///
+    /// An owner that accepts stores the bundle — all of it — somewhere that outlives this
+    /// call, and reads what it owes through [`SettlementBundle::issued`], which takes nothing
+    /// out of it. There is no half to store instead. The operations M11.T26 needs beyond
+    /// reading — recording an attempt's outcome, and discharging the obligation once every
+    /// attempt has one — belong beside [`SettlementBundle::transfer_to`], where releasing the
+    /// authority is observed, and not in a widening of what an owner may take apart.
     ///
     /// # Declining
     ///
@@ -251,10 +269,18 @@ impl SettlementBundle {
 
     /// Takes the obligation apart: the authority, and the inventory it is answerable for.
     ///
-    /// The one way to part with either, and therefore the one way a bundle is *settled*
-    /// rather than merely gone. Whoever calls this is stating that it is now the party that
-    /// decides when the admission is released.
-    pub(crate) fn into_parts(mut self) -> (Admission, IssuedAttempts) {
+    /// **Private, and the privacy is the invariant** (review comment `5369004357`). It is the
+    /// one operation that separates the halves, and it also clears the field [`Drop`] reads —
+    /// so an owner able to call it could drop the returned [`Admission`], return `Ok(())`, and
+    /// have [`Self::transfer_to`] see an unraised flag and issue a [`SettlementReceipt`] for a
+    /// job whose publication lock it had just opened. Dropping the returned [`IssuedAttempts`]
+    /// is the same defect from the other side: the receipt says how many attempts moved and
+    /// nobody holds a record of them.
+    ///
+    /// Its two callers are the two situations in which nothing was transferred at all — no
+    /// owner, and an owner that gave the obligation back — so no receipt exists for a partial
+    /// release to contradict, and no owner can reach either.
+    fn into_parts(mut self) -> (Admission, IssuedAttempts) {
         let admission = self
             .admission
             .take()
@@ -283,14 +309,19 @@ impl SettlementBundle {
     ///
     /// * the owner returned the bundle — it declined, nothing was released, and the phase
     ///   still owes the attempts;
-    /// * the owner kept it, whole or taken apart — nothing was released *unsettled*, so it is
-    ///   now the party that decides when the admission goes, and a receipt is issued;
+    /// * the owner kept it — necessarily whole, since [`Self::into_parts`] is private, so it
+    ///   is now the party that decides when the admission goes and a receipt is issued;
     /// * the owner dropped it — the flag is up, the lock is already gone, and there is no
     ///   receipt to issue for an obligation nobody holds.
     ///
+    /// There is no fourth state in which the owner kept one half. That was the fourth state
+    /// until review comment `5369004357`, and it produced a receipt.
+    ///
     /// A `Drop` that happens *later*, after this returned, is the owner losing something it
     /// had accepted; that is its own failure and its own log line, not a transfer that never
-    /// happened.
+    /// happened. An owner that `mem::forget`s the bundle is issued a receipt and never
+    /// releases the authority — the conservative direction, and the only reason `Drop` is
+    /// enough here: what it cannot observe is retention, not release.
     pub(crate) fn transfer_to<O: SettlementOwner + ?Sized>(
         self,
         owner: &O,
@@ -312,7 +343,10 @@ impl SettlementBundle {
     /// This is not a transfer and does not go through [`SettlementOwner`]: it is the
     /// statement that nothing was handed over, and the caller is still the one that must
     /// settle. M11.T25 always takes this branch.
-    pub(crate) fn keep(self) -> (Admission, IssuedAttempts) {
+    ///
+    /// Private for the reason [`Self::into_parts`] is: an owner that could call it would have
+    /// a second name for the same partial release.
+    fn keep(self) -> (Admission, IssuedAttempts) {
         self.into_parts()
     }
 }

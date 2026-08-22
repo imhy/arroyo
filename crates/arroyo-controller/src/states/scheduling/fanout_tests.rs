@@ -480,21 +480,37 @@ async fn an_explicitly_refused_attempt_settles_and_its_sibling_is_unaffected() {
 ///
 /// M11.T25 has no owner of its own — `PhaseContext::settlement_owner` answers `None` — so a
 /// double is the only way to observe the seam at all. What it does is what a real one must:
-/// it takes the bundle apart and *holds* the authority, rather than dropping it.
+/// it *holds* the obligation, whole, rather than dropping it. Since review comment
+/// `5369004357` that is also the only thing it can do — the authority and the inventory are
+/// separable only inside `settlement.rs` — so this double cannot drift from the contract by
+/// keeping one half of what it was handed.
 #[derive(Default)]
 struct RecordingOwner {
-    /// The lifecycle authority, held exactly as a real owner would hold it.
-    held: Mutex<Option<Admission>>,
-    /// The inventory that arrived with it.
+    /// The obligation, whole. Holding it is what holds the job's lifecycle authority.
+    held: Mutex<Option<SettlementBundle>>,
+    /// What the inventory said on arrival, copied out for a row to compare against. Reading
+    /// it takes nothing out of the obligation, and it is published *after* `held`, so a row
+    /// that has observed it can rely on the obligation being there.
     issued: Mutex<Option<IssuedAttempts>>,
 }
 
 impl SettlementOwner for RecordingOwner {
     fn take_over(&self, bundle: SettlementBundle) -> Result<(), SettlementBundle> {
-        let (admission, issued) = bundle.into_parts();
-        *self.issued.lock().unwrap() = Some(issued);
-        *self.held.lock().unwrap() = Some(admission);
+        let arrived_with = bundle.issued().clone();
+        *self.held.lock().unwrap() = Some(bundle);
+        *self.issued.lock().unwrap() = Some(arrived_with);
         Ok(())
+    }
+}
+
+impl RecordingOwner {
+    /// The inventory the obligation this owner is holding still lists, if it is holding one.
+    fn retained(&self) -> Option<IssuedAttempts> {
+        self.held
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|bundle| bundle.issued().clone())
     }
 }
 
@@ -596,6 +612,12 @@ async fn a_cancelled_fan_out_hands_its_obligation_to_the_settlement_owner() {
         "what the owner receives is what the workers answered, under the identifier they were \
          actually sent — the live ledger the rescued region went on writing to, not a summary \
          composed before the cancellation"
+    );
+    assert_eq!(
+        owner.retained(),
+        Some(expected.clone()),
+        "and it is still holding all of it, read back out of the obligation rather than from \
+         the copy it took on arrival — the rescued path's half of review comment `5369004357`"
     );
     assert!(
         gate.admit_publication().is_none(),
