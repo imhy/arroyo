@@ -98,7 +98,10 @@ pub mod scheduling {
             pub fn workers_are_sufficient(&self) -> bool {
                 unimplemented!()
             }
-            pub async fn await_worker_channels(&mut self) -> Result<(), StateError> {
+            pub async fn await_worker_channels(&mut self) -> Result<PhaseWait, StateError> {
+                unimplemented!()
+            }
+            pub fn worker_channels_are_open(&self) -> bool {
                 unimplemented!()
             }
             pub fn require_reconciling_workers(&self) -> Result<(), StateError> {

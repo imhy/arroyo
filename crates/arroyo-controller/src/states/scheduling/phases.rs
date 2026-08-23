@@ -166,9 +166,14 @@ impl<'a, 'ctx> AwaitingWorkers<'a, 'ctx> {
         self.ctx.workers_are_sufficient()
     }
 
-    /// Waits for every registered worker's outbound channel to be open.
-    pub(crate) async fn await_worker_channels(&mut self) -> Result<(), StateError> {
+    /// Waits one turn for the next registered worker's outbound channel to open.
+    pub(crate) async fn await_worker_channels(&mut self) -> Result<PhaseWait, StateError> {
         self.ctx.await_worker_channels().await
+    }
+
+    /// Whether every registered worker's outbound channel is open.
+    pub(crate) fn worker_channels_are_open(&self) -> bool {
+        self.ctx.worker_channels_are_open()
     }
 
     /// Crosses into the fan-out.
@@ -458,8 +463,20 @@ async fn wait_for_workers<'a, 'ctx>(
             break;
         }
     }
-    if let Err(reason) = awaiting.await_worker_channels().await {
-        return Err(awaiting.fence(reason));
+    // The same shape as the loop above, and for the same reason: opening the workers'
+    // channels is a wait, and every interruptible wait is a consumption point (M11.D39a).
+    // PR #160 review comment `5384611151`.
+    while !awaiting.worker_channels_are_open() {
+        match awaiting.observe_intent() {
+            Ok(PhaseWait::Continue) => {}
+            Ok(PhaseWait::Leave(transition)) => return Ok(Advanced::Left(transition)),
+            Err(reason) => return Err(awaiting.fence(reason)),
+        }
+        match awaiting.await_worker_channels().await {
+            Ok(PhaseWait::Continue) => {}
+            Ok(PhaseWait::Leave(transition)) => return Ok(Advanced::Left(transition)),
+            Err(reason) => return Err(awaiting.fence(reason)),
+        }
     }
     awaiting.admit_fan_out().await
 }

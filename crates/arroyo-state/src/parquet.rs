@@ -232,7 +232,22 @@ impl BackingStore for ParquetBackend {
             },
         )?;
 
-        let mut plans = Vec::with_capacity(metadata.operator_ids.len());
+        // The entitlement for the write that *ends* this cleanup, proven here rather than
+        // after the deletions — PR #160 review comment `5384611151`. `check_whole` on this
+        // token is the strictest check the cleanup makes: it compares the identity the
+        // metadata claims against the one the cleanup earned, and refuses metadata that names
+        // an operator twice. Run last, as it was, any of those refusals arrived with the data
+        // files and the old per-epoch metadata already deleted and `min_epoch` never
+        // advanced, leaving the top-level object pointing at epochs that no longer exist.
+        // Nothing below this line is reversible, so everything that can refuse is above it.
+        let operator_count = metadata.operator_ids.len();
+        metadata.min_epoch = min_epoch;
+        let write = Validated::validate(
+            CheckpointMetadataWrite::after_cleanup(metadata, &cleanup),
+            (),
+        )?;
+
+        let mut plans = Vec::with_capacity(operator_count);
         for operator in CheckpointCleanup::operators(&cleanup) {
             plans.push(OperatorCleanupPlan {
                 operator_id: operator.operator_id().to_string(),
@@ -295,15 +310,7 @@ impl BackingStore for ParquetBackend {
                 )))
                 .await?;
         }
-        metadata.min_epoch = min_epoch;
-        Self::write_checkpoint_metadata(
-            role,
-            Validated::validate(
-                CheckpointMetadataWrite::after_cleanup(metadata, &cleanup),
-                (),
-            )?,
-        )
-        .await?;
+        Self::write_checkpoint_metadata(role, write).await?;
         Ok(())
     }
 }
@@ -1039,6 +1046,101 @@ mod tests {
         );
         // The checkpoint's own metadata is neither dropped nor rewritten with the new min epoch.
         assert!(!store.exists(&metadata_path(&base_path(JOB_ID, 1))).await);
+    }
+
+    /// A checkpoint that names the same operator twice is refused before anything is deleted.
+    ///
+    /// **PR #160 review comment `5384611151`.** The cleanup token compared its collected
+    /// operators with the checkpoint's list by length and position only — and the collected
+    /// operators are built *from* that list, so `["node_1", "node_1"]` zips against itself and
+    /// agrees on both. The uniqueness rule existed, but in
+    /// `CheckpointMetadataWrite::check_whole`: the write that *ends* the cleanup, and therefore
+    /// ran after every deletion. The cleanup failed with the data files and the dropped
+    /// per-epoch metadata already gone and `min_epoch` never advanced, leaving the top-level
+    /// object pointing at epochs that no longer existed.
+    ///
+    /// The error is asserted by the cleanup scope's own wording rather than the metadata
+    /// write's, because both now refuse this input and the two closures are separate: moving
+    /// the entitlement ahead of the deletions stops the *effect*, and the token's own
+    /// uniqueness check is what makes the token honest about what it authorized.
+    #[tokio::test]
+    async fn a_duplicate_operator_stops_cleanup_before_anything_is_deleted() {
+        let store = LocalCheckpointStore::new("duplicate-operator");
+        let dropped = write_epoch(&store, "node_1", 0, "parquet").await;
+        let kept = write_epoch(&store, "node_1", 1, "parquet").await;
+
+        let err = ParquetBackend::cleanup_checkpoint(
+            &store.role,
+            StateBackendSelector::Parquet,
+            asked_for(1),
+            checkpoint_metadata(&["node_1", "node_1"], 1),
+            0,
+            1,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("lists an operator more than once"),
+            "the cleanup token must refuse the duplicate itself, not leave it to the write \
+             that ends the cleanup: {err}"
+        );
+        assert!(
+            store.exists(&dropped).await,
+            "the dropped epoch's file was deleted before the duplicate was found"
+        );
+        assert!(store.exists(&kept).await);
+        assert!(
+            store
+                .exists(&metadata_path(&operator_path(JOB_ID, 0, "node_1")))
+                .await,
+            "the dropped epoch's metadata was deleted before the duplicate was found"
+        );
+        assert!(
+            !store.exists(&metadata_path(&base_path(JOB_ID, 1))).await,
+            "and `min_epoch` was never advanced, so nothing points at the deleted epochs"
+        );
+    }
+
+    /// Nothing irreversible in `cleanup_checkpoint` runs before the token that authorizes it.
+    ///
+    /// **The row that would have found the ordering half of PR #160 review comment
+    /// `5384611151` first**, stated as the property rather than as one input's behaviour. The
+    /// duplicate was only the input that reached it: `CheckpointMetadataWrite::check_whole`
+    /// also compares the identity the metadata claims against the one the cleanup earned, and
+    /// every refusal it can make arrived, before this change, after the deletions.
+    ///
+    /// A source-order pin, and its gap is that: it reads the order of two statements, not the
+    /// order two operations execute in. What makes that worth having anyway is that
+    /// `cleanup_checkpoint` is one linear function with no branch between the two — which is
+    /// itself the property being pinned, since a delete moved into a conditional above the
+    /// entitlement would fail this row.
+    #[test]
+    fn a_cleanup_proves_its_write_entitlement_before_it_deletes_anything() {
+        let source = include_str!("parquet.rs");
+        let at = source
+            .find("async fn cleanup_checkpoint(")
+            .expect("the cleanup this row is about");
+        let body = &source[at..];
+        let end = body
+            .find("\n    }")
+            .expect("a function that ends at its impl block's indentation");
+        let body = &body[..end];
+
+        let entitlement = body
+            .find("CheckpointMetadataWrite::after_cleanup(")
+            .expect("the token that authorizes the write ending the cleanup");
+        let first_delete = body
+            .find("delete_if_present(")
+            .expect("the deletions the cleanup performs");
+        assert!(
+            entitlement < first_delete,
+            "the entitlement for the write that ends the cleanup is proven at byte \
+             {entitlement} of this function and the first deletion runs at byte \
+             {first_delete}. Everything that can refuse must stand above everything that \
+             cannot be undone: a refusal found after the deletions leaves the checkpoint's \
+             top-level metadata naming epochs that no longer exist"
+        );
     }
 
     /// Finding 4: compaction validated one operator at a time, so a mismatch in a later

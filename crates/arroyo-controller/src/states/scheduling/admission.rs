@@ -49,6 +49,7 @@ use crate::job_controller::JobController;
 use crate::states::{Admission, JobContext, StateError, fatal};
 
 pub(super) mod execution;
+pub(super) mod handover;
 pub(super) mod observation;
 
 pub(super) use observation::stop_transition;

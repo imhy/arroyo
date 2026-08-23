@@ -34,26 +34,20 @@
 //! [`RefusalGate`](crate::states::RefusalGate), and this wait already selects on the channel.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::anyhow;
-use arroyo_rpc::LeaderContext;
 use arroyo_rpc::config::config;
 use arroyo_rpc::grpc::rpc::{JobFailure, JobState};
 use arroyo_rpc::worker_types::RunningMessage;
 use arroyo_types::{JobId, WorkerId};
-use arroyo_worker::job_controller::job_metrics::JobMetrics;
 use tracing::{error, info, warn};
 
 use super::super::{Scheduling, WorkerState, handle_worker_connect};
 use super::{PhaseContext, PhaseWait, stop_transition};
 use crate::JobMessage;
-use crate::job_controller::JobController;
-use crate::job_controller::checkpoint_store::DbCheckpointMetadataStore;
 use crate::job_controller::leader_manager::LeaderManager;
-use crate::states::leader_running::LeaderRunning;
-use crate::states::running::Running as RunningState;
-use crate::states::{Admission, StateError, Transition, check_config_update};
+use crate::states::{StateError, check_config_update};
 
 /// The two interruptible waits: everything the phase graph does while it holds no token.
 impl PhaseContext<'_, '_> {
@@ -90,14 +84,51 @@ impl PhaseContext<'_, '_> {
         self.workers.values().map(|w| w.slots).sum::<usize>() >= self.slots_needed
     }
 
-    /// Waits for every registered worker's outbound channel to be open.
-    pub(crate) async fn await_worker_channels(&mut self) -> Result<(), StateError> {
-        for h in std::mem::take(&mut self.handles) {
-            if let Err(e) = h.await {
-                return Err(self.retryable("Failed to start cluster for pipeline", e.into(), 10));
+    /// One turn of the wait for the registered workers' outbound channels to open.
+    ///
+    /// **PR #160 review comment `5384611151`.** This was a bare
+    /// `for h in take(&mut self.handles) { h.await }` — the one wait in the module whose
+    /// subject *is* the interruptible waits that could not be interrupted.
+    /// [`wait_for_workers`](super::super::phases::wait_for_workers) enters it as soon as the
+    /// last registration makes capacity sufficient, and each setup task makes up to three
+    /// 90-second connection attempts, so a stop or a refusal decided while it ran went unseen
+    /// for as long as 270 seconds.
+    ///
+    /// A *turn* rather than the whole wait, so the caller's loop reads the job's writer
+    /// between channels exactly as it does between worker messages and task messages.
+    /// `&mut JoinHandle` is a cancel-safe future and `JoinHandle` is `Unpin`: a turn the wake
+    /// ends leaves the handle in place, and the next turn polls the same task again rather
+    /// than restarting or detaching it.
+    ///
+    /// The channels are awaited in the order they were spawned, which is the order the
+    /// previous `for` loop used — so which failure is reported first is unchanged.
+    pub(crate) async fn await_worker_channels(&mut self) -> Result<PhaseWait, StateError> {
+        // Taken before the borrow below, for the reason `await_message_from_workers` gives.
+        let wake = self.ctx.lifecycle_wakeup();
+        let joined = {
+            let Some(handle) = self.handles.first_mut() else {
+                return Ok(PhaseWait::Continue);
+            };
+            tokio::select! {
+                joined = handle => Some(joined),
+                // The caller reads the job's writer at the top of every turn, so ending the
+                // turn is the whole of what this arm has to do. The handle is left untouched.
+                _ = wake.notified() => None,
             }
+        };
+        let Some(joined) = joined else {
+            return Ok(PhaseWait::Continue);
+        };
+        self.handles.remove(0);
+        match joined {
+            Ok(()) => Ok(PhaseWait::Continue),
+            Err(e) => Err(self.retryable("Failed to start cluster for pipeline", e.into(), 10)),
         }
-        Ok(())
+    }
+
+    /// Whether every registered worker's outbound channel is open.
+    pub(crate) fn worker_channels_are_open(&self) -> bool {
+        self.handles.is_empty()
     }
 
     /// One turn of the wait for the started execution's tasks to report in.
@@ -317,7 +348,7 @@ impl PhaseContext<'_, '_> {
     }
 
     /// The worker that runs this job's controller, in leader mode.
-    fn leader_endpoint(&self) -> Option<(WorkerId, String)> {
+    pub(super) fn leader_endpoint(&self) -> Option<(WorkerId, String)> {
         if !self.leader_mode {
             return None;
         }
@@ -341,156 +372,4 @@ enum LeaderVerdict {
     /// The leader reports the job failing or failed and carried no failure to say why. The
     /// status is worth another attempt: the payload may simply not have been written yet.
     FailedWithoutReason,
-}
-
-/// The handover from a started execution to the state that runs it.
-impl PhaseContext<'_, '_> {
-    /// Whether the restored checkpoint left a two-phase commit to finish.
-    ///
-    /// Answered from the flag [`Self::prepare_handover`] records rather than from
-    /// `committing_state`, which that same handover has by then moved into the job controller.
-    pub(crate) fn needs_restored_commits(&self) -> bool {
-        self.restored_commits_pending
-    }
-
-    /// Records the task count and builds the job controller a non-leader execution runs under.
-    ///
-    /// Nothing here is irreversible, which is why it happens before the third admission is
-    /// taken rather than inside it.
-    pub(crate) async fn prepare_handover(&mut self) {
-        self.ctx.status.tasks = Some(self.ctx.program.task_count() as i32);
-        // Before the controller is built, because building it takes the commits with it.
-        self.restored_commits_pending = self.committing_state.is_some();
-        if self.leader_mode {
-            return;
-        }
-
-        let program = Arc::new(self.ctx.program.clone());
-        let metrics = if config().controller.metrics.enabled {
-            let metrics = JobMetrics::new(program.clone());
-            self.ctx
-                .metrics
-                .write()
-                .await
-                .insert(self.ctx.config.id.clone(), metrics.clone());
-            Some(metrics)
-        } else {
-            None
-        };
-
-        let checkpoint_store = Arc::new(DbCheckpointMetadataStore {
-            organization_id: self.ctx.config.organization_id.clone(),
-            job_id: self.ctx.config.id.clone(),
-            state_backend: self.ctx.execution_selector,
-            db: self.ctx.db.clone(),
-        });
-        let (start_epoch, min_epoch) = self.epochs();
-        self.job_controller = Some(JobController::new(
-            checkpoint_store,
-            self.ctx.config.clone(),
-            self.ctx.pipeline_info.pipeline_id.clone(),
-            self.ctx.pipeline_info.state_url.clone(),
-            self.ctx.status.generation,
-            program,
-            start_epoch,
-            min_epoch,
-            std::mem::take(&mut self.started_connects),
-            self.committing_state.take(),
-            metrics,
-        ));
-    }
-
-    /// Publishes the restored checkpoint's commits.
-    ///
-    /// These finish a two-phase commit against the job's sinks: they are visible outside the
-    /// cluster and cannot be withdrawn, which is the whole reason this is a region of its own.
-    pub(crate) async fn publish_restored_commits(&mut self, a: &Admission) {
-        info!(
-            job_id = %self.ctx.config.id,
-            pipeline_id = *self.ctx.pipeline_info.pipeline_id,
-            "restored checkpoint was in committing phase, sending commits"
-        );
-        let controller = self
-            .job_controller
-            .as_mut()
-            .expect("the handover built a job controller before admitting a commit publication");
-        a.effect(
-            "publish the restored checkpoint's commits",
-            controller.send_commit_messages(),
-        )
-        .await
-        .expect("failed to send commit messages");
-    }
-
-    /// The transition out of `Scheduling` for an execution that is up.
-    ///
-    /// Hands the context back with the error, because a phase that cannot leave has to be able
-    /// to fence, and fencing needs the context it was holding.
-    pub(crate) async fn into_transition(mut self) -> Result<Transition, (Self, StateError)> {
-        let Some((id, addr)) = self.leader_endpoint() else {
-            self.ctx.job_controller = self.job_controller.take();
-            return Ok(Transition::next(Scheduling {}, RunningState {}));
-        };
-
-        self.ctx.job_controller = None;
-        let connected = LeaderManager::connect(
-            JobId(self.ctx.config.id.clone()),
-            self.ctx.pipeline_info.pipeline_id.clone(),
-            self.ctx.status.generation,
-            id,
-            addr.clone(),
-            config().controller.connect_timeout.as_deref().copied(),
-            self.ctx.execution_selector,
-        )
-        .await;
-        let leader_manager = match connected {
-            Ok(m) => m,
-            Err(e) => {
-                let reason = self.retryable("failed to connect to worker leader", e, 10);
-                return Err((self, reason));
-            }
-        };
-
-        self.ctx.leader_manager = Some(leader_manager);
-        self.ctx.status.state_context.leader = Some(LeaderContext {
-            worker_id: id,
-            rpc_address: addr,
-            generation: self.ctx.status.generation,
-        });
-        Ok(Transition::next(
-            Scheduling {},
-            LeaderRunning {
-                started: Instant::now(),
-            },
-        ))
-    }
-
-    /// The epochs the execution starts from.
-    ///
-    /// The two controller modes read `ignore_state_before_epoch` differently: in controller
-    /// mode it is an epoch threshold, and in leader mode the same field is a generation number
-    /// that must not affect the checkpoint epoch.
-    pub(crate) fn epochs(&self) -> (u64, u64) {
-        let default_epoch = if self.leader_mode {
-            0
-        } else {
-            self.ctx
-                .config
-                .ignore_state_before_epoch
-                .filter(|&t| t > 0)
-                .map(|t| (t - 1) as u64)
-                .unwrap_or(0)
-        };
-        let start = self
-            .checkpoint_info
-            .as_ref()
-            .map(|i| i.epoch)
-            .unwrap_or(default_epoch);
-        let min = self
-            .checkpoint_info
-            .as_ref()
-            .map(|i| i.min_epoch)
-            .unwrap_or(default_epoch);
-        (start, min)
-    }
 }

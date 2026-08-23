@@ -11,6 +11,7 @@ use arroyo_rpc::grpc::rpc::{OperatorCheckpointMetadata, TableCheckpointMetadata,
 use arroyo_rpc::state_backend::validated::identity::{CheckpointIdentity, check_operator_header};
 use arroyo_rpc::state_backend::validated::{Validated, WholeObject};
 use arroyo_rpc::state_backend::{StateBackendSelector, validate_restored_operator_metadata};
+use std::collections::BTreeSet;
 
 /// Every operator and every epoch a checkpoint cleanup is about to act on.
 ///
@@ -166,6 +167,22 @@ impl WholeObject for CheckpointCleanup {
             &self.checkpoint,
             structural,
         )?;
+
+        // A duplicated id passes the positional comparison below — the collected operators
+        // are built *from* this list, so `["a", "a"]` zips against itself and agrees. The
+        // rule exists downstream, in `CheckpointMetadataWrite::check_whole`, which is the
+        // write that ends the cleanup and therefore runs after every deletion. A token whose
+        // check is weaker than the check gating the effect it authorizes is the defect:
+        // PR #160 review comment `5384611151`.
+        let listed: BTreeSet<&str> = scope.operator_ids.iter().map(String::as_str).collect();
+        if listed.len() != scope.operator_ids.len() {
+            return Err(structural(format!(
+                "the cleanup of job {} was scoped to a checkpoint that lists an operator more \
+                 than once: {:?}",
+                self.job_id(),
+                scope.operator_ids,
+            )));
+        }
 
         if self.operators.len() != scope.operator_ids.len()
             || self

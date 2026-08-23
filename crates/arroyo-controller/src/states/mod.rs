@@ -9743,20 +9743,54 @@ mod tests {
 
         // The phase graph splits the two halves across its modules on purpose: the loop that
         // reads lives with the typestate that can see it, and the `select!` that is woken lives
-        // with the context that owns the job's channel. These two counts are what the three
-        // `EXEMPT` entries above are held by.
-        let phases = include_str!("scheduling/phases.rs");
-        assert_eq!(
-            phases.matches("awaiting.observe_intent()").count(),
-            2,
-            "both interruptible waits of the phase graph read the job's single writer"
+        // with the context that owns the job's channel. This is what the three `EXEMPT` entries
+        // above are held by instead of the partition.
+        //
+        // **It is a rule per wait, not a total — PR #160 review comment `5384611151`.** It used
+        // to assert that `execution.rs` contained `wake.notified()` exactly twice. That is a
+        // statement about how many of the interruptible waits are interruptible, not about
+        // whether all of them are: the module held a *third* wait, `await_worker_channels`, a
+        // bare `for h in handles { h.await }` with no `select!` at all, and a count pinned at
+        // two was perfectly consistent with it. Every wait is now asked individually, and the
+        // count that remains is derived from the waits rather than written down beside them.
+        let execution = include_str!("scheduling/admission/execution.rs");
+        const WAIT: &str = "pub(crate) async fn await_";
+        let mut waits = 0;
+        let mut rest = execution;
+        while let Some(at) = rest.find(WAIT) {
+            let from = &rest[at..];
+            let name: String = from[WAIT.len()..]
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            // A function body at the module's own indentation ends at the first `\n    }`;
+            // everything nested inside it closes deeper than that.
+            let end = from
+                .find("\n    }")
+                .expect("a wait that ends at the module's indentation");
+            let body = &from[..end];
+            assert!(
+                body.contains("tokio::select!") && body.contains("wake.notified()"),
+                "await_{name} waits without a `select!` that a submission can wake. Every wait \
+                 in this module is a consumption point under M11.D39a; a wait that parks on \
+                 what it was already waiting for cannot be told the job has been stopped"
+            );
+            waits += 1;
+            rest = &from[end..];
+        }
+        assert!(
+            waits >= 3,
+            "this row asked {waits} of the phase graph's waits, fewer than the module held \
+             when it was written"
         );
         assert_eq!(
-            include_str!("scheduling/admission/execution.rs")
-                .matches("wake.notified()")
+            include_str!("scheduling/phases.rs")
+                .matches("awaiting.observe_intent()")
                 .count(),
-            2,
-            "and both of their `select!`s can be woken by a submission"
+            waits,
+            "every wait in `execution.rs` must be driven by a loop in `phases.rs` that reads \
+             the job's writer before it — the two halves of the split, tied to each other so \
+             that adding one without the other fails here"
         );
     }
 
