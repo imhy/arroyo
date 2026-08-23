@@ -3284,11 +3284,11 @@ mod tests {
         GetJobCheckpointsResp, GetWorkerPhaseReq, GetWorkerPhaseResp, GlobalKeyedTableConfig,
         GlobalKeyedTableTaskCheckpointMetadata, HeartbeatNodeReq, JobControllerInitReq,
         JobControllerInitResp, JobFailure, JobFinishedReq, JobFinishedResp, JobState,
-        JobStatus as LeaderJobStatus, JobStatusReq, JobStatusResp, LoadCompactedDataReq,
-        LoadCompactedDataRes, MetricsReq, MetricsResp, OperatorCheckpointMetadata,
-        OperatorMetadata, RegisterNodeReq, StartExecutionReq, StartExecutionResp, StopExecutionReq,
-        StopExecutionResp, StopJobReq, StopJobResp, TableCheckpointMetadata, TableConfig,
-        TableEnum, WorkerFinishedReq,
+        JobStatus as LeaderJobStatus, JobStatusReq, JobStatusResp, JobStopMode,
+        LoadCompactedDataReq, LoadCompactedDataRes, MetricsReq, MetricsResp,
+        OperatorCheckpointMetadata, OperatorMetadata, RegisterNodeReq, StartExecutionReq,
+        StartExecutionResp, StopExecutionReq, StopExecutionResp, StopJobReq, StopJobResp,
+        TableCheckpointMetadata, TableConfig, TableEnum, WorkerFinishedReq,
     };
     use arroyo_rpc::identity::worker_client;
     use arroyo_rpc::state_backend::validated::Validated;
@@ -4175,11 +4175,13 @@ mod tests {
         Routes,
         /// Acts on it with this state's own rule, whose source marker is named here.
         Acts(&'static str),
-        /// Nothing further, and for one reason in every case: besides the stop it answers, all
+        /// Nothing further, for one of two reasons. Usually: besides the stop it answers, all
         /// that file's `ConfigUpdate` arm does with an update is `check_config_update`, and the
         /// job's writer refuses a configuration that changes the state backend rather than
-        /// adopting it. The new configuration is published into `JobContext::config`, which is
-        /// the field those states already read.
+        /// adopting it — the new configuration is published into `JobContext::config`, which is
+        /// the field those states already read. For `leader_stopping.rs` the reason is one step
+        /// shorter: it has no `ConfigUpdate` arm to agree with, because it is ending the job and
+        /// starts nothing a configuration could change.
         NothingFurther,
         /// Carries the outcome to its caller without reading it. `JobWait` is the wait, not a
         /// decider; what a decision means belongs to the state that owns the wait.
@@ -4207,6 +4209,10 @@ mod tests {
                 AdoptedAnswer::Acts("ctx.config.restart_mode == RestartMode::force"),
             ),
             ("states/leader_restarting.rs", AdoptedAnswer::NothingFurther),
+            // Ending the job: it schedules nothing, restarts nothing and rescales nothing, so
+            // there is no later work an adopted configuration could change. Added with the
+            // consumption point itself — PR #160 review comment `5384225297`.
+            ("states/leader_stopping.rs", AdoptedAnswer::NothingFurther),
             ("states/rescaling.rs", AdoptedAnswer::NothingFurther),
             (
                 "states/checkpoint_stopping.rs",
@@ -9599,44 +9605,146 @@ mod tests {
     /// be driven without a live worker leader to answer them, and a wait that quietly lost
     /// either half would go unnoticed exactly where it is least testable.
     ///
+    /// **Its domain is walked, not listed — PR #160 review comment `5384225297`.** This row used
+    /// to iterate seven `include_str!`s, and `leader_stopping.rs` was not one of them: the one
+    /// wait in the module that watched neither the mailbox nor the job's channel was never
+    /// exempted, it was simply never asked. A list of files is the same maintenance hazard as a
+    /// list of states, one level up — the argument `every_state_in_the_module` already makes
+    /// against a list of states. So every production file under `states/`, plus the module the
+    /// leader-mode wait lives in, is read, and each one that contains a wait must fall into one
+    /// of three buckets: it reads the writer itself, it delegates to a primitive that does, or
+    /// it is named in `EXEMPT` with the reason. `EXEMPT` is asserted to be exactly the set that
+    /// was used, so an exemption cannot go stale and a new file cannot land in it by accident.
+    ///
+    /// Its gap, stated: the buckets are per file, so the three exempt entries are held by the
+    /// paired counts at the end rather than by this partition, and a new file added *under*
+    /// `scheduling/` with an unobserved wait would be answered by those counts and not by the
+    /// walk.
+    ///
     /// The intended reading of a failure here is "this wait can no longer be interrupted", not
-    /// "the test is stale". A wait that genuinely has nothing an intent could decide — `Stopping`
-    /// and `Finishing`, which are already ending the job and have no transition an intent could
-    /// produce — is deliberately absent rather than listed and excused.
+    /// "the test is stale".
     #[test]
     fn every_long_running_wait_reads_the_jobs_writer_and_can_be_woken_by_it() {
-        for (name, source) in [
-            ("running.rs", include_str!("running.rs")),
-            ("leader_running.rs", include_str!("leader_running.rs")),
-            ("restarting.rs", include_str!("restarting.rs")),
-            ("rescaling.rs", include_str!("rescaling.rs")),
+        /// What makes a file one this row has anything to say about.
+        const WAITS: [&str; 4] = [
+            "tokio::select!",
+            "wait_for_state(",
+            "wait_for_finish(",
+            "handle_leader_stopping(",
+        ];
+        /// Reading the job's single writer on every turn, in the file's own body.
+        const READS: &str = "ConsumptionPoint::InsideInterruptibleWait";
+        /// And being woken by a submission rather than by whatever ended the previous turn.
+        const WOKEN: &str = "wake.notified()";
+        /// Handing the wait to a primitive that does both. `JobWait::recv` reads the writer
+        /// before it parks and again on the turn a submission ends; `handle_leader_stopping`
+        /// is the leader-mode wait three states share.
+        const DELEGATES: [&str; 2] = ["wait_for_finish(", "handle_leader_stopping("];
+
+        /// A wait held by something other than the markers above, and the argument for it.
+        const EXEMPT: [(&str, &str); 3] = [
             (
-                "checkpoint_stopping.rs",
-                include_str!("checkpoint_stopping.rs"),
+                "lifecycle/waiting.rs",
+                "is the primitive the delegating files reach: it is where reading the writer                  before parking is implemented, so requiring it to delegate to itself is                  circular",
             ),
-            ("leader_restarting.rs", include_str!("leader_restarting.rs")),
             (
-                "leader_manager.rs",
-                include_str!("../job_controller/leader_manager.rs"),
+                "scheduling.rs",
+                "the phase graph splits the two halves across its modules on purpose — the loop                  that reads lives with the typestate that can see it — and the paired counts                  below are what hold it",
             ),
-        ] {
-            assert!(
-                source.contains("ConsumptionPoint::InsideInterruptibleWait"),
-                "{name}: every turn of a long-running wait must read the job's single writer. \
-                 Under M11.D39a nothing is sent to the job's channel when the poll decides \
-                 something, so a wait that does not read the mailbox does not learn"
-            );
-            assert!(
-                source.contains("ctx.lifecycle_wakeup()") && source.contains("wake.notified()"),
-                "{name}: and it must be woken by a submission, or the read at the top of the \
-                 turn is only reached when something else — a message, a timeout — ended the \
-                 previous one"
-            );
+            (
+                "scheduling/admission/execution.rs",
+                "the other half of that split: the `select!` that is woken lives with the                  context that owns the job's channel, and is held by the same paired counts",
+            ),
+        ];
+
+        /// Everything in a file before its test module. The same rule
+        /// `every_state_in_the_module` applies, kept separate so that neither row's domain
+        /// moves when the other is edited.
+        fn production_half(source: &str) -> &str {
+            match source.find("\n#[cfg(test)]") {
+                Some(at) => &source[..at],
+                None => source,
+            }
         }
+
+        fn walk(dir: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("the states module's own source") {
+                let path = entry.expect("a readable directory entry").path();
+                if path.is_dir() {
+                    walk(&path, found);
+                    continue;
+                }
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .expect("a readable file name")
+                    .to_string();
+                // Production files only: a test module's own fixtures wait on things no job
+                // ever sits in, and `production_half` cannot see a file that is test code all
+                // the way down.
+                if !name.ends_with(".rs") || name == "tests.rs" || name.ends_with("_tests.rs") {
+                    continue;
+                }
+                found.push(path);
+            }
+        }
+
+        let states = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/states");
+        let mut sources = Vec::new();
+        walk(&states, &mut sources);
+        sources.push(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src/job_controller/leader_manager.rs"),
+        );
+        sources.sort();
+
+        let mut in_domain = 0;
+        let mut exemptions_used = std::collections::BTreeSet::new();
+        for path in &sources {
+            let source = std::fs::read_to_string(path).expect("a readable source file");
+            let source = production_half(&source);
+            if !WAITS.iter().any(|wait| source.contains(wait)) {
+                continue;
+            }
+            in_domain += 1;
+
+            let name = path
+                .strip_prefix(&states)
+                .unwrap_or(path)
+                .to_str()
+                .expect("a printable path")
+                .to_string();
+            if source.contains(READS) && source.contains(WOKEN) {
+                continue;
+            }
+            if DELEGATES.iter().any(|to| source.contains(to)) {
+                continue;
+            }
+            let excused = EXEMPT.iter().find(|(file, _)| *file == name);
+            assert!(
+                excused.is_some(),
+                "{name}: every turn of a long-running wait must read the job's single writer                  and be woken by a submission to it. Under M11.D39a nothing is sent to the                  job's channel when the poll decides something, so a wait that does neither                  does not learn — and a wait that only reads is only reached when something                  else ended the previous turn. Fix the wait, or name this file in `EXEMPT`                  with the reason it is held elsewhere"
+            );
+            exemptions_used.insert(name);
+        }
+
+        assert!(
+            in_domain >= 15,
+            "this row asked {in_domain} files, which is fewer than `states/` held when it was              written — the walk has stopped reading the source it quantifies over"
+        );
+        assert_eq!(
+            exemptions_used,
+            EXEMPT
+                .iter()
+                .map(|(file, _)| (*file).to_string())
+                .collect::<std::collections::BTreeSet<_>>(),
+            "`EXEMPT` must name exactly the files that needed excusing: an entry no file used              is a stale exemption waiting to excuse the next wait that lands on it"
+        );
 
         // The phase graph splits the two halves across its modules on purpose: the loop that
         // reads lives with the typestate that can see it, and the `select!` that is woken lives
-        // with the context that owns the job's channel.
+        // with the context that owns the job's channel. These two counts are what the three
+        // `EXEMPT` entries above are held by.
         let phases = include_str!("scheduling/phases.rs");
         assert_eq!(
             phases.matches("awaiting.observe_intent()").count(),
@@ -9933,9 +10041,10 @@ mod tests {
 
     /// A worker leader, as far as [`LeaderManager`] can tell.
     ///
-    /// Only `GetJobStatus` is ever called: connecting polls once, and that poll is the whole
-    /// handshake. The other three are the rest of the service and answer as a leader that has
-    /// been asked something it has no business being asked at this point in a job's life.
+    /// `GetJobStatus` and `StopJob` are answered: connecting polls once, and that poll is the
+    /// whole handshake; a state that is stopping the job sends the stop before it waits. The
+    /// other two are the rest of the service and answer as a leader that has been asked
+    /// something it has no business being asked at this point in a job's life.
     struct FakeLeader {
         job_id: String,
         generation: u64,
@@ -9946,6 +10055,11 @@ mod tests {
         job_status: LeaderJobStatus,
         /// One per status poll, so a row can say the handshake happened rather than assume it.
         polls: Arc<AtomicU64>,
+        /// One entry per `StopJob`, carrying the mode it asked for — the leader-mode
+        /// counterpart of `WorkerCalls::stop_execution`. What a state *sent* is the half a
+        /// transition cannot show: an escalation that re-sent the weaker stop first, or sent
+        /// the harder one twice, reaches the same next state as one that did neither.
+        stops: Arc<Mutex<Vec<i32>>>,
     }
 
     #[tonic::async_trait]
@@ -9965,11 +10079,10 @@ mod tests {
 
         async fn stop_job(
             &self,
-            _: tonic::Request<StopJobReq>,
+            req: tonic::Request<StopJobReq>,
         ) -> Result<tonic::Response<StopJobResp>, tonic::Status> {
-            Err(tonic::Status::unimplemented(
-                "this leader is only ever asked for its status",
-            ))
+            self.stops.lock().unwrap().push(req.into_inner().stop_mode);
+            Ok(tonic::Response::new(StopJobResp {}))
         }
 
         async fn get_job_checkpoints(
@@ -10002,7 +10115,19 @@ mod tests {
         state_backend: &str,
         job_status: LeaderJobStatus,
     ) -> (Arc<AtomicU64>, String) {
+        let (polls, _stops, address) =
+            fake_leader_recording(generation, state_backend, job_status).await;
+        (polls, address)
+    }
+
+    /// The same leader, keeping the stops it was sent.
+    async fn fake_leader_recording(
+        generation: u64,
+        state_backend: &str,
+        job_status: LeaderJobStatus,
+    ) -> (Arc<AtomicU64>, Arc<Mutex<Vec<i32>>>, String) {
         let polls = Arc::new(AtomicU64::new(0));
+        let stops = Arc::new(Mutex::new(Vec::new()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(
@@ -10013,10 +10138,11 @@ mod tests {
                     state_backend: state_backend.to_string(),
                     job_status,
                     polls: polls.clone(),
+                    stops: stops.clone(),
                 }))
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
         );
-        (polls, format!("http://{addr}"))
+        (polls, stops, format!("http://{addr}"))
     }
 
     /// The leader-mode tail attaches to the job's leader and records where it is
@@ -10979,6 +11105,76 @@ mod tests {
         );
     }
 
+    /// `LeaderStopping` leaves for a stop that arrived between states only when it goes
+    /// further than the stop it is already making.
+    ///
+    /// The escalation row for the state the earlier rounds left alone, and its own control —
+    /// PR #160 review comment `5384225297`. This state was recorded as staying because "this
+    /// state is the stop", which is true of the stop it holds and false of a harder one an
+    /// operator asked for afterwards. Leaving is what keeps `stop_leader(JobStopGraceful)`
+    /// from being sent to a leader the operator has already given up on.
+    ///
+    /// The order matters in both directions, so the domain is every pair rather than the two
+    /// cells that would have passed a weaker rule. A rule that left for *every* stop would
+    /// answer the stop that created the state with a transition back to itself and send the
+    /// same `stop_leader` again on each turn; a rule with no order would let a `graceful`
+    /// arriving after an `immediate` walk the job back to the gentler stop already abandoned.
+    /// `Stopped` is what a cell that stays reaches: with no `LeaderManager` in this context the
+    /// body takes its worker-stopping arm, so "stayed" and "ran its body" are one answer.
+    #[tokio::test]
+    async fn leader_stopping_leaves_only_for_a_stop_that_goes_further_than_its_own() {
+        const GRACEFUL: LeaderStopBehavior =
+            LeaderStopBehavior::StopJob(JobStopMode::JobStopGraceful);
+        const IMMEDIATE: LeaderStopBehavior =
+            LeaderStopBehavior::StopJob(JobStopMode::JobStopImmediate);
+        const WORKERS: LeaderStopBehavior = LeaderStopBehavior::StopWorkers;
+
+        for (holding, asked, expected) in [
+            // Strictly harder than the stop in flight: the escalation.
+            (
+                GRACEFUL,
+                StopMode::immediate,
+                "LeaderStopping { stop_behavior: StopJob(JobStopImmediate) }",
+            ),
+            (
+                GRACEFUL,
+                StopMode::force,
+                "LeaderStopping { stop_behavior: StopWorkers }",
+            ),
+            (
+                IMMEDIATE,
+                StopMode::force,
+                "LeaderStopping { stop_behavior: StopWorkers }",
+            ),
+            // The stop already in flight: answering it would send it a second time.
+            (GRACEFUL, StopMode::graceful, "Stopped"),
+            (IMMEDIATE, StopMode::immediate, "Stopped"),
+            (WORKERS, StopMode::force, "Stopped"),
+            // Weaker: an operator does not get a gentler ending by asking for one later.
+            (IMMEDIATE, StopMode::graceful, "Stopped"),
+            (WORKERS, StopMode::immediate, "Stopped"),
+            (WORKERS, StopMode::graceful, "Stopped"),
+            // Not a stop this family acts on: `leader_stop_escalation` answers `None` for
+            // both, and a checkpoint stop is `LeaderCheckpointStopping`'s to make.
+            (GRACEFUL, StopMode::checkpoint, "Stopped"),
+            (GRACEFUL, StopMode::none, "Stopped"),
+        ] {
+            let left = a_stop_arriving_between_states(
+                Box::new(LeaderStopping {
+                    stop_behavior: holding,
+                }),
+                asked,
+            )
+            .await;
+
+            assert_eq!(
+                format!("{left:?}"),
+                expected,
+                "holding {holding:?} and asked for a {asked:?} stop"
+            );
+        }
+    }
+
     /// A `CheckpointStopping` asked to stop the way it is already stopping stays and finishes
     /// its checkpoint.
     ///
@@ -11407,6 +11603,33 @@ mod tests {
         .expect("the fake leader agrees about the job, its generation and its backend")
     }
 
+    /// The same leader, and the stops it was sent.
+    async fn leader_manager_recording_stops(
+        job_state: JobState,
+    ) -> (Arc<Mutex<Vec<i32>>>, LeaderManager) {
+        let (_polls, stops, address) = fake_leader_recording(
+            LEADER_GENERATION,
+            "parquet",
+            LeaderJobStatus {
+                job_state: job_state as i32,
+                ..Default::default()
+            },
+        )
+        .await;
+        let manager = LeaderManager::connect(
+            JobId(Arc::new("job_abc".to_string())),
+            PipelineId("pipeline_1".to_string().into()),
+            LEADER_GENERATION,
+            WorkerId(7),
+            address,
+            Some(Duration::from_secs(5)),
+            StateBackendSelector::Parquet,
+        )
+        .await
+        .expect("the fake leader agrees about the job, its generation and its backend");
+        (stops, manager)
+    }
+
     /// The `TaskFinished` the single task of [`one_operator_program_at`] reports.
     fn task_finished() -> JobMessage {
         JobMessage::RunningMessage(RunningMessage::TaskFinished {
@@ -11695,6 +11918,80 @@ mod tests {
         );
     }
 
+    /// A leader-mode stop already in flight is overtaken by a harder one that arrives only in
+    /// the job's mailbox.
+    ///
+    /// The finding driven end to end — PR #160 review comment `5384225297`, the wait half. The
+    /// mailbox is empty when the state starts, so the boundary consumes nothing and the body
+    /// runs; the leader reports `JobFinishing` for ever, so `wait_for_state(JobStopped)` never
+    /// returns and the submission below is the only thing in the process that can end the wait.
+    /// Before this change that wait watched neither the mailbox nor the job's channel, so the
+    /// force stop sat behind `FINISH_TIMEOUT` — sixty seconds, three times this row's deadline.
+    ///
+    /// This is also the variant `no_state_that_stays_waits_out_the_stop_it_was_handed` cannot
+    /// reach: that row runs one instance per state, and the instance recorded for this one is
+    /// `StopWorkers`, whose body stops the workers and returns without waiting at all.
+    #[tokio::test]
+    async fn a_stopping_leader_is_overtaken_by_a_harder_stop_from_the_mailbox() {
+        let mailbox = intent_mailbox();
+        let (stops, leader_manager) = leader_manager_recording_stops(JobState::JobFinishing).await;
+
+        let mut harness = Harness::new(3)
+            .with_db(sqlite_startable_job("Running", 2))
+            .with_program(one_operator_program_at(1))
+            .with_leader_manager(leader_manager)
+            .with_actor(&mailbox);
+        let ctx = harness.ctx(
+            running_config(StateBackendSelector::Parquet),
+            StateBackendSelector::Parquet,
+        );
+
+        let mut forced = running_config(StateBackendSelector::Parquet);
+        forced.stop_mode = StopMode::force;
+        let submit = async {
+            // Long enough that the wait is parked. Not load-bearing: submitting earlier only
+            // makes the wait read the stop before it parks, which is the same consumption
+            // point on the same turn.
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            mailbox.submit(LifecycleIntent::Adopt(Box::new(forced)));
+        };
+
+        let (stopping, ()) = tokio::time::timeout(STOP_REACHES_THE_WAIT, async {
+            tokio::join!(
+                execute_state(
+                    Box::new(LeaderStopping {
+                        stop_behavior: LeaderStopBehavior::StopJob(JobStopMode::JobStopGraceful),
+                    }),
+                    ctx,
+                ),
+                submit
+            )
+        })
+        .await
+        .expect(
+            "reaching this deadline is the finding: the escalation was submitted to the job's \
+             writer, and a wait watching neither of the sources a stop arrives on holds the job \
+             on its graceful stop until `FINISH_TIMEOUT`",
+        );
+        let (next, _ctx) = stopping;
+
+        assert_eq!(
+            format!(
+                "{:?}",
+                next.expect("a job that is stopping transitions; it does not end here")
+            ),
+            "LeaderStopping { stop_behavior: StopWorkers }",
+            "the behaviour `leader_stop_escalation` names for a force stop — the same mapping \
+             the state boundary answers with, read here at the wait's own consumption point"
+        );
+        assert_eq!(
+            stops.lock().unwrap().as_slice(),
+            [JobStopMode::JobStopGraceful as i32],
+            "and the leader was sent the graceful stop once and nothing after it: an escalation \
+             is a transition, and asking the workers directly is `StopWorkers`'s own body"
+        );
+    }
+
     /// No state that stays can wait out the stop it was handed.
     ///
     /// The quantified row, and the one that would have found this finding. Its domain is
@@ -11706,6 +12003,14 @@ mod tests {
     /// Each body runs through `execute_state`, so the stop arrives the way the finding
     /// describes: decided by the job's writer, consumed at the boundary, and never sent to the
     /// job's channel at all. Reaching the deadline is the failure this row exists to report.
+    ///
+    /// **Its own gap, and PR #160 review comment `5384225297` is what that cost.** The table
+    /// holds one instance per state, so a state whose body branches on how it was constructed
+    /// is asked about one branch. The instance recorded here for `LeaderStopping` is
+    /// `StopWorkers`, whose body stops the workers and returns without waiting at all — so this
+    /// row passed while the same state's other branch waited out every stop that was not a
+    /// message. `a_stopping_leader_is_overtaken_by_a_harder_stop_from_the_mailbox` is that
+    /// branch, driven separately because it needs a live leader to wait on.
     #[tokio::test]
     async fn no_state_that_stays_waits_out_the_stop_it_was_handed() {
         let mut ran = 0;
