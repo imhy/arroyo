@@ -91,37 +91,53 @@ impl ProtocolPaths {
         format!("{}/{}/generations/", self.pipeline_id, self.job_id)
     }
 
-    /// Whether `path` names an object this job's cleanup may delete.
+    /// Whether `path` names a **table data file** of this job that a cleanup may delete.
     ///
-    /// Stronger than "starts with the namespace", because deleting a data file is not only a
-    /// delete of that object: `delete_classified_history` also removes the file's parent
-    /// directory and *that* directory's parent, to clear the operator and checkpoint
-    /// directories a file leaves behind. So a file must be deep enough inside the namespace
-    /// that both of those stay inside it — `P/J/generations/f.parquet` would otherwise put
-    /// `delete_directory` on `P/J` itself. The canonical layout is
-    /// `…/generations/{g}/checkpoints/checkpoint-{e}/operator-{o}/{file}`, which is four
-    /// segments deeper than the prefix.
+    /// Namespace is not enough, and neither is depth — PR #160 review comment `5385867064`.
+    /// A retained checkpoint's own `checkpoint-manifest.pb` is inside the namespace and has a
+    /// grandparent inside it too, so a namespace-and-depth test called it a data file: an
+    /// older manifest naming that path had the *live* control object deleted, and the retained
+    /// checkpoint's table references cannot protect it, because a control object is not a
+    /// table reference. So the layout is parsed, and only the shape a worker writes table data
+    /// at is accepted:
+    ///
+    /// `{pipeline}/{job}/generations/{g}/checkpoints/checkpoint-{e:07}/operator-{o}/table-{…}`
+    ///
+    /// Every control object this crate writes fails that by construction rather than by being
+    /// listed: `checkpoint-manifest.pb` and `committed.json` sit one level shallower, in the
+    /// checkpoint directory itself; `generation-manifest.json` is shallower again; and
+    /// `current-generation.json` and `epochs/epoch-{e}.record` are not under `generations/` at
+    /// all. Excluding them by the shape data *has*, rather than by a list of the things it is
+    /// not, is what stops a control object added later from being deletable the day it lands.
+    ///
+    /// The depth this enforces also subsumes the directory rule it replaces: a path of exactly
+    /// this shape has its parent at `operator-{o}` and its grandparent at the checkpoint
+    /// directory, both inside the namespace, so the parent and grandparent
+    /// `delete_classified_history` derives can never escape it.
     ///
     /// One rule, two readers: the check that lets a history become a token, and the deletion
     /// that spends it.
     pub fn contains_deletable_object(&self, path: &str) -> bool {
         let prefix = self.generations_prefix();
-        let inside = |candidate: &str| candidate.starts_with(&prefix);
-
-        let parent = |candidate: &str| {
-            std::path::Path::new(candidate)
-                .parent()
-                .and_then(|p| p.to_str())
-                .map(str::to_string)
-        };
-        let Some(directory) = parent(path) else {
+        let Some(tail) = path.strip_prefix(prefix.as_str()) else {
             return false;
         };
-        let Some(checkpoint_directory) = parent(&directory) else {
+        let segments: Vec<&str> = tail.split('/').collect();
+        let [generation, "checkpoints", checkpoint, operator, table] = segments.as_slice() else {
             return false;
         };
+        let named = |segment: &str, kind: &str| {
+            segment
+                .strip_prefix(kind)
+                .is_some_and(|name| !name.is_empty())
+        };
 
-        inside(path) && inside(&directory) && inside(&checkpoint_directory)
+        generation.parse::<u64>().is_ok()
+            && checkpoint
+                .strip_prefix("checkpoint-")
+                .is_some_and(|epoch| !epoch.is_empty() && epoch.bytes().all(|b| b.is_ascii_digit()))
+            && named(operator, "operator-")
+            && named(table, "table-")
     }
 
     fn path(&self, suffix: impl AsRef<str>) -> CheckpointRef {
@@ -328,7 +344,11 @@ mod tests {
         .unwrap();
     }
 
-    /// A manifest cannot aim the cleanup at another job's objects.
+    /// A manifest cannot aim the cleanup at anything but this job's own table data.
+    ///
+    /// Renamed from `..._refuses_data_files_outside_the_namespace_it_was_collected_for` when
+    /// PR #160 review comment `5385867064` widened it: being inside the namespace turned out
+    /// not to be the property, because a *control* object is inside it too.
     ///
     /// **PR #160 review comment `5384870087`.** `CheckpointRef` validates a path's *shape* —
     /// relative, no empty or `..` segments, under a length cap — and says nothing about its
@@ -341,7 +361,7 @@ mod tests {
     /// `starts_with`, and its grandparent is `P/J` itself, which is what `delete_directory`
     /// would then be handed.
     #[test]
-    fn a_history_refuses_data_files_outside_the_namespace_it_was_collected_for() {
+    fn a_history_refuses_anything_that_is_not_this_jobs_table_data() {
         let paths = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J"));
         let collecting = CollectingJob {
             state_backend: StateBackendSelector::Parquet,
@@ -379,10 +399,36 @@ mod tests {
             "a file whose grandparent is the job root would have `delete_directory` run on it",
         );
 
-        // The control: the layout a worker actually writes is accepted, so this rule refuses a
-        // namespace rather than refusing data files.
-        Validated::validate(with_data_file(data_ref(&paths, 1)), collecting)
-            .expect("a data file inside the namespace is what a cleanup exists to delete");
+        // PR #160 review comment `5385867064`: every control object this crate writes is
+        // inside the namespace, and three of them are at the depth the previous rule accepted.
+        // A retained checkpoint's manifest named by an *older* manifest was therefore deletable,
+        // and no table reference protects a control object, because it is not a table
+        // reference. Each is refused by the shape data has rather than by being listed.
+        for (control, what) in [
+            (
+                paths.checkpoint_manifest(Generation(1), Epoch(2)),
+                "a retained checkpoint's own manifest",
+            ),
+            (
+                paths.committed_marker(Generation(1), Epoch(2)),
+                "a retained checkpoint's commit marker",
+            ),
+            (
+                paths.generation_manifest(Generation(1)),
+                "the generation manifest",
+            ),
+            (paths.epoch_record(Epoch(2)), "an epoch record"),
+            (paths.current_generation(), "the current-generation fence"),
+        ] {
+            refused(control, what);
+        }
+
+        // The controls: the layout a worker actually writes is accepted, at the retained epoch
+        // and at an older one, so this rule refuses an object class rather than refusing data.
+        for epoch in [1, 7] {
+            Validated::validate(with_data_file(data_ref(&paths, epoch)), collecting)
+                .expect("this job's own table data is what a cleanup exists to delete");
+        }
     }
 
     fn data_ref(paths: &ProtocolPaths, epoch: u64) -> CheckpointRef {

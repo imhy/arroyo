@@ -314,15 +314,14 @@ fn check_table_files_in_namespace(
     operator_id: &str,
     metadata: &OperatorCheckpointMetadata,
 ) -> Result<(), StateError> {
-    let prefix = format!("{job_id}/checkpoints/");
     for table in tables_of(operator_id, metadata)? {
         for file in table_file_refs(&table)? {
-            if !file.starts_with(&prefix) {
+            if !is_table_data_file(job_id, operator_id, table.name, &file) {
                 return Err(StateError::Other {
                     table: table.name.to_string(),
                     error: format!(
-                        "operator {operator_id} table {} references the file {file:?}, which is \
-                         outside the namespace {prefix:?} this cleanup was collected for",
+                        "operator {operator_id} table {} references {file:?}, which is not the \
+                         path this job writes that table's data at",
                         table.name,
                     ),
                 });
@@ -330,6 +329,43 @@ fn check_table_files_in_namespace(
         }
     }
     Ok(())
+}
+
+/// Whether `file` is the path a worker writes *this operator's, this table's* data at.
+///
+/// `{job_id}/checkpoints/checkpoint-{epoch:07}/operator-{operator_id}/table-{table}-{sub}`,
+/// optionally suffixed `-compacted` — the layout
+/// `CheckpointFilePathLayout::table_checkpoint_path` builds.
+///
+/// **Binding the operator and the table is the point, not the namespace — PR #160 review
+/// comment `5385867064`.** A namespace-only test let operator A's *dropped* epoch name
+/// operator B's *retained* data file. `files_no_longer_referenced` subtracts only the retained
+/// references of the operator it is planning for, so B's file was in nobody's keep-set and was
+/// deleted while every identity, selector and namespace check passed — B's live state, lost to
+/// a cleanup that was correct about everything except which object it was looking at.
+///
+/// The epoch is deliberately unconstrained. A file carried forward from an older epoch is
+/// still this operator's and this table's, and `files_to_keep` exists precisely because epochs
+/// share files; pinning the epoch would delete state the retained checkpoint still needs.
+fn is_table_data_file(job_id: &str, operator_id: &str, table_name: &str, file: &str) -> bool {
+    let segments: Vec<&str> = file.split('/').collect();
+    let [job, "checkpoints", checkpoint, operator, table] = segments.as_slice() else {
+        return false;
+    };
+    if *job != job_id || *operator != format!("operator-{operator_id}") {
+        return false;
+    }
+    let Some(epoch) = checkpoint.strip_prefix("checkpoint-") else {
+        return false;
+    };
+    if epoch.is_empty() || !epoch.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    let Some(subtask) = table.strip_prefix(format!("table-{table_name}-").as_str()) else {
+        return false;
+    };
+    let subtask = subtask.strip_suffix("-compacted").unwrap_or(subtask);
+    !subtask.is_empty() && subtask.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// The file strings one table's checkpoint metadata carries, by encoding.

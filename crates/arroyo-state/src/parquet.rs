@@ -890,10 +890,7 @@ mod tests {
         // a table references live in the job's own checkpoint namespace (PR #160 review comment
         // `5384870087`), and a fixture that writes somewhere no worker would is a fixture that
         // cannot exercise the check it has to pass.
-        let file = format!(
-            "{}/table-g-000.parquet",
-            operator_path(JOB_ID, epoch, operator_id)
-        );
+        let file = format!("{}/table-g-000", operator_path(JOB_ID, epoch, operator_id));
         store.put(&file, b"data".to_vec()).await;
         ParquetBackend::write_operator_checkpoint_metadata(
             &store.role,
@@ -1421,7 +1418,12 @@ mod tests {
 
     /// One operator's collected epochs, all agreeing with the job, as a whole cleanup
     /// records them.
-    /// A table may not point the cleanup at another job's files, in either encoding.
+    /// A table may not point the cleanup at anything but its own operator's, its own
+    /// table's data — in either encoding.
+    ///
+    /// Renamed from `..._refuses_table_files_outside_the_jobs_namespace` when PR #160 review
+    /// comment `5385867064` widened it: the namespace turned out not to be the property,
+    /// because another operator's live file is inside it too.
     ///
     /// **PR #160 review comment `5384870087`.** The file strings inside a table's checkpoint
     /// metadata are that object's contents: the operator header, the selector and the epoch all
@@ -1434,7 +1436,7 @@ mod tests {
     /// The positive control is the last assertion: the canonical path is accepted, so the rule
     /// is refusing a namespace rather than refusing everything.
     #[test]
-    fn a_cleanup_refuses_table_files_outside_the_jobs_namespace() {
+    fn a_cleanup_refuses_anything_that_is_not_this_operators_table_data() {
         let cleanup_of = |metadata: OperatorCheckpointMetadata| {
             Validated::validate(
                 CheckpointCleanup::new(
@@ -1457,41 +1459,85 @@ mod tests {
             )
         };
 
-        let canonical = format!("{}/table-g-000.parquet", operator_path(JOB_ID, 1, "node_1"));
-        let another_job = format!(
-            "{}/table-g-000.parquet",
-            operator_path("job_2", 1, "node_1")
-        );
+        // One path builder, so each cell below varies exactly one dimension of it.
+        let data_file = |job: &str, operator: &str, table: &str| {
+            format!("{}/table-{table}-000", operator_path(job, 1, operator))
+        };
 
-        // Global keyed: `files` is a plain list of strings.
-        let err = cleanup_of(operator_metadata(
-            "node_1",
-            1,
-            "parquet",
-            std::slice::from_ref(&another_job),
-        ))
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("outside the namespace"),
-            "a global-keyed table aimed the cleanup at job_2 and earned a token: {err}"
-        );
+        // Global keyed: `files` is a plain list of strings. The table is named "g".
+        for (aimed_at, what) in [
+            (data_file("job_2", "node_1", "g"), "another job"),
+            // The cells added for PR #160 review comment `5385867064`. The job and the layout
+            // are right and the *operator* is not — the one `files_no_longer_referenced`
+            // cannot defend against, because it subtracts only the retained references of the
+            // operator it is planning for, so another operator's live file is in nobody's
+            // keep-set. Then the same one level down, another table inside this operator.
+            (
+                data_file(JOB_ID, "node_2", "g"),
+                "another operator's retained data file",
+            ),
+            (
+                data_file(JOB_ID, "node_1", "other"),
+                "another table inside this operator",
+            ),
+        ] {
+            let err = cleanup_of(operator_metadata(
+                "node_1",
+                1,
+                "parquet",
+                std::slice::from_ref(&aimed_at),
+            ))
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("not the path this job writes"),
+                "a global-keyed table of node_1 named {what} and earned a token: {err}"
+            );
+        }
 
-        // Expiring keyed time: `files` is a list of `ParquetTimeFile`, read through `.file`.
-        let err = cleanup_of(expiring_operator_metadata("node_1", 1, &[another_job])).unwrap_err();
-        assert!(
-            err.to_string().contains("outside the namespace"),
-            "an expiring table aimed the cleanup at job_2 and earned a token: {err}"
-        );
+        // Expiring keyed time: `files` is a list of `ParquetTimeFile`, read through `.file`,
+        // and the table is named "e". Both encodings are driven because `table_file_refs`
+        // reads them differently and one being bound says nothing about the other.
+        for (aimed_at, what) in [
+            (data_file("job_2", "node_1", "e"), "another job"),
+            (
+                data_file(JOB_ID, "node_2", "e"),
+                "another operator's retained data file",
+            ),
+            (
+                data_file(JOB_ID, "node_1", "other"),
+                "another table inside this operator",
+            ),
+        ] {
+            let err = cleanup_of(expiring_operator_metadata("node_1", 1, &[aimed_at])).unwrap_err();
+            assert!(
+                err.to_string().contains("not the path this job writes"),
+                "an expiring table of node_1 named {what} and earned a token: {err}"
+            );
+        }
 
+        // The positive controls: the path a worker actually writes, for each encoding, at an
+        // epoch other than the one being retained — a carried-forward file is still this
+        // operator's and this table's, and refusing it would delete state the retained
+        // checkpoint needs.
         cleanup_of(operator_metadata(
             "node_1",
             1,
             "parquet",
-            std::slice::from_ref(&canonical),
+            &[
+                data_file(JOB_ID, "node_1", "g"),
+                format!(
+                    "{}/table-g-004-compacted",
+                    operator_path(JOB_ID, 0, "node_1")
+                ),
+            ],
         ))
-        .expect("a file in the job's own checkpoint namespace is what a cleanup is for");
-        cleanup_of(expiring_operator_metadata("node_1", 1, &[canonical]))
-            .expect("and the same for the other encoding");
+        .expect("this operator's own table data is what a cleanup is for");
+        cleanup_of(expiring_operator_metadata(
+            "node_1",
+            1,
+            &[data_file(JOB_ID, "node_1", "e")],
+        ))
+        .expect("and the same for the other encoding");
     }
 
     /// One operator epoch whose single table uses the expiring-keyed-time encoding.
