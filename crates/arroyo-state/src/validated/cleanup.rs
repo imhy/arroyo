@@ -7,10 +7,14 @@
 //! that is only true while they live in one module.
 
 use arroyo_rpc::errors::StateError;
-use arroyo_rpc::grpc::rpc::{OperatorCheckpointMetadata, TableCheckpointMetadata, TableConfig};
+use arroyo_rpc::grpc::rpc::{
+    ExpiringKeyedTimeTableCheckpointMetadata, GlobalKeyedTableTaskCheckpointMetadata,
+    OperatorCheckpointMetadata, TableCheckpointMetadata, TableConfig, TableEnum,
+};
 use arroyo_rpc::state_backend::validated::identity::{CheckpointIdentity, check_operator_header};
 use arroyo_rpc::state_backend::validated::{Validated, WholeObject};
 use arroyo_rpc::state_backend::{StateBackendSelector, validate_restored_operator_metadata};
+use prost::Message;
 use std::collections::BTreeSet;
 
 /// Every operator and every epoch a checkpoint cleanup is about to act on.
@@ -226,6 +230,11 @@ impl WholeObject for CheckpointCleanup {
                 structural,
             )?;
             validate_restored_operator_metadata(scope.job, &operator.retained)?;
+            check_table_files_in_namespace(
+                self.job_id(),
+                &operator.operator_id,
+                &operator.retained,
+            )?;
 
             for (epoch, metadata) in &operator.dropped {
                 let Some(metadata) = metadata else { continue };
@@ -237,6 +246,7 @@ impl WholeObject for CheckpointCleanup {
                     structural,
                 )?;
                 validate_restored_operator_metadata(scope.job, metadata)?;
+                check_table_files_in_namespace(self.job_id(), &operator.operator_id, metadata)?;
             }
         }
 
@@ -283,6 +293,76 @@ impl<'a> ValidatedOperatorCleanup<'a> {
         }
         Ok(tables)
     }
+}
+
+/// Every data file one collected epoch references, checked against the job's own namespace.
+///
+/// **PR #160 review comment `5384870087`.** The file strings inside a table's checkpoint
+/// metadata are that object's *contents*: nothing about the operator header, the selector or
+/// the epoch says where they point. `ParquetBackend::files_no_longer_referenced` reads exactly
+/// these strings into the deletion plan and `cleanup_checkpoint` deletes them, so a metadata
+/// object for job `A` naming a path under job `B` deleted `B`'s data. Checked here, where the
+/// token is earned, rather than where the plan is built — a token whose check is weaker than
+/// the effect it authorizes is the defect the round before this one closed.
+///
+/// The legacy layout is `{job_id}/checkpoints/checkpoint-{epoch}/operator-{op}/table-…`, and
+/// the prefix asserted is `{job_id}/checkpoints/` rather than this epoch's own directory: a
+/// file carried forward from an older epoch is still this job's, and `files_to_keep` exists
+/// precisely because epochs share files.
+fn check_table_files_in_namespace(
+    job_id: &str,
+    operator_id: &str,
+    metadata: &OperatorCheckpointMetadata,
+) -> Result<(), StateError> {
+    let prefix = format!("{job_id}/checkpoints/");
+    for table in tables_of(operator_id, metadata)? {
+        for file in table_file_refs(&table)? {
+            if !file.starts_with(&prefix) {
+                return Err(StateError::Other {
+                    table: table.name.to_string(),
+                    error: format!(
+                        "operator {operator_id} table {} references the file {file:?}, which is \
+                         outside the namespace {prefix:?} this cleanup was collected for",
+                        table.name,
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The file strings one table's checkpoint metadata carries, by encoding.
+///
+/// Exhaustive over [`TableEnum`], so a third encoding cannot be added without answering where
+/// its files live. `MissingTableType` yields nothing rather than erroring: it is refused a few
+/// steps later by `files_no_longer_referenced`, which is the place that already says why a
+/// table with no type cannot have its file set determined, and answering it twice would be two
+/// spellings of one rule.
+fn table_file_refs(table: &ValidatedTable<'_>) -> Result<Vec<String>, StateError> {
+    let decode_failed = |e: prost::DecodeError| StateError::Other {
+        table: table.name.to_string(),
+        error: format!(
+            "table {} has undecodable checkpoint metadata: {e}",
+            table.name
+        ),
+    };
+    Ok(match table.config.table_type() {
+        TableEnum::MissingTableType => Vec::new(),
+        TableEnum::GlobalKeyValue => {
+            GlobalKeyedTableTaskCheckpointMetadata::decode(table.checkpoint.data.as_slice())
+                .map_err(decode_failed)?
+                .files
+        }
+        TableEnum::ExpiringKeyedTimeTable => {
+            ExpiringKeyedTimeTableCheckpointMetadata::decode(table.checkpoint.data.as_slice())
+                .map_err(decode_failed)?
+                .files
+                .into_iter()
+                .map(|file| file.file)
+                .collect()
+        }
+    })
 }
 
 /// Pairs each of one operator epoch's tables with the config that describes it.

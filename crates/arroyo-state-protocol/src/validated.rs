@@ -379,6 +379,21 @@ impl WholeObject for CheckpointHistory {
     /// the traversal's own job, and re-checking it would mean buffering the file lists the
     /// traversal exists to stream past.
     fn check_whole(&self, job: CollectingJob) -> Result<(), StoreError> {
+        // The data files come out of the manifests' *contents*, and `CheckpointRef` validates
+        // only their shape — relative, no empty or `..` segments, under a length cap. Shape is
+        // not place: a syntactically perfect path can name another job's object, and
+        // `delete_classified_history` deletes these strings directly. PR #160 review comment
+        // `5384870087`.
+        for file in &self.data_files {
+            if !self.paths.contains_deletable_object(file.as_str()) {
+                return Err(StoreError::Protocol(ProtocolError::InvalidCheckpointRef {
+                    path: file.as_str().to_string(),
+                    reason: "manifest names a data file outside the namespace this history was \
+                             collected for",
+                }));
+            }
+        }
+
         for checkpoint in &self.reached {
             let identity = identify_checkpoint_manifest(
                 &self.paths,

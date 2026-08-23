@@ -37,12 +37,26 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::LazyLock;
 
 /// The toolchain the diagnostic categories below were verified against.
 const PINNED_RUSTC: &str = "1.96.0";
 
-/// The phase graph under test: the real source, verbatim.
-const PHASES: &str = include_str!("phases.rs");
+/// The phase graph under test: the real source, verbatim — both halves of it.
+///
+/// `phases.rs` was split at PR #160 review comment `5384870087`, which took it past the plan's
+/// 500-line production bar. These rows compile the graph as one standalone file against a stub
+/// environment, so the two halves are rejoined here exactly as the compiler sees them: the
+/// typestates without the `mod driver;` that a standalone file cannot resolve, and the driver
+/// without the `use super::*;` that would then have no parent. Rejoining rather than compiling
+/// only one half is the point — the mutations below weaken code in both.
+static PHASES: LazyLock<String> = LazyLock::new(|| {
+    let typestates = include_str!("phases.rs")
+        .replace("\nmod driver;\n", "\n")
+        .replace("\npub(crate) use driver::schedule;\n", "\n");
+    let driver = include_str!("phases/driver.rs").replace("\nuse super::*;\n", "\n");
+    format!("{typestates}\n{driver}")
+});
 
 /// The stub environment it is compiled against.
 const STUB: &str = include_str!("compile_fail/stub.rs");
@@ -304,14 +318,14 @@ fn irreversible_phases_consume_admission() {
 
     compile(
         "positive-admission",
-        PHASES,
+        PHASES.as_str(),
         include_str!("compile_fail/positive_admission.rs"),
     )
     .assert_compiles("the permitted use of the phase API");
 
     compile(
         "negative-admission-reuse",
-        PHASES,
+        PHASES.as_str(),
         include_str!("compile_fail/negative_admission_reuse.rs"),
     )
     .assert_fails_with(
@@ -322,7 +336,7 @@ fn irreversible_phases_consume_admission() {
 
     compile(
         "negative-admission-absent",
-        PHASES,
+        PHASES.as_str(),
         include_str!("compile_fail/negative_admission_absent.rs"),
     )
     .assert_fails_with(
@@ -335,7 +349,7 @@ fn irreversible_phases_consume_admission() {
     // and the fixture that proved it stops proving anything.
     compile(
         "weakened-admission-reuse",
-        &BORROWS_INSTEAD_OF_CONSUMING.apply(PHASES),
+        &BORROWS_INSTEAD_OF_CONSUMING.apply(PHASES.as_str()),
         include_str!("compile_fail/negative_admission_reuse.rs"),
     )
     .assert_compiles(
@@ -345,7 +359,7 @@ fn irreversible_phases_consume_admission() {
 
     compile(
         "weakened-admission-absent",
-        &A_WAIT_KEEPS_THE_TOKEN.apply(PHASES),
+        &A_WAIT_KEEPS_THE_TOKEN.apply(PHASES.as_str()),
         include_str!("compile_fail/negative_admission_absent.rs"),
     )
     .assert_compiles(
@@ -362,14 +376,14 @@ fn token_owning_phase_cannot_recv() {
 
     compile(
         "positive-recv",
-        PHASES,
+        PHASES.as_str(),
         include_str!("compile_fail/positive_recv.rs"),
     )
     .assert_compiles("a token-free phase waiting on the job's channel");
 
     compile(
         "negative-recv",
-        PHASES,
+        PHASES.as_str(),
         include_str!("compile_fail/negative_recv.rs"),
     )
     .assert_fails_with(
@@ -380,7 +394,7 @@ fn token_owning_phase_cannot_recv() {
 
     compile(
         "weakened-recv",
-        &A_TOKEN_OWNING_PHASE_MAY_WAIT.apply(PHASES),
+        &A_TOKEN_OWNING_PHASE_MAY_WAIT.apply(PHASES.as_str()),
         include_str!("compile_fail/negative_recv.rs"),
     )
     .assert_compiles(

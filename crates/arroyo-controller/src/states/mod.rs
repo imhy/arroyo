@@ -9783,11 +9783,17 @@ mod tests {
             "this row asked {waits} of the phase graph's waits, fewer than the module held \
              when it was written"
         );
-        assert_eq!(
-            include_str!("scheduling/phases.rs")
+        // Both halves of the phase graph: the driver moved into a child of `phases` when
+        // review comment `5384870087` took that file past the 500-line bar, and the loops this
+        // counts moved with it. Counting only the parent would have silently reached zero.
+        let driver_loops = include_str!("scheduling/phases.rs")
+            .matches("awaiting.observe_intent()")
+            .count()
+            + include_str!("scheduling/phases/driver.rs")
                 .matches("awaiting.observe_intent()")
-                .count(),
-            waits,
+                .count();
+        assert_eq!(
+            driver_loops, waits,
             "every wait in `execution.rs` must be driven by a loop in `phases.rs` that reads \
              the job's writer before it — the two halves of the split, tied to each other so \
              that adding one without the other fails here"

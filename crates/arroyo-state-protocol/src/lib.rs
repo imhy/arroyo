@@ -81,6 +81,49 @@ impl ProtocolPaths {
         self.path(format!("epochs/epoch-{epoch:07}.record"))
     }
 
+    /// The prefix every checkpoint artifact of this pipeline/job lives under.
+    ///
+    /// One spelling of the namespace, so that a check on where an object *is* and the builders
+    /// that decide where an object *goes* cannot come to disagree. Every builder above routes
+    /// through [`Self::path`], and `generations/` is the segment all of them but
+    /// [`Self::current_generation`] and [`Self::epoch_record`] share.
+    pub fn generations_prefix(&self) -> String {
+        format!("{}/{}/generations/", self.pipeline_id, self.job_id)
+    }
+
+    /// Whether `path` names an object this job's cleanup may delete.
+    ///
+    /// Stronger than "starts with the namespace", because deleting a data file is not only a
+    /// delete of that object: `delete_classified_history` also removes the file's parent
+    /// directory and *that* directory's parent, to clear the operator and checkpoint
+    /// directories a file leaves behind. So a file must be deep enough inside the namespace
+    /// that both of those stay inside it — `P/J/generations/f.parquet` would otherwise put
+    /// `delete_directory` on `P/J` itself. The canonical layout is
+    /// `…/generations/{g}/checkpoints/checkpoint-{e}/operator-{o}/{file}`, which is four
+    /// segments deeper than the prefix.
+    ///
+    /// One rule, two readers: the check that lets a history become a token, and the deletion
+    /// that spends it.
+    pub fn contains_deletable_object(&self, path: &str) -> bool {
+        let prefix = self.generations_prefix();
+        let inside = |candidate: &str| candidate.starts_with(&prefix);
+
+        let parent = |candidate: &str| {
+            std::path::Path::new(candidate)
+                .parent()
+                .and_then(|p| p.to_str())
+                .map(str::to_string)
+        };
+        let Some(directory) = parent(path) else {
+            return false;
+        };
+        let Some(checkpoint_directory) = parent(&directory) else {
+            return false;
+        };
+
+        inside(path) && inside(&directory) && inside(&checkpoint_directory)
+    }
+
     fn path(&self, suffix: impl AsRef<str>) -> CheckpointRef {
         CheckpointRef::from_validated(format!(
             "{}/{}/{}",
@@ -283,6 +326,63 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    /// A manifest cannot aim the cleanup at another job's objects.
+    ///
+    /// **PR #160 review comment `5384870087`.** `CheckpointRef` validates a path's *shape* —
+    /// relative, no empty or `..` segments, under a length cap — and says nothing about its
+    /// place. These strings come out of the manifests' contents, so a manifest otherwise
+    /// entirely valid for `P/J` could name a path under `P/J2`, and `delete_classified_history`
+    /// deletes each string plus the two directories above it.
+    ///
+    /// The second case is the one the directory deletions make worse than a prefix test would
+    /// suggest: a file sitting directly under `generations/` is inside the namespace by any
+    /// `starts_with`, and its grandparent is `P/J` itself, which is what `delete_directory`
+    /// would then be handed.
+    #[test]
+    fn a_history_refuses_data_files_outside_the_namespace_it_was_collected_for() {
+        let paths = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J"));
+        let collecting = CollectingJob {
+            state_backend: StateBackendSelector::Parquet,
+        };
+        let with_data_file = |file: CheckpointRef| {
+            let mut history = CheckpointHistory::new(paths.clone());
+            history.classified(vec![], vec![file]);
+            history
+        };
+        let refused = |file: CheckpointRef, why: &str| {
+            let err = Validated::validate(with_data_file(file), collecting).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    StoreError::Protocol(ProtocolError::InvalidCheckpointRef { .. })
+                ),
+                "{why}: {err:?}"
+            );
+        };
+
+        let other_job = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J2"));
+        refused(
+            data_ref(&other_job, 1),
+            "a canonical path under a sibling job earned a cleanup token",
+        );
+
+        let other_pipeline = ProtocolPaths::new(PipelineId::new("P2"), JobId::new("J"));
+        refused(
+            data_ref(&other_pipeline, 1),
+            "the same job id under another pipeline is a different namespace",
+        );
+
+        refused(
+            checkpoint_ref(&format!("{}stray.parquet", paths.generations_prefix())),
+            "a file whose grandparent is the job root would have `delete_directory` run on it",
+        );
+
+        // The control: the layout a worker actually writes is accepted, so this rule refuses a
+        // namespace rather than refusing data files.
+        Validated::validate(with_data_file(data_ref(&paths, 1)), collecting)
+            .expect("a data file inside the namespace is what a cleanup exists to delete");
     }
 
     fn data_ref(paths: &ProtocolPaths, epoch: u64) -> CheckpointRef {

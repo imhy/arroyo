@@ -754,9 +754,9 @@ mod tests {
     use crate::{BackingStore, StorageProviderFor, get_storage_provider};
     use arroyo_rpc::errors::StateError;
     use arroyo_rpc::grpc::rpc::{
-        CheckpointMetadata, GlobalKeyedTableConfig, GlobalKeyedTableTaskCheckpointMetadata,
-        OperatorCheckpointMetadata, OperatorMetadata, TableCheckpointMetadata, TableConfig,
-        TableEnum,
+        CheckpointMetadata, ExpiringKeyedTimeTableCheckpointMetadata, GlobalKeyedTableConfig,
+        GlobalKeyedTableTaskCheckpointMetadata, OperatorCheckpointMetadata, OperatorMetadata,
+        ParquetTimeFile, TableCheckpointMetadata, TableConfig, TableEnum,
     };
     use arroyo_rpc::state_backend::validated::Validated;
     use arroyo_rpc::state_backend::{StateBackendError, StateBackendSelector};
@@ -885,7 +885,15 @@ mod tests {
         epoch: u32,
         state_backend: &str,
     ) -> String {
-        let file = format!("{}/{operator_id}-{epoch}.parquet", JOB_ID);
+        // The layout a worker actually writes — `CheckpointFilePathLayout::table_checkpoint_path`
+        // — rather than a flat name under the job. The cleanup token now checks that the files
+        // a table references live in the job's own checkpoint namespace (PR #160 review comment
+        // `5384870087`), and a fixture that writes somewhere no worker would is a fixture that
+        // cannot exercise the check it has to pass.
+        let file = format!(
+            "{}/table-g-000.parquet",
+            operator_path(JOB_ID, epoch, operator_id)
+        );
         store.put(&file, b"data".to_vec()).await;
         ParquetBackend::write_operator_checkpoint_metadata(
             &store.role,
@@ -1413,6 +1421,112 @@ mod tests {
 
     /// One operator's collected epochs, all agreeing with the job, as a whole cleanup
     /// records them.
+    /// A table may not point the cleanup at another job's files, in either encoding.
+    ///
+    /// **PR #160 review comment `5384870087`.** The file strings inside a table's checkpoint
+    /// metadata are that object's contents: the operator header, the selector and the epoch all
+    /// agree while the files point anywhere at all. `files_no_longer_referenced` reads exactly
+    /// these strings into the deletion plan, so a metadata object for `job_1` naming a path
+    /// under `job_2` deleted `job_2`'s data. Both encodings are driven, because
+    /// `table_file_refs` reads them differently — `files` of `String` against `files` of
+    /// `ParquetTimeFile` — and one of them being bound says nothing about the other.
+    ///
+    /// The positive control is the last assertion: the canonical path is accepted, so the rule
+    /// is refusing a namespace rather than refusing everything.
+    #[test]
+    fn a_cleanup_refuses_table_files_outside_the_jobs_namespace() {
+        let cleanup_of = |metadata: OperatorCheckpointMetadata| {
+            Validated::validate(
+                CheckpointCleanup::new(
+                    // Retains epoch 1 and drops nothing, so the only object the check reads is
+                    // the retained metadata whose files this row is about.
+                    asked_for(1),
+                    1,
+                    1,
+                    vec![OperatorCleanup::new(
+                        "node_1".to_string(),
+                        metadata,
+                        Vec::new(),
+                    )],
+                ),
+                CleanupScope {
+                    job: StateBackendSelector::Parquet,
+                    operator_ids: &["node_1".to_string()],
+                    expected: &asked_for(1),
+                },
+            )
+        };
+
+        let canonical = format!("{}/table-g-000.parquet", operator_path(JOB_ID, 1, "node_1"));
+        let another_job = format!(
+            "{}/table-g-000.parquet",
+            operator_path("job_2", 1, "node_1")
+        );
+
+        // Global keyed: `files` is a plain list of strings.
+        let err = cleanup_of(operator_metadata(
+            "node_1",
+            1,
+            "parquet",
+            std::slice::from_ref(&another_job),
+        ))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("outside the namespace"),
+            "a global-keyed table aimed the cleanup at job_2 and earned a token: {err}"
+        );
+
+        // Expiring keyed time: `files` is a list of `ParquetTimeFile`, read through `.file`.
+        let err = cleanup_of(expiring_operator_metadata("node_1", 1, &[another_job])).unwrap_err();
+        assert!(
+            err.to_string().contains("outside the namespace"),
+            "an expiring table aimed the cleanup at job_2 and earned a token: {err}"
+        );
+
+        cleanup_of(operator_metadata(
+            "node_1",
+            1,
+            "parquet",
+            std::slice::from_ref(&canonical),
+        ))
+        .expect("a file in the job's own checkpoint namespace is what a cleanup is for");
+        cleanup_of(expiring_operator_metadata("node_1", 1, &[canonical]))
+            .expect("and the same for the other encoding");
+    }
+
+    /// One operator epoch whose single table uses the expiring-keyed-time encoding.
+    fn expiring_operator_metadata(
+        operator_id: &str,
+        epoch: u32,
+        files: &[String],
+    ) -> OperatorCheckpointMetadata {
+        let mut metadata = operator_metadata(operator_id, epoch, "parquet", &[]);
+        metadata.table_checkpoint_metadata = HashMap::from([(
+            "e".to_string(),
+            TableCheckpointMetadata {
+                table_type: TableEnum::ExpiringKeyedTimeTable as i32,
+                data: ExpiringKeyedTimeTableCheckpointMetadata {
+                    files: files
+                        .iter()
+                        .map(|file| ParquetTimeFile {
+                            file: file.clone(),
+                            max_timestamp_micros: 0,
+                            max_routing_key: 0,
+                            min_routing_key: 0,
+                            epoch: 0,
+                            generation: 0,
+                        })
+                        .collect(),
+                }
+                .encode_to_vec(),
+            },
+        )]);
+        let mut config = table_config("parquet");
+        config.table_type = TableEnum::ExpiringKeyedTimeTable as i32;
+        metadata.table_configs = HashMap::from([("e".to_string(), config)]);
+        metadata
+    }
+
     fn agreeing_operator(operator_id: &str, dropped: &[u32]) -> OperatorCleanup {
         OperatorCleanup::new(
             operator_id.to_string(),
