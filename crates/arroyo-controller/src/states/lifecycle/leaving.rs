@@ -36,10 +36,10 @@
 //! body it is a claim about — a state that stays has to say *why* nothing it goes on to do
 //! outruns the stop, and that reason is about that state.
 //!
-//! Nothing here runs in production through M11.T25: the boundary only asks when the job's
-//! writer decided something, and under
-//! [`LifecycleMode::LegacyT08`](super::LifecycleMode::LegacyT08) — the selected mode — there
-//! is no writer to decide.
+//! The boundary only asks when the job's writer decided something, so nothing here runs for a
+//! job built in the pre-flag-day peer mode
+//! [`LifecycleMode::LegacyT08`](super::LifecycleMode::LegacyT08), which has no writer to decide.
+//! Every production job has had one since M11.T26h's activation change.
 
 use crate::JobConfig;
 use crate::states::checkpoint_stopping::CheckpointStopping;

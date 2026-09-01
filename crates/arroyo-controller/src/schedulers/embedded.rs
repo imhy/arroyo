@@ -136,6 +136,12 @@ impl Scheduler for EmbeddedScheduler {
         Ok(())
     }
 
+    /// Authoritative: the embedded scheduler holds the worker tasks it started, keyed by
+    /// [`WorkerId`], and drops one when its task ends.
+    fn generation_termination_reporting(&self) -> super::GenerationTerminationReporting {
+        super::GenerationTerminationReporting::Authoritative
+    }
+
     async fn workers_for_job(
         &self,
         job_id: &str,

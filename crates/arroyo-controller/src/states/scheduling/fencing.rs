@@ -36,13 +36,20 @@
 //! for a *configuration* the job no longer has — and for nothing else, which is what
 //! [`FatalProvenance`] is for. See [`Fencing::coalesce_intent`].
 
+pub(crate) mod durable;
+
 use std::collections::BTreeSet;
 
+use arroyo_rpc::fencing::FenceTargetState;
 use arroyo_types::WorkerId;
 use tracing::info;
 
 use super::admission::{FencedIntent, PhaseContext};
-use super::fanout::{HandoverRecord, IssuedAttempts};
+use super::fanout::{HandoverRecord, IssuedAttempts, Observed};
+use crate::states::lifecycle::fence::obligation::{self, ObligationRefusal};
+use crate::states::lifecycle::handshake::FenceAcknowledgement;
+use crate::states::lifecycle::recovery::ObservedTermination;
+use crate::states::lifecycle::settlement::Progress;
 use crate::states::{FatalProvenance, StateError, Transition};
 
 /// The worker generations a stale request issued by this scheduling attempt could still be
@@ -73,6 +80,34 @@ impl FenceTargets {
     /// How many targets are still unaccounted for.
     pub(crate) fn pending(&self) -> usize {
         self.pending.len()
+    }
+
+    /// Every target and what it has done about the fence, as the durable record names them.
+    ///
+    /// The three sets are M11.T26b's three [`FenceTargetState`] values — S1's record was shaped
+    /// as an image of this obligation rather than as a summary of it — so this is a projection
+    /// and not a translation. Ordered, because the sets are ordered and a durable record whose
+    /// row order changed on every write would make two identical obligations two different
+    /// column values.
+    pub(crate) fn each(&self) -> impl Iterator<Item = (WorkerId, FenceTargetState)> + '_ {
+        let pending = self
+            .pending
+            .iter()
+            .map(|w| (WorkerId(*w), FenceTargetState::Pending));
+        let acknowledged = self
+            .acknowledged
+            .iter()
+            .map(|w| (WorkerId(*w), FenceTargetState::Acknowledged));
+        let terminated = self
+            .terminated
+            .iter()
+            .map(|w| (WorkerId(*w), FenceTargetState::Terminated));
+        pending.chain(acknowledged).chain(terminated)
+    }
+
+    /// How many targets this obligation names at all.
+    pub(crate) fn count(&self) -> usize {
+        self.pending.len() + self.acknowledged.len() + self.terminated.len()
     }
 
     /// Records a target's acknowledgement of the newer fence and its revokes.
@@ -148,6 +183,19 @@ impl IntentCoalescing {
 pub(crate) struct Fencing<'a, 'ctx> {
     ctx: PhaseContext<'a, 'ctx>,
     targets: FenceTargets,
+    /// The lifecycle fence this attempt addressed [`Self::targets`] under (M11.T26f).
+    ///
+    /// It is what an acknowledgement is measured against: a generation acknowledging fence *f*
+    /// has revoked what was issued under *f - 1* and has changed nothing about what was issued
+    /// under *f*, so an acknowledgement settles a target here only if it is strictly above this.
+    /// Recorded once, from the attempt's own protocol, rather than read at each observation —
+    /// the attempt's fence does not change while it is fencing, and reading it twice would be
+    /// two places for it to differ.
+    ///
+    /// Zero under the pre-flag-day protocol, where nothing is addressed under a fence at all.
+    /// No acknowledgement can reach this substrate then: the handshake that produces one runs
+    /// only on the fenced arm.
+    addressed_fence: u64,
     outstanding: IssuedAttempts,
     /// What became of the obligation an interrupted fan-out offered its settlement owner, if
     /// the controller had one.
@@ -157,6 +205,22 @@ pub(crate) struct Fencing<'a, 'ctx> {
     /// assumed so that a reconciliation says how much of the obligation it is still speaking
     /// for — and, separately, how much of it *nobody* is.
     handover: HandoverRecord,
+    /// The lost fence duel this attempt learned about, if it lost one (M11.D39d).
+    ///
+    /// A controller that no longer holds the job cannot publish anything about it — not a
+    /// refusal, not a failure, not a reschedule — so what a fencing attempt does with this is
+    /// end. It is a field rather than a flag so the reconciliation can say *which* authority
+    /// was refused; see [`Interrupted::reconcile_and_report`].
+    superseded: Option<crate::StaleAuthority>,
+    /// The candidate metadata object this attempt published and never rooted, if it published
+    /// one (M11.D39d).
+    ///
+    /// This is what a losing controller leaves behind: an immutable, fence-scoped object the
+    /// job's row does not name. It is carried here so that the durable fencing record
+    /// M11.T26f writes can name it — `arroyo_rpc::fencing::Fencing::candidate_root` is the
+    /// field it becomes — rather than leaving the object discoverable only by listing the
+    /// store.
+    unrooted_candidate: Option<String>,
 }
 
 impl<'a, 'ctx> Fencing<'a, 'ctx> {
@@ -168,19 +232,43 @@ impl<'a, 'ctx> Fencing<'a, 'ctx> {
     pub(crate) fn new(
         ctx: PhaseContext<'a, 'ctx>,
         targets: FenceTargets,
+        addressed_fence: u64,
         outstanding: IssuedAttempts,
     ) -> Self {
         Self {
             ctx,
             targets,
+            addressed_fence,
             outstanding,
             handover: HandoverRecord::default(),
+            superseded: None,
+            unrooted_candidate: None,
         }
     }
 
     /// Records what an owner outside this phase did with the obligation it was offered.
     pub(crate) fn note_handover(&mut self, handover: HandoverRecord) {
         self.handover = handover;
+    }
+
+    /// Records that this controller lost the job's durable lifecycle authority.
+    pub(crate) fn note_superseded(&mut self, stale: crate::StaleAuthority) {
+        self.superseded = Some(stale);
+    }
+
+    /// Records the candidate metadata object this attempt published and never rooted.
+    pub(crate) fn note_unrooted_candidate(&mut self, candidate: String) {
+        self.unrooted_candidate = Some(candidate);
+    }
+
+    /// The authority this controller was told it no longer holds, if it was told so.
+    pub(crate) fn superseded(&self) -> Option<&crate::StaleAuthority> {
+        self.superseded.as_ref()
+    }
+
+    /// The candidate object this attempt left unrooted, if it left one.
+    pub(crate) fn unrooted_candidate(&self) -> Option<&str> {
+        self.unrooted_candidate.as_deref()
     }
 
     /// Reconciles what this job still owes, and reports what is left.
@@ -190,11 +278,11 @@ impl<'a, 'ctx> Fencing<'a, 'ctx> {
     /// produces the same answer, which is what lets a caller run it on every turn of whatever
     /// loop it is in without tracking whether it already has.
     pub(crate) fn reconcile(&mut self) -> FenceReconciliation {
-        for worker in self.ctx.observed_fence_acknowledgements() {
-            self.observe_fence_acknowledged(worker);
+        for acknowledgement in self.ctx.observed_fence_acknowledgements() {
+            self.observe_fence_acknowledged(&acknowledgement);
         }
-        for worker in self.ctx.observed_generation_terminations() {
-            self.observe_generation_terminated(worker);
+        for termination in self.ctx.observed_generation_terminations() {
+            self.observe_generation_terminated(&termination);
         }
         let reconciliation = FenceReconciliation {
             pending_targets: self.targets().pending(),
@@ -225,16 +313,41 @@ impl<'a, 'ctx> Fencing<'a, 'ctx> {
         reconciliation
     }
 
-    /// Records that a worker generation has acknowledged the newer fence and its revokes.
+    /// Records that a worker generation has acknowledged a fence that supersedes this
+    /// attempt's, and the revokes that came with it.
     ///
     /// Returns whether anything changed. Every attempt this generation was issued is settled
-    /// by the acknowledgement, because an acknowledged revoke makes those identifiers
+    /// by such an acknowledgement, because an acknowledged revoke makes those identifiers
     /// permanently inapplicable — that is the M11.D39e rule this substrate is shaped for, and
-    /// M11.T26 supplies the protocol that makes an acknowledgement observable at all.
-    pub(crate) fn observe_fence_acknowledged(&mut self, worker: WorkerId) -> bool {
-        let changed = self.targets.acknowledge(worker);
+    /// M11.T26c/f supply the protocol that makes an acknowledgement observable at all.
+    ///
+    /// **The height is checked before the target set is touched** (M11.T26f). An
+    /// acknowledgement of the fence this attempt's own directives carry supersedes nothing of
+    /// this attempt's — a worker revokes what is *below* the fence it takes — and it is exactly
+    /// the acknowledgement the attempt's own handshake produces, so it arrives here on the
+    /// ordinary path. Marking the target acknowledged on the strength of it and then having the
+    /// identifier accounting refuse it would leave the two halves of one obligation disagreeing
+    /// about whether the target had answered; validating first is what keeps them one fact.
+    pub(crate) fn observe_fence_acknowledged(
+        &mut self,
+        acknowledgement: &FenceAcknowledgement,
+    ) -> bool {
+        if acknowledgement.generation() != self.ctx.addressed_generation() {
+            return false;
+        }
+        if !acknowledgement.supersedes(self.addressed_fence) {
+            info!(
+                worker_id = acknowledgement.worker().0,
+                observed_fence = acknowledgement.observed_fence(),
+                addressed_fence = self.addressed_fence,
+                "a worker generation acknowledged a fence that does not supersede the one this \
+                 attempt addressed it under, so it settles nothing this attempt issued"
+            );
+            return false;
+        }
+        let changed = self.targets.acknowledge(acknowledgement.worker());
         if changed {
-            self.outstanding.settled(worker);
+            self.account(Observed::acknowledged_fence(acknowledgement));
         }
         changed
     }
@@ -242,13 +355,73 @@ impl<'a, 'ctx> Fencing<'a, 'ctx> {
     /// Records that a worker generation has been observed torn down.
     ///
     /// The other way an issued attempt stops being applicable: a generation that no longer
-    /// exists cannot apply anything addressed to it.
-    pub(crate) fn observe_generation_terminated(&mut self, worker: WorkerId) -> bool {
-        let changed = self.targets.terminate(worker);
+    /// exists cannot apply anything addressed to it. No height to compare — a generation that
+    /// is gone is gone for every fence — but the generation itself still has to be this
+    /// attempt's, or the observation is about somebody else's workers.
+    pub(crate) fn observe_generation_terminated(
+        &mut self,
+        termination: &ObservedTermination,
+    ) -> bool {
+        if termination.generation() != self.ctx.addressed_generation() {
+            return false;
+        }
+        let changed = self.targets.terminate(termination.worker());
         if changed {
-            self.outstanding.settled(worker);
+            self.account(Observed::terminated_generation(termination));
         }
         changed
+    }
+
+    /// Records one observation everywhere the identifiers it accounts for can be.
+    ///
+    /// Two places, and never both for one identifier: an interrupted phase either kept its
+    /// inventory — in which case this is what settles it — or handed it to the job's settlement
+    /// owner, in which case what it kept is empty and the owner is holding what the observation
+    /// is about. Writing it to one of them would leave the other silently unaccounted for,
+    /// depending on which way the hand-over went.
+    fn account(&mut self, observed: Observed) {
+        // The phase's own inventory. After a hand-over it lists nothing and this accounts for
+        // nothing, which is the correct answer rather than a missed one.
+        let _accounted_here = self.outstanding.observe(&observed);
+        self.tell_the_owner(observed);
+    }
+
+    /// Passes an observation on to whoever owns the identifiers it accounts for.
+    ///
+    /// The two methods above settle *this phase's* inventory, which after a hand-over is empty:
+    /// what the observation accounts for is then held by the job's settlement owner, and telling
+    /// it is not an extra effect but the same fact reaching the party the identifiers belong to.
+    /// Without this an acknowledged fence would settle nothing at all for a transferred
+    /// obligation, and the authority behind identifiers the fence had already made inapplicable
+    /// would be held for the life of the process.
+    ///
+    /// It is not a widening of what [`Fencing`] may do. Nothing here takes or holds an
+    /// [`Admission`](crate::states::Admission), nothing is published, rescheduled or committed,
+    /// and the release the owner may perform is gated on its own inventory rather than on
+    /// anything this phase asserts — see
+    /// `the_source_of_fencing_exposes_no_admission_and_no_irreversible_effect`, whose inventory
+    /// this adds no `pub(crate)` method to.
+    fn tell_the_owner(&self, observed: Observed) {
+        let Some(owner) = self.ctx.settlement() else {
+            return;
+        };
+        let worker_id = observed.worker().0;
+        match owner.observe(&observed) {
+            Progress::NothingHeld => {}
+            Progress::NotThisObligation => {}
+            Progress::StillOwed { outstanding } => info!(
+                job_id = %self.ctx.job().config.id,
+                worker_id,
+                outstanding,
+                "the job's settlement owner accounted for a target this attempt reconciled, and                  is still answerable for others"
+            ),
+            Progress::Discharged(discharged) => info!(
+                job_id = %self.ctx.job().config.id,
+                worker_id,
+                identifiers = discharged.count(),
+                "the job's settlement owner accounted for the last identifier it was answerable                  for, and has released the lifecycle authority"
+            ),
+        }
     }
 
     /// Folds whatever the job's single writer has decided since the last look into how this
@@ -358,6 +531,38 @@ impl<'a, 'ctx> Fencing<'a, 'ctx> {
     pub(crate) fn outstanding(&self) -> &IssuedAttempts {
         &self.outstanding
     }
+
+    /// The durable image of what this attempt still owes, or `None` if it owes nothing
+    /// (M11.T26f, design M11.D39d).
+    ///
+    /// A **read**, and deliberately only a read: it names the targets, the identifiers they
+    /// were issued and the candidate this attempt left unrooted, and it writes nothing
+    /// anywhere. Persisting it is [`Interrupted::reconcile_and_report`]'s, through the one
+    /// publication funnel, from outside this type — see the inventory pinned by
+    /// `the_source_of_fencing_exposes_no_admission_and_no_irreversible_effect`, which this adds
+    /// no effect to.
+    ///
+    /// # Errors
+    ///
+    /// [`ObligationRefusal`] when the obligation cannot be described: more targets than the
+    /// durable record's capacity, an identifier or address it cannot carry, or an inventory
+    /// that disagrees with the target set about which generation was addressed. Every one of
+    /// them fails closed — the attempt reports the refusal rather than persisting a truncated
+    /// obligation, because an obligation missing a target is one whose worker nothing will ever
+    /// fence.
+    pub(crate) fn durable_obligation(
+        &self,
+        since_millis: Option<u64>,
+    ) -> Result<Option<arroyo_rpc::fencing::Fencing>, ObligationRefusal> {
+        obligation::describe(
+            self.ctx.addressed_generation(),
+            &self.targets,
+            &self.outstanding,
+            &self.ctx.target_addresses(),
+            self.unrooted_candidate(),
+            since_millis,
+        )
+    }
 }
 
 /// A phase that could not continue, and the fencing state it released its authority into.
@@ -391,21 +596,54 @@ impl<'a, 'ctx> Interrupted<'a, 'ctx> {
     /// `Refused` is M11.T26's, and needs the durable fence this half deliberately does not
     /// have.
     ///
-    /// The `Ok` half is a job that ends by *stopping*: an interruption is not always a failure,
-    /// because the writer may have answered the refusal that caused it by asking the job to
-    /// stop. Reporting that as an error would fail a job the operator asked to be stopped, and
-    /// would throw away the final checkpoint its stop mode called for.
-    pub(crate) fn reconcile_and_report(mut self) -> Result<Transition, StateError> {
+    /// The `Ok` half is a job that ends by *stopping*, and there are two ways to reach it.
+    ///
+    /// The first is an interruption the writer has answered by asking the job to stop: an
+    /// interruption is not always a failure, and reporting that one as an error would fail a
+    /// job the operator asked to be stopped and throw away the final checkpoint its stop mode
+    /// called for.
+    ///
+    /// The second is M11.D39d's: this controller has been told it no longer holds the job. It
+    /// then has nothing to report *about* the job — a failure it published would be an opinion
+    /// about somebody else's execution, and the conditional write would refuse it anyway — so
+    /// it stands down. The obligation it recorded is durable and belongs to whoever holds the
+    /// row; what this process owes is to stop writing.
+    ///
+    /// A stop the writer decided wins over standing down, because it is the job's own
+    /// operator's instruction and it ends the task either way.
+    pub(crate) async fn reconcile_and_report(mut self) -> Result<Transition, StateError> {
+        // The one observation this attempt can still make about its own targets: whether the
+        // scheduler has already reclaimed the generation it addressed. Asked before the
+        // reconciliation reads its inbox, and asked once — a target it cannot answer for stays
+        // pending, and the next controller advances a fence at it.
+        self.fencing.ctx.observe_generation_teardown().await;
         let reconciliation = self.fencing.reconcile();
         let coalescing = self.fencing.coalesce_intent(&mut self.reason);
+        self.persist_obligation().await;
         info!(
             settled = reconciliation.is_settled(),
             coalescing = coalescing.as_str(),
+            superseded = self.fencing.superseded().is_some(),
+            unrooted_candidate = self.fencing.unrooted_candidate().unwrap_or(""),
             "a scheduling attempt ended in token-free fencing"
         );
         match coalescing {
             IntentCoalescing::Leave(stop) => Ok(stop),
-            IntentCoalescing::Unchanged | IntentCoalescing::Coalesced => Err(self.reason),
+            IntentCoalescing::Unchanged | IntentCoalescing::Coalesced => {
+                match self.fencing.superseded() {
+                    Some(stale) => {
+                        info!(
+                            job_id = %stale.job_id,
+                            presented_fence = %stale.presented_fence,
+                            unrooted_candidate = self.fencing.unrooted_candidate().unwrap_or(""),
+                            "this controller no longer holds the job: standing down without \
+                             publishing, and leaving any candidate it wrote unrooted"
+                        );
+                        Ok(Transition::Stop)
+                    }
+                    None => Err(self.reason),
+                }
+            }
         }
     }
 }

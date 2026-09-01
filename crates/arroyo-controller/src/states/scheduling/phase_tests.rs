@@ -11,17 +11,33 @@ use std::sync::Mutex;
 use arroyo_types::WorkerId;
 
 use super::fanout::settlement::SettlementOutcome;
-use super::fanout::{HandoverRecord, IssuedAttempts, SettlementBundle, SettlementOwner, hand_over};
+use super::fanout::{
+    HandoverRecord, IssuedAttempts, Observed, SettlementBundle, SettlementOwner, hand_over,
+};
 use super::fencing::FenceTargets;
-use crate::states::{Admission, RefusalGate};
+use crate::states::{Admission, AdmissionLock};
 
-/// An [`Admission`] taken from a gate the test also holds, so it can ask afterwards whether the
-/// job's publication lock is free.
-async fn admitted() -> (RefusalGate, Admission) {
-    let mut gate = RefusalGate::default();
-    let (admission, refusal) = gate.admit_scheduling().await;
-    assert!(refusal.is_none(), "a fresh gate has refused nothing");
-    (gate, admission)
+/// Records an authoritative response for `worker`'s attempt, through the one validated seam.
+///
+/// What `AttemptLedger::answered` does in production, spelled out for a row that builds an
+/// inventory by hand: an inventory records an answer only for the identifier it says that
+/// worker was issued, and only for the generation it addressed. The rows here are about what an
+/// *obligation* does with an accounted-for identifier, so this is their precondition rather than
+/// their subject; the rows that vary the three halves of that identity against each other are in
+/// `crate::states::lifecycle::settlement_tests`.
+fn answered(issued: &mut IssuedAttempts, worker: WorkerId, attempt_id: &str) {
+    let generation = issued.generation();
+    let _accounted = issued.observe(&Observed::authoritative_response(
+        worker, generation, attempt_id,
+    ));
+}
+
+/// An [`Admission`] taken from an [`AdmissionLock`] the row also holds, so it can ask
+/// afterwards whether the job's lifecycle authority is free.
+async fn admitted() -> (AdmissionLock, Admission) {
+    let lock = AdmissionLock::default();
+    let admission = lock.admit().await;
+    (lock, admission)
 }
 
 /// The inventory accounts for every target and settles idempotently.
@@ -37,16 +53,16 @@ fn issued_attempts_account_for_every_target_and_settle_idempotently() {
     assert_eq!(issued.issued_count(), 2);
     assert_eq!(issued.outstanding_count(), 2);
 
-    issued.settled(WorkerId(1));
+    answered(&mut issued, WorkerId(1), "aa");
     assert_eq!(issued.outstanding_count(), 1);
-    issued.settled(WorkerId(1));
+    answered(&mut issued, WorkerId(1), "aa");
     assert_eq!(
         issued.outstanding_count(),
         1,
         "settling an attempt twice is not two outcomes"
     );
 
-    issued.settled(WorkerId(99));
+    answered(&mut issued, WorkerId(99), "zz");
     assert_eq!(
         issued.issued_count(),
         2,
@@ -134,17 +150,18 @@ impl RecordingOwner {
 /// The transfer interface moves the issued-attempt inventory and the lifecycle authority as one
 /// unit.
 ///
-/// The authority half is asserted the only way it can be: by asking the gate whether a
+/// The authority half is asserted the only way it can be: by asking the job's `AdmissionLock`
+/// whether a
 /// publication is possible. While the owner holds the admission it is not, which is what "the
 /// obligation moved" has to mean — an owner that had received the inventory without the
 /// authority would leave a refusal publishable behind attempts it had just taken charge of.
 #[tokio::test]
 async fn an_interrupted_fan_out_hands_over_inventory_and_authority_together() {
-    let (gate, admission) = admitted().await;
+    let (authority, admission) = admitted().await;
     let mut issued = IssuedAttempts::default();
     issued.issued(WorkerId(4), "cc".to_string());
     issued.issued(WorkerId(5), "dd".to_string());
-    issued.settled(WorkerId(4));
+    answered(&mut issued, WorkerId(4), "cc");
 
     let owner = RecordingOwner::default();
     let outcome = hand_over(SettlementBundle::new(admission, issued), Some(&owner));
@@ -165,7 +182,7 @@ async fn an_interrupted_fan_out_hands_over_inventory_and_authority_together() {
          obligation itself rather than from the copy it took on arrival"
     );
     assert!(
-        gate.admit_publication().is_none(),
+        !authority.is_free(),
         "and the authority went with it: nothing can be published while the owner holds the \
          admission it was handed"
     );
@@ -174,20 +191,19 @@ async fn an_interrupted_fan_out_hands_over_inventory_and_authority_together() {
     // the transfer point — and it is the only way to get the authority back out.
     drop(owner.held.lock().unwrap().take());
     assert!(
-        gate.admit_publication().is_some(),
-        "the control — the gate is only closed because the owner was holding it"
+        authority.is_free(),
+        "the control — the authority was only held because the owner was holding it"
     );
 }
 
-/// M11.T25 has no settlement owner, so an interrupted fan-out keeps its own obligation.
+/// A job with no settlement owner keeps its own obligation when its fan-out is interrupted.
 ///
-/// This is the whole of "T25 cannot release or activate through the transfer interface": with no
-/// owner there is nothing to transfer to, the admission comes back to the phase, and the landed
-/// `settle_under_admission` rescue is what settles the attempts — unchanged, and still selected
-/// in production.
+/// The pre-flag-day peer's shape, which no production job has since M11.T26h: with no owner
+/// there is nothing to transfer to, the admission comes back to the phase, and the phase settles
+/// the attempts itself before releasing anything.
 #[tokio::test]
 async fn without_a_settlement_owner_an_interrupted_fan_out_keeps_its_obligation() {
-    let (gate, admission) = admitted().await;
+    let (authority, admission) = admitted().await;
     let mut issued = IssuedAttempts::default();
     issued.issued(WorkerId(6), "ee".to_string());
 
@@ -197,12 +213,12 @@ async fn without_a_settlement_owner_an_interrupted_fan_out_keeps_its_obligation(
     };
     assert_eq!(issued.outstanding_count(), 1);
     assert!(
-        gate.admit_publication().is_none(),
+        !authority.is_free(),
         "and the phase still holds the authority, so nothing is publishable behind the attempts \
          it is still waiting on"
     );
     drop(admission);
-    assert!(gate.admit_publication().is_some());
+    assert!(authority.is_free());
 }
 
 /// An owner that gives the obligation back, which is the one correct way to say no.
@@ -237,12 +253,11 @@ impl SettlementOwner for AbandoningOwner {
 /// An owner that declines leaves the obligation exactly where it was.
 ///
 /// Fail-closed in the useful direction: declining is indistinguishable, from the phase's side,
-/// from there being no owner at all — which is the situation M11.T25 is always in — so the
-/// attempts are settled in place under the landed `settle_under_admission` rescue and the
+/// from there being no owner at all, so the attempts are settled in place by the phase and the
 /// authority never leaves.
 #[tokio::test]
 async fn a_settlement_owner_that_declines_leaves_the_obligation_with_the_phase() {
-    let (gate, admission) = admitted().await;
+    let (authority, admission) = admitted().await;
     let mut issued = IssuedAttempts::default();
     issued.issued(WorkerId(11), "ff".to_string());
 
@@ -259,12 +274,12 @@ async fn a_settlement_owner_that_declines_leaves_the_obligation_with_the_phase()
         "and it came back whole: the phase knows what it is still waiting on"
     );
     assert!(
-        gate.admit_publication().is_none(),
+        !authority.is_free(),
         "nothing was released, so nothing is publishable behind the attempts this phase is \
          still answerable for"
     );
     drop(admission);
-    assert!(gate.admit_publication().is_some(), "the control");
+    assert!(authority.is_free(), "the control");
 }
 
 /// An owner that drops the obligation is not issued a receipt for it.
@@ -276,11 +291,11 @@ async fn a_settlement_owner_that_declines_leaves_the_obligation_with_the_phase()
 /// raises a flag `transfer_to` is holding a handle on — so the loss is reported as a loss.
 #[tokio::test]
 async fn a_settlement_owner_that_drops_the_obligation_is_issued_no_receipt() {
-    let (gate, admission) = admitted().await;
+    let (authority, admission) = admitted().await;
     let mut issued = IssuedAttempts::default();
     issued.issued(WorkerId(12), "gg".to_string());
     issued.issued(WorkerId(13), "hh".to_string());
-    issued.settled(WorkerId(12));
+    answered(&mut issued, WorkerId(12), "gg");
 
     let outcome = hand_over(
         SettlementBundle::new(admission, issued),
@@ -295,7 +310,7 @@ async fn a_settlement_owner_that_drops_the_obligation_is_issued_no_receipt() {
          about it"
     );
     assert!(
-        gate.admit_publication().is_some(),
+        authority.is_free(),
         "and this is the damage the outcome is reporting: the authority went with the bundle, \
          so a refusal is publishable behind an attempt no worker has answered. A receipt here \
          would have said the opposite"
@@ -310,7 +325,7 @@ async fn a_settlement_owner_that_drops_the_obligation_is_issued_no_receipt() {
 /// attempt an owner lost has nobody.
 #[tokio::test]
 async fn a_fencing_record_distinguishes_a_transfer_from_a_loss() {
-    let (gate, admission) = admitted().await;
+    let (authority, admission) = admitted().await;
     let mut issued = IssuedAttempts::default();
     issued.issued(WorkerId(14), "ii".to_string());
 
@@ -319,15 +334,15 @@ async fn a_fencing_record_distinguishes_a_transfer_from_a_loss() {
     assert_eq!(kept.outstanding_count(), 1);
     assert_eq!(record, HandoverRecord::default());
     assert!(
-        gate.admit_publication().is_some(),
+        authority.is_free(),
         "the admission is released by the outcome rather than handed back to a phase that has \
          already been interrupted"
     );
 
     let owner = RecordingOwner::default();
-    let (_, gate_admission) = admitted().await;
+    let (_, other_admission) = admitted().await;
     let SettlementOutcome::Transferred(receipt) = hand_over(
-        SettlementBundle::new(gate_admission, issued.clone()),
+        SettlementBundle::new(other_admission, issued.clone()),
         Some(&owner),
     ) else {
         panic!("an owner that took the obligation apart took it over")
@@ -452,7 +467,7 @@ async fn a_receipt_is_issued_only_where_the_publication_lock_did_not_come_back()
     issued.issued(WorkerId(21), "j1".to_string());
     issued.issued(WorkerId(22), "j2".to_string());
     issued.issued(WorkerId(23), "j3".to_string());
-    issued.settled(WorkerId(21));
+    answered(&mut issued, WorkerId(21), "j1");
 
     let cells = [
         (
@@ -498,7 +513,7 @@ async fn a_receipt_is_issued_only_where_the_publication_lock_did_not_come_back()
     ];
 
     for (parting, expected) in cells {
-        let (gate, admission) = admitted().await;
+        let (authority, admission) = admitted().await;
         let owner = PartingOwner::new(parting);
         let outcome = hand_over(
             SettlementBundle::new(admission, issued.clone()),
@@ -539,12 +554,12 @@ async fn a_receipt_is_issued_only_where_the_publication_lock_did_not_come_back()
              for are counted apart"
         );
 
-        let publishable = gate.admit_publication().is_some();
+        let publishable = authority.is_free();
         assert_eq!(
             word == "transferred",
             !publishable,
             "{parting:?}: THE agreement. A receipt says the job's lifecycle authority is \
-             somewhere other than here; the gate says whether it came back. The two disagreed \
+             somewhere other than here; the authority says whether it came back. The two disagreed \
              exactly once — an owner that took the obligation apart, dropped the admission and \
              returned `Ok(())` — and that is the state this row exists to make unreachable"
         );
@@ -657,12 +672,20 @@ fn phase_graph_production_sources() -> Vec<(&'static str, &'static str)> {
             production_half(include_str!("admission/observation.rs")),
         ),
         (
+            "scheduling/admission/root.rs",
+            production_half(include_str!("admission/root.rs")),
+        ),
+        (
             "scheduling/fanout.rs",
             production_half(include_str!("fanout.rs")),
         ),
         (
             "scheduling/fanout/settlement.rs",
             production_half(include_str!("fanout/settlement.rs")),
+        ),
+        (
+            "scheduling/fanout/settlement/observed.rs",
+            production_half(include_str!("fanout/settlement/observed.rs")),
         ),
         (
             "scheduling/fencing.rs",
@@ -676,26 +699,34 @@ fn phase_graph_production_sources() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
-/// Nothing in M11.T25 implements the transfer interface (M11.R59b).
+/// The phase graph implements no settlement owner (M11.R59b, M11.T26e).
 ///
-/// **A structural source pin, and the name says so.** The claim it protects is not that
-/// transferring is discouraged but that this half *cannot* transfer: `SettlementOwner` has no
-/// implementation outside a test, so `PhaseContext::settlement_owner` has nothing to answer with
-/// and the only outcome an interrupted fan-out has is settling in place under the landed rescue.
+/// **A structural source pin, and the name says so.** M11.T25's version of this said that
+/// *nothing* implemented the transfer interface, and recorded that a failure here should be read
+/// as "M11.T26 has arrived". It has: `states/lifecycle/settlement.rs` supplies
+/// `JobSettlementOwner`. So the claim is rewritten rather than deleted, to the half that is still
+/// load-bearing and is now load-bearing for a different reason.
 ///
-/// The intended reading of a failure here is "M11.T26 has arrived", not "the test is stale" — and
-/// T26's owner must come with the durable fence that lets a controller restart recover the same
-/// obligation, because an owner without one is a way to lose it.
+/// An owner exists for the path on which the phase does not. The controller's shutdown token
+/// drops the job's state task as a whole, so `StartFanOut::issue` never reaches the line that
+/// hands anything over and the region rescue is the only thing left holding the authority. An
+/// owner implemented *here* — by a phase, by the fan-out, or by anything the phase graph owns —
+/// would be an owner that went with the task it was supposed to outlive, and the seam would work
+/// on every path except the one it is for.
+///
+/// The other half of the claim — that exactly one production implementation exists at all, and
+/// where — is
+/// `crate::states::lifecycle::settlement_tests::exactly_one_production_settlement_owner_exists`,
+/// which walks the whole crate rather than this file list.
 #[test]
-fn no_production_code_implements_the_settlement_owner() {
+fn the_phase_graph_implements_no_settlement_owner() {
     for (file, source) in phase_graph_production_sources() {
         assert_eq!(
             source.matches("impl SettlementOwner").count()
                 + source.matches("SettlementOwner for").count(),
             0,
-            "{file}: M11.T25 defines the transfer interface and implements it nowhere. An \
-             implementation here would let an interrupted phase release its lifecycle authority \
-             to something that cannot be recovered after a controller restart"
+            "{file}: an owner implemented inside the phase graph is one that is dropped with the \
+             job's state task, which is exactly the cancellation it exists to survive"
         );
     }
 }
@@ -749,18 +780,28 @@ fn the_source_of_fencing_exposes_no_admission_and_no_irreversible_effect() {
         methods,
         [
             "coalesce_intent",
+            "durable_obligation",
             "new",
             "note_handover",
+            "note_superseded",
+            "note_unrooted_candidate",
             "observe_fence_acknowledged",
             "observe_generation_terminated",
             "outstanding",
             "reconcile",
+            "superseded",
             "targets",
+            "unrooted_candidate",
         ],
         "`Fencing` may reconcile fences and revokes, observe a generation's teardown or \
-         termination, and coalesce the job's intents. Adding a start, generation, recovery or \
-         commit effect to it — or a publication of `Refused`, which needs the durable fence \
-         M11.T26 owns — is the change this pin exists to force a decision about"
+         termination, coalesce the job's intents, and *record* what the attempt that ended \
+         here already learned — a lost fence duel, and a candidate object it published and \
+         never rooted (M11.D39d). Every one of those is an observation the attempt made \
+         before it fenced; none of them acts. `durable_obligation` is M11.T26f's and is a \
+         *read*: it names what this attempt owes and writes nothing anywhere — persisting it \
+         is `Interrupted`'s, through the one publication funnel, from outside this type. \
+         Adding a start, generation, recovery or commit effect here — or a publication of \
+         `Refused` — is the change this pin exists to force a decision about"
     );
     assert_eq!(
         body.matches("&Admission").count() + body.matches(": Admission").count(),
@@ -770,21 +811,160 @@ fn the_source_of_fencing_exposes_no_admission_and_no_irreversible_effect() {
     );
 }
 
-/// An obligation has no publicly separable halves (review comment `5369004357`).
+/// The preamble adopts the job's durable authority before it does anything else, and roots its
+/// metadata last (M11.D39d).
+///
+/// **A structural source pin, and the name says so.** What a behavioural test can show is that
+/// a *lost* adoption causes no effect — `a_superseded_controller_stands_down_before_its_first_effect`
+/// does, against a real row and a real store. What it cannot show is the order of the steps a
+/// *successful* attempt takes, because a successful attempt takes all of them and the row it
+/// leaves behind is the same whichever order they ran in.
+///
+/// So the order is pinned where it is written. The phase graph already makes each step consume
+/// the admission and hand back a fresh `Preamble`, so the steps are a chain rather than a set;
+/// this says which chain. Adoption first is M11.D39d's "before any effect", and the metadata
+/// root last is the same rule from the other end — a root names the generation and the recovery
+/// checkpoint the steps before it established.
+///
+/// The intended reading of a failure here is not "the test is stale" but "say why this effect
+/// belongs before the adoption that entitles the controller to perform it".
+#[test]
+fn the_preamble_adopts_before_every_other_effect_and_roots_last() {
+    let source = include_str!("phases/driver.rs");
+    let at = source
+        .find("async fn preamble<'a, 'ctx>(")
+        .expect("the preamble driver has been renamed");
+    let body = &source[at..source[at..]
+        .find("\n}\n")
+        .map(|end| at + end)
+        .expect("unterminated function")];
+
+    let steps: Vec<&str> = body
+        .match_indices("preamble.")
+        .map(|(i, m)| {
+            let rest = &body[i + m.len()..];
+            &rest[..rest.find('(').expect("a step is a call")]
+        })
+        .collect();
+    assert_eq!(
+        steps,
+        [
+            "adopt_lifecycle_authority",
+            "discharge_recovered_fencing",
+            "persist_generation",
+            "tear_down_existing_cluster",
+            "start_replacement_workers",
+            "prepare_recovery_checkpoint",
+            "publish_metadata_root",
+            "release",
+        ],
+        "the preamble's steps, in order. Adoption is first because M11.D39d puts cold adoption \
+         before any effect; the recovered obligation is discharged second because M11.D39d \
+         makes admission of a replacement generation — which `persist_generation` is — \
+         reachable only after every target an earlier attempt addressed has acknowledged a \
+         superseding fence or been observed terminated; and the metadata root is last because \
+         it names what the steps before it established"
+    );
+
+    // And each of them is a method of the phase rather than something the driver does for
+    // itself, so the admission travels through the chain one effect at a time.
+    let phases = include_str!("phases.rs");
+    for step in &steps[..steps.len() - 1] {
+        assert_eq!(
+            phases
+                .matches(&format!(
+                    "pub(crate) async fn {step}(mut self) -> PreambleStep"
+                ))
+                .count(),
+            1,
+            "`{step}` is a preamble method that consumes the phase and hands a fresh one back"
+        );
+    }
+}
+
+/// An obligation has no publicly separable halves (review comment `5369004357`, M11.T26e).
 ///
 /// **A structural source pin, and the name says so.** The compile-fail fixtures next door
 /// prove that the two operations which separate a bundle today are unreachable from an owner.
 /// What no fixture can notice is a *third* one added later — and `settlement.rs` is exactly
 /// where "the owner needs to get at the admission, so let us hand it back" is a tempting thing
-/// to write, because that is what M11.T26 will want and there is nowhere else to put it.
+/// to write, because that is what M11.T26 wanted and there was nowhere else to put it.
 ///
-/// So the inventory of what a bundle exposes is pinned. Everything the crate outside this
-/// module may do with an obligation is on this list, and each entry hands over all of it or
-/// none of it: build one, read what it lists, or offer the whole of it to an owner. Anything
-/// added here has to answer the question the finding asked — what does the seam observe if the
-/// caller keeps only half of what this returns?
+/// M11.T26e put it in a child module instead, which is what M11.T25's module documentation asked
+/// for, so this reads **both** files. A child of `settlement` may reach the private halves — that
+/// is why the operations went there — so an inventory pinned over the parent alone would have
+/// stopped covering the place the next separator is most likely to appear. The compile-fail
+/// fixtures cannot reach the child at all: `compile_fail::SETTLEMENT` removes its declaration
+/// because a standalone compile cannot resolve a sibling file, and this is what stands in for
+/// that.
+///
+/// Everything the crate outside those two modules may do with an obligation is on these lists,
+/// and each entry hands over all of it or none of it: build one, read what it lists, offer the
+/// whole of it to an owner, record what has been observed about it, discharge it, or retain it.
+/// Not one of them yields an `Admission` — the last two release and retain the authority *here*,
+/// inside the module that owns the coupling. Anything added has to answer the question the
+/// finding asked: what does the seam observe if the caller keeps only half of what this returns?
 #[test]
 fn the_source_of_a_settlement_bundle_exposes_no_way_to_part_with_half_of_it() {
+    let child = production_half(include_str!("fanout/settlement/observed.rs"));
+    for (file, source, expected) in [
+        (
+            "fanout/settlement.rs",
+            production_half(include_str!("fanout/settlement.rs")),
+            vec!["issued", "new", "transfer_to"],
+        ),
+        (
+            "fanout/settlement/observed.rs",
+            child,
+            vec!["discharge", "observe", "retain_unsettled"],
+        ),
+    ] {
+        let impl_at = source
+            .find("impl SettlementBundle {")
+            .unwrap_or_else(|| panic!("{file}: the settlement bundle's impl has been renamed"));
+        let body = &source[impl_at
+            ..source[impl_at..]
+                .find("\n}\n")
+                .map(|at| impl_at + at)
+                .expect("unterminated impl")];
+        let mut exposed: Vec<&str> = body
+            .match_indices("pub(crate) fn ")
+            .chain(body.match_indices("pub(crate) async fn "))
+            .map(|(i, m)| {
+                let rest = &body[i + m.len()..];
+                &rest[..rest.find(['(', '<']).expect("a method has arguments")]
+            })
+            .collect();
+        exposed.sort_unstable();
+        assert_eq!(
+            exposed, expected,
+            "{file}: a `SettlementBundle` may be built, read, offered to an owner whole, told \
+             what has been observed about it, discharged and retained. It may not be taken apart \
+             by anything that could then be issued a receipt for half of it"
+        );
+    }
+
+    // The child is where the authority actually leaves, so what it does with the two halves
+    // `into_parts` hands it is pinned too: one release, one retention, and nothing returned.
+    assert_eq!(
+        child.matches("self.into_parts()").count(),
+        2,
+        "the child separates an obligation exactly twice — to release the authority on discharge \
+         and to retain it when nothing can settle what is left — and a third would be a third \
+         thing to justify"
+    );
+    assert_eq!(
+        child.matches("drop(admission);").count(),
+        1,
+        "the discharge releases the authority here rather than handing it out"
+    );
+    assert_eq!(
+        child.matches("std::mem::forget(admission);").count(),
+        1,
+        "and the retention keeps it here, which is the only safe answer for an obligation \
+         nothing left can settle"
+    );
+
     let source = production_half(include_str!("fanout/settlement.rs"));
     let impl_at = source
         .find("impl SettlementBundle {")
@@ -794,23 +974,6 @@ fn the_source_of_a_settlement_bundle_exposes_no_way_to_part_with_half_of_it() {
             .find("\n}\n")
             .map(|at| impl_at + at)
             .expect("unterminated impl")];
-    let mut exposed: Vec<&str> = body
-        .match_indices("pub(crate) fn ")
-        .chain(body.match_indices("pub(crate) async fn "))
-        .map(|(i, m)| {
-            let rest = &body[i + m.len()..];
-            &rest[..rest.find(['(', '<']).expect("a method has arguments")]
-        })
-        .collect();
-    exposed.sort_unstable();
-    assert_eq!(
-        exposed,
-        ["issued", "new", "transfer_to"],
-        "a `SettlementBundle` may be built, read, and offered to an owner whole. It may not be \
-         taken apart by anything that could then be issued a receipt for half of it: \
-         `into_parts` and `keep` are private, which is what makes the coupling the type's \
-         rather than the caller's"
-    );
     for separator in ["fn into_parts", "fn keep"] {
         assert_eq!(
             body.matches(&format!("pub(crate) {separator}")).count()

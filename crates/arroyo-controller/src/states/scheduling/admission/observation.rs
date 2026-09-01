@@ -110,7 +110,7 @@ impl PhaseContext<'_, '_> {
             return Ok(Admitted::Leave(stop));
         }
         Ok(Admitted::Region(
-            self.ctx.admit_irreversible_scheduling().await?,
+            self.ctx.admit_irreversible_scheduling().await,
         ))
     }
 

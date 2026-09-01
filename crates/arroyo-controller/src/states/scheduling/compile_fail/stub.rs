@@ -76,7 +76,25 @@ pub mod scheduling {
                 unimplemented!()
             }
             pub fn begin_wait(&mut self) {}
+            pub async fn adopt_lifecycle_authority(
+                &mut self,
+                _a: &Admission,
+            ) -> Result<(), StateError> {
+                unimplemented!()
+            }
+            pub async fn discharge_recovered_fencing(
+                &mut self,
+                _a: &Admission,
+            ) -> Result<(), StateError> {
+                unimplemented!()
+            }
             pub async fn persist_generation(&mut self, _a: &Admission) -> Result<(), StateError> {
+                unimplemented!()
+            }
+            pub async fn publish_metadata_root(
+                &mut self,
+                _a: &Admission,
+            ) -> Result<(), StateError> {
                 unimplemented!()
             }
             pub async fn tear_down_existing_cluster(&mut self, _a: &Admission) {}
@@ -122,7 +140,9 @@ pub mod scheduling {
             pub fn tasks_are_all_started(&self) -> bool {
                 unimplemented!()
             }
-            pub async fn prepare_handover(&mut self) {}
+            pub async fn prepare_handover(&mut self) -> Result<(), StateError> {
+                unimplemented!()
+            }
             pub fn needs_restored_commits(&self) -> bool {
                 unimplemented!()
             }
@@ -209,7 +229,7 @@ pub mod scheduling {
             pub fn fencing_mut(&mut self) -> &mut Fencing<'a, 'ctx> {
                 unimplemented!()
             }
-            pub fn reconcile_and_report(self) -> Result<Transition, StateError> {
+            pub async fn reconcile_and_report(self) -> Result<Transition, StateError> {
                 unimplemented!()
             }
         }

@@ -9,7 +9,9 @@ use crate::JobConfig;
 use crate::JobMessage;
 use crate::states::LeavingForStop;
 use crate::states::finishing::Finishing;
-use crate::states::lifecycle::{ConsumptionPoint, ObservedIntent, leaving};
+use crate::states::lifecycle::{
+    ConsumptionPoint, ObservedIntent, StatusPublication, leaving, stand_down,
+};
 use crate::states::recovering::Recovering;
 use crate::states::rescaling::Rescaling;
 use crate::states::restarting::Restarting;
@@ -111,9 +113,9 @@ impl State for Running {
         log_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
         // What the select below parks on so that a lifecycle intent submitted while the job is
-        // healthy ends the wait. Never ready for a job on the landed M11.T08 mechanism, which
-        // is every production job through M11.T25: there the poll publishes into the channel
-        // the first arm already reads.
+        // healthy ends the wait. Never ready for a job built in the pre-flag-day peer mode,
+        // which no production job is: there the poll publishes into the channel the first arm
+        // already reads.
         let wake = ctx.lifecycle_wakeup();
 
         loop {
@@ -190,15 +192,27 @@ impl State for Running {
                     if ctx.status.restarts > 0 && running_start.elapsed() > *pipeline_config.healthy_duration {
                         let restarts = ctx.status.restarts;
                         ctx.status.restarts = 0;
-                        if let Err(e) = ctx.status.update_db(&ctx.db).await {
-                            error!(
-                                message = "Failed to update status",
-                                error = format!("{:?}", e),
-                                job_id = %ctx.config.id,
-                                pipeline_id = *ctx.pipeline_info.pipeline_id
-                            );
-                            ctx.status.restarts = restarts;
-                            // we'll try again on the next round
+                        match ctx.publish_status().await {
+                            Ok(StatusPublication::Published) => {}
+                            // Another controller holds this job. Restoring the counter and
+                            // trying again next round is what a *failure* deserves; a lost
+                            // authority is not one, and retrying it is a superseded controller
+                            // trying to overwrite a live one on a two-hundred-millisecond
+                            // timer. This task ends instead.
+                            Ok(StatusPublication::Superseded(stale)) => {
+                                stand_down(stale);
+                                return Ok(Transition::Stop);
+                            }
+                            Err(e) => {
+                                error!(
+                                    message = "Failed to update status",
+                                    error = format!("{:?}", e),
+                                    job_id = %ctx.config.id,
+                                    pipeline_id = *ctx.pipeline_info.pipeline_id
+                                );
+                                ctx.status.restarts = restarts;
+                                // we'll try again on the next round
+                            }
                         }
                     }
 

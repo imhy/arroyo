@@ -7,7 +7,9 @@ use crate::states::leader_finishing::LeaderFinishing;
 use crate::states::leader_rescaling::LeaderRescaling;
 use crate::states::leader_restarting::LeaderRestarting;
 use crate::states::leader_stop_if_desired_running;
-use crate::states::lifecycle::{ConsumptionPoint, ObservedIntent, leaving};
+use crate::states::lifecycle::{
+    ConsumptionPoint, ObservedIntent, StatusPublication, leaving, stand_down,
+};
 use crate::states::{ConfigApplied, RunningConfigAction, decide_running_config};
 use anyhow::anyhow;
 use arroyo_rpc::config::config;
@@ -225,14 +227,23 @@ impl State for LeaderRunning {
                     if ctx.status.restarts > 0 && self.started.elapsed() > *pipeline_config.healthy_duration {
                         let restarts = ctx.status.restarts;
                         ctx.status.restarts = 0;
-                        if let Err(e) = ctx.status.update_db(&ctx.db).await {
-                            error!(
-                                message = "Failed to update status",
-                                error = format!("{:?}", e),
-                                job_id = %ctx.config.id,
-                                pipeline_id = *ctx.pipeline_info.pipeline_id
-                            );
-                            ctx.status.restarts = restarts;
+                        match ctx.publish_status().await {
+                            Ok(StatusPublication::Published) => {}
+                            // The same decision as `Running`'s, for the same reason: a lost
+                            // authority is not a failure to retry, so this task ends.
+                            Ok(StatusPublication::Superseded(stale)) => {
+                                stand_down(stale);
+                                return Ok(Transition::Stop);
+                            }
+                            Err(e) => {
+                                error!(
+                                    message = "Failed to update status",
+                                    error = format!("{:?}", e),
+                                    job_id = %ctx.config.id,
+                                    pipeline_id = *ctx.pipeline_info.pipeline_id
+                                );
+                                ctx.status.restarts = restarts;
+                            }
                         }
                     }
 

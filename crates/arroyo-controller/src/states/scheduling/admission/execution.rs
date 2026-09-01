@@ -29,9 +29,9 @@
 //! selects, and the deadline for observing a decision becomes the submission rather than the
 //! timeout.
 //!
-//! For a job on the landed M11.T08 mechanism that arm is a future that never completes: there
-//! is no mailbox, the poll publishes into the job's channel and to the
-//! [`RefusalGate`](crate::states::RefusalGate), and this wait already selects on the channel.
+//! For a job built in the pre-flag-day peer mode that arm is a future that never completes:
+//! there is no mailbox, the poll publishes into the job's channel, and this wait already
+//! selects on the channel.
 
 use std::sync::Arc;
 use std::time::Duration;

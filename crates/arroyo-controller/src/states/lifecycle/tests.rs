@@ -73,21 +73,24 @@ fn new_mailbox() -> Arc<IntentMailbox> {
     Arc::new(IntentMailbox::new(Arc::new("job_abc".to_string())))
 }
 
-/// Production runs [`LifecycleMode::LegacyT08`], and the claim is checked over the whole
-/// enum rather than by sampling one call (M11.T25f, DoD M11.T25l).
+/// Production runs [`LifecycleMode::FencedV2`], and the claim is checked over the whole enum
+/// rather than by sampling one call (M11.T26h, DoD M11.T26z).
 ///
-/// Two things have to hold together, and either alone would be worth little. The selection
-/// must name `LegacyT08` — and it must do so for *every* variant's worth of reasoning, so
-/// that a mode added later is not silently selectable. The `match` below is what makes the
-/// second half true: it is exhaustive, so a new variant stops this test compiling until
-/// somebody says whether production may run it, and `ALL` is checked to be the same set the
-/// selection searches.
+/// Two things have to hold together, and either alone would be worth little. The selection must
+/// name `FencedV2` — and it must do so for *every* variant's worth of reasoning, so that a mode
+/// added later is not silently selectable. The `match` below is what makes the second half true:
+/// it is exhaustive, so a new variant stops this test compiling until somebody says whether
+/// production may run it, and `ALL` is checked to be the same set the selection searches.
 ///
-/// The companion source pin `no_production_path_selects_the_fenced_v2_lifecycle`, in
-/// `states/mod.rs`, covers what this cannot: that no production *call site* passes anything
-/// but the selection.
+/// The companion source pin `every_production_path_selects_the_fenced_v2_lifecycle`, in
+/// `states/mod.rs`, covers what this cannot: that no production *call site* passes anything but
+/// the selection.
+///
+/// M11.T25's version of this row asserted the opposite answer and was rewritten — not deleted —
+/// by the activation change, so the requirement it carried ("exactly one mode is production's,
+/// and it is a consequence of the enum") is still carried by a row of this name.
 #[test]
-fn production_selects_only_the_legacy_t08_lifecycle() {
+fn production_selects_only_the_fenced_v2_lifecycle() {
     assert_eq!(
         LifecycleMode::ALL.len(),
         2,
@@ -100,25 +103,24 @@ fn production_selects_only_the_legacy_t08_lifecycle() {
         // Exhaustive by construction: adding a variant to `LifecycleMode` without answering
         // here does not compile, so this cannot quietly sample a subset of the enum.
         let expected = match mode {
-            LifecycleMode::LegacyT08 => true,
-            LifecycleMode::FencedV2 => false,
+            LifecycleMode::LegacyT08 => false,
+            LifecycleMode::FencedV2 => true,
         };
 
         assert_eq!(
             mode == LifecycleMode::SELECTED,
             expected,
-            "{mode:?}: M11.T25 builds the D39a substrate and does not activate it, so \
-             `LegacyT08` — and only `LegacyT08` — is what a production controller runs. \
-             M11.T26 owns the change, together with the durable fence and the worker \
-             acknowledgement protocol that make the new path's settlement claim true"
+            "{mode:?}: since M11.T26h's activation change `FencedV2` — and only `FencedV2` — \
+             is what a production controller runs. `LegacyT08` is retained as the description \
+             of a pre-flag-day peer and is not selectable"
         );
     }
 
     assert_eq!(
         LifecycleMode::SELECTED,
-        LifecycleMode::LegacyT08,
-        "and the selection is the landed M11.T08 mechanism, whose gate quartet, settlement \
-         rescue, source-level admission regression and capability gate all stay selected"
+        LifecycleMode::FencedV2,
+        "and the selection is the D39a mechanism, whose durable fence and acknowledged worker \
+         protocol are what made its settlement claim true"
     );
 }
 

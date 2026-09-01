@@ -20,6 +20,12 @@ message WorkerResources {
 }
 
 message RegisterWorkerReq {
+  // 3 held `string job_id` until the worker-initialization state machine folded it into
+  // `worker_context`, and 7 held `string job_hash` before that. Neither was reserved when it
+  // was removed, so a message from a build old enough to still set one is wire-
+  // indistinguishable from a message setting a new field at the same tag. Reserving them here
+  // is what makes protoc, rather than a reviewer, refuse the reuse.
+  reserved 3, 7;
   WorkerContext worker_context = 1;
   uint64 time = 2;
   string rpc_address = 4;
@@ -43,6 +49,19 @@ message RegisterWorkerReq {
 }
 
 message RegisterWorkerResp {
+  // Set by a controller that requires the lifecycle-fence protocol of the worker generation
+  // it has just registered.
+  //
+  // False is the proto3 default and is therefore exactly what a controller predating this
+  // field reports. It is also the only honest answer such a controller could give: one that
+  // sends no fence cannot require one, so false means "this registration does not activate
+  // strict mode" and leaves the pre-flag-day compatibility window open — a worker registered
+  // to a legacy controller may still accept fence-less starts.
+  //
+  // The field is carried on the registration *response* rather than probed later because the
+  // decision has to be known before the generation admits its first StartExecution, and
+  // registration is the only controller->worker message guaranteed to precede one.
+  bool requires_lifecycle_fence = 1;
 }
 
 message HeartbeatReq {
@@ -502,6 +521,22 @@ message TaskAssignment {
   string worker_rpc = 6;
 }
 
+// What a StartExecutionReq asks of the worker generation it is addressed to.
+//
+// The fence protocol carries fence advancement and revocation on the existing StartExecution
+// RPC rather than adding one, so a single message expresses all three operations. Only START
+// applies a program.
+enum LifecycleOperation {
+  // Apply the request's program. This is the zero value, and so is what a request from a
+  // controller predating the field means — the only thing StartExecution has ever meant.
+  LIFECYCLE_OPERATION_START = 0;
+  // Advance the addressed generation's highest acknowledged fence. Applies no program.
+  LIFECYCLE_OPERATION_FENCE_ONLY = 1;
+  // Advance the fence and make every identifier in `revoked_execution_ids` permanently
+  // non-applicable for the addressed generation. Applies no program.
+  LIFECYCLE_OPERATION_REVOKE = 2;
+}
+
 message StartExecutionReq {
   api.ArrowProgram program = 1;
   optional uint64 restore_epoch = 2;
@@ -525,9 +560,66 @@ message StartExecutionReq {
   // idempotent retry, so a client-side timeout can be reconciled without starting twice or
   // releasing the controller's admission while the first handler may still be running.
   string start_execution_id = 12;
+  // The lifecycle fence this request is issued under.
+  //
+  // Zero means "this request carries no fence", which is what a request from a controller
+  // predating this field decodes as. Zero is safe as that sentinel because it is never an
+  // adopted fence: `job_statuses.lifecycle_fence` starts at 0 and cold adoption increments it
+  // before the adopting controller causes any effect. "The sender carried no fence" and "no
+  // controller has adopted this job's lifecycle" are therefore the same value, and both mean
+  // the request is not fenced.
+  uint64 lifecycle_fence = 13;
+  // The worker id this request is addressed to, paired with `target_worker_generation`. An
+  // endpoint can be reused, so the generation — not the address, and not the id alone — is
+  // what distinguishes a restarted worker from its predecessor.
+  uint64 target_worker_id = 14;
+  // The worker generation this request is addressed to, and the sentinel for the pair: it is
+  // zero exactly when the request addresses no generation.
+  //
+  // Generation zero is not a live worker generation. `job_statuses.run_id` starts at 0 and the
+  // scheduling preamble increments it before that generation's workers are launched, so every
+  // generation a worker can be running under is at least 1. `target_worker_id` could not serve
+  // as the sentinel in its place: a worker id is `worker.id` from configuration when that is
+  // set, and zero is a representable value there.
+  uint64 target_worker_generation = 15;
+  // What the addressed generation is being asked to do.
+  LifecycleOperation lifecycle_operation = 16;
+  // Outstanding `start_execution_id`s this request revokes for the addressed generation.
+  //
+  // Empty means "revoke nothing", which is what a request from a controller predating this
+  // field decodes as. The named set is acknowledged as a whole or not at all: the response
+  // carries no per-identifier result, so no partial revocation can be expressed on this wire.
+  repeated string revoked_execution_ids = 17;
+}
+
+// What a successful StartExecution response settles.
+//
+// Only a successful response carries one. A request the worker does not accept is answered
+// with a gRPC status and no StartExecutionResp at all, so no value here means "rejected"; the
+// status codes remain the sole carrier of that, and `Aborted` remains a definitive
+// "nothing was applied".
+enum StartExecutionOutcome {
+  // The addressed attempt is applied — accepted by this call, or already accepted under the
+  // same `start_execution_id`. This is the zero value, and so is what a response from a worker
+  // predating the field means: an Ok StartExecutionResp has always meant exactly this.
+  START_EXECUTION_OUTCOME_APPLIED = 0;
+  // A fence-only operation was acknowledged. Nothing was applied.
+  START_EXECUTION_OUTCOME_FENCE_ACKNOWLEDGED = 1;
+  // The fence was acknowledged and every named identifier is now permanently non-applicable
+  // for the responding generation. Nothing was applied.
+  START_EXECUTION_OUTCOME_REVOKED = 2;
 }
 
 message StartExecutionResp {
+  // The highest lifecycle fence the responding worker generation has acknowledged.
+  //
+  // Zero means "this generation has acknowledged no fence". That is what a response from a
+  // worker predating this field decodes as, and it is also what a fence-capable generation
+  // that has acknowledged none reports; the two readings agree because zero is never an
+  // adopted fence, so there is no acknowledgement of fence zero to confuse it with.
+  uint64 observed_lifecycle_fence = 1;
+  // What this response settles.
+  StartExecutionOutcome outcome = 2;
 }
 
 message CheckpointReq {
@@ -546,6 +638,18 @@ message CheckpointResp {
 message CommitReq {
   uint64 epoch = 1;
   map<string, OperatorCommitData> committing_data = 2;
+  // The lifecycle fence this commit directive is issued under, and the worker generation it is
+  // addressed to. The three fields mean exactly what the identically named fields on
+  // StartExecutionReq mean, including their zero values: a commit from a controller predating
+  // them carries no fence and addresses no generation. A worker refuses a commit addressed to
+  // another generation, or issued under a fence below the highest it has acknowledged, and
+  // applies one that carries none only while it is not in strict mode (M11.D39d, M11.D39e).
+  // Which form a sender issues is a property of its selected lifecycle mode, not of these
+  // fields: a controller on the pre-flag-day side of M11.D75's window issues the unfenced form,
+  // and one after it issues the fenced form for every commit.
+  uint64 lifecycle_fence = 3;
+  uint64 target_worker_id = 4;
+  uint64 target_worker_generation = 5;
 }
 
 message CommitResp {

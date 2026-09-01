@@ -15,6 +15,7 @@
 //! on the strength of a future having been dropped or a budget having been spent; it records
 //! only what a worker answered.
 
+use arroyo_rpc::fencing::MAX_ATTEMPT_ID_CHARS;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -24,16 +25,40 @@ use arroyo_rpc::grpc::rpc::worker_grpc_server::{WorkerGrpc, WorkerGrpcServer};
 use arroyo_rpc::grpc::rpc::{
     CheckpointReq, CheckpointResp, CommitReq, CommitResp, GetWorkerPhaseReq, GetWorkerPhaseResp,
     JobControllerInitReq, JobControllerInitResp, JobFinishedReq, JobFinishedResp,
-    LoadCompactedDataReq, LoadCompactedDataRes, MetricsReq, MetricsResp, StartExecutionReq,
-    StartExecutionResp, StopExecutionReq, StopExecutionResp,
+    LoadCompactedDataReq, LoadCompactedDataRes, MetricsReq, MetricsResp, StartExecutionOutcome,
+    StartExecutionReq, StartExecutionResp, StopExecutionReq, StopExecutionResp,
 };
 use arroyo_rpc::identity::{WorkerClient, worker_client};
 use arroyo_rpc::state_backend::StateBackendSelector;
 use arroyo_types::{MachineId, PipelineId, WorkerId};
 
 use super::ExecutionPlan;
-use super::fanout::{AttemptLedger, IssuedAttempts, SettlementBundle, SettlementOwner};
-use crate::states::{Admission, RefusalGate};
+use super::fanout::{AttemptLedger, IssuedAttempts, Observed};
+use crate::states::lifecycle::{FenceProtocol, StartTargets};
+use crate::states::{Admission, AdmissionLock};
+
+/// Records an authoritative response for `worker`'s attempt in an inventory a row built by hand,
+/// through the one validated seam `AttemptLedger::answered` uses.
+///
+/// The identifier is named rather than assumed, because that is the whole of what the seam
+/// checks: an inventory accounts for an answer only when the answer names the identifier that
+/// worker was issued, in the generation this fan-out addressed. The rows that vary those against
+/// each other are in `crate::states::lifecycle::settlement_tests`.
+fn answered(issued: &mut IssuedAttempts, worker: WorkerId, attempt_id: &str) {
+    let generation = issued.generation();
+    let _accounted = issued.observe(&Observed::authoritative_response(
+        worker, generation, attempt_id,
+    ));
+}
+
+/// The ledger of a fan-out with no settlement owner, addressing [`GENERATION`].
+///
+/// A generation is named rather than defaulted because a ledger has one: the fan-out seeds it
+/// from the job's own scheduling generation, and an inventory carrying zero would be claiming to
+/// address nothing.
+fn unowned_ledger() -> AttemptLedger {
+    AttemptLedger::owned_by(None, GENERATION, FENCE)
+}
 
 /// How long a row waits to establish that something has *not* happened.
 ///
@@ -51,6 +76,22 @@ const MAX_TURNS: usize = 400;
 
 /// One turn of that driving.
 const TURN: Duration = Duration::from_millis(10);
+
+/// The worker generation these rows' fan-outs address.
+///
+/// A fan-out's inventory carries the generation its identifiers were issued to (M11.T26e), so
+/// that an observation about another generation accounts for nothing in it. These rows are about
+/// what the fan-out records rather than about who observes it, so one generation is enough — but
+/// it is a named non-zero value rather than the `Default` zero, because zero is the sentinel for
+/// "addresses no generation" and an inventory that carried it would be claiming that.
+const GENERATION: u64 = 3;
+
+/// The lifecycle fence these rows' fan-outs issue their identifiers under.
+///
+/// Non-zero, so that an acknowledgement can be *above* it and settle: a worker revokes what is
+/// below the fence it takes, so an inventory issued under fence zero could be settled by any
+/// acknowledgement at all and would prove nothing about the height check (M11.T26f).
+const FENCE: u64 = 5;
 
 /// What a worker was asked to start.
 #[derive(Default)]
@@ -94,6 +135,12 @@ enum Answers {
     /// Answers `Unavailable` to every attempt, forever, and never applies anything. The shape a
     /// partitioned or half-dead peer presents: reachable, and never an answer.
     NeverSettling,
+    /// Answers `Ok` with a settlement that is not an application of the request.
+    ///
+    /// The shape M11.T26c's response reading exists for: a `StartExecutionResp` is a success at
+    /// the transport layer whatever it says, and a generation that acknowledged a fence has
+    /// started nothing.
+    NotApplying(StartExecutionResp),
 }
 
 /// A worker, as far as the controller can tell.
@@ -129,8 +176,16 @@ impl WorkerGrpc for TestWorker {
                     "this worker can never settle the request",
                 ));
             }
+            Answers::NotApplying(response) => {
+                return Ok(tonic::Response::new(*response));
+            }
         }
-        Ok(tonic::Response::new(StartExecutionResp {}))
+        // The double answers as the worker in this build does: it acknowledges no lifecycle
+        // fence, and an `Ok` response means the addressed attempt is applied.
+        Ok(tonic::Response::new(StartExecutionResp {
+            observed_lifecycle_fence: 0,
+            outcome: StartExecutionOutcome::Applied as i32,
+        }))
     }
 
     async fn get_worker_phase(
@@ -239,13 +294,12 @@ fn machine_ids(workers: &[WorkerId]) -> HashMap<WorkerId, MachineId> {
         .collect()
 }
 
-/// An [`Admission`] taken from a gate the row also holds, so it can ask afterwards whether the
-/// job's publication lock is free.
-async fn admitted() -> (RefusalGate, Admission) {
-    let mut gate = RefusalGate::default();
-    let (admission, refusal) = gate.admit_scheduling().await;
-    assert!(refusal.is_none(), "a fresh gate has refused nothing");
-    (gate, admission)
+/// An [`Admission`] taken from an [`AdmissionLock`] the row also holds, so it can ask
+/// afterwards whether the job's lifecycle authority is free.
+async fn admitted() -> (AdmissionLock, Admission) {
+    let lock = AdmissionLock::default();
+    let admission = lock.admit().await;
+    (lock, admission)
 }
 
 /// Runs the fan-out over `connects` to completion and returns what it settled.
@@ -261,7 +315,11 @@ async fn fan_out(
         PipelineId(Arc::new("pipeline_1".to_string())),
         plan(),
         ids,
-        connects,
+        // The landed rows are about the pre-flag-day fan-out, so they address their workers the
+        // way `LifecycleMode::LegacyT08` does: no fence, no addressed generation. The fenced
+        // shape has its own rows in `lifecycle::handshake_tests`.
+        StartTargets::without_a_handshake(FenceProtocol::Legacy, connects)
+            .expect("the legacy protocol needs no handshake"),
         attempts,
     )
     .await
@@ -292,8 +350,8 @@ async fn fanout_future_owns_all_request_children() {
     let (quick_calls, quick) = worker(WorkerId(2), Answers::Accepting).await;
     let connects = HashMap::from([(WorkerId(1), slow), (WorkerId(2), quick)]);
 
-    let (gate, admission) = admitted().await;
-    let attempts = Arc::new(AttemptLedger::default());
+    let (authority, admission) = admitted().await;
+    let attempts = Arc::new(unowned_ledger());
     let requests = fan_out(admission, connects, Arc::clone(&attempts));
 
     // Nobody has polled it. If any request had a life of its own it would have run by now:
@@ -356,11 +414,11 @@ async fn fanout_future_owns_all_request_children() {
         "and every request settled once the fan-out was driven to the end"
     );
 
-    let mut expected = IssuedAttempts::default();
+    let mut expected = IssuedAttempts::issued_under(GENERATION, FENCE);
     expected.issued(WorkerId(1), slow_calls.first_id());
     expected.issued(WorkerId(2), quick_calls.first_id());
-    expected.settled(WorkerId(1));
-    expected.settled(WorkerId(2));
+    answered(&mut expected, WorkerId(1), &slow_calls.first_id());
+    answered(&mut expected, WorkerId(2), &quick_calls.first_id());
     assert_eq!(
         attempts.snapshot(),
         expected,
@@ -371,7 +429,7 @@ async fn fanout_future_owns_all_request_children() {
 
     drop(admission);
     assert!(
-        gate.admit_publication().is_some(),
+        authority.is_free(),
         "the control: the admission travelled with the fan-out and came back with it"
     );
 }
@@ -386,8 +444,8 @@ async fn fanout_future_owns_all_request_children() {
 #[tokio::test]
 async fn an_abandoned_attempt_stays_outstanding_under_its_own_identifier() {
     let (calls, never) = worker(WorkerId(3), Answers::NeverSettling).await;
-    let (gate, admission) = admitted().await;
-    let attempts = Arc::new(AttemptLedger::default());
+    let (authority, admission) = admitted().await;
+    let attempts = Arc::new(unowned_ledger());
 
     let (admission, started) = fan_out(
         admission,
@@ -401,7 +459,7 @@ async fn an_abandoned_attempt_stays_outstanding_under_its_own_identifier() {
     );
 
     let issued = attempts.snapshot();
-    let mut expected = IssuedAttempts::default();
+    let mut expected = IssuedAttempts::issued_under(GENERATION, FENCE);
     expected.issued(WorkerId(3), calls.first_id());
     assert_eq!(
         issued, expected,
@@ -428,7 +486,7 @@ async fn an_abandoned_attempt_stays_outstanding_under_its_own_identifier() {
     );
 
     drop(admission);
-    assert!(gate.admit_publication().is_some());
+    assert!(authority.is_free());
 }
 
 /// A worker's explicit refusal is an outcome, and settles that worker's attempt alone.
@@ -441,8 +499,8 @@ async fn an_abandoned_attempt_stays_outstanding_under_its_own_identifier() {
 async fn an_explicitly_refused_attempt_settles_and_its_sibling_is_unaffected() {
     let (refused_calls, refusing) = worker(WorkerId(4), Answers::Refusing).await;
     let (accepted_calls, accepting) = worker(WorkerId(5), Answers::Accepting).await;
-    let (gate, admission) = admitted().await;
-    let attempts = Arc::new(AttemptLedger::default());
+    let (authority, admission) = admitted().await;
+    let attempts = Arc::new(unowned_ledger());
 
     let (admission, started) = fan_out(
         admission,
@@ -455,11 +513,11 @@ async fn an_explicitly_refused_attempt_settles_and_its_sibling_is_unaffected() {
         "the fan-out reports the first failing worker's error"
     );
 
-    let mut expected = IssuedAttempts::default();
+    let mut expected = IssuedAttempts::issued_under(GENERATION, FENCE);
     expected.issued(WorkerId(4), refused_calls.first_id());
     expected.issued(WorkerId(5), accepted_calls.first_id());
-    expected.settled(WorkerId(4));
-    expected.settled(WorkerId(5));
+    answered(&mut expected, WorkerId(4), &refused_calls.first_id());
+    answered(&mut expected, WorkerId(5), &accepted_calls.first_id());
     assert_eq!(
         attempts.snapshot(),
         expected,
@@ -473,392 +531,177 @@ async fn an_explicitly_refused_attempt_settles_and_its_sibling_is_unaffected() {
     );
 
     drop(admission);
-    assert!(gate.admit_publication().is_some());
+    assert!(authority.is_free());
 }
 
-/// A settlement owner that keeps whatever it is handed, so a row can ask what actually moved.
+/// The identifier the fan-out actually mints is exactly the width every bounded record accepts.
 ///
-/// M11.T25 has no owner of its own — `PhaseContext::settlement_owner` answers `None` — so a
-/// double is the only way to observe the seam at all. What it does is what a real one must:
-/// it *holds* the obligation, whole, rather than dropping it. Since review comment
-/// `5369004357` that is also the only thing it can do — the authority and the inventory are
-/// separable only inside `settlement.rs` — so this double cannot drift from the contract by
-/// keeping one half of what it was handed.
-#[derive(Default)]
-struct RecordingOwner {
-    /// The obligation, whole. Holding it is what holds the job's lifecycle authority.
-    held: Mutex<Option<SettlementBundle>>,
-    /// What the inventory said on arrival, copied out for a row to compare against. Reading
-    /// it takes nothing out of the obligation, and it is published *after* `held`, so a row
-    /// that has observed it can rely on the obligation being there.
-    issued: Mutex<Option<IssuedAttempts>>,
-}
+/// The worker's applied/revoked record (`arroyo_worker::lifecycle_fence::attempt_ids`), the
+/// durable fencing record (`arroyo_rpc::fencing::Fencing`) and the revocation list on a decoded
+/// `StartExecutionReq` (`arroyo_rpc::fence_wire`) all refuse an identifier wider than
+/// [`MAX_ATTEMPT_ID_CHARS`], and none of them can widen to fit one: a refusal there is a request
+/// the worker will not apply. So the producer has to be pinned against the bound rather than
+/// argued about, and it has to be *this* producer — the expression the fan-out runs — so that a
+/// change to the minting format fails here instead of on the wire.
+///
+/// `{:016x}` is a minimum width, and 16 is also the maximum number of hexadecimal digits a
+/// `u64` has, so the width is a constant rather than a distribution; the sampling below is
+/// belt-and-braces over that argument, not the argument itself.
+#[test]
+fn the_minted_start_execution_id_is_exactly_the_bounded_width() {
+    assert_eq!(
+        MAX_ATTEMPT_ID_CHARS, 32,
+        "two u64s in zero-padded hexadecimal"
+    );
 
-impl SettlementOwner for RecordingOwner {
-    fn take_over(&self, bundle: SettlementBundle) -> Result<(), SettlementBundle> {
-        let arrived_with = bundle.issued().clone();
-        *self.held.lock().unwrap() = Some(bundle);
-        *self.issued.lock().unwrap() = Some(arrived_with);
-        Ok(())
+    for _ in 0..1024 {
+        let minted = super::mint_start_execution_id();
+        assert_eq!(
+            minted.chars().count(),
+            MAX_ATTEMPT_ID_CHARS,
+            "minted {minted:?}"
+        );
+        // Characters and bytes agree, so a record that bounds either bounds both.
+        assert_eq!(minted.len(), MAX_ATTEMPT_ID_CHARS, "minted {minted:?}");
+        assert!(
+            minted
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+            "minted {minted:?}"
+        );
     }
-}
 
-impl RecordingOwner {
-    /// The inventory the obligation this owner is holding still lists, if it is holding one.
-    fn retained(&self) -> Option<IssuedAttempts> {
-        self.held
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|bundle| bundle.issued().clone())
+    // The two extremes of the value space produce the same width as any sample, which is what
+    // makes the constant a constant: a zero half is padded to 16 and a saturated half is 16.
+    for (high, low) in [(0, 0), (u64::MAX, u64::MAX), (0, u64::MAX), (u64::MAX, 0)] {
+        assert_eq!(
+            format!("{high:016x}{low:016x}").chars().count(),
+            MAX_ATTEMPT_ID_CHARS
+        );
     }
+
+    // And it is non-empty, which every one of those records also requires.
+    assert!(!super::mint_start_execution_id().is_empty());
 }
 
-/// Waits, bounded, for the detached region rescue to have handed the obligation over.
-///
-/// A bound rather than a wait: a row whose handover never happens fails with its own assertion
-/// instead of hanging the suite.
-async fn handed_over(owner: &Arc<RecordingOwner>) -> Option<IssuedAttempts> {
-    for _ in 0..MAX_TURNS {
-        if let Some(issued) = owner.issued.lock().unwrap().clone() {
-            return Some(issued);
-        }
-        tokio::time::sleep(TURN).await;
-    }
-    None
-}
+// ---------------------------------------------------------------------------------------------
+// M11.T26c — the response is read, not merely received
+// ---------------------------------------------------------------------------------------------
 
-/// A fan-out whose phase is **cancelled** still hands its obligation to the job's settlement
-/// owner.
+/// An `Ok` response that does not say the request was applied does not start a worker.
 ///
-/// This is the path an owner exists for, and the one on which no line of the phase runs. When
-/// the controller's shutdown token fires the job's state task is dropped as a whole — see
-/// `ShutdownGuard::into_spawn_task` — so `StartFanOut::issue` never reaches its own
-/// `settlement_owner()` / `hand_over` block: the `await` it is suspended at simply never
-/// returns. What survives is the region rescue inside `settle_under_admission`, which holds the
-/// admission until the issued requests settle; before this fix it then *dropped* what it had
-/// rescued, so an owner received neither the inventory nor the authority on the only path it
-/// was built for.
+/// A `StartExecutionResp` is a transport success whatever it carries, and the landed loop treated
+/// every one of them as "the worker entered initialization". Under M11.D39e a generation answers a
+/// fence-only or revoke directive with `FENCE_ACKNOWLEDGED` or `REVOKED`; a `START` answered with
+/// either is a worker that advanced its fence and ran nothing, and reporting it as started would
+/// leave the controller waiting for tasks that were never launched.
 ///
-/// The three assertions are the three halves of "the obligation moved as one unit", at the
-/// three moments they can be made:
-///
-/// * while the request is unsettled, nothing has been handed over and nothing is publishable;
-/// * once the worker answers, the owner has the inventory — with the identifier that worker was
-///   actually sent, read back from the worker itself;
-/// * and it has the authority too, which is why the gate is still closed until the owner lets
-///   it go.
+/// Both are definitive: the attempt is accounted for, and the identifier is not re-offered.
 #[tokio::test]
-async fn a_cancelled_fan_out_hands_its_obligation_to_the_settlement_owner() {
-    let paused = Arc::new(Paused::default());
-    let (calls, slow) = worker(WorkerId(8), Answers::Pausing(paused.clone())).await;
-    let (gate, admission) = admitted().await;
+async fn a_response_that_acknowledges_a_fence_does_not_start_a_worker() {
+    for outcome in [
+        StartExecutionOutcome::FenceAcknowledged,
+        StartExecutionOutcome::Revoked,
+    ] {
+        let (calls, client) = worker(
+            WorkerId(1),
+            Answers::NotApplying(StartExecutionResp {
+                observed_lifecycle_fence: 9,
+                outcome: outcome as i32,
+            }),
+        )
+        .await;
+        let (_authority, admission) = admitted().await;
+        let attempts = Arc::new(unowned_ledger());
+        let (admission, started) = fan_out(
+            admission,
+            HashMap::from([(WorkerId(1), client)]),
+            Arc::clone(&attempts),
+        )
+        .await;
+        drop(admission);
 
-    let owner = Arc::new(RecordingOwner::default());
-    let attempts = Arc::new(AttemptLedger::owned_by(Some(
-        Arc::clone(&owner) as Arc<dyn SettlementOwner>
-    )));
-    let mut requests = Box::pin(fan_out(
-        admission,
-        HashMap::from([(WorkerId(8), slow)]),
-        Arc::clone(&attempts),
-    ));
-
-    // Drive it until the worker has been asked and has not answered.
-    let mut asked = false;
-    for _ in 0..MAX_TURNS {
-        tokio::select! {
-            _ = &mut requests => panic!("the fan-out cannot finish while the worker is paused"),
-            _ = tokio::time::sleep(TURN) => {}
-        }
-        if !calls.ids().is_empty() {
-            asked = true;
-            break;
-        }
+        assert!(
+            started.is_err(),
+            "{outcome:?}: a generation that acknowledged a fence has started nothing"
+        );
+        assert_eq!(
+            calls.ids().len(),
+            1,
+            "{outcome:?}: and it is the generation's own answer, so the identifier is offered \
+             once and not re-offered"
+        );
+        assert_eq!(
+            attempts.snapshot().outstanding_count(),
+            0,
+            "{outcome:?}: a response is an answer, so the attempt is accounted for"
+        );
     }
-    assert!(
-        asked,
-        "the fixture's precondition: the request reached the worker"
-    );
-
-    // The job's state task is cancelled. Everything the phase would have done next goes with
-    // it, including the hand-over it performs on its own return path.
-    drop(requests);
-
-    tokio::time::sleep(NOTHING_HAPPENS_GRACE).await;
-    assert!(
-        owner.issued.lock().unwrap().is_none(),
-        "nothing is handed over while a request the fan-out issued is still unsettled: the \
-         rescue is holding the authority precisely so that nothing can be published behind it"
-    );
-    assert!(
-        gate.admit_publication().is_none(),
-        "and the job's publication lock is still held, by the rescue rather than by the phase"
-    );
-
-    // The worker answers. The rescue settles, and the obligation reaches the owner.
-    paused.released.notify_one();
-    let issued = handed_over(&owner).await.expect(
-        "a cancelled fan-out's inventory and its lifecycle authority must reach the job's \
-         settlement owner: the phase that would have handed them over no longer exists, so this \
-         is the only path left that can",
-    );
-
-    let mut expected = IssuedAttempts::default();
-    expected.issued(WorkerId(8), calls.first_id());
-    expected.settled(WorkerId(8));
-    assert_eq!(
-        issued, expected,
-        "what the owner receives is what the workers answered, under the identifier they were \
-         actually sent — the live ledger the rescued region went on writing to, not a summary \
-         composed before the cancellation"
-    );
-    assert_eq!(
-        owner.retained(),
-        Some(expected.clone()),
-        "and it is still holding all of it, read back out of the obligation rather than from \
-         the copy it took on arrival — the rescued path's half of review comment `5369004357`"
-    );
-    assert!(
-        gate.admit_publication().is_none(),
-        "and the authority came with it: a refusal is no more publishable now than it was \
-         before, because the owner is the one holding the lock"
-    );
-
-    drop(owner.held.lock().unwrap().take());
-    assert!(
-        gate.admit_publication().is_some(),
-        "the control — the gate is closed only because the owner was holding the admission it \
-         was handed"
-    );
 }
 
-/// The same cancellation, for a controller with no settlement owner, releases the admission
-/// once the requests settle and hands nothing anywhere.
+/// A response this build cannot name is not evidence that anything was applied.
 ///
-/// The control for the row above and the statement that M11.T25's own behaviour is unchanged:
-/// every ledger this half builds has no owner, so the rescue does exactly what it has always
-/// done. If this row ever stopped passing, the landed M11.T08 path would have acquired a
-/// behaviour it did not have.
+/// `observed_settlement` refuses a response claiming to have acknowledged a fence while reporting
+/// none, and an outcome value this build does not know — which is what a *newer* worker's answer
+/// arrives as, since proto3 keeps an unrecognized enum value verbatim. Reading either as
+/// `APPLIED` is how a controller would wait for tasks that were never started.
 #[tokio::test]
-async fn a_cancelled_fan_out_without_an_owner_releases_its_admission_as_before() {
-    let paused = Arc::new(Paused::default());
-    let (calls, slow) = worker(WorkerId(9), Answers::Pausing(paused.clone())).await;
-    let (gate, admission) = admitted().await;
+async fn a_response_this_build_cannot_read_is_not_an_application() {
+    for response in [
+        // Acknowledges a fence while reporting none observed.
+        StartExecutionResp {
+            observed_lifecycle_fence: 0,
+            outcome: StartExecutionOutcome::FenceAcknowledged as i32,
+        },
+        // An outcome from a build newer than this one.
+        StartExecutionResp {
+            observed_lifecycle_fence: 3,
+            outcome: 99,
+        },
+    ] {
+        let (calls, client) = worker(WorkerId(1), Answers::NotApplying(response)).await;
+        let (_authority, admission) = admitted().await;
+        let (admission, started) = fan_out(
+            admission,
+            HashMap::from([(WorkerId(1), client)]),
+            Arc::new(unowned_ledger()),
+        )
+        .await;
+        drop(admission);
 
-    let attempts = Arc::new(AttemptLedger::default());
-    let mut requests = Box::pin(fan_out(
-        admission,
-        HashMap::from([(WorkerId(9), slow)]),
-        Arc::clone(&attempts),
-    ));
-    let mut asked = false;
-    for _ in 0..MAX_TURNS {
-        tokio::select! {
-            _ = &mut requests => panic!("the fan-out cannot finish while the worker is paused"),
-            _ = tokio::time::sleep(TURN) => {}
-        }
-        if !calls.ids().is_empty() {
-            asked = true;
-            break;
-        }
-    }
-    assert!(
-        asked,
-        "the fixture's precondition: the request reached the worker"
-    );
-
-    drop(requests);
-    tokio::time::sleep(NOTHING_HAPPENS_GRACE).await;
-    assert!(
-        gate.admit_publication().is_none(),
-        "the rescue holds the admission while the request it issued is unsettled"
-    );
-
-    paused.released.notify_one();
-    let mut released = false;
-    for _ in 0..MAX_TURNS {
-        if gate.admit_publication().is_some() {
-            released = true;
-            break;
-        }
-        tokio::time::sleep(TURN).await;
-    }
-    assert!(
-        released,
-        "and releases it once the worker has answered — the landed M11.T08 rescue, unchanged"
-    );
-    assert_eq!(
-        attempts.snapshot().outstanding_count(),
-        0,
-        "with the attempt accounted for by the answer that arrived, not by the cancellation"
-    );
-}
-
-/// An owner that gives a rescued obligation back, which is the one correct way to say no.
-///
-/// A real one declines because it is shutting down, or because it already holds an obligation
-/// for a newer generation of this job. The first of those is why this pairs so badly with
-/// cancellation: a controller shutting down is what cancels the job's state task in the first
-/// place, so "the owner is going away" and "the phase has already gone" are the *same* event
-/// seen twice, and the rescue is where they meet.
-struct DecliningOwner;
-
-impl SettlementOwner for DecliningOwner {
-    fn take_over(&self, bundle: SettlementBundle) -> Result<(), SettlementBundle> {
-        Err(bundle)
+        assert!(
+            started.is_err(),
+            "{response:?}: a response this build cannot name is not an application"
+        );
+        assert_eq!(calls.ids().len(), 1, "{response:?}: and it is not retried");
     }
 }
 
-/// The ledger of a fan-out whose obligation `owner` will be offered if it is interrupted.
-fn owned_ledger(owner: impl SettlementOwner + 'static) -> Arc<AttemptLedger> {
-    Arc::new(AttemptLedger::owned_by(Some(
-        Arc::new(owner) as Arc<dyn SettlementOwner>
-    )))
-}
-
-/// Drives `requests` until the worker has been asked, without letting the fan-out finish.
+/// The response the worker in this build sends before the flag day still starts the worker.
 ///
-/// A bound rather than a wait: a row whose request never arrives fails with its own assertion
-/// instead of hanging the suite.
-async fn asked_and_still_running(
-    requests: &mut std::pin::Pin<
-        Box<
-            impl std::future::Future<
-                Output = (Admission, anyhow::Result<HashMap<WorkerId, WorkerClient>>),
-            >,
-        >,
-    >,
-    calls: &Arc<Calls>,
-) {
-    for _ in 0..MAX_TURNS {
-        tokio::select! {
-            _ = &mut *requests => panic!("the fan-out cannot finish before the worker answers"),
-            _ = tokio::time::sleep(TURN) => {}
-        }
-        if !calls.ids().is_empty() {
-            return;
-        }
-    }
-    panic!("the fixture's precondition: the request reached the worker");
-}
-
-/// A cancelled fan-out whose settlement owner **declines** does not release the job's
-/// lifecycle authority while an attempt is unaccounted for (review round 4, finding 1).
-///
-/// This is a regression review round 3 introduced and review round 4 caught. Before round 3
-/// `SettlementBundle::transfer_to` issued a receipt unconditionally, so the rescue's
-/// `Some(owner)` hand-over could only end in `Transferred` and discarding its outcome cost
-/// nothing. Round 3 made a decline observable — correctly — and the rescue went on discarding
-/// what came back, so `SettlementOutcome::SettledInPlace` fell out of scope and released the
-/// admission on the spot. "The phase keeps it and settles in place" is true of
-/// `StartFanOut::issue`; it is false here, because there is no phase.
-///
-/// The row is built out of the two facts that make the hazard real together:
-///
-/// * the worker never answers, so the fan-out spends its reconcile budget and gives the
-///   attempt up — the controller stopped offering the identifier and never learned what the
-///   worker did with it, which is the definition of unaccounted for; and
-/// * the state task is cancelled first, so nothing but the rescue is left to decide.
-///
-/// What must not happen is what happened: the authority released while that attempt is
-/// outstanding, which is a refusal becoming publishable behind a `StartExecution` a worker may
-/// still be applying.
+/// The control for the two rows above, and the compatibility half of M11.T26c: `APPLIED` with no
+/// observed fence is what both a fence-capable generation and a worker predating the fields
+/// answer, and the fan-out reads it exactly as it always did.
 #[tokio::test]
-async fn a_cancelled_fan_out_whose_owner_declines_retains_the_unaccounted_authority() {
-    let (calls, never) = worker(WorkerId(10), Answers::NeverSettling).await;
-    let (gate, admission) = admitted().await;
-    let attempts = owned_ledger(DecliningOwner);
-
-    let mut requests = Box::pin(fan_out(
+async fn the_pre_flag_day_response_still_starts_the_worker() {
+    let (calls, client) = worker(
+        WorkerId(1),
+        Answers::NotApplying(StartExecutionResp::default()),
+    )
+    .await;
+    let (_authority, admission) = admitted().await;
+    let (admission, started) = fan_out(
         admission,
-        HashMap::from([(WorkerId(10), never)]),
-        Arc::clone(&attempts),
-    ));
-    asked_and_still_running(&mut requests, &calls).await;
+        HashMap::from([(WorkerId(1), client)]),
+        Arc::new(unowned_ledger()),
+    )
+    .await;
+    drop(admission);
 
-    // The job's state task is cancelled. The rescue is now the only thing holding the
-    // authority, and the region it rescued goes on retrying under it.
-    drop(requests);
-
-    // Wait for the region to reach its own terminal path: the first request plus the whole
-    // reconcile budget, after which the fan-out stops offering the identifier and returns.
-    let mut gave_up = false;
-    for _ in 0..MAX_TURNS {
-        if calls.ids().len() == super::START_EXECUTION_RECONCILE_ATTEMPTS + 1 {
-            gave_up = true;
-            break;
-        }
-        tokio::time::sleep(TURN).await;
-    }
     assert!(
-        gave_up,
-        "the fixture's precondition: the rescued region spends its budget and gives the \
-         attempt up, which is what leaves it outstanding"
+        started.is_ok(),
+        "the default response is `APPLIED` with no observed fence, which is what a worker \
+         predating these fields sends"
     );
-    assert_eq!(
-        attempts.snapshot().outstanding_count(),
-        1,
-        "and the ledger says so: nobody answered, so nothing is settled"
-    );
-
-    // Long enough for the region to return and the rescue to run — both are microseconds after
-    // the last request fails, and the whole point is that nothing is released when it does.
-    tokio::time::sleep(NOTHING_HAPPENS_GRACE).await;
-    assert!(
-        gate.admit_publication().is_none(),
-        "the owner declined, and there is no phase to hand the obligation back to, so the \
-         authority is retained rather than released: a refusal published here would be \
-         published behind a StartExecution this worker may still apply"
-    );
-}
-
-/// The same decline, once every attempt has been answered, releases the authority.
-///
-/// The control, and the reason the row above is about the *obligation* rather than about
-/// declining. What entitles a rescue to release the job's publication lock is that nothing is
-/// owed under it — here the worker answers, the ledger settles, and the declined obligation is
-/// discharged, so releasing is exactly what a controller with no owner at all does. A fix that
-/// simply never released would pass the row above and fail this one.
-#[tokio::test]
-async fn a_cancelled_fan_out_whose_owner_declines_releases_a_fully_answered_obligation() {
-    let paused = Arc::new(Paused::default());
-    let (calls, slow) = worker(WorkerId(11), Answers::Pausing(paused.clone())).await;
-    let (gate, admission) = admitted().await;
-    let attempts = owned_ledger(DecliningOwner);
-
-    let mut requests = Box::pin(fan_out(
-        admission,
-        HashMap::from([(WorkerId(11), slow)]),
-        Arc::clone(&attempts),
-    ));
-    asked_and_still_running(&mut requests, &calls).await;
-
-    drop(requests);
-    tokio::time::sleep(NOTHING_HAPPENS_GRACE).await;
-    assert!(
-        gate.admit_publication().is_none(),
-        "nothing is released while the request the fan-out issued is unsettled, owner or no \
-         owner"
-    );
-
-    paused.released.notify_one();
-    let mut released = false;
-    for _ in 0..MAX_TURNS {
-        if gate.admit_publication().is_some() {
-            released = true;
-            break;
-        }
-        tokio::time::sleep(TURN).await;
-    }
-    assert!(
-        released,
-        "and once the worker has answered there is nothing left to be answerable for, so the \
-         declined obligation is discharged and the authority goes"
-    );
-    assert_eq!(
-        attempts.snapshot().outstanding_count(),
-        0,
-        "accounted for by the answer that arrived, not by the cancellation"
-    );
+    assert_eq!(calls.ids().len(), 1);
 }

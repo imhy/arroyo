@@ -11,9 +11,10 @@ use arroyo_rpc::checkpoints::{
     UpdateCheckpointReq,
 };
 use arroyo_rpc::config::config;
+use arroyo_rpc::fence_wire::CommitAuthority;
 use arroyo_rpc::grpc::rpc::{
     CheckpointManifest, CheckpointReq, CommitReq, JobFinishedReq, LabelPair, LoadCompactedDataReq,
-    MetricsReq, OperatorCheckpointMetadata, TaskCheckpointEventType,
+    MetricsReq, OperatorCheckpointMetadata, OperatorCommitData, TaskCheckpointEventType,
 };
 use arroyo_rpc::identity::WorkerClient;
 use arroyo_rpc::public_ids::{IdTypes, generate_id};
@@ -66,6 +67,18 @@ pub struct RunningJobModel {
 
     pub worker_leader_mode: bool,
 
+    /// The lifecycle-fence authority every commit this model publishes is issued under
+    /// (M11.D39d).
+    ///
+    /// One value per running execution, held rather than re-derived per commit, because a
+    /// commit is a directive from the same sender, under the same authority, to the same worker
+    /// generation as the `StartExecution` that began the execution. In controller mode it comes
+    /// from the job's `FenceProtocol`; in worker-leader mode it is the authority the leader's
+    /// own admitted start conferred. Both topologies commit through
+    /// [`Self::commit_to_workers`], so there is one place that addresses a commit and one value
+    /// it addresses it under.
+    pub commit_authority: CommitAuthority,
+
     /// Identifies which process / role is running this model and where its
     /// checkpoint storage lives.
     ///
@@ -100,7 +113,75 @@ impl std::fmt::Debug for RunningJobModel {
     }
 }
 
+/// A commit that names no worker, and therefore cannot be sent as it is.
+///
+/// A `CommitReq` on the wire carries both what is being committed and *who is being asked* —
+/// the fence and the target worker generation M11.D39d puts on commit directives. Those two
+/// halves come from different places: the epoch and the committing data from the checkpoint
+/// being published, the address from the sender's lifecycle authority and the particular worker
+/// the request is going to. This is the first half on its own, so the second is not something a
+/// caller has to remember: the only thing that turns one of these into a `CommitReq` is
+/// [`addressed_commit`], which supplies both.
+///
+/// That the *only* thing is not something these types can say — prost's generated structs have
+/// public fields, so any file could assemble a `CommitReq` — which is why
+/// `lifecycle_fence::wiring_tests::one_place_in_this_crate_builds_a_commit_to_send` counts the
+/// builders on source instead.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CommitBody {
+    /// The checkpoint epoch this commit publishes.
+    pub epoch: u64,
+    /// The per-operator data being committed for that epoch.
+    pub committing_data: HashMap<String, OperatorCommitData>,
+}
+
+/// `body`, addressed to `worker` under `authority`.
+///
+/// The single place a sendable [`CommitReq`] comes into existence on any production path in
+/// either topology — counted by
+/// `lifecycle_fence::wiring_tests::one_place_in_this_crate_builds_a_commit_to_send`, since
+/// nothing about the generated struct prevents a second one. Every lifecycle field is written by
+/// `CommitDirective::stamp`, on both of its arms, so a commit carries one directive rather than
+/// a mixture of one and whatever the literal left behind; under `LifecycleMode::LegacyT08` that
+/// directive is `Unfenced` and the three fields are stamped back to the zeros a sender predating
+/// them produced.
+///
+/// A free function rather than a method because the fan-out below holds each worker's channel
+/// mutably while it builds that worker's request, and because the replay path builds all of them
+/// before it sends any.
+pub fn addressed_commit(
+    authority: CommitAuthority,
+    worker: WorkerId,
+    body: &CommitBody,
+) -> CommitReq {
+    let mut req = CommitReq {
+        epoch: body.epoch,
+        committing_data: body.committing_data.clone(),
+        // Written by the directive below, on every arm; see `fence_wire::stamp`.
+        ..Default::default()
+    };
+    authority.directive(worker.0).stamp(&mut req);
+    req
+}
+
 impl RunningJobModel {
+    /// Sends `body` to every worker of this job, each addressed to itself.
+    ///
+    /// One loop for both topologies and for both of the moments a checkpoint is committed, so
+    /// "which authority does a commit go out under" has one answer per running execution. It
+    /// stops at the first worker that refuses, which is the landed behaviour: a commit a worker
+    /// generation refuses is not one the rest of the job may be told to publish.
+    pub async fn commit_to_workers(&mut self, body: &CommitBody) -> anyhow::Result<()> {
+        let authority = self.commit_authority;
+        for (id, worker) in self.workers.iter_mut() {
+            worker
+                .connect
+                .commit(Request::new(addressed_commit(authority, *id, body)))
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn update_db(&self, store: &dyn CheckpointMetadataStore) -> anyhow::Result<()> {
         if let Some(CheckpointingOrCommittingState::Checkpointing(checkpoint_state)) =
             &self.checkpoint_state
@@ -597,17 +678,14 @@ impl RunningJobModel {
                 .await?
                 {
                     CommitAuthorization::Authorized { .. } => {
-                        // commit to workers
-                        for worker in self.workers.values_mut() {
-                            worker
-                                .connect
-                                .commit(Request::new(CommitReq {
-                                    epoch: *self.epoch,
-                                    // TODO: this is pretty expensive
-                                    committing_data: committing_data.clone(),
-                                }))
-                                .await?;
-                        }
+                        // commit to workers, each addressed to itself under this leader's
+                        // lifecycle authority (M11.D39d)
+                        self.commit_to_workers(&CommitBody {
+                            epoch: *self.epoch,
+                            // TODO: this is pretty expensive
+                            committing_data: committing_data.clone(),
+                        })
+                        .await?;
                     }
                     CommitAuthorization::AlreadyCommitted { .. } => {
                         unreachable!(
@@ -731,15 +809,11 @@ impl RunningJobModel {
 
                     // TODO: this should be done in parallel, but we're being conservative for now
                     //  about changing existing behaviorÏ
-                    for worker in self.workers.values_mut() {
-                        worker
-                            .connect
-                            .commit(Request::new(CommitReq {
-                                epoch: *self.epoch,
-                                committing_data: committing.committing_data().clone(),
-                            }))
-                            .await?;
-                    }
+                    self.commit_to_workers(&CommitBody {
+                        epoch: *self.epoch,
+                        committing_data: committing.committing_data().clone(),
+                    })
+                    .await?;
 
                     self.checkpoint_state =
                         Some(CheckpointingOrCommittingState::Committing(committing));

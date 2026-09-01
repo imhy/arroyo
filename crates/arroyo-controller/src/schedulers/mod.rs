@@ -67,7 +67,44 @@ pub trait Scheduler: Send + Sync {
         generation: Option<u64>,
     ) -> anyhow::Result<Vec<WorkerId>>;
 
+    /// Whether [`Self::workers_for_job`] is authoritative about a specific worker generation
+    /// having **terminated** (M11.T26f, design M11.D39e(v)).
+    ///
+    /// M11.D39e(v) allows exactly three facts to settle an issued `StartExecution`, and one of
+    /// them is *observed target worker-generation termination*. The controller observes it here:
+    /// a target the scheduler no longer lists among a job's live workers is a target that cannot
+    /// apply what was addressed to it. That reading is only sound for a scheduler whose listing
+    /// names the workers it started, by id — and not every implementation's does. An empty
+    /// listing from one that keeps no registry means *"I do not know"*, and reading it as
+    /// *"they are gone"* would settle every target of every job the moment it was asked, which
+    /// is precisely the false settlement the whole fence exists to prevent.
+    ///
+    /// It has no default. A scheduler added later must say which of the two it is, because the
+    /// safe answer is not the convenient one and an omission would inherit whichever was written
+    /// here.
+    fn generation_termination_reporting(&self) -> GenerationTerminationReporting;
+
     async fn shutdown(&self) {}
+}
+
+/// What a scheduler's live-worker listing says about termination.
+///
+/// A value rather than a `bool` so that the negative arm carries what an operator needs: which
+/// scheduler could not answer, and why it cannot. A job that will not leave `Fencing` because
+/// its deployment's scheduler does not track worker identities is a very different report from
+/// one held by a partitioned worker, and a flag could not tell them apart.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GenerationTerminationReporting {
+    /// The scheduler owns the worker processes and lists the live ones by worker id, so a
+    /// target it does not list has terminated.
+    Authoritative,
+    /// The scheduler cannot say whether a particular worker generation has terminated.
+    Untracked {
+        /// The scheduler, for the log.
+        scheduler: &'static str,
+        /// Why it cannot say.
+        why: &'static str,
+    },
 }
 
 pub struct ProcessWorker {
@@ -283,6 +320,12 @@ impl Scheduler for ProcessScheduler {
             .collect())
     }
 
+    /// Authoritative: this scheduler owns the worker *processes*, keys them by [`WorkerId`], and
+    /// removes an entry when its process is finished.
+    fn generation_termination_reporting(&self) -> GenerationTerminationReporting {
+        GenerationTerminationReporting::Authoritative
+    }
+
     async fn stop_workers(
         &self,
         job_id: &str,
@@ -465,6 +508,16 @@ impl Scheduler for ManualScheduler {
         _run_id: Option<u64>,
     ) -> anyhow::Result<Vec<WorkerId>> {
         Ok(vec![])
+    }
+
+    /// Untracked. This scheduler's workers are started by a person in another terminal and it
+    /// keeps no registry of them at all, so its empty listing is not a statement about anything.
+    fn generation_termination_reporting(&self) -> GenerationTerminationReporting {
+        GenerationTerminationReporting::Untracked {
+            scheduler: "manual",
+            why: "its workers are started by an operator and it keeps no registry of them, so \
+                  an empty listing says nothing about whether a generation has terminated",
+        }
     }
 
     async fn stop_workers(
@@ -746,6 +799,12 @@ impl Scheduler for NodeScheduler {
         }
     }
 
+    /// Authoritative: the node scheduler keys its live workers by [`WorkerId`] and removes one
+    /// when its node reports the worker finished.
+    fn generation_termination_reporting(&self) -> GenerationTerminationReporting {
+        GenerationTerminationReporting::Authoritative
+    }
+
     async fn workers_for_job(
         &self,
         job_id: &str,
@@ -916,3 +975,6 @@ impl Scheduler for NodeScheduler {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod reporting_tests;

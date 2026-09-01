@@ -328,6 +328,26 @@ impl Scheduler for KubernetesScheduler {
         bail!("workers failed to shut down");
     }
 
+    /// **Untracked**, and this is a limitation of the listing rather than of Kubernetes.
+    ///
+    /// The implementation below lists the job's pods and maps every one of them to
+    /// `WorkerId(1)` — see the `TODO` in it — because a pod does not carry the worker id the
+    /// controller assigned. A listing in which every live worker answers to the same id cannot
+    /// say that some *other* id has terminated: it would report every worker but one as gone,
+    /// which is a false settlement of exactly the kind M11.D39e(v) forbids.
+    ///
+    /// So a Kubernetes deployment discharges a recovered fencing obligation by acknowledgement
+    /// only, and a target it cannot reach keeps its job in `Fencing` — M11.D39g's declared
+    /// choice, arrived at here for a reason worth removing. Giving the pods their worker id, or
+    /// listing by it, makes this `Authoritative` and nothing else has to change.
+    fn generation_termination_reporting(&self) -> super::GenerationTerminationReporting {
+        super::GenerationTerminationReporting::Untracked {
+            scheduler: "kubernetes",
+            why: "its pod listing does not carry the worker id the controller assigned, so it \
+                  cannot say that a particular worker generation has terminated",
+        }
+    }
+
     async fn workers_for_job(
         &self,
         job_id: &str,

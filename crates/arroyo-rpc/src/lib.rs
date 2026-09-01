@@ -1,6 +1,9 @@
 pub mod api_types;
 pub mod checkpoints;
+pub mod fence_wire;
+pub mod fencing;
 pub mod formats;
+pub mod metadata_root;
 pub mod public_ids;
 pub mod schema_resolver;
 pub mod state_backend;
@@ -9,6 +12,7 @@ pub mod worker_types;
 
 use crate::api_types::checkpoints::CheckpointEventSpan;
 use crate::config::{TlsConfig, config};
+use crate::fencing::Fencing;
 use crate::formats::{BadData, Format, Framing};
 use crate::grpc::api::TaskCheckpointDetail;
 use crate::grpc::rpc::controller_grpc_client::ControllerGrpcClient;
@@ -17,6 +21,7 @@ use crate::grpc::rpc::{
     job_controller_grpc_client, job_status_grpc_client,
 };
 use crate::identity::InjectWorkerId;
+use crate::metadata_root::MetadataRoot;
 use anyhow::{Context, Result, anyhow};
 use arrow::compute::kernels::cast_utils::parse_interval_day_time;
 use arrow::row::{OwnedRow, RowConverter, RowParser, Rows, SortField};
@@ -1295,6 +1300,41 @@ pub struct StateContext {
     /// defaulted to the config row's value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_selector: Option<String>,
+    /// What this job's last interrupted scheduling attempt still owes its workers
+    /// (M11.D39d), or `None` if it owes nothing.
+    ///
+    /// It sits beside [`Self::execution_selector`] rather than inside it because the two have
+    /// different lifetimes: the selector is fixed for the life of the job's execution, and
+    /// this is the residue of one interrupted attempt on it. `None` is therefore a distinct
+    /// value from an empty [`Fencing`] — no obligation was recorded at all, rather than one
+    /// that was recorded and holds nothing — and what an empty record means is decided where
+    /// records are written, not here.
+    ///
+    /// Skipped when absent, so a `state_context` written before this field existed decodes
+    /// and re-serializes without acquiring it; see
+    /// `a_legacy_execution_record_decodes_and_re_serializes_without_a_fencing_record`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fencing: Option<Fencing>,
+    /// The generation metadata this job's controller has made **authoritative** (M11.D39d),
+    /// or `None` if no conditional update has ever installed one.
+    ///
+    /// M11.D39d publishes generation and checkpoint metadata in two steps: the object is
+    /// written first, under an immutable fence-scoped candidate name, and it becomes the root
+    /// only when the conditional `job_statuses` update — matched on job id, `lifecycle_fence`
+    /// and `controller_epoch` — installs this reference. So this field, and only this field,
+    /// says which candidate is authoritative; an object the row does not name is unrooted,
+    /// however recently it was written and whichever controller wrote it.
+    ///
+    /// It sits beside [`Self::fencing`] rather than inside it because the two answer opposite
+    /// questions: that one is what a *losing* attempt left behind, and this is what a *winning*
+    /// one installed. A job can carry both — the residue of an interrupted attempt and the root
+    /// of the last one that completed.
+    ///
+    /// Skipped when absent, so a `state_context` written before this field existed decodes and
+    /// re-serializes without acquiring it; see
+    /// `a_legacy_execution_record_decodes_and_re_serializes_without_a_metadata_root`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_root: Option<MetadataRoot>,
 }
 
 #[cfg(test)]

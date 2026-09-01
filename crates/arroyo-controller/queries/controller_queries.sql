@@ -25,11 +25,21 @@ SELECT
     state_context,
     env_vars,
     scheduler_config,
-    state_backend
+    state_backend,
+    lifecycle_fence,
+    controller_epoch
 FROM job_configs c
 INNER JOIN job_statuses s ON c.id = s.id;
 
---! update_job_status (start_time?, finish_time?, tasks?, failure_message?, failure_domain?, pipeline_path?, wasm_path?)
+--! adopt_job_lifecycle
+UPDATE job_statuses
+SET lifecycle_fence = lifecycle_fence + 1,
+    controller_epoch = :controller_epoch
+WHERE id = :job_id
+  AND lifecycle_fence = :observed_fence
+  AND controller_epoch = :observed_epoch;
+
+--! update_job_status_under_authority (start_time?, finish_time?, tasks?, failure_message?, failure_domain?, pipeline_path?, wasm_path?)
 UPDATE job_statuses
 SET state = :state,
     start_time = :start_time,
@@ -43,7 +53,9 @@ SET state = :state,
     run_id = :run_id,
     restart_nonce = :restart_nonce,
     state_context = :state_context
-WHERE id = :job_id;
+WHERE id = :job_id
+  AND lifecycle_fence = :lifecycle_fence
+  AND controller_epoch = :controller_epoch;
 
 --! get_program : PipelineRow(state_url?)
 SELECT program, pub_id as pipeline_id, proto_version, state_url, tags FROM pipelines WHERE id = :id;

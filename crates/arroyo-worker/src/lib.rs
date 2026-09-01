@@ -8,6 +8,7 @@ use crate::job_controller::{
 use crate::network_manager::NetworkManager;
 use anyhow::{Context, Result, anyhow};
 
+use arroyo_rpc::fence_wire::CommitAuthority;
 use arroyo_rpc::grpc::rpc::worker_grpc_server::{WorkerGrpc, WorkerGrpcServer};
 use arroyo_rpc::grpc::rpc::{
     CheckpointManifest, CheckpointReq, CheckpointResp, CommitReq, CommitResp,
@@ -45,6 +46,7 @@ use tonic::{Request, Response, Status};
 use tracing::{debug, error, info, trace, warn};
 
 use crate::job_controller::controller::WorkerJobController;
+use crate::lifecycle_fence::guard::{StartAdmission, StartAdmitted, WorkerLifecycle};
 use crate::utils::{MAX_TASK_ERROR_FIELD_BYTES, maybe_truncate, to_d2};
 use arroyo_datastream::logical::LogicalProgram;
 use arroyo_planner::physical::new_registry;
@@ -76,6 +78,7 @@ pub mod arrow;
 
 pub mod engine;
 pub mod job_controller;
+mod lifecycle_fence;
 mod network_manager;
 pub mod utils;
 
@@ -122,6 +125,14 @@ enum WorkerExecutionPhase {
     Idle,
     Initializing {
         started_at: SystemTime,
+        /// Proof that [`WorkerLifecycle::admit_start`] admitted the start this phase belongs to.
+        ///
+        /// Its field is private to `lifecycle_fence::guard`, so this variant cannot be built
+        /// anywhere else. "The worker is initializing an execution" and "the fence guard admitted
+        /// that execution" are therefore one fact rather than two that could disagree. Nothing
+        /// reads it — a witness that had to be read would be a check a caller could skip — so it
+        /// is underscore-named to say that its whole job is done by the type checker.
+        _admitted: StartAdmitted,
     },
     WaitingOnLeader {
         control_rx: Receiver<ControlResp>,
@@ -225,7 +236,13 @@ fn request_state_backend(
 #[derive(Clone)]
 pub struct WorkerState {
     worker_context: WorkerContext,
-    phase: Arc<Mutex<WorkerExecutionPhase>>,
+    /// This worker generation's execution phase and lifecycle-fence state, under one lock.
+    ///
+    /// The two are one value because M11.D39d requires fence advancement and `StartExecution`
+    /// admission to be serialized under the same non-blocking guard; see
+    /// [`crate::lifecycle_fence::guard`]. A second lock, or a fence held outside this one, is
+    /// what would reintroduce the validate→apply gap the fence exists to close.
+    lifecycle: Arc<Mutex<WorkerLifecycle>>,
     network: Arc<Mutex<Option<NetworkManager>>>,
     // used to send messages to the local job controller -- only on the leader node
     job_controller_tx: Arc<OnceLock<Sender<RunningMessage>>>,
@@ -240,24 +257,25 @@ pub struct WorkerState {
     /// lets that controller detect a disagreement before it administers the job. Set from
     /// [`StartExecutionReq::state_backend`] as the execution starts and never reassigned.
     state_backend: Arc<OnceLock<StateBackendSelector>>,
-    /// The non-empty idempotency key of the execution this worker accepted.
-    ///
-    /// A controller retries the same `StartExecution` after an ambiguous transport outcome.
-    /// Keeping the key beside the phase lets the worker acknowledge that retry without
-    /// starting the execution twice. A worker process is generation-scoped, so this is never
-    /// cleared: even a retry delayed until after `JobFinished` must not replay the execution.
-    start_execution_id: Arc<OnceLock<String>>,
 }
 
 impl WorkerState {
-    async fn initialize(self, shutdown_guard: ShutdownGuard, req: StartExecutionReq) {
+    async fn initialize(
+        self,
+        shutdown_guard: ShutdownGuard,
+        req: StartExecutionReq,
+        commit_authority: CommitAuthority,
+    ) {
         let worker_context = self.worker_context.clone();
 
-        let phase = self.phase.clone();
+        let lifecycle = self.lifecycle.clone();
 
-        let error_message = if let Err(e) = self.initialize_inner(shutdown_guard, req).await {
-            let mut phase_guard = phase.lock().unwrap();
-            *phase_guard = WorkerExecutionPhase::Failed {
+        let error_message = if let Err(e) = self
+            .initialize_inner(shutdown_guard, req, commit_authority)
+            .await
+        {
+            let mut phase_guard = lifecycle.lock().unwrap();
+            *phase_guard.execution_mut() = WorkerExecutionPhase::Failed {
                 started_at: SystemTime::now(),
                 error_message: e.to_string(),
             };
@@ -295,6 +313,7 @@ impl WorkerState {
         checkpoint_interval: Duration,
         parent: Option<(CheckpointRef, CheckpointManifest)>,
         state_backend: StateBackendSelector,
+        commit_authority: CommitAuthority,
     ) -> anyhow::Result<bool> {
         // runs only on the leader
 
@@ -332,6 +351,7 @@ impl WorkerState {
             parent,
             metrics,
             state_backend,
+            commit_authority,
         )
         .await
         {
@@ -358,6 +378,7 @@ impl WorkerState {
         mut self,
         shutdown_guard: ShutdownGuard,
         req: StartExecutionReq,
+        commit_authority: CommitAuthority,
     ) -> Result<()> {
         // Normalized exactly once per worker start, before anything else in the start
         // sequence runs. Both the leader's job controller and this worker's own tasks are
@@ -434,6 +455,7 @@ impl WorkerState {
                     Duration::from_micros(req.checkpoint_interval_micros),
                     parent.clone(),
                     state_backend,
+                    commit_authority,
                 )
                 .await?
             {
@@ -494,7 +516,7 @@ impl WorkerState {
             shutdown_guard: shutdown_guard.child("engine-state"),
         };
 
-        let mut phase_guard = self.phase.lock().unwrap();
+        let mut phase_guard = self.lifecycle.lock().unwrap();
 
         let job_controller_addr = req
             .job_controller_addr
@@ -503,7 +525,7 @@ impl WorkerState {
 
         if req.wait_for_leader {
             info!("waiting for leader");
-            *phase_guard = WorkerExecutionPhase::WaitingOnLeader {
+            *phase_guard.execution_mut() = WorkerExecutionPhase::WaitingOnLeader {
                 control_rx,
                 engine_state,
                 job_controller_addr,
@@ -511,7 +533,7 @@ impl WorkerState {
             drop(phase_guard);
         } else {
             info!("Worker moving to running phase");
-            *phase_guard = WorkerExecutionPhase::Running(engine_state);
+            *phase_guard.execution_mut() = WorkerExecutionPhase::Running(engine_state);
             drop(phase_guard);
 
             let cancel_token = shutdown_guard.token();
@@ -693,7 +715,10 @@ impl WorkerState {
                     }
                 }
                 _ = tick.tick() => {
-                    if matches!(*self.phase.lock().unwrap(), WorkerExecutionPhase::Running { .. }) {
+                    if matches!(
+                        self.lifecycle.lock().unwrap().execution(),
+                        WorkerExecutionPhase::Running { .. }
+                    ) {
                         let result = job_controller.heartbeat(Request::new(HeartbeatReq {
                             worker_context: Some(self.worker_context.as_proto()),
                             time: to_micros(SystemTime::now()),
@@ -761,7 +786,7 @@ impl WorkerServer {
     ) -> Self {
         Self {
             state: WorkerState {
-                phase: Arc::new(Mutex::new(WorkerExecutionPhase::Idle)),
+                lifecycle: Arc::new(Mutex::new(WorkerLifecycle::idle(worker_id.0, run_id))),
                 network: Arc::new(Mutex::new(None)),
                 job_controller_tx: Arc::new(OnceLock::new()),
                 worker_context: WorkerContext {
@@ -781,7 +806,6 @@ impl WorkerServer {
                 checkpoint_history: Arc::new(Mutex::new(CheckpointHistory::default())),
                 metrics: Arc::new(OnceLock::new()),
                 state_backend: Arc::new(OnceLock::new()),
-                start_execution_id: Arc::new(OnceLock::new()),
             },
             shutdown_guard,
         }
@@ -820,6 +844,7 @@ impl WorkerServer {
         *self.state.network.lock().unwrap() = Some(network);
 
         let context = self.state.worker_context.clone();
+        let lifecycle = self.state.lifecycle.clone();
 
         let hostname = local_address(config.worker.bind_address);
         let rpc_address = format!("http://{}:{}", hostname, local_addr.port());
@@ -882,7 +907,7 @@ impl WorkerServer {
         // ideally, get a signal when the server is started...
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        client
+        let registration = client
             .register_worker(Request::new(RegisterWorkerReq {
                 time: to_micros(SystemTime::now()),
                 worker_context: Some(context.as_proto()),
@@ -901,7 +926,17 @@ impl WorkerServer {
                 // set this is not sent a `StartExecution` at all.
                 reconciles_start_execution: true,
             }))
-            .await?;
+            .await?
+            .into_inner();
+
+        // M11.D39e(i): registration is what admits starts at all, and its response is what may
+        // activate strict mode for this generation. Recording it here — after the response, and
+        // through the same lock that admits starts — is what makes "no start before registration
+        // completes" and "strict mode is monotonic" one decision rather than two.
+        lifecycle
+            .lock()
+            .unwrap()
+            .registered(registration.requires_lifecycle_fence);
 
         Ok(())
     }
@@ -918,11 +953,11 @@ impl WorkerGrpc for WorkerServer {
         &self,
         _req: Request<GetWorkerPhaseReq>,
     ) -> Result<Response<GetWorkerPhaseResp>, Status> {
-        let phase = self.state.phase.lock().unwrap();
+        let phase = self.state.lifecycle.lock().unwrap();
 
-        let (phase_enum, phase_started_at, error_message) = match &*phase {
+        let (phase_enum, phase_started_at, error_message) = match phase.execution() {
             WorkerExecutionPhase::Idle => (WorkerPhase::Idle as i32, None, None),
-            WorkerExecutionPhase::Initializing { started_at } => (
+            WorkerExecutionPhase::Initializing { started_at, .. } => (
                 WorkerPhase::Initializing as i32,
                 Some(to_micros(*started_at)),
                 None,
@@ -948,6 +983,13 @@ impl WorkerGrpc for WorkerServer {
         }))
     }
 
+    /// Advances this generation's lifecycle fence and admits or refuses the request, both under
+    /// the one non-blocking guard (M11.D39d, M11.D39e).
+    ///
+    /// Every decision below the `try_lock` belongs to
+    /// [`WorkerLifecycle::admit_start`](crate::lifecycle_fence::guard::WorkerLifecycle::admit_start):
+    /// this handler contributes the lock discipline and the initialization it spawns, and holds
+    /// no fence state of its own to get out of step with the guard's.
     async fn start_execution(
         &self,
         request: Request<StartExecutionReq>,
@@ -957,8 +999,12 @@ impl WorkerGrpc for WorkerServer {
         // controller process) can disappear while a blocking mutex wait is in progress, and
         // tonic cannot cancel that poll; the stale handler could otherwise acquire the lock
         // later and start behind a refusal published by a replacement controller.
-        let mut phase = match self.state.phase.try_lock() {
-            Ok(phase) => phase,
+        //
+        // `Aborted` is definitive "nothing applied" (M11.D39e(iii)): this contention answer is
+        // given before `admit_start` runs, so no fence was advanced, no identifier recorded and
+        // no phase moved. Only a later scheduling attempt may retry it.
+        let mut lifecycle = match self.state.lifecycle.try_lock() {
+            Ok(lifecycle) => lifecycle,
             Err(TryLockError::WouldBlock) => {
                 return Err(Status::aborted("Worker execution phase is busy; retry"));
             }
@@ -967,60 +1013,26 @@ impl WorkerGrpc for WorkerServer {
             }
         };
 
-        // A lost response is not a lost decision. The controller keeps the same admission
-        // while retrying this ID, and this acknowledgement is what lets it resolve an
-        // otherwise ambiguous client timeout/reset without applying the request twice.
-        if !req.start_execution_id.is_empty()
-            && self.state.start_execution_id.get().map(String::as_str)
-                == Some(req.start_execution_id.as_str())
-        {
-            return Ok(Response::new(StartExecutionResp {}));
-        }
-
-        match &*phase {
-            WorkerExecutionPhase::Idle => {
-                if !req.start_execution_id.is_empty()
-                    && self
-                        .state
-                        .start_execution_id
-                        .set(req.start_execution_id.clone())
-                        .is_err()
-                {
-                    return Err(Status::failed_precondition(
-                        "Worker already accepted another execution",
-                    ));
-                }
-                *phase = WorkerExecutionPhase::Initializing {
-                    started_at: SystemTime::now(),
-                };
-
-                // Spawn async initialization
+        Ok(Response::new(match lifecycle.admit_start(&req)? {
+            StartAdmission::Settled(response) => response,
+            StartAdmission::Apply(applied) => {
                 let state = self.state.clone();
                 let shutdown_guard = self.shutdown_guard.clone_temporary();
 
-                self.shutdown_guard.spawn_temporary(async move {
-                    state.initialize(shutdown_guard, req).await;
-                    Ok(())
-                });
-
-                Ok(Response::new(StartExecutionResp {}))
+                // The response is reachable only through this closure, so an admitted start
+                // cannot be reported applied without its initialization having been handed off;
+                // and the authority it is handed is the one the admission established, so a
+                // leader's commits go out under the fence its own start carried.
+                applied.start(move |commit_authority| {
+                    self.shutdown_guard.spawn_temporary(async move {
+                        state
+                            .initialize(shutdown_guard, req, commit_authority)
+                            .await;
+                        Ok(())
+                    });
+                })
             }
-            WorkerExecutionPhase::Initializing { .. } => {
-                // `Unavailable` is reserved for ambiguous transport outcomes: the controller
-                // retries those under its admission. This is an authoritative application
-                // response for another attempt, so it must use a definitive status.
-                Err(Status::failed_precondition("Worker is initializing"))
-            }
-            WorkerExecutionPhase::WaitingOnLeader { .. } => {
-                Err(Status::failed_precondition("Worker is waiting for leader"))
-            }
-            WorkerExecutionPhase::Running(_) => {
-                Err(Status::failed_precondition("Worker is already running"))
-            }
-            WorkerExecutionPhase::Failed { .. } => {
-                Err(Status::failed_precondition("Worker is in failed state"))
-            }
-        }
+        }))
     }
 
     async fn checkpoint(
@@ -1030,8 +1042,8 @@ impl WorkerGrpc for WorkerServer {
         let req = request.into_inner();
 
         let (sinks, sources) = {
-            let phase = self.state.phase.lock().unwrap();
-            match &*phase {
+            let phase = self.state.lifecycle.lock().unwrap();
+            match phase.execution() {
                 WorkerExecutionPhase::Running(engine_state) => {
                     (engine_state.sinks.clone(), engine_state.sources.clone())
                 }
@@ -1068,13 +1080,30 @@ impl WorkerGrpc for WorkerServer {
         Ok(Response::new(CheckpointResp {}))
     }
 
+    /// Admits or refuses a commit directive and, if it is admitted, publishes it to this
+    /// worker's operators (M11.D39d).
+    ///
+    /// The fence decision is taken under the same lock the phase is read under, and before it:
+    /// a commit from a controller this generation has moved past is refused because it is
+    /// superseded, not answered with whatever this worker's phase happens to be.
+    ///
+    /// Which commits arrive is not something this handler can know — a worker decides about the
+    /// request in front of it, not about the sender's build. What it does say is that a commit
+    /// carrying no lifecycle fields is admitted while this generation is not strict, and that
+    /// nothing below this line reads those fields again, so for such a commit what follows is
+    /// byte-for-byte the M11.T08 path.
+    ///
+    /// The committing data is reachable only out of
+    /// [`AdmittedCommit`](crate::lifecycle_fence::guard::AdmittedCommit), so this handler cannot
+    /// publish a commit it did not put through that decision.
     async fn commit(&self, request: Request<CommitReq>) -> Result<Response<CommitResp>, Status> {
         let req = request.into_inner();
         debug!("received commit request {:?}", req);
 
-        let sender_commit_map_pairs = {
-            let phase = self.state.phase.lock().unwrap();
-            let engine_state = match &*phase {
+        let (epoch, sender_commit_map_pairs) = {
+            let lifecycle = self.state.lifecycle.lock().unwrap();
+            let (epoch, committing_data) = lifecycle.admit_commit(req)?.into_parts();
+            let engine_state = match lifecycle.execution() {
                 WorkerExecutionPhase::WaitingOnLeader { engine_state, .. }
                 | WorkerExecutionPhase::Running(engine_state) => engine_state,
                 _ => {
@@ -1083,7 +1112,7 @@ impl WorkerGrpc for WorkerServer {
             };
 
             let mut sender_commit_map_pairs = vec![];
-            for (operator_id, commit_operator) in req.committing_data {
+            for (operator_id, commit_operator) in committing_data {
                 let node_id = engine_state
                     .operator_to_node
                     .get(&operator_id)
@@ -1096,14 +1125,14 @@ impl WorkerGrpc for WorkerServer {
                     .collect();
                 sender_commit_map_pairs.push((nodes, commit_map));
             }
-            sender_commit_map_pairs
+            (epoch, sender_commit_map_pairs)
         };
 
         for (senders, commit_map) in sender_commit_map_pairs {
             for sender in senders {
                 sender
                     .send(ControlMessage::Commit {
-                        epoch: req.epoch as u32,
+                        epoch: epoch as u32,
                         commit_data: commit_map.clone(),
                     })
                     .await
@@ -1120,8 +1149,8 @@ impl WorkerGrpc for WorkerServer {
         let req = request.into_inner();
 
         let nodes = {
-            let phase = self.state.phase.lock().unwrap();
-            let engine_state = match &*phase {
+            let phase = self.state.lifecycle.lock().unwrap();
+            let engine_state = match phase.execution() {
                 WorkerExecutionPhase::Running(engine_state) => engine_state,
                 _ => {
                     return Err(Status::failed_precondition("Worker not in running phase"));
@@ -1160,8 +1189,8 @@ impl WorkerGrpc for WorkerServer {
         request: Request<StopExecutionReq>,
     ) -> Result<Response<StopExecutionResp>, Status> {
         let sources = {
-            let phase = self.state.phase.lock().unwrap();
-            let engine_state = match &*phase {
+            let phase = self.state.lifecycle.lock().unwrap();
+            let engine_state = match phase.execution() {
                 WorkerExecutionPhase::Running(engine_state) => engine_state,
                 _ => {
                     return Err(Status::failed_precondition("Worker not in running phase"));
@@ -1189,11 +1218,11 @@ impl WorkerGrpc for WorkerServer {
     ) -> Result<Response<JobFinishedResp>, Status> {
         let is_worker_leader = self.state.job_controller_tx.get().is_some();
 
-        let mut phase = self.state.phase.lock().unwrap();
-        if let WorkerExecutionPhase::Running(engine_state) = &*phase {
+        let mut phase = self.state.lifecycle.lock().unwrap();
+        if let WorkerExecutionPhase::Running(engine_state) = phase.execution() {
             engine_state.shutdown_guard.cancel();
         }
-        *phase = WorkerExecutionPhase::Idle;
+        *phase.execution_mut() = WorkerExecutionPhase::Idle;
         drop(phase);
 
         if is_worker_leader {
@@ -1249,14 +1278,14 @@ impl WorkerGrpc for WorkerServer {
         &self,
         _: Request<JobControllerInitReq>,
     ) -> std::result::Result<Response<JobControllerInitResp>, Status> {
-        let mut phase = self.state.phase.lock().unwrap();
+        let mut phase = self.state.lifecycle.lock().unwrap();
         let mut tmp_phase = WorkerExecutionPhase::Idle;
-        mem::swap(&mut *phase, &mut tmp_phase);
+        mem::swap(phase.execution_mut(), &mut tmp_phase);
 
         let (job_controller_addr, control_rx) = match tmp_phase {
             WorkerExecutionPhase::Running(e) => {
                 debug!("job_controller_init called on worker but already in running phase");
-                *phase = WorkerExecutionPhase::Running(e);
+                *phase.execution_mut() = WorkerExecutionPhase::Running(e);
                 return Ok(Response::new(JobControllerInitResp {}));
             }
             WorkerExecutionPhase::WaitingOnLeader {
@@ -1264,12 +1293,12 @@ impl WorkerGrpc for WorkerServer {
                 engine_state,
                 job_controller_addr,
             } => {
-                *phase = WorkerExecutionPhase::Running(engine_state);
+                *phase.execution_mut() = WorkerExecutionPhase::Running(engine_state);
                 (job_controller_addr, control_rx)
             }
             p => {
                 let msg = format!("job_controller_init called on worker in {p} phase");
-                *phase = p;
+                *phase.execution_mut() = p;
                 return Err(Status::failed_precondition(msg));
             }
         };
@@ -1605,6 +1634,8 @@ mod tests {
     use super::*;
     use crate::job_controller::JobControllerStatus;
     use arroyo_rpc::checkpoints::{CheckpointMetadataStore, CreateCheckpointReq};
+    use arroyo_rpc::fence_wire::observed_settlement;
+    use arroyo_rpc::grpc::rpc::{LifecycleOperation, StartExecutionOutcome};
     use arroyo_rpc::state_backend::validate_leader_selector;
     use arroyo_server_common::shutdown::{Shutdown, SignalBehavior};
     use arroyo_types::TaskInfo;
@@ -1668,13 +1699,15 @@ mod tests {
             1,
             shutdown.guard("worker"),
         );
+        // No registration line: M11.T26d gates the fenced protocol, not the fence-less route
+        // this test drives, so the landed contract is pinned under its original preconditions.
         let request = StartExecutionReq {
             start_execution_id: "attempt_1".to_string(),
             ..Default::default()
         };
 
         let busy = {
-            let _phase = server.state.phase.lock().unwrap();
+            let _phase = server.state.lifecycle.lock().unwrap();
             WorkerGrpc::start_execution(&server, Request::new(request.clone()))
                 .now_or_never()
                 .expect("a contended start returns synchronously")
@@ -1682,7 +1715,7 @@ mod tests {
         };
         assert_eq!(busy.code(), tonic::Code::Aborted);
         assert!(
-            server.state.start_execution_id.get().is_none(),
+            server.state.lifecycle.lock().unwrap().applied().is_none(),
             "returning Aborted must not record or apply the attempt"
         );
 
@@ -1701,7 +1734,7 @@ mod tests {
             .expect("a delayed retry after completion is acknowledged, not replayed");
         assert!(
             matches!(
-                *server.state.phase.lock().unwrap(),
+                server.state.lifecycle.lock().unwrap().execution(),
                 WorkerExecutionPhase::Idle
             ),
             "acknowledging the delayed retry must not initialize the worker again"
@@ -1715,6 +1748,170 @@ mod tests {
             .await
             .expect_err("a different attempt cannot reuse a busy worker");
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    }
+
+    /// The lifecycle fields M11.T26c added now decide the route a `StartExecution` takes.
+    ///
+    /// This replaces M11.T26c's pin that they changed nothing. It is deliberately built from the
+    /// *same* request that pin asserted was accepted unchanged — fence 4, REVOKE, addressed to
+    /// worker 99 generation 7 while this worker is 1/1, revoking `attempt_0` — and asserts that
+    /// M11.T26d refuses it, because a directive addressed to another generation is now read
+    /// rather than carried. The rest walks the four routes the guard is reached through from
+    /// the production handler: an addressed revocation is acknowledged without applying a
+    /// program, a start under that fence is applied and its retry acknowledged, a start under an
+    /// older fence is permanently stale, and a request from a controller that sends no lifecycle
+    /// fields at all is still accepted before the flag day.
+    #[tokio::test]
+    async fn fence_fields_now_decide_the_start_execution_route() {
+        let shutdown = Shutdown::new("fence-fields-route-test", SignalBehavior::None);
+        let server = WorkerServer::new(
+            MachineId(Arc::new("machine_1".to_string())),
+            WorkerId(1),
+            PipelineId(Arc::new("pipeline_1".to_string())),
+            JobId(Arc::new("job_1".to_string())),
+            1,
+            shutdown.guard("worker"),
+        );
+        server.state.lifecycle.lock().unwrap().registered(false);
+
+        // The exact request M11.T26c pinned as accepted unchanged.
+        let misaddressed = StartExecutionReq {
+            start_execution_id: "attempt_1".to_string(),
+            lifecycle_fence: 4,
+            target_worker_id: 99,
+            target_worker_generation: 7,
+            lifecycle_operation: LifecycleOperation::Revoke as i32,
+            revoked_execution_ids: vec!["attempt_0".to_string()],
+            ..Default::default()
+        };
+        assert_ne!(server.state.worker_context.worker_id, WorkerId(99));
+        assert_ne!(server.state.worker_context.generation, 7);
+
+        let refused = WorkerGrpc::start_execution(&server, Request::new(misaddressed.clone()))
+            .await
+            .expect_err("a directive addressed to another generation is refused, not carried");
+        assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+        {
+            let lifecycle = server.state.lifecycle.lock().unwrap();
+            assert_eq!(lifecycle.acknowledged_fence(), 0);
+            assert_eq!(lifecycle.tracked_ids(), 0);
+            assert!(matches!(lifecycle.execution(), WorkerExecutionPhase::Idle));
+        }
+
+        // The same directive addressed to this generation acknowledges the fence and the
+        // revocation, and applies no program.
+        let addressed = StartExecutionReq {
+            target_worker_id: 1,
+            target_worker_generation: 1,
+            ..misaddressed
+        };
+        let acknowledged = WorkerGrpc::start_execution(&server, Request::new(addressed))
+            .await
+            .expect("an addressed revocation is acknowledged")
+            .into_inner();
+        let settlement = observed_settlement(&acknowledged).unwrap();
+        assert_eq!(settlement.observed_fence(), Some(4));
+        assert_eq!(settlement.outcome(), StartExecutionOutcome::Revoked);
+        {
+            let lifecycle = server.state.lifecycle.lock().unwrap();
+            assert_eq!(lifecycle.acknowledged_fence(), 4);
+            assert_eq!(lifecycle.applied(), None);
+            assert!(matches!(lifecycle.execution(), WorkerExecutionPhase::Idle));
+        }
+
+        // A start under that fence applies, is recorded under its identifier, and its identical
+        // retry is acknowledged rather than replayed.
+        let start = StartExecutionReq {
+            start_execution_id: "attempt_1".to_string(),
+            lifecycle_fence: 4,
+            target_worker_id: 1,
+            target_worker_generation: 1,
+            lifecycle_operation: LifecycleOperation::Start as i32,
+            ..Default::default()
+        };
+        let applied = WorkerGrpc::start_execution(&server, Request::new(start.clone()))
+            .await
+            .expect("a start under the acknowledged fence applies")
+            .into_inner();
+        let settlement = observed_settlement(&applied).unwrap();
+        assert_eq!(settlement.observed_fence(), Some(4));
+        assert_eq!(settlement.outcome(), StartExecutionOutcome::Applied);
+        assert_eq!(
+            server.state.lifecycle.lock().unwrap().applied(),
+            Some("attempt_1"),
+            "the attempt is recorded under its identifier and not under the fence"
+        );
+        let retry = WorkerGrpc::start_execution(&server, Request::new(start))
+            .await
+            .expect("the identical fenced retry is acknowledged")
+            .into_inner();
+        assert_eq!(retry, applied);
+
+        // A revoked identifier is never applied, whatever fence carries it.
+        let revoked = StartExecutionReq {
+            start_execution_id: "attempt_0".to_string(),
+            lifecycle_fence: 4,
+            target_worker_id: 1,
+            target_worker_generation: 1,
+            lifecycle_operation: LifecycleOperation::Start as i32,
+            ..Default::default()
+        };
+        assert_eq!(
+            WorkerGrpc::start_execution(&server, Request::new(revoked))
+                .await
+                .expect_err("a revoked identifier cannot be applied")
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+
+        // A start under an older fence is permanently stale.
+        let stale = StartExecutionReq {
+            start_execution_id: "attempt_2".to_string(),
+            lifecycle_fence: 3,
+            target_worker_id: 1,
+            target_worker_generation: 1,
+            lifecycle_operation: LifecycleOperation::Start as i32,
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            assert_eq!(
+                WorkerGrpc::start_execution(&server, Request::new(stale.clone()))
+                    .await
+                    .expect_err("a start under a superseded fence is stale")
+                    .code(),
+                tonic::Code::FailedPrecondition
+            );
+        }
+
+        // The compatibility direction is unchanged, and is not even gated by registration: a
+        // generation still accepts a request that carries no lifecycle fields, and such a
+        // request acknowledges nothing.
+        let legacy_shutdown = Shutdown::new("fence-fields-legacy-test", SignalBehavior::None);
+        let legacy = WorkerServer::new(
+            MachineId(Arc::new("machine_1".to_string())),
+            WorkerId(1),
+            PipelineId(Arc::new("pipeline_1".to_string())),
+            JobId(Arc::new("job_1".to_string())),
+            1,
+            legacy_shutdown.guard("worker"),
+        );
+        let accepted = WorkerGrpc::start_execution(
+            &legacy,
+            Request::new(StartExecutionReq {
+                start_execution_id: "attempt_1".to_string(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("an unfenced start is accepted before the flag day")
+        .into_inner();
+        let settlement = observed_settlement(&accepted).unwrap();
+        assert_eq!(settlement.observed_fence(), None);
+        assert_eq!(settlement.outcome(), StartExecutionOutcome::Applied);
+        assert_eq!(
+            legacy.state.lifecycle.lock().unwrap().acknowledged_fence(),
+            0
+        );
     }
 
     /// An unrecognized value fails the worker start with a typed error naming the job,

@@ -61,8 +61,20 @@ static PHASES: LazyLock<String> = LazyLock::new(|| {
 /// The stub environment it is compiled against.
 const STUB: &str = include_str!("compile_fail/stub.rs");
 
-/// The transfer seam under test: the real source, verbatim.
-const SETTLEMENT: &str = include_str!("fanout/settlement.rs");
+/// The transfer seam under test: the real source, with one line removed.
+///
+/// The line is `pub(crate) mod observed;`, M11.T26e's child module — the observation and
+/// discharge operations. It is a *file*, and `@SETTLEMENT@` is a copy at a temporary path with
+/// no sibling of that name, so a standalone compile cannot resolve it; the phase-graph fixture
+/// above removes `mod driver;` for exactly the same reason.
+///
+/// What that costs, stated rather than assumed: these fixtures cover the privacy inventory of
+/// `settlement.rs` and not of its child. The child's inventory is pinned instead by
+/// `the_source_of_a_settlement_bundle_exposes_no_way_to_part_with_half_of_it`, which reads both
+/// files.
+static SETTLEMENT: LazyLock<String> = LazyLock::new(|| {
+    include_str!("fanout/settlement.rs").replace("\npub(crate) mod observed;\n", "\n")
+});
 
 /// The stub environment *it* is compiled against.
 ///
@@ -443,14 +455,14 @@ fn an_owner_cannot_keep_half_an_obligation() {
 
     compile_settlement(
         "positive-settlement",
-        SETTLEMENT,
+        SETTLEMENT.as_str(),
         include_str!("compile_fail/positive_settlement.rs"),
     )
     .assert_compiles("an owner that keeps the whole obligation and reads what it lists");
 
     compile_settlement(
         "negative-settlement-into-parts",
-        SETTLEMENT,
+        SETTLEMENT.as_str(),
         include_str!("compile_fail/negative_settlement_into_parts.rs"),
     )
     .assert_fails_with(
@@ -461,7 +473,7 @@ fn an_owner_cannot_keep_half_an_obligation() {
 
     compile_settlement(
         "negative-settlement-keep",
-        SETTLEMENT,
+        SETTLEMENT.as_str(),
         include_str!("compile_fail/negative_settlement_keep.rs"),
     )
     .assert_fails_with(
@@ -475,7 +487,7 @@ fn an_owner_cannot_keep_half_an_obligation() {
     // does. That is what makes this two closed doors rather than one.
     compile_settlement(
         "weakened-settlement-into-parts",
-        &INTO_PARTS_IS_REACHABLE.apply(SETTLEMENT),
+        &INTO_PARTS_IS_REACHABLE.apply(SETTLEMENT.as_str()),
         include_str!("compile_fail/negative_settlement_into_parts.rs"),
     )
     .assert_compiles(
@@ -485,7 +497,7 @@ fn an_owner_cannot_keep_half_an_obligation() {
 
     compile_settlement(
         "weakened-settlement-keep",
-        &KEEP_IS_REACHABLE.apply(SETTLEMENT),
+        &KEEP_IS_REACHABLE.apply(SETTLEMENT.as_str()),
         include_str!("compile_fail/negative_settlement_keep.rs"),
     )
     .assert_compiles(
@@ -496,7 +508,7 @@ fn an_owner_cannot_keep_half_an_obligation() {
 
     compile_settlement(
         "weakened-settlement-crossed",
-        &KEEP_IS_REACHABLE.apply(SETTLEMENT),
+        &KEEP_IS_REACHABLE.apply(SETTLEMENT.as_str()),
         include_str!("compile_fail/negative_settlement_into_parts.rs"),
     )
     .assert_fails_with(

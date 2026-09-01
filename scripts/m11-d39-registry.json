@@ -1,0 +1,728 @@
+{
+  "schema": "m11-d39-registry/1",
+  "milestone": "M11.T26h",
+  "design": [
+    "M11.D39g",
+    "M11.D96"
+  ],
+  "plan": "plans/M11/T26-durable-worker-fence.md#m11t26m",
+  "base_pin": "21b12e165ee04eb30d761afc49cac7c2fda05d45",
+  "packages": [
+    "arroyo-controller",
+    "arroyo-worker",
+    "arroyo-rpc",
+    "arroyo-api",
+    "arroyo-state",
+    "arroyo-state-protocol"
+  ],
+  "topologies": [
+    {
+      "id": "controller",
+      "env": {
+        "ARROYO__JOB_CONTROLLER": "controller"
+      },
+      "why": "JobControllerMode::Controller \u2014 the job controller runs in the controller process."
+    },
+    {
+      "id": "worker-leader",
+      "env": {
+        "ARROYO__JOB_CONTROLLER": "worker"
+      },
+      "why": "JobControllerMode::Worker \u2014 the job controller runs on a worker leader."
+    }
+  ],
+  "rows": [
+    {
+      "id": 1,
+      "owner": "T25-landed",
+      "owner_verbatim": "T25, landed",
+      "requirement": "Cleanup only after whole-checkpoint validation",
+      "topology": "independent",
+      "fixture": "portable",
+      "tests": [
+        {
+          "crate": "arroyo-state",
+          "name": "cleanup_requires_validated_whole_checkpoint",
+          "kind": "test",
+          "path": "crates/arroyo-state/src/parquet.rs"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "owner": "T25-landed",
+      "owner_verbatim": "T25, landed",
+      "requirement": "GC only from a validated manifest set",
+      "topology": "independent",
+      "fixture": "portable",
+      "tests": [
+        {
+          "crate": "arroyo-state-protocol",
+          "name": "gc_requires_validated_manifest_set",
+          "kind": "test",
+          "path": "crates/arroyo-state-protocol/src/lib.rs"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "owner": "T25-landed",
+      "owner_verbatim": "T25, landed",
+      "requirement": "Compaction after whole-job validation",
+      "topology": "independent",
+      "fixture": "portable",
+      "tests": [
+        {
+          "crate": "arroyo-state",
+          "name": "compaction_after_whole_job_validation",
+          "kind": "test",
+          "path": "crates/arroyo-state/src/parquet.rs"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "owner": "T25-landed",
+      "owner_verbatim": "T25, landed",
+      "requirement": "Metadata write requires every operator validated",
+      "topology": "independent",
+      "fixture": "portable",
+      "tests": [
+        {
+          "crate": "arroyo-state",
+          "name": "metadata_write_requires_validated_operators",
+          "kind": "test",
+          "path": "crates/arroyo-state/src/parquet.rs"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "owner": "T25-landed",
+      "owner_verbatim": "T25, landed",
+      "requirement": "Selector change refused before adoption",
+      "topology": "independent",
+      "fixture": "portable",
+      "tests": [
+        {
+          "crate": "arroyo-controller",
+          "name": "selector_change_refused_before_execution_adoption",
+          "kind": "test",
+          "path": "crates/arroyo-controller/src/states/mod.rs"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "owner": "T25-landed",
+      "owner_verbatim": "T25, landed",
+      "requirement": "Classify before adopting execution config",
+      "topology": "independent",
+      "fixture": "portable",
+      "tests": [
+        {
+          "crate": "arroyo-controller",
+          "name": "classify_then_adopt_execution_config",
+          "kind": "test",
+          "path": "crates/arroyo-controller/src/states/mod.rs"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "owner": "T25-landed",
+      "owner_verbatim": "T25, landed",
+      "requirement": "Stop wins over refusal",
+      "topology": "independent",
+      "fixture": "portable",
+      "tests": [
+        {
+          "crate": "arroyo-controller",
+          "name": "stop_wins_over_refusal",
+          "kind": "test",
+          "path": "crates/arroyo-controller/src/states/lifecycle/tests.rs"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "owner": "T25-landed",
+      "owner_verbatim": "T25, landed",
+      "requirement": "Intent coalescing does not backpressure polling",
+      "topology": "independent",
+      "fixture": "portable",
+      "tests": [
+        {
+          "crate": "arroyo-controller",
+          "name": "intent_coalescing_never_backpressures_config_polling",
+          "kind": "test",
+          "path": "crates/arroyo-controller/src/states/lifecycle/tests.rs"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "owner": "T25-landed",
+      "owner_verbatim": "T25, landed",
+      "requirement": "Repaired row not failed by stale intent",
+      "topology": "independent",
+      "fixture": "portable",
+      "tests": [
+        {
+          "crate": "arroyo-controller",
+          "name": "repaired_row_not_failed_by_stale_intent",
+          "kind": "test",
+          "path": "crates/arroyo-controller/src/states/lifecycle/tests.rs"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "owner": "T25-landed",
+      "owner_verbatim": "T25, landed",
+      "requirement": "Inactive refused row still honors stop",
+      "topology": "dependent",
+      "fixture": "portable",
+      "tests": [
+        {
+          "crate": "arroyo-controller",
+          "name": "inactive_refused_row_honors_stop",
+          "kind": "test",
+          "path": "crates/arroyo-controller/src/states/mod.rs"
+        }
+      ],
+      "distinct_path": "The fixture now gives the running job the state_context.leader a leader-mode row carries, so run_to_completion rebuilds a real LeaderManager against a real leader before the job's first state \u2014 the same reconnect production makes. The row then asserts the stop's last two status writes as one closed-form pair per topology: controller mode funnels every stop mode through Stopping before Stopped, because that is where this controller tears the workers down; worker-leader mode reaches Stopped straight from CheckpointStopping for a checkpoint stop, because the leader does the teardown and LeaderCheckpointStopping only waits for it to report JobStopped. The worker-leader cell therefore proves the job stopped through the leader, not merely that the row ran again."
+    },
+    {
+      "id": 11,
+      "owner": "T25-landed",
+      "owner_verbatim": "T25, landed",
+      "requirement": "Load failure retries without losing refusal",
+      "topology": "independent",
+      "fixture": "portable",
+      "tests": [
+        {
+          "crate": "arroyo-controller",
+          "name": "program_load_failure_retries_keeping_refusal",
+          "kind": "test",
+          "path": "crates/arroyo-controller/src/states/mod.rs"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "owner": "T25-landed",
+      "owner_verbatim": "T25, landed compile check",
+      "requirement": "Irreversible phases require consumed admission",
+      "topology": "independent",
+      "fixture": "portable",
+      "tests": [
+        {
+          "crate": "arroyo-controller",
+          "name": "irreversible_phases_consume_admission",
+          "kind": "compile-check",
+          "path": "crates/arroyo-controller/src/states/scheduling/compile_fail.rs"
+        }
+      ],
+      "note": "Not an ordinary behavioural test: the body invokes rustc over a positive fixture, two intended-diagnostic negative fixtures and two weakened-API mutations, asserting the exact error codes. It is topology-independent by construction \u2014 rustc reads no runtime configuration \u2014 and it is slow, so the runner budgets for it explicitly."
+    },
+    {
+      "id": 13,
+      "owner": "T25-landed",
+      "owner_verbatim": "T25, landed compile check",
+      "requirement": "Token-owning phase cannot receive",
+      "topology": "independent",
+      "fixture": "portable",
+      "tests": [
+        {
+          "crate": "arroyo-controller",
+          "name": "token_owning_phase_cannot_recv",
+          "kind": "compile-check",
+          "path": "crates/arroyo-controller/src/states/scheduling/compile_fail.rs"
+        }
+      ],
+      "note": "Same shape as row 12: positive, intended-negative and weakened-API fixtures compiled by rustc."
+    },
+    {
+      "id": 14,
+      "owner": "T25-landed",
+      "owner_verbatim": "T25, landed",
+      "requirement": "Fan-out owns every request child",
+      "topology": "independent",
+      "fixture": "portable",
+      "tests": [
+        {
+          "crate": "arroyo-controller",
+          "name": "fanout_future_owns_all_request_children",
+          "kind": "test",
+          "path": "crates/arroyo-controller/src/states/scheduling/fanout_tests.rs"
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "owner": "T26",
+      "owner_verbatim": "T26",
+      "requirement": "Durable selector authority and fence duel",
+      "topology": "independent",
+      "fixture": "portable",
+      "tests": [
+        {
+          "crate": "arroyo-controller",
+          "name": "selector_authority_is_durable_record",
+          "kind": "test",
+          "path": "crates/arroyo-controller/src/states/lifecycle/fence_tests.rs"
+        },
+        {
+          "crate": "arroyo-controller",
+          "name": "fence_duel_installs_exactly_one_authoritative_root",
+          "kind": "test",
+          "path": "crates/arroyo-controller/src/states/lifecycle/fence_tests.rs"
+        }
+      ]
+    },
+    {
+      "id": 16,
+      "owner": "T26",
+      "owner_verbatim": "T26, cross-half",
+      "requirement": "Refusal and irreversible phase entry linearize once",
+      "topology": "independent",
+      "fixture": "portable",
+      "tests": [
+        {
+          "crate": "arroyo-controller",
+          "name": "refusal_and_phase_entry_linearize_once",
+          "kind": "test",
+          "path": "crates/arroyo-controller/src/states/lifecycle/faults_tests.rs"
+        }
+      ]
+    },
+    {
+      "id": 17,
+      "owner": "T26",
+      "owner_verbatim": "T26",
+      "requirement": "Replacement cannot publish before worker settlement",
+      "topology": "independent",
+      "fixture": "portable",
+      "tests": [
+        {
+          "crate": "arroyo-controller",
+          "name": "replacement_cannot_publish_before_worker_fence_settlement",
+          "kind": "test",
+          "path": "crates/arroyo-controller/src/states/lifecycle/recovery_tests.rs"
+        }
+      ]
+    },
+    {
+      "id": 18,
+      "owner": "T26",
+      "owner_verbatim": "T26",
+      "requirement": "Delayed post-refusal start is rejected",
+      "topology": "independent",
+      "fixture": "portable",
+      "tests": [
+        {
+          "crate": "arroyo-worker",
+          "name": "delayed_start_after_refusal_rejected_by_acknowledged_fence",
+          "kind": "test",
+          "path": "crates/arroyo-worker/src/lifecycle_fence/faults_tests.rs"
+        }
+      ]
+    },
+    {
+      "id": 19,
+      "owner": "T26",
+      "owner_verbatim": "T26 closure",
+      "requirement": "Fence acknowledgement serializes with start application",
+      "topology": "independent",
+      "fixture": "portable",
+      "tests": [
+        {
+          "crate": "arroyo-worker",
+          "name": "fence_ack_serializes_with_start_application",
+          "kind": "test",
+          "path": "crates/arroyo-worker/src/lifecycle_fence/tests.rs"
+        }
+      ]
+    },
+    {
+      "id": 20,
+      "owner": "T26",
+      "owner_verbatim": "T26 closure, cross-half",
+      "requirement": "Partition holds one job in Fencing while another progresses",
+      "topology": "independent",
+      "fixture": "portable",
+      "tests": [
+        {
+          "crate": "arroyo-controller",
+          "name": "partition_keeps_one_job_fencing_without_blocking_others",
+          "kind": "test",
+          "path": "crates/arroyo-controller/src/states/mod.rs"
+        }
+      ],
+      "note": "Both topologies name their running state `Running`, and the fixture's workers now serve JobStatusGrpc beside WorkerGrpc, so the worker-leader cell really performs the handover to a leader (LeaderManager::connect, which validates the reported backend) before the ordinary job is reported running. The row does not assert which route was taken, so its worker-leader cell proves that branch executed, not what it did."
+    },
+    {
+      "id": 21,
+      "owner": "T26",
+      "owner_verbatim": "T26 closure",
+      "requirement": "Registration and active handshake precede admission",
+      "topology": "dependent",
+      "fixture": "portable",
+      "tests": [
+        {
+          "crate": "arroyo-controller",
+          "name": "registration_and_fence_handshake_precede_start_admission",
+          "kind": "test",
+          "path": "crates/arroyo-controller/src/states/mod.rs"
+        }
+      ],
+      "distinct_path": "Asserts the restored checkpoint's commit fences as one closed-form value per topology: in controller mode [Some((adopted_fence, generation))], because prepare_handover builds the job's JobController holding its FenceProtocol; in worker-leader mode the empty list, because prepare_handover returns before building one and the leader commits under the CommitAuthority its own fenced start conferred (row 24). It then asserts status.state_context.leader.is_some() equals the topology, so the empty list is the leader route having been taken rather than a fan-out that never got that far."
+    },
+    {
+      "id": 22,
+      "owner": "T26",
+      "owner_verbatim": "T26 closure",
+      "requirement": "Reused endpoint cannot impersonate predecessor generation",
+      "topology": "independent",
+      "fixture": "portable",
+      "tests": [
+        {
+          "crate": "arroyo-worker",
+          "name": "worker_generation_mismatch_rejects_delayed_start",
+          "kind": "test",
+          "path": "crates/arroyo-worker/src/lifecycle_fence/tests.rs"
+        }
+      ]
+    },
+    {
+      "id": 23,
+      "owner": "T26",
+      "owner_verbatim": "T26 closure",
+      "requirement": "`Aborted` is definitive no-apply",
+      "topology": "independent",
+      "fixture": "portable",
+      "tests": [
+        {
+          "crate": "arroyo-worker",
+          "name": "aborted_is_definitive_no_apply",
+          "kind": "test",
+          "path": "crates/arroyo-worker/src/lifecycle_fence/tests.rs"
+        }
+      ]
+    },
+    {
+      "id": 24,
+      "owner": "T26",
+      "owner_verbatim": "T26 closure",
+      "requirement": "Fence protocol covers both controller topologies",
+      "topology": "dependent",
+      "fixture": "portable",
+      "tests": [
+        {
+          "crate": "arroyo-controller",
+          "name": "fence_protocol_covers_both_controller_modes",
+          "kind": "test",
+          "path": "crates/arroyo-controller/src/states/lifecycle/faults_tests.rs"
+        }
+      ],
+      "distinct_path": "Reads config().job_controller and asserts it resolves to the topology ARROYO__JOB_CONTROLLER declares, so a broken figment mapping cannot make the two cells the same process. Then branches on that value: in controller mode it asserts the commit fence comes from the JobController's own FenceProtocol; in worker-leader mode it asserts prepare_handover returns before building one, so the fence can only come from the CommitAuthority the leader's own fenced start conferred \u2014 and asserts both routes produce the same fence and target. The match over JobControllerMode is exhaustive."
+    },
+    {
+      "id": 25,
+      "owner": "T26",
+      "owner_verbatim": "T26 closure, cross-half",
+      "requirement": "Losing candidate never becomes authoritative",
+      "topology": "independent",
+      "fixture": "portable",
+      "tests": [
+        {
+          "crate": "arroyo-controller",
+          "name": "stale_controller_candidate_never_becomes_authoritative_root",
+          "kind": "test",
+          "path": "crates/arroyo-controller/src/states/lifecycle/fence_tests.rs"
+        }
+      ]
+    },
+    {
+      "id": 26,
+      "owner": "T08-carried",
+      "owner_verbatim": "T08 behavior plus T26 successor",
+      "requirement": "Busy worker returns definitive `Aborted` without application",
+      "topology": "independent",
+      "fixture": "portable",
+      "tests": [
+        {
+          "crate": "arroyo-worker",
+          "name": "start_execution_retries_are_idempotent_by_execution_id",
+          "kind": "test",
+          "path": "crates/arroyo-worker/src/lib.rs"
+        },
+        {
+          "crate": "arroyo-controller",
+          "name": "busy_aborted_settles_no_apply_without_ambiguous_reconcile",
+          "kind": "test",
+          "path": "crates/arroyo-controller/src/states/mod.rs"
+        }
+      ],
+      "note": "Multi-test cell; it passes as a group. M11.T26m declared the controller control `a_busy_worker_phase_is_retried_under_the_same_start_admission` a PRE-ACTIVATION CONTROL ONLY, and M11.T26h's activation change removed it: it asserted that the fan-out retries the same identifier under the same admission after an `Aborted`, which is the reading M11.D39e(iii) replaces. `transport_settlement` no longer takes a mode and answers `Definitive` for `Aborted`, so the control could only have passed by keeping the mechanism it was a control for. Its half of the requirement \u2014 the controller's reading of a busy worker's answer \u2014 is carried by `busy_aborted_settles_no_apply_without_ambiguous_reconcile`, which asserts the stronger fact: exactly one START reaches the worker, the identifier is accounted for by an authoritative response, and the attempt ends as a retryable scheduling error so that only a LATER scheduling attempt may try again. The landed worker-side no-apply proof is unchanged."
+    },
+    {
+      "id": 27,
+      "owner": "T08-carried",
+      "owner_verbatim": "T08 behavior, landed; owned by T26",
+      "requirement": "Ambiguous outcomes retry the same ID before admission release",
+      "topology": "independent",
+      "fixture": "portable",
+      "tests": [
+        {
+          "crate": "arroyo-controller",
+          "name": "a_transport_error_is_reconciled_before_the_start_admission_is_released",
+          "kind": "test",
+          "path": "crates/arroyo-controller/src/states/mod.rs"
+        },
+        {
+          "crate": "arroyo-worker",
+          "name": "start_execution_retries_are_idempotent_by_execution_id",
+          "kind": "test",
+          "path": "crates/arroyo-worker/src/lib.rs"
+        }
+      ],
+      "note": "Same SchedulingRun shape as row 26 for the controller half, and the same reading of its worker-leader cell: the ambiguous-retry reconciliation is identical under both process configurations, and the row asserts nothing about the topology itself."
+    },
+    {
+      "id": 28,
+      "owner": "T08-carried",
+      "owner_verbatim": "T08 behavior plus T26 successor",
+      "requirement": "Permanently unsettled start ends fan-out safely",
+      "topology": "independent",
+      "fixture": "portable",
+      "tests": [
+        {
+          "crate": "arroyo-controller",
+          "name": "permanently_unsettled_start_enters_durable_fencing",
+          "kind": "test",
+          "path": "crates/arroyo-controller/src/states/mod.rs"
+        }
+      ],
+      "note": "M11.T26m declared the control `a_permanently_unsettled_start_execution_ends_the_fan_out_and_releases_the_admission` a PRE-ACTIVATION CONTROL ONLY, and M11.T26h's activation change removed it. It asserted that budget exhaustion RELEASES the job's lifecycle authority \u2014 observed through `RefusalGate::admit_publication`, which the same change removed \u2014 and after activation budget exhaustion must enter durable `Fencing` instead, holding the authority until the obligation is discharged. The requirement 'a permanently unsettled start ends the fan-out safely' is carried whole by `permanently_unsettled_start_enters_durable_fencing`, which asserts the bounded terminal path AND the durable obligation the release used to skip; `budget_exhaustion_transfers_into_token_free_fencing_without_publishing_or_rescheduling` covers the same transfer at the phase seam."
+    },
+    {
+      "id": 29,
+      "owner": "T08-carried",
+      "owner_verbatim": "T08 behavior, landed; retained",
+      "requirement": "Incapable worker is never sent a start, including replacement",
+      "topology": "independent",
+      "fixture": "portable",
+      "tests": [
+        {
+          "crate": "arroyo-controller",
+          "name": "a_worker_predating_the_reconciliation_contract_is_never_sent_a_start_execution",
+          "kind": "test",
+          "path": "crates/arroyo-controller/src/states/mod.rs"
+        },
+        {
+          "crate": "arroyo-controller",
+          "name": "a_controller_replacement_leaves_no_legacy_start_execution_handler_behind_its_gate",
+          "kind": "test",
+          "path": "crates/arroyo-controller/src/states/mod.rs"
+        }
+      ]
+    },
+    {
+      "id": 30,
+      "owner": "T08-carried",
+      "owner_verbatim": "T08 carried, landed",
+      "requirement": "Clone/replace preserves backend selector",
+      "topology": "independent",
+      "fixture": "portable",
+      "tests": [
+        {
+          "crate": "arroyo-api",
+          "name": "replace_job_without_state_replaces_terminal_job_and_deletes_history",
+          "kind": "test",
+          "path": "crates/arroyo-api/src/jobs.rs"
+        },
+        {
+          "crate": "arroyo-api",
+          "name": "replace_job_without_state_preserves_a_legacy_empty_selector",
+          "kind": "test",
+          "path": "crates/arroyo-api/src/jobs.rs"
+        },
+        {
+          "crate": "arroyo-api",
+          "name": "both_replacement_statements_copy_the_same_columns",
+          "kind": "test",
+          "path": "crates/arroyo-api/src/jobs.rs"
+        }
+      ]
+    },
+    {
+      "id": 31,
+      "owner": "T08-carried",
+      "owner_verbatim": "T08 carried, landed",
+      "requirement": "Generation validates recovery metadata before write",
+      "topology": "independent",
+      "fixture": "portable",
+      "tests": [
+        {
+          "crate": "arroyo-state-protocol",
+          "name": "initialize_generation_writes_nothing_when_the_recovery_checkpoint_disagrees",
+          "kind": "test",
+          "path": "crates/arroyo-state-protocol/src/lib.rs"
+        },
+        {
+          "crate": "arroyo-state-protocol",
+          "name": "initialize_generation_publishes_a_legacy_recovery_checkpoint",
+          "kind": "test",
+          "path": "crates/arroyo-state-protocol/src/lib.rs"
+        }
+      ]
+    },
+    {
+      "id": 32,
+      "owner": "T08-carried",
+      "owner_verbatim": "T08 carried, landed",
+      "requirement": "Exact program coverage before rewrite",
+      "topology": "independent",
+      "fixture": "portable",
+      "tests": [
+        {
+          "crate": "arroyo-state",
+          "name": "loading_a_checkpoints_operators_refuses_a_program_operator_it_omits",
+          "kind": "test",
+          "path": "crates/arroyo-state/src/parquet.rs"
+        },
+        {
+          "crate": "arroyo-state",
+          "name": "loading_a_checkpoints_operators_refuses_one_the_program_does_not_contain",
+          "kind": "test",
+          "path": "crates/arroyo-state/src/parquet.rs"
+        },
+        {
+          "crate": "arroyo-controller",
+          "name": "an_operator_the_checkpoint_omits_is_refused_before_the_rewrite",
+          "kind": "test",
+          "path": "crates/arroyo-controller/src/states/scheduling.rs"
+        },
+        {
+          "crate": "arroyo-controller",
+          "name": "a_listed_operator_with_no_object_is_refused_before_the_rewrite",
+          "kind": "test",
+          "path": "crates/arroyo-controller/src/states/scheduling.rs"
+        }
+      ]
+    },
+    {
+      "id": 33,
+      "owner": "T08-carried",
+      "owner_verbatim": "T08 carried, landed",
+      "requirement": "Unknown selector fails closed",
+      "topology": "independent",
+      "fixture": "portable",
+      "tests": [
+        {
+          "crate": "arroyo-controller",
+          "name": "an_uninterpretable_row_is_refused_to_the_running_job",
+          "kind": "test",
+          "path": "crates/arroyo-controller/src/states/mod.rs"
+        },
+        {
+          "crate": "arroyo-controller",
+          "name": "a_job_that_never_started_and_has_an_unusable_row_never_starts",
+          "kind": "test",
+          "path": "crates/arroyo-controller/src/lib.rs"
+        },
+        {
+          "crate": "arroyo-controller",
+          "name": "an_execution_recording_an_unknown_backend_is_never_guessed_at",
+          "kind": "test",
+          "path": "crates/arroyo-controller/src/lib.rs"
+        }
+      ]
+    },
+    {
+      "id": 34,
+      "owner": "T08-carried",
+      "owner_verbatim": "T08 carried, landed",
+      "requirement": "Leader recovery validates every restored shape/path",
+      "topology": "independent",
+      "fixture": "portable",
+      "tests": [
+        {
+          "crate": "arroyo-state-protocol",
+          "name": "initialize_generation_refuses_every_unrestorable_manifest_shape",
+          "kind": "test",
+          "path": "crates/arroyo-state-protocol/src/lib.rs"
+        },
+        {
+          "crate": "arroyo-state-protocol",
+          "name": "cleanup_rejects_a_history_written_by_another_backend",
+          "kind": "test",
+          "path": "crates/arroyo-state-protocol/src/lib.rs"
+        },
+        {
+          "crate": "arroyo-state-protocol",
+          "name": "cleanup_rejects_a_retained_checkpoint_written_by_another_backend",
+          "kind": "test",
+          "path": "crates/arroyo-state-protocol/src/lib.rs"
+        }
+      ]
+    },
+    {
+      "id": 35,
+      "owner": "T08-carried",
+      "owner_verbatim": "T08 carried, landed",
+      "requirement": "Both controller topologies recover durable selector",
+      "topology": "dependent",
+      "fixture": "portable",
+      "tests": [
+        {
+          "crate": "arroyo-controller",
+          "name": "an_execution_started_before_the_selector_existed_recovers_as_parquet",
+          "kind": "test",
+          "path": "crates/arroyo-controller/src/lib.rs"
+        },
+        {
+          "crate": "arroyo-controller",
+          "name": "a_pre_upgrade_execution_with_an_unusable_row_is_adopted_under_parquet",
+          "kind": "test",
+          "path": "crates/arroyo-controller/src/lib.rs"
+        }
+      ],
+      "distinct_path": "Both tests loop `for leader in [true, false]` internally and drive `classify_polled_job`/`StateMachine` down each topology's own recovery route, asserting the same durable selector is adopted on both. The distinct path is reached inside the test rather than through the process knob, which is why this row is the one landed row that already satisfies the both-topologies requirement on its own."
+    },
+    {
+      "id": 36,
+      "owner": "T08-carried",
+      "owner_verbatim": "T08 carried, landed",
+      "requirement": "Malformed durable context fails closed",
+      "topology": "independent",
+      "fixture": "portable",
+      "tests": [
+        {
+          "crate": "arroyo-controller",
+          "name": "an_undecodable_execution_record_skips_only_that_job",
+          "kind": "test",
+          "path": "crates/arroyo-controller/src/lib.rs"
+        }
+      ]
+    },
+    {
+      "id": 37,
+      "owner": "T08-carried",
+      "owner_verbatim": "T08 carried, landed",
+      "requirement": "Controller tests do not use process-wide cluster identity",
+      "topology": "independent",
+      "fixture": "portable",
+      "tests": [
+        {
+          "crate": "arroyo-controller",
+          "name": "no_state_and_no_state_test_reaches_for_a_process_wide_cluster_identity",
+          "kind": "test",
+          "path": "crates/arroyo-controller/src/states/mod.rs"
+        }
+      ]
+    }
+  ]
+}

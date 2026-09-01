@@ -42,12 +42,21 @@ impl PhaseContext<'_, '_> {
     ///
     /// Nothing here is irreversible, which is why it happens before the third admission is
     /// taken rather than inside it.
-    pub(crate) async fn prepare_handover(&mut self) {
+    ///
+    /// # Errors
+    ///
+    /// Retryable, for the one reason [`fence_protocol`](Self::fence_protocol) can fail: a
+    /// controller that must fence and holds no adopted fence cannot address the generation whose
+    /// commits this controller would publish. It is not reachable from a completed fan-out —
+    /// which failed for the same reason before reaching here — and it is propagated rather than
+    /// defaulted, because a commit that quietly went out unfenced is precisely the write a
+    /// superseded controller must not be able to make.
+    pub(crate) async fn prepare_handover(&mut self) -> Result<(), StateError> {
         self.ctx.status.tasks = Some(self.ctx.program.task_count() as i32);
         // Before the controller is built, because building it takes the commits with it.
         self.restored_commits_pending = self.committing_state.is_some();
         if self.leader_mode {
-            return;
+            return Ok(());
         }
 
         let program = Arc::new(self.ctx.program.clone());
@@ -70,6 +79,14 @@ impl PhaseContext<'_, '_> {
             db: self.ctx.db.clone(),
         });
         let (start_epoch, min_epoch) = self.epochs();
+        // The same protocol the fan-out addressed this generation under: a commit is a directive
+        // from the same controller, under the same authority, to the same generation. Read here
+        // rather than carried from the fan-out because the two readings are of the same two
+        // values — the job's authority and its scheduling generation — neither of which changes
+        // within one attempt; and a job whose fence cannot address its generations has already
+        // failed the fan-out, so this is not reachable with an unfenced answer under the fenced
+        // protocol.
+        let fence_protocol = self.fence_protocol()?;
         self.job_controller = Some(JobController::new(
             checkpoint_store,
             self.ctx.config.clone(),
@@ -82,7 +99,9 @@ impl PhaseContext<'_, '_> {
             std::mem::take(&mut self.started_connects),
             self.committing_state.take(),
             metrics,
+            fence_protocol,
         ));
+        Ok(())
     }
 
     /// Publishes the restored checkpoint's commits.

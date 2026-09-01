@@ -7,7 +7,7 @@ use std::{
 use crate::types::public::StopMode as SqlStopMode;
 use anyhow::bail;
 use arroyo_rpc::checkpoints::CheckpointMetadataStore;
-use arroyo_rpc::grpc::rpc::{CommitReq, StopExecutionReq, StopMode};
+use arroyo_rpc::grpc::rpc::{StopExecutionReq, StopMode};
 use arroyo_rpc::identity::WorkerClient;
 use arroyo_state::validated::CheckpointIdentity;
 use arroyo_state::{BackingStore, StateBackend, StorageProviderFor};
@@ -15,6 +15,7 @@ use arroyo_types::{JobId, PipelineId, WorkerId};
 use rand::{Rng, rng};
 
 use crate::states::StateError;
+use crate::states::lifecycle::FenceProtocol;
 use crate::states::lifecycle::{ConsumptionPoint, JobWait, ObservedIntent, Waited};
 use crate::{JobConfig, JobMessage};
 use arroyo_datastream::logical::LogicalProgram;
@@ -25,8 +26,8 @@ use arroyo_worker::job_controller::committing_state::CommittingState;
 use arroyo_worker::job_controller::job_metrics;
 use arroyo_worker::job_controller::job_metrics::JobMetrics;
 use arroyo_worker::job_controller::model::{
-    CheckpointingOrCommittingState, JobState, RunningJobModel, TaskState, TaskStatus, WorkerState,
-    WorkerStatus,
+    CheckpointingOrCommittingState, CommitBody, JobState, RunningJobModel, TaskState, TaskStatus,
+    WorkerState, WorkerStatus,
 };
 use tokio::task::JoinHandle;
 use tracing::{error, info};
@@ -106,7 +107,7 @@ pub enum ControllerProgress {
 
 impl JobController {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new(
         checkpoint_store: Arc<dyn CheckpointMetadataStore>,
         config: JobConfig,
         pipeline_id: PipelineId,
@@ -118,6 +119,7 @@ impl JobController {
         worker_connects: HashMap<WorkerId, WorkerClient>,
         commit_state: Option<CommittingState>,
         job_metrics: Option<JobMetrics>,
+        fence_protocol: FenceProtocol,
     ) -> Self {
         Self {
             checkpoint_store,
@@ -171,6 +173,13 @@ impl JobController {
                 program,
                 checkpoint_spans: vec![],
                 worker_leader_mode: false,
+                // The lifecycle-fence authority this controller's commits are issued under
+                // (M11.D39e), taken once from the protocol the scheduling attempt established
+                // rather than re-derived per commit: a commit is a directive from the same
+                // controller, under the same authority, to the same worker generation as the
+                // `StartExecution` that began the execution, and one holder of it is what makes
+                // that true by construction rather than by two reads agreeing.
+                commit_authority: fence_protocol.commit_authority(),
                 storage_role: StorageProviderFor::Controller {
                     storage_url: state_url,
                 },
@@ -341,16 +350,14 @@ impl JobController {
         else {
             bail!("should be committing")
         };
-        for worker in self.model.workers.values_mut() {
-            worker
-                .connect
-                .commit(CommitReq {
-                    epoch: *self.model.epoch,
-                    committing_data: committing.committing_data(),
-                })
-                .await?;
-        }
-        Ok(())
+        // The fence and the generation it addresses, from one value, per worker (M11.D39d).
+        // Under `LifecycleMode::LegacyT08` the model's authority is unfenced and every request
+        // this sends is byte-identical to the one it sent before the fields existed.
+        let body = CommitBody {
+            epoch: *self.model.epoch,
+            committing_data: committing.committing_data(),
+        };
+        self.model.commit_to_workers(&body).await
     }
 
     /// Waits for every task of this job to finish, or for the job's writer to say it stops.

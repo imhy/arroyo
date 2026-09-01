@@ -1,7 +1,7 @@
 use crate::job_controller::job_metrics::JobMetrics;
 use crate::job_controller::model::{
-    CheckpointingOrCommittingState, JobState, RunningJobModel, TaskState, TaskStatus, WorkerState,
-    WorkerStatus,
+    CheckpointingOrCommittingState, CommitBody, JobState, RunningJobModel, TaskState, TaskStatus,
+    WorkerState, WorkerStatus, addressed_commit,
 };
 use crate::job_controller::{
     CheckpointHistory, JobControllerStatus, RetireWorkerLeader, RunningMessage, TaskFailedEvent,
@@ -9,9 +9,10 @@ use crate::job_controller::{
 };
 use anyhow::{anyhow, bail};
 use arroyo_datastream::logical::LogicalProgram;
+use arroyo_rpc::fence_wire::CommitAuthority;
 use arroyo_rpc::grpc::rpc;
 use arroyo_rpc::grpc::rpc::{
-    CheckpointManifest, CommitReq, GetWorkerPhaseReq, JobControllerInitReq, JobFailure, JobStatus,
+    CheckpointManifest, GetWorkerPhaseReq, JobControllerInitReq, JobFailure, JobStatus,
     JobStopMode, OperatorCommitData, StopExecutionReq, StopMode, TableCommitData, TableEnum,
     TaskAssignment, TaskCheckpointEventType, WorkerPhase,
 };
@@ -54,7 +55,7 @@ pub struct WorkerJobController {
     stopping: bool,
     failing: bool,
     final_checkpoint_started: bool,
-    replay_commits: Option<(CommitReq, CommitPermit)>,
+    replay_commits: Option<(CommitBody, CommitPermit)>,
 }
 
 const FAILURE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(60);
@@ -95,6 +96,7 @@ impl WorkerJobController {
         parent_ref: Option<(CheckpointRef, CheckpointManifest)>,
         metrics: Option<JobMetrics>,
         state_backend: StateBackendSelector,
+        commit_authority: CommitAuthority,
     ) -> anyhow::Result<Self> {
         info!(job_id =? worker_context.job_id,
             restore_from =? parent_ref.as_ref().map(|p| &p.0),
@@ -245,7 +247,7 @@ impl WorkerJobController {
 
                     (
                         Some(r),
-                        Some((manifest_into_commit_req(manifest)?, commit_permit)),
+                        Some((manifest_into_commit_body(manifest)?, commit_permit)),
                     )
                 } else {
                     panic!(
@@ -282,6 +284,10 @@ impl WorkerJobController {
                 checkpoint_parent_ref: parent_ref,
                 checkpoint_spans: vec![],
                 worker_leader_mode: true,
+                // The authority this leader's own `StartExecution` conferred: the fence it was
+                // started under, addressed to the generation it was started as, which is the
+                // generation every worker it commits to also runs under (M11.D39d).
+                commit_authority,
                 storage_role: StorageProviderFor::Worker,
                 finished_operators: vec![],
                 state_backend,
@@ -347,18 +353,22 @@ impl WorkerJobController {
         try_join_all(futures).await?;
 
         // before starting, we need to replay our commits from the previous checkpoint
-        if let Some((commit_req, commit_permit)) = self.replay_commits.take() {
-            let futures = self
-                .model
-                .workers
-                .iter_mut()
-                .map(|(_, status)| status.connect.commit(commit_req.clone()));
+        if let Some((commit_body, commit_permit)) = self.replay_commits.take() {
+            // Each worker is addressed to itself under this leader's own authority; the body is
+            // the same for all of them. Under `LifecycleMode::LegacyT08` the authority is
+            // unfenced and every request is the one this path sent before the fields existed.
+            let authority = self.model.commit_authority;
+            let futures = self.model.workers.iter_mut().map(|(id, status)| {
+                status
+                    .connect
+                    .commit(addressed_commit(authority, *id, &commit_body))
+            });
 
             try_join_all(futures).await?;
 
             let mut subtasks_to_commit = HashSet::new();
 
-            for (op, data) in &commit_req.committing_data {
+            for (op, data) in &commit_body.committing_data {
                 for t in data.committing_data.values() {
                     for subtask in t.commit_data_by_subtask.keys() {
                         subtasks_to_commit.insert((op.clone(), *subtask));
@@ -790,16 +800,11 @@ impl WorkerJobController {
         else {
             bail!("should be committing")
         };
-        for worker in self.model.workers.values_mut() {
-            worker
-                .connect
-                .commit(CommitReq {
-                    epoch: *self.model.epoch,
-                    committing_data: committing.committing_data(),
-                })
-                .await?;
-        }
-        Ok(())
+        let body = CommitBody {
+            epoch: *self.model.epoch,
+            committing_data: committing.committing_data(),
+        };
+        self.model.commit_to_workers(&body).await
     }
 
     pub async fn wait_for_finish(
@@ -883,7 +888,7 @@ impl WorkerJobController {
     }
 }
 
-fn manifest_into_commit_req(manifest: CheckpointManifest) -> anyhow::Result<CommitReq> {
+fn manifest_into_commit_body(manifest: CheckpointManifest) -> anyhow::Result<CommitBody> {
     let mut committing_data: HashMap<String, OperatorCommitData> = HashMap::new();
 
     for mut operator in manifest.operators {
@@ -928,7 +933,10 @@ fn manifest_into_commit_req(manifest: CheckpointManifest) -> anyhow::Result<Comm
         }
     }
 
-    Ok(CommitReq {
+    // What is committed, and not who is being asked: a manifest records the checkpoint, never
+    // the lifecycle authority a replay of it is issued under. That comes from the leader, per
+    // worker, where the request is addressed.
+    Ok(CommitBody {
         epoch: manifest.epoch,
         committing_data,
     })

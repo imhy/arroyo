@@ -36,10 +36,11 @@
 //!
 //! # What runs this
 //!
-//! [`schedule`], for a job whose lifecycle mechanism is M11.D39a's single writer. No
-//! production job has one through M11.T25 — see
-//! [`LifecycleMode::SELECTED`](crate::states::lifecycle::LifecycleMode::SELECTED) — and the
-//! landed `Scheduling::next` remains compiled, selected and unchanged.
+//! [`schedule`], for a job whose lifecycle mechanism is M11.D39a's single writer — every
+//! production job since M11.T26h, see
+//! [`LifecycleMode::SELECTED`](crate::states::lifecycle::LifecycleMode::SELECTED). The landed
+//! `Scheduling::next` remains compiled and unchanged, and is what a job built in the
+//! pre-flag-day peer mode runs.
 
 use super::admission::{Admitted, PhaseContext, PhaseWait};
 use super::fanout::{IssuedAttempts, SettlementBundle, hand_over};
@@ -69,6 +70,17 @@ pub(crate) enum Advanced<P> {
 /// hands a fresh `Preamble` back, so the token travels through the preamble one effect at a
 /// time and the preamble cannot perform two effects from one token without threading the
 /// result. There is no method here that waits on the job's channel.
+///
+/// The first of those effects is [`Self::adopt_lifecycle_authority`], and it is first because
+/// M11.D39d says so: cold adoption raises the job's durable fence and installs a fresh epoch
+/// *before any effect*. Everything after it — the recovered obligation, the generation write,
+/// the teardown, the replacement cluster, the metadata root — is an effect this controller
+/// performs only because the row said it may.
+///
+/// The second is [`Self::discharge_recovered_fencing`], and it is second for the other half of
+/// the same rule: M11.D39d makes *"admission of a replacement generation"* reachable only after
+/// every target generation an earlier attempt addressed has acknowledged a superseding fence or
+/// been observed terminated, and [`Self::persist_generation`] is that admission.
 pub(crate) struct Preamble<'a, 'ctx> {
     admission: Admission,
     ctx: PhaseContext<'a, 'ctx>,
@@ -84,6 +96,23 @@ impl<'a, 'ctx> Preamble<'a, 'ctx> {
             Ok(Admitted::Region(admission)) => Ok(Advanced::To(Self { admission, ctx })),
             Ok(Admitted::Leave(stop)) => Ok(Advanced::Left(stop)),
             Err(reason) => Err(ctx.into_fencing(reason, IssuedAttempts::default())),
+        }
+    }
+
+    /// Adopts the job's durable lifecycle authority, before this attempt's first other effect.
+    pub(crate) async fn adopt_lifecycle_authority(mut self) -> PreambleStep<'a, 'ctx> {
+        match self.ctx.adopt_lifecycle_authority(&self.admission).await {
+            Ok(()) => Ok(self),
+            Err(reason) => Err(self.fence(reason)),
+        }
+    }
+
+    /// Discharges the fencing obligation an earlier attempt left durably, before this one
+    /// admits a replacement generation (M11.T26f, M11.D39d).
+    pub(crate) async fn discharge_recovered_fencing(mut self) -> PreambleStep<'a, 'ctx> {
+        match self.ctx.discharge_recovered_fencing(&self.admission).await {
+            Ok(()) => Ok(self),
+            Err(reason) => Err(self.fence(reason)),
         }
     }
 
@@ -112,6 +141,14 @@ impl<'a, 'ctx> Preamble<'a, 'ctx> {
     /// Registers this generation and prepares the checkpoint it restores from.
     pub(crate) async fn prepare_recovery_checkpoint(mut self) -> PreambleStep<'a, 'ctx> {
         match self.ctx.prepare_recovery_checkpoint(&self.admission).await {
+            Ok(()) => Ok(self),
+            Err(reason) => Err(self.fence(reason)),
+        }
+    }
+
+    /// Publishes this generation's metadata as a candidate and roots it conditionally.
+    pub(crate) async fn publish_metadata_root(mut self) -> PreambleStep<'a, 'ctx> {
+        match self.ctx.publish_metadata_root(&self.admission).await {
             Ok(()) => Ok(self),
             Err(reason) => Err(self.fence(reason)),
         }
@@ -231,9 +268,11 @@ impl<'a, 'ctx> StartFanOut<'a, 'ctx> {
     /// `super::fanout::SettlementOutcome::into_fencing_record`.
     ///
     /// If this future is *dropped* instead — the job's state task cancelled mid-fan-out —
-    /// nothing below the `await` runs at all, and the same offer is made from the region rescue
-    /// that outlives it. See `super::fanout::AttemptLedger::settlement_rescue`: the seam is
-    /// reached on both paths, and the cancelled one is the path an owner exists for.
+    /// nothing below the `await` runs at all. Nothing in this process is left to publish behind
+    /// the requests either, because that task was the job's only decider; what the attempt owed
+    /// is recovered from the job's row by whatever controller adopts it next, which raises the
+    /// fence above every identifier this one could have issued before it causes any effect
+    /// (M11.D39d).
     pub(crate) async fn issue(self) -> Result<Self, Interrupted<'a, 'ctx>> {
         let Self {
             admission,
@@ -318,7 +357,9 @@ impl<'a, 'ctx> AwaitingTasks<'a, 'ctx> {
             Ok(PhaseWait::Leave(stop)) => return Ok(Advanced::Left(stop)),
             Err(reason) => return Err(ctx.into_fencing(reason, issued)),
         }
-        ctx.prepare_handover().await;
+        if let Err(reason) = ctx.prepare_handover().await {
+            return Err(ctx.into_fencing(reason, issued));
+        }
         if !ctx.needs_restored_commits() {
             return Ok(Advanced::To(CommitOrRun::Run(Running { ctx, issued })));
         }

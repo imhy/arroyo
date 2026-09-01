@@ -414,9 +414,8 @@ impl IntentMailbox {
 ///
 /// # Why the `LegacyT08` arm is a future that never completes
 ///
-/// A job on the landed mechanism has no mailbox at all — the poll thread publishes to the
-/// [`RefusalGate`](crate::states::RefusalGate) and to the job's message queue, and every wait
-/// already selects on that queue. So there is nothing to wake *for*, and the honest way to say
+/// A job in the pre-flag-day peer mode has no mailbox at all — the poll thread publishes to
+/// the job's message queue, and every wait already selects on that queue. So there is nothing to wake *for*, and the honest way to say
 /// so is an arm that is never ready rather than one that fires and finds nothing. The selected
 /// production path therefore behaves exactly as it did: the branch is polled once per turn,
 /// returns `Pending`, and is never woken.

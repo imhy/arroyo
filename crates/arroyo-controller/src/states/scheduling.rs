@@ -1,4 +1,7 @@
-use arroyo_rpc::grpc::rpc::{JobState, StartExecutionReq, TaskAssignment};
+use arroyo_rpc::fence_wire::observed_settlement;
+use arroyo_rpc::grpc::rpc::{
+    JobState, StartExecutionOutcome, StartExecutionReq, StartExecutionResp, TaskAssignment,
+};
 use arroyo_rpc::identity::{WorkerClient, worker_client};
 use arroyo_types::{CLUSTER_ID_ENV, JobId, MachineId, PipelineId, WorkerId};
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -9,15 +12,17 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{select, sync::Mutex, task::JoinHandle};
-use tonic::{Code, Request};
+use tonic::Request;
 use tracing::{debug, error, info, warn};
 
 use super::{
     Admission, JobContext, State, Transition, check_config_update,
     leader_running::LeaderRunning,
-    lifecycle::{ConsumptionPoint, ObservedIntent, leaving},
+    lifecycle::{
+        ConsumptionPoint, ObservedIntent, StartTargets, StatusPublication, TransportSettlement,
+        leaving, stand_down,
+    },
     running::Running,
-    settle_under_admission,
 };
 use crate::JobConfig;
 use crate::job_controller::checkpoint_store::DbCheckpointMetadataStore;
@@ -77,7 +82,7 @@ pub(crate) const START_EXECUTION_RECONCILE_ATTEMPTS: usize = 8;
 
 /// The pause between those attempts. Short, because the common case is a worker that is
 /// momentarily busy rather than one that is gone.
-const START_EXECUTION_RECONCILE_DELAY: Duration = Duration::from_millis(250);
+pub(crate) const START_EXECUTION_RECONCILE_DELAY: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone)]
 struct WorkerStatus {
@@ -120,13 +125,14 @@ impl Scheduling {
 /// down to the set of things its interruptible stretches may await — and the landed body must
 /// keep passing that pin unchanged, which is exactly what M11.T25 promises about it.
 ///
-/// **No production job takes the first branch.** A job's lifecycle mechanism is fixed when its
-/// state machine is created, from
+/// **Every production job takes the first branch, since M11.T26h's activation change.** A
+/// job's lifecycle mechanism is fixed when its state machine is created, from
 /// [`LifecycleMode::SELECTED`](crate::states::lifecycle::LifecycleMode::SELECTED), and that is
-/// `LegacyT08` for the whole of M11.T25; a job on the legacy mechanism has no lifecycle actor,
-/// so [`JobContext::runs_fenced_lifecycle`](crate::states::JobContext::runs_fenced_lifecycle)
-/// is `false` and every state — `Scheduling` included — runs the same body it ran before this
-/// module existed.
+/// `FencedV2`; such a job has a lifecycle actor, so
+/// [`JobContext::runs_fenced_lifecycle`](crate::states::JobContext::runs_fenced_lifecycle) is
+/// `true` and `Scheduling` runs the M11.D39b phase graph. The landed body below is what a job
+/// built in the pre-flag-day peer mode runs — nothing outside a test module builds one — and it
+/// still runs exactly as M11.T08 landed it, which is what its pins are for.
 pub(crate) async fn run_state_body(
     state: Box<dyn State>,
     ctx: &mut JobContext<'_>,
@@ -326,17 +332,21 @@ struct ExecutionPlan {
 ///
 /// * every request is awaited to an outcome, including the siblings of one that has already
 ///   failed; the first error is remembered and reported once the last request is in;
-/// * the region owns its [`Admission`] and hands it back only when that is done, and
-///   [`settle_under_admission`] keeps both together if the job's state task is dropped
-///   underneath it, so a cancelled task cannot release the admission either.
+/// * the region owns its [`Admission`] and hands it back only when that is done. A state task
+///   dropped underneath it takes the requests and the admission with it, which is safe under
+///   M11.D39a because the dropped task is the job's *only* decider: there is nobody left to
+///   publish anything behind the requests, and what a replacement controller owes is in the
+///   job's row — it re-adopts, which raises the fence above every identifier this attempt
+///   could have issued, before it causes any effect (M11.D39d).
 ///
 /// A transport error is not an answer from the worker: `Endpoint::timeout` is client-side and a
 /// reset stream does not prove whether the synchronous application completed. Every request
 /// therefore carries a stable non-empty `start_execution_id`. On an ambiguous timeout/reset this
 /// function retries the same ID while retaining the admission; the worker acknowledges a
 /// duplicate ID without applying it twice. `Aborted` is also retried because it is the worker's
-/// definitive "phase lock busy, nothing applied" response. Other explicit statuses settle the
-/// attempt.
+/// definitive "phase lock busy, nothing applied" response under the pre-flag-day protocol; since
+/// M11.T26h `Aborted` is settlement and only a later scheduling attempt may try again. Other
+/// explicit statuses settle the attempt.
 ///
 /// # Why every peer here is one that can be reconciled
 ///
@@ -377,11 +387,62 @@ struct ExecutionPlan {
 ///
 /// # Latency
 ///
+/// Mints the stable `start_execution_id` one worker's `StartExecution` attempt carries.
+///
+/// Two `u64`s in zero-padded lowercase hexadecimal. `{:016x}` is a minimum width and 16 is also
+/// the maximum number of hexadecimal digits a `u64` has, so every identifier this produces is
+/// exactly 32 ASCII characters — never fewer, never more.
+///
+/// That width is not incidental. `arroyo_rpc::fencing::MAX_ATTEMPT_ID_CHARS` is
+/// `2 × (u64::BITS / 4)` *because* of this format, and both ends of the protocol bound
+/// identifiers by it: the durable fencing record, the revocation list on a decoded
+/// `StartExecutionReq`, and the worker's bounded applied/revoked record all refuse an identifier
+/// wider than that. Changing this format therefore has to change that constant with it, which is
+/// what `the_minted_start_execution_id_is_exactly_the_bounded_width` exists to enforce.
+fn mint_start_execution_id() -> String {
+    format!(
+        "{:016x}{:016x}",
+        rand::random::<u64>(),
+        rand::random::<u64>()
+    )
+}
+
+/// Reads a `StartExecution` response as "this generation applied the request".
+///
+/// Through [`observed_settlement`] rather than off the response's fields, for the reason that
+/// seam exists: `outcome` and `observed_lifecycle_fence` are one statement, and a response that
+/// claims to have acknowledged a fence while reporting none is a shape this build refuses rather
+/// than reads half of.
+///
+/// Only `APPLIED` starts a worker. `FENCE_ACKNOWLEDGED` and `REVOKED` are what a generation
+/// answers a fence-only or revoke directive with; a `START` answered with either is a worker that
+/// advanced its fence and ran nothing, and reporting it as started would leave the controller
+/// waiting for tasks that were never launched. Each is definitive — the generation's own answer
+/// about this identifier — so none of them is retried.
+///
+/// # Errors
+///
+/// The report to put in the fan-out's error, for a response that does not say the request was
+/// applied.
+fn applied_start(response: &StartExecutionResp) -> Result<Option<u64>, String> {
+    let settlement = observed_settlement(response).map_err(|e| e.to_string())?;
+    match settlement.outcome() {
+        StartExecutionOutcome::Applied => Ok(settlement.observed_fence()),
+        outcome => Err(format!(
+            "it answered {outcome:?}, which acknowledges a fence rather than starting the execution"
+        )),
+    }
+}
+
 /// An explicit server error costs the slowest sibling instead of returning at once. An ambiguous
-/// transport failure costs up to [`START_EXECUTION_RECONCILE_ATTEMPTS`] further attempts, each
+/// transport failure — which is what
+/// [`FenceProtocol::transport_settlement`](crate::states::lifecycle::FenceProtocol::transport_settlement)
+/// says, exhaustively over `tonic::Code` and for the protocol these targets were addressed
+/// under — costs up to [`START_EXECUTION_RECONCILE_ATTEMPTS`] further attempts, each
 /// separated by [`START_EXECUTION_RECONCILE_DELAY`] and each bounded by the channel's own 90s
-/// `Endpoint::timeout`; state-task cancellation still hands the whole settling region to
-/// [`settle_under_admission`].
+/// `Endpoint::timeout`. An interrupted phase hands the whole obligation — the inventory and
+/// the admission together — to the job's `JobSettlementOwner`; see
+/// [`SettlementBundle::hand_over`](fanout::settlement::hand_over).
 ///
 /// # What it records while it runs
 ///
@@ -407,25 +468,24 @@ async fn start_execution_on_workers(
     pipeline_id: PipelineId,
     plan: ExecutionPlan,
     machine_ids: HashMap<WorkerId, MachineId>,
-    worker_connects: HashMap<WorkerId, WorkerClient>,
+    targets: StartTargets,
     attempts: Arc<AttemptLedger>,
 ) -> (Admission, anyhow::Result<HashMap<WorkerId, WorkerClient>>) {
-    // Taken before the ledger is moved into the region. It is `None` for every caller in
-    // M11.T25 — including the landed body below, whose ledger has no owner — so the rescue
-    // releases the admission once the requests settle, exactly as it always has.
-    let rescue = attempts.settlement_rescue();
-    settle_under_admission(
-        admission,
-        move |admission| async move {
-            // The whole of this — issuing the requests as much as waiting for them — is one effect
-            // inside one region, and none of it may outlive the guard.
-            let started = admission
+    // Read once, from the targets themselves. A worker's channel and the directive its request
+    // carries arrive here as one value (M11.D39e), so the retry table below and the fence a
+    // request was issued under cannot be read from different modes.
+    let protocol = targets.protocol();
+    {
+        // The whole of this — issuing the requests as much as waiting for them — is one effect
+        // inside one region, and none of it may outlive the guard.
+        let started = admission
                 .effect("send every worker its StartExecution", async move {
                     let (leader_id, leader_addr) = plan.leader.unzip();
 
-                    let mut requests: FuturesUnordered<_> = worker_connects
+                    let mut requests: FuturesUnordered<_> = targets
+                        .into_starts()
                         .into_iter()
-                        .map(|(id, mut c)| {
+                        .map(|(id, mut c, directive)| {
                             let assignments = plan.assignments.clone();
                             let job_id = job_id.clone();
                             let pipeline_id = pipeline_id.clone();
@@ -440,11 +500,7 @@ async fn start_execution_on_workers(
                             let leader_addr = leader_addr.clone();
                             let checkpoint_manifest_ref = plan.checkpoint_manifest_ref.clone();
                             let state_backend = plan.state_backend;
-                            let start_execution_id = format!(
-                                "{:016x}{:016x}",
-                                rand::random::<u64>(),
-                                rand::random::<u64>()
-                            );
+                            let start_execution_id = mint_start_execution_id();
                             // Recorded here, where the identifier is minted and before the first
                             // request carrying it is sent, rather than when a request returns. An
                             // inventory that under-reports could let a phase release its authority
@@ -468,7 +524,7 @@ async fn start_execution_on_workers(
                                     machine_id = *machine_id.0,
                                 );
 
-                                let request = StartExecutionReq {
+                                let mut request = StartExecutionReq {
                                         restore_epoch,
                                         start_epoch,
                                         min_epoch,
@@ -481,30 +537,66 @@ async fn start_execution_on_workers(
                                         checkpoint_manifest_ref,
                                         state_backend: state_backend.as_str().to_string(),
                                         start_execution_id,
+                                        // Every lifecycle field is written by the directive
+                                        // below, on every arm, so none is named here: this
+                                        // literal cannot leave a fence or a target behind that
+                                        // the directive did not ask for.
+                                        ..Default::default()
                                     };
+                                // The five lifecycle fields, from one value. Under
+                                // `LifecycleMode::LegacyT08` the directive is `Unfenced` and
+                                // stamps the zeros a controller predating the fields sends, so
+                                // what leaves this process is byte-identical to what left it
+                                // before they existed.
+                                directive.stamp(&mut request);
                                 let mut unsettled = 0usize;
                                 loop {
                                     match c.start_execution(Request::new(request.clone())).await {
-                                        Ok(_) => {
-                                            attempts.settled(id);
-                                        debug!(
-                                            message = "worker entered initialization phase",
-                                            job_id = %job_id,
-                                            pipeline_id = *pipeline_id,
-                                            worker_id = id.0,
-                                            machine_id = *machine_id.0,
-                                        );
-                                            break Ok((id, c));
+                                        Ok(response) => {
+                                            // A response is an answer, so the attempt is
+                                            // accounted for however it reads.
+                                            attempts.answered(id, &request.start_execution_id);
+                                            // Read whole, through the seam, rather than as two
+                                            // fields: a worker that acknowledged a fence rather
+                                            // than applying the request has *not* started, and a
+                                            // response this build cannot name is not evidence
+                                            // that it has. Both are definitive, so neither is
+                                            // retried. Before the flag day this is the same
+                                            // answer the landed path gave: the worker reports
+                                            // `APPLIED` and no observed fence, which is also what
+                                            // a worker predating the fields reports.
+                                            match applied_start(&response.into_inner()) {
+                                                Ok(observed) => {
+                                                    debug!(
+                                                        message = "worker entered initialization phase",
+                                                        job_id = %job_id,
+                                                        pipeline_id = *pipeline_id,
+                                                        worker_id = id.0,
+                                                        machine_id = *machine_id.0,
+                                                        observed_lifecycle_fence = observed,
+                                                    );
+                                                    break Ok((id, c));
+                                                }
+                                                Err(report) => {
+                                                    error!(
+                                                        message = "worker answered StartExecution without applying it",
+                                                        job_id = %job_id,
+                                                        pipeline_id = *pipeline_id,
+                                                        worker_id = id.0,
+                                                        machine_id = *machine_id.0,
+                                                        report = %report,
+                                                    );
+                                                    break Err(anyhow!(
+                                                        "worker {id:?} did not apply StartExecution \
+                                                         {}: {report}",
+                                                        request.start_execution_id
+                                                    ));
+                                                }
+                                            }
                                         }
                                         Err(e)
-                                            if matches!(
-                                                e.code(),
-                                                Code::Cancelled
-                                                    | Code::Unknown
-                                                    | Code::DeadlineExceeded
-                                                    | Code::Unavailable
-                                                    | Code::Aborted
-                                            ) =>
+                                            if protocol.transport_settlement(e.code())
+                                                == TransportSettlement::Ambiguous =>
                                         {
                                             unsettled += 1;
                                             if unsettled > START_EXECUTION_RECONCILE_ATTEMPTS {
@@ -552,7 +644,7 @@ async fn start_execution_on_workers(
                                             // An explicit status other than the ambiguous set is
                                             // the worker's own decision about this request, so the
                                             // attempt is accounted for even though it failed.
-                                            attempts.settled(id);
+                                            attempts.answered(id, &request.start_execution_id);
                                             error!(
                                             message = "failed to start execution on worker",
                                             job_id = %job_id,
@@ -596,11 +688,8 @@ async fn start_execution_on_workers(
                 })
                 .await;
 
-            (admission, started)
-        },
-        rescue,
-    )
-    .await
+        (admission, started)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1237,23 +1326,35 @@ impl State for Scheduling {
         // minutes would make the job unrefusable for exactly as long as it is least able to
         // defend itself. It must also be dropped before the next crossing takes it again — the
         // guard does not re-enter.
-        let admission = ctx.admit_irreversible_scheduling().await?;
+        let admission = ctx.admit_irreversible_scheduling().await;
 
         // update the generation for this scheduling attempt
         ctx.status.generation += 1;
-        if let Err(e) = admission
+        match admission
             .effect(
                 "persist the incremented scheduling generation",
-                ctx.status.update_db(&ctx.db),
+                ctx.publish_status(),
             )
             .await
         {
-            return Err(ctx.retryable(
-                self,
-                "failed to advance generation for scheduling retry",
-                anyhow!("{}", e),
-                10,
-            ));
+            Ok(StatusPublication::Published) => {}
+            // Unreachable on this body — it runs only for a job on the landed mechanism, whose
+            // publication is unconditional and cannot be refused by another controller's
+            // authority — and answered rather than asserted, because the answer a superseded
+            // controller owes is the same everywhere: stand down, do not retry, do not fail a
+            // job somebody else is running.
+            Ok(StatusPublication::Superseded(stale)) => {
+                stand_down(stale);
+                return Ok(Transition::Stop);
+            }
+            Err(e) => {
+                return Err(ctx.retryable(
+                    self,
+                    "failed to advance generation for scheduling retry",
+                    anyhow!("{}", e),
+                    10,
+                ));
+            }
         }
 
         // clear out any existing workers for this job
@@ -1334,9 +1435,9 @@ impl State for Scheduling {
             // message in the queue, so a decision published while it waited can be sitting
             // behind those messages, unread; reading the job's intent here does not depend
             // on the channel at all. Not `async`, so it adds nothing to what the pinned
-            // interruptible stretches await. A no-op under `LifecycleMode::LegacyT08`,
-            // which is what production runs: there the gate read at the next crossing is
-            // the mechanism.
+            // interruptible stretches await. A no-op in this body, which only a job built
+            // in the pre-flag-day peer mode reaches: such a job has no actor, so the answer
+            // is always `ObservedIntent::Continue`.
             //
             // A consumed stop leaves through the same macro the message-borne one below
             // uses. This body is not reachable under the other mode — `run_state_body`
@@ -1529,18 +1630,56 @@ impl State for Scheduling {
             .collect();
         // The fan-out's own inventory of what it issues, bounded by the number of target
         // workers. The landed path does not consult it: acting on an attempt that never
-        // settled needs the M11.D39b phase graph, which no production job runs, so this is
+        // settled needs the M11.D39b phase graph, which this body is not, so this is
         // created here and dropped with the region. It is the fan-out that keeps the record,
         // rather than either caller, so both routes are recording the same thing.
-        let attempts = Arc::new(AttemptLedger::default());
-        let admission = ctx.admit_irreversible_scheduling().await?;
+        //
+        // The protocol this job's directives are issued under, derived from the job's own
+        // lifecycle mechanism rather than written here (M11.D39e(i)). This body runs only for a
+        // job whose mechanism is `JobLifecycle::LegacyT08` — `run_state_body` sends every other
+        // one to the M11.D39b phase graph — so the answer is `Legacy`, and it is an answer
+        // rather than a literal so that activating the fence does not leave a hard-coded zero
+        // behind here.
+        let protocol = match ctx.fence_protocol() {
+            Ok(protocol) => protocol,
+            Err(e) => {
+                return Err(ctx.retryable(
+                    self,
+                    "the job's lifecycle fence cannot address its worker generations",
+                    anyhow!("{e}"),
+                    10,
+                ));
+            }
+        };
+        // No settlement owner, which is what a job running the landed mechanism has (M11.T26e):
+        // the rescue releases the admission once the requests settle, exactly as it always has.
+        // The generation and the fence are the job's own, so that this route's inventory says
+        // what the phase graph's says about which worker generation its identifiers addressed
+        // and under which fence. Built after the protocol above for that reason: the fence is
+        // read from the same answer the directives are stamped from, not from a second one.
+        let attempts = Arc::new(AttemptLedger::owned_by(
+            None,
+            ctx.status.generation,
+            protocol.fence(),
+        ));
+        let Some(targets) = StartTargets::without_a_handshake(protocol, worker_connects) else {
+            return Err(ctx.retryable(
+                self,
+                "a fenced job reached the pre-fence scheduling body",
+                anyhow!(
+                    "the landed M11.T08 scheduling body cannot advance a lifecycle fence, so a                      job running the fenced protocol belongs to the M11.D39b phase graph"
+                ),
+                10,
+            ));
+        };
+        let admission = ctx.admit_irreversible_scheduling().await;
         let (admission, started) = start_execution_on_workers(
             admission,
             ctx.config.id.clone(),
             ctx.pipeline_info.pipeline_id.clone(),
             plan,
             machine_ids,
-            worker_connects,
+            targets,
             attempts,
         )
         .await;
@@ -1724,6 +1863,7 @@ impl State for Scheduling {
                     worker_connects,
                     committing_state,
                     metrics,
+                    protocol,
                 );
                 if needs_commit {
                     info!(
@@ -1736,7 +1876,7 @@ impl State for Scheduling {
                     // be behind that message. These commits finish a two-phase commit against
                     // the job's sinks — they are visible outside the cluster and cannot be
                     // withdrawn — so the gate is read again here, and held until they are out.
-                    let admission = ctx.admit_irreversible_scheduling().await?;
+                    let admission = ctx.admit_irreversible_scheduling().await;
                     admission
                         .effect(
                             "publish the restored checkpoint's commits",

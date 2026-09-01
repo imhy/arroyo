@@ -6,6 +6,7 @@
 
 use anyhow::Result;
 use arroyo_rpc::config::config;
+use arroyo_rpc::fencing::Fencing;
 use arroyo_rpc::grpc::rpc;
 use arroyo_rpc::grpc::rpc::controller_grpc_server::{ControllerGrpc, ControllerGrpcServer};
 use arroyo_rpc::grpc::rpc::job_controller_grpc_server::{
@@ -20,6 +21,7 @@ use arroyo_rpc::grpc::rpc::{
     WorkerErrorRes, WorkerFinishedReq, WorkerFinishedResp, WorkerInitializationCompleteReq,
     WorkerInitializationCompleteResp,
 };
+use arroyo_rpc::metadata_root::MetadataRoot;
 use arroyo_rpc::public_ids::{IdTypes, generate_id};
 use arroyo_rpc::state_backend::{StateBackendError, StateBackendSelector};
 use arroyo_rpc::worker_types::{RunningMessage, TaskFailedEvent};
@@ -31,9 +33,11 @@ use arroyo_worker::job_controller::job_metrics::JobMetrics;
 use cornucopia_async::DatabaseSource;
 use lazy_static::lazy_static;
 use prometheus::{IntGaugeVec, register_int_gauge_vec};
+use states::lifecycle::LifecycleMode;
 use states::lifecycle::classification::{
     SelectorClassification, classify_selector, decode_execution_record,
 };
+use states::lifecycle::root::{RootCandidate, RootInstallRefusal};
 use states::{Created, State, StateMachine};
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -50,12 +54,24 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::codec::CompressionEncoding;
 use tonic::{Request, Response, Status};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 //pub mod compiler;
 pub mod job_controller;
 pub mod schedulers;
 mod states;
+
+// The durable execution authority (M11.D39d), for this crate only.
+//
+// M11.T26b re-exported these from the crate root because `JobStatus`'s conditional write was
+// `pub` and a caller holding a `JobStatus` had to be able to name what it may present with one
+// — a surface nothing outside this crate ever reached, and one M11.T26b disclosed as a residual
+// to narrow "when they are genuinely used". M11.T26h narrows it: the only item this crate
+// exposes outside itself is `ControllerServer`, so the authority methods are `pub(crate)` and
+// the authority types are named nowhere a downstream crate can see.
+pub(crate) use states::lifecycle::fence::{
+    AuthorityOutcome, AuthorityWriteError, LifecycleAuthority, StaleAuthority,
+};
 
 const TTL_PIPELINE_CLEANUP_TIME: Duration = Duration::from_secs(60 * 60);
 
@@ -264,6 +280,19 @@ fn classify_polled_job(row: queries::controller_queries::Job) -> Option<(PolledJ
     // rejected row can skip just this job.
     let state_context = decode_execution_record(&id, &row.state_context)?;
 
+    // The durable authority is read from the same row, in the same pass, and a row whose
+    // fence this build cannot interpret is skipped for the reason every other unusable
+    // durable value is: the controller cannot say who holds the job, and a job it cannot
+    // place is not a job it may administer. Reported on every poll, like the rest.
+    let authority = match LifecycleAuthority::observed(&row) {
+        Ok(authority) => authority,
+        Err(e) => {
+            error!(job_id = %id, error = %e,
+                "skipping job whose durable lifecycle authority cannot be interpreted");
+            return None;
+        }
+    };
+
     let status = JobStatus {
         id: id.clone(),
         generation: row.run_id.unwrap_or(0).max(0) as u64,
@@ -281,6 +310,7 @@ fn classify_polled_job(row: queries::controller_queries::Job) -> Option<(PolledJ
         wasm_path: row.wasm_path.clone(),
         restart_nonce: row.status_restart_nonce,
         state_context,
+        authority,
     };
 
     // Resolved against the job's own execution record, not just parsed: a controller that
@@ -314,6 +344,14 @@ pub struct JobStatus {
     wasm_path: Option<String>,
     restart_nonce: i32,
     state_context: StateContext,
+    /// The durable lifecycle authority this row carried when it was read (M11.D39d).
+    ///
+    /// Read on the poll path, and presented by every write this status performs — since
+    /// M11.T26h's activation change that is every status write there is. It is carried on the
+    /// status rather than passed alongside it so that the authority a conditional write
+    /// presents can only ever be the one this job's own row produced — see
+    /// [`Self::update_db_under_authority`] and [`Self::install_metadata_root`].
+    authority: LifecycleAuthority,
 }
 
 impl JobStatus {
@@ -388,10 +426,167 @@ impl JobStatus {
         }
     }
 
-    pub async fn update_db(&self, database: &DatabaseSource) -> Result<(), String> {
-        let c = database.client().await.map_err(|e| format!("{e:?}"))?;
-        let res = queries::controller_queries::execute_update_job_status(
-            &c,
+    /// The durable lifecycle authority this row carried when it was read (M11.D39d).
+    pub(crate) fn authority(&self) -> &LifecycleAuthority {
+        &self.authority
+    }
+
+    /// The fencing obligation this job's durable record carries, if it carries one
+    /// (M11.T26f, design M11.D39d).
+    ///
+    /// `None` means no interrupted scheduling attempt of this job owes a worker generation an
+    /// acknowledgement — which is a different statement from an empty record, and is why the
+    /// column's value is an `Option` rather than a possibly-empty [`Fencing`]. A controller that
+    /// finds `Some` here has recovered an obligation it must discharge before it may publish
+    /// `Refused` or admit a replacement generation; see
+    /// [`states::lifecycle::recovery`](crate::states::lifecycle::recovery).
+    pub(crate) fn recorded_fencing(&self) -> Option<&Fencing> {
+        self.state_context.fencing.as_ref()
+    }
+
+    /// The metadata root this job's row names as authoritative, if it names one (M11.D39d).
+    ///
+    /// The read half of [`Self::install_metadata_root`]. It is what a controller that did not
+    /// write the root reads back to learn which candidate object became authoritative — the
+    /// object store holds every candidate any controller ever published, and this field, and
+    /// only this field, says which of them the job is running under.
+    pub(crate) fn metadata_root(&self) -> Option<&MetadataRoot> {
+        self.state_context.metadata_root.as_ref()
+    }
+
+    /// Installs (or clears) this status's durable fencing obligation, for the next publication
+    /// to carry (M11.T26f).
+    ///
+    /// **Stages, and does not write.** The write is the caller's, through the one publication
+    /// funnel — `states::lifecycle::publish_status` — so that the fencing record reaches the row
+    /// under the job's id, fence and epoch like every other status write. A method here that
+    /// performed its own statement would be a seventh publishing site, which is exactly what
+    /// `the_production_status_write_is_conditional_since_the_activation_change` counts.
+    ///
+    /// It stages *before* the write and stays staged if the write fails, which is the opposite
+    /// of what [`Self::install_metadata_root`] does — deliberately, because the two fail in
+    /// opposite directions. A root this status claimed but never installed would be presented to
+    /// a later reader as authoritative; an obligation this status claims but has not yet written
+    /// keeps the job fencing, and the next pass republishes it. Fail-closed for each is a
+    /// different direction, so they are different code.
+    pub(crate) fn record_fencing_obligation(&mut self, fencing: Option<Fencing>) {
+        self.state_context.fencing = fencing;
+    }
+
+    /// Adopts this job's durable lifecycle authority, raising its fence and installing a
+    /// fresh controller epoch, and keeps what the adoption installed.
+    ///
+    /// The status's own authority is replaced only when the row accepted the adoption, which
+    /// is what makes [`Self::update_db_under_authority`] present the authority the row now
+    /// holds rather than the one this controller read. A stale adoption leaves the status
+    /// exactly as it was: a controller that lost the job must not go on to write it under the
+    /// authority it *would* have installed.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthorityWriteError`] if the adoption could not be attempted. Losing the job to
+    /// another controller is [`AuthorityOutcome::Stale`], not an error.
+    pub(crate) async fn adopt_lifecycle_authority(
+        &mut self,
+        database: &DatabaseSource,
+    ) -> Result<AuthorityOutcome<()>, AuthorityWriteError> {
+        match self.authority.adopt(database).await? {
+            AuthorityOutcome::Applied(adopted) => {
+                self.authority = adopted;
+                Ok(AuthorityOutcome::Applied(()))
+            }
+            AuthorityOutcome::Stale(stale) => Ok(AuthorityOutcome::Stale(stale)),
+        }
+    }
+
+    /// The M11.D39d status write: the columns M11.T08 wrote unconditionally, written only
+    /// while this job's row still carries the authority this status holds.
+    ///
+    /// It replaced an unconditional `update_db` in M11.T26h's activation change, and the two
+    /// were deliberately separate functions rather than one with a flag while both existed:
+    /// they differ in what a caller must do afterwards — an unconditional write that touched
+    /// no row is a job that has been deleted, and a conditional one that touched no row is a
+    /// job another controller now owns — and a single function returning one type would have
+    /// had to collapse that difference. Every status write in this crate now reaches this
+    /// through one place, `states::lifecycle::publication`.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthorityWriteError`] if the write could not be attempted. Zero updated rows is
+    /// [`AuthorityOutcome::Stale`], never `Ok(())` and never an error.
+    pub(crate) async fn update_db_under_authority(
+        &self,
+        database: &DatabaseSource,
+    ) -> Result<AuthorityOutcome<()>, AuthorityWriteError> {
+        self.write_under_authority(database, &self.state_context, "publish the job's status")
+            .await
+    }
+
+    /// Installs `candidate` as this job's authoritative metadata root (M11.D39d, M11.T26g).
+    ///
+    /// This is the second half of M11.D39d's two-step publication. The candidate object has
+    /// already been written, under a name that embeds the whole identity and that nothing else
+    /// can write; what this does is name it in the job's row, through the *same* conditional
+    /// statement every other status write goes through. The candidate becomes authoritative if
+    /// and only if that statement matches the row.
+    ///
+    /// Three things happen in this order, and the order is the guarantee:
+    ///
+    /// 1. the candidate is compared with the authority this status presents **now** and with
+    ///    the generation this status holds — a re-adoption since the candidate was minted
+    ///    replaces the first, and a later scheduling attempt replaces the second;
+    /// 2. the row is written, with the root in a `StateContext` built for the write; and
+    /// 3. only if the row accepted it does this status adopt that context.
+    ///
+    /// Step 3 is why the new context is a local rather than an assignment: a status that had
+    /// already adopted a root the row refused would go on to present it — to the next status
+    /// write, to a log, to whatever read it — as though it were installed.
+    ///
+    /// # Errors
+    ///
+    /// [`RootInstallRefusal`] when the candidate and this status describe different things,
+    /// which no row could reconcile, and [`AuthorityWriteError`] when the write could not be
+    /// attempted. Losing the duel is [`AuthorityOutcome::Stale`]: the candidate stays unrooted
+    /// and the row keeps whichever root the controller that holds it installed.
+    pub(crate) async fn install_metadata_root(
+        &mut self,
+        database: &DatabaseSource,
+        candidate: &RootCandidate,
+    ) -> Result<Result<AuthorityOutcome<()>, AuthorityWriteError>, RootInstallRefusal> {
+        candidate.agrees_with(&self.authority, self.generation)?;
+        let rooted = StateContext {
+            metadata_root: Some(candidate.root().clone()),
+            ..self.state_context.clone()
+        };
+        let written = self
+            .write_under_authority(database, &rooted, "install the job's metadata root")
+            .await;
+        if let Ok(AuthorityOutcome::Applied(())) = &written {
+            self.state_context = rooted;
+        }
+        Ok(written)
+    }
+
+    /// The one conditional `job_statuses` write, with the state context the caller is
+    /// publishing.
+    ///
+    /// Taking the context as an argument rather than reading `self.state_context` is what lets
+    /// [`Self::install_metadata_root`] validate first and commit second: the row is written
+    /// with a value this status has not yet adopted, and adopts it only if the row accepted it.
+    async fn write_under_authority(
+        &self,
+        database: &DatabaseSource,
+        state_context: &StateContext,
+        operation: &'static str,
+    ) -> Result<AuthorityOutcome<()>, AuthorityWriteError> {
+        let client = self.authority.client(database).await?;
+        let fence = i64::try_from(self.authority.fence().get()).map_err(|_| {
+            AuthorityWriteError::Exhausted {
+                job_id: (**self.authority.job_id()).clone(),
+            }
+        })?;
+        let rows = queries::controller_queries::execute_update_job_status_under_authority(
+            &client,
             &self.state,
             &self.start_time,
             &self.finish_time,
@@ -403,17 +598,19 @@ impl JobStatus {
             &self.wasm_path,
             &(self.generation as i64),
             &self.restart_nonce,
-            &serde_json::to_value(&self.state_context).expect("failed to serialize"),
-            &*self.id,
+            &serde_json::to_value(state_context).expect("failed to serialize"),
+            &**self.authority.job_id(),
+            &fence,
+            &self.authority.epoch(),
         )
         .await
-        .map_err(|e| format!("{e:?}"))?;
+        .map_err(|e| AuthorityWriteError::Database {
+            job_id: (**self.authority.job_id()).clone(),
+            operation,
+            report: format!("{e:?}"),
+        })?;
 
-        if res == 0 {
-            Err("Job status does not exist".to_string())
-        } else {
-            Ok(())
-        }
+        self.authority.outcome(rows, operation, || ())
     }
 }
 
@@ -460,14 +657,6 @@ impl RefusedConfig {
     /// Whether this refusal still describes the job's configuration.
     pub(crate) fn is_current(&self) -> bool {
         self.current.load(atomic::Ordering::SeqCst) == self.version
-    }
-
-    /// The version this refusal was raised at.
-    ///
-    /// Read by the state task's `RefusalGate`, which is consulted before every state and
-    /// so has to be able to tell a refusal it has already turned fatal from a new one.
-    pub(crate) fn version(&self) -> u64 {
-        self.version
     }
 
     /// The error this refusal reports, or `None` if it has been superseded since it was
@@ -571,7 +760,20 @@ impl ControllerGrpc for ControllerServer {
         )
         .await?;
 
-        Ok(Response::new(RegisterWorkerResp {}))
+        // The flag day, and it is *derived* rather than written (M11.D39e(i), M11.D75).
+        //
+        // `LifecycleMode::SELECTED` is `FencedV2` since M11.T26h, so this answers true: this
+        // registration is the flag day for the generation that receives it, and from here on
+        // that generation refuses a fence-less start. A controller on the other side of the
+        // window answers false — it sends no fence, and one that sends none must not require
+        // one — which is indistinguishable from a controller predating the field.
+        //
+        // Reading it from the mode is what makes activation one change: selecting `FencedV2`
+        // flips this, the directives the fan-out stamps and the fan-out's own retry taxonomy
+        // together, rather than leaving a literal here for someone to find.
+        Ok(Response::new(RegisterWorkerResp {
+            requires_lifecycle_fence: LifecycleMode::SELECTED.requires_lifecycle_fence(),
+        }))
     }
 
     async fn task_started(
@@ -1135,6 +1337,7 @@ mod tests {
     use super::*;
     use crate::queries::controller_queries::{Job, LastSuccessfulCheckpoint};
     use arroyo_rpc::LeaderContext;
+    use arroyo_rpc::fencing::{MAX_ATTEMPT_ID_CHARS, MAX_FENCE_TARGETS};
     use arroyo_rpc::grpc::rpc::StartExecutionReq;
     use arroyo_rpc::state_backend::validate_restored_checkpoint;
 
@@ -1172,6 +1375,11 @@ mod tests {
             env_vars: serde_json::json!({}),
             scheduler_config: serde_json::json!({}),
             state_backend: state_backend.to_string(),
+            // Exactly what the V34/V12 migration's defaults put in the columns for a job no
+            // controller has adopted, which is what every row of an upgraded deployment
+            // carries until one does.
+            lifecycle_fence: 0,
+            controller_epoch: String::new(),
         }
     }
 
@@ -1200,7 +1408,10 @@ mod tests {
                     generation: 1,
                 }),
                 execution_selector: recorded.map(str::to_string),
+                fencing: None,
+                metadata_root: None,
             },
+            authority: LifecycleAuthority::unadopted("job_abc"),
         }
     }
 
@@ -1504,6 +1715,154 @@ mod tests {
             polled.refusal,
             Some(StateBackendError::JobSelectorChanged { .. })
         ));
+    }
+
+    /// The deployability guarantee for the M11.D39d subrecord: every `state_context` shape
+    /// that exists in a deployment today decodes to exactly what it decoded to before the
+    /// field existed, and re-serializes without gaining it.
+    ///
+    /// The four shapes are the four a real row can have — the migration default, a record
+    /// with a leader, one with a recorded selector, and one with both — because "absent
+    /// decodes as absent" is a claim about the rows that are out there, not about one of
+    /// them.
+    #[test]
+    fn a_legacy_execution_record_decodes_and_re_serializes_without_a_fencing_record() {
+        for original in [
+            serde_json::json!({ "version": 1 }),
+            serde_json::json!({ "version": 1, "execution_selector": "stateengine" }),
+            serde_json::json!({
+                "version": 1,
+                "leader": {
+                    "worker_id": 1,
+                    "rpc_address": "http://worker:1234",
+                    "generation": 3,
+                },
+            }),
+            serde_json::json!({
+                "version": 1,
+                "leader": {
+                    "worker_id": 1,
+                    "rpc_address": "http://worker:1234",
+                    "generation": 3,
+                },
+                "execution_selector": "parquet",
+            }),
+        ] {
+            let decoded = decode_execution_record("job_abc", &original)
+                .unwrap_or_else(|| panic!("a legacy record must still decode: {original}"));
+            assert_eq!(
+                decoded.fencing, None,
+                "a record written before the field existed owes nothing: {original}"
+            );
+
+            let mut expected = original.clone();
+            // `leader` is the one field that was never `skip_serializing_if`, so a record
+            // that never had one re-serializes with an explicit null. That is what it did
+            // before this field existed too, and is the whole of the difference.
+            if expected.get("leader").is_none() {
+                expected["leader"] = serde_json::Value::Null;
+            }
+            assert_eq!(
+                serde_json::to_value(&decoded).expect("must serialize"),
+                expected,
+                "a legacy record must not gain a fencing field on the way back out"
+            );
+        }
+    }
+
+    /// The subrecord is durable state and therefore untrusted, and it fails closed through
+    /// the *same* path an unusable execution record does: the job is skipped, and only that
+    /// job. Each shape below breaks one of the rules `arroyo_rpc::fencing` enforces.
+    #[test]
+    fn an_unusable_fencing_record_skips_only_that_job() {
+        let target = |worker_id: u64| serde_json::json!({ "worker_id": worker_id, "generation": 2, "state": "pending" });
+        for broken in [
+            // A version this build has no rules for.
+            serde_json::json!({ "version": 1, "fencing": { "version": 2, "targets": [] } }),
+            // More targets than one job can owe.
+            serde_json::json!({
+                "version": 1,
+                "fencing": {
+                    "version": 1,
+                    "targets": (0..=MAX_FENCE_TARGETS as u64).map(target).collect::<Vec<_>>(),
+                },
+            }),
+            // Two answers about one worker generation.
+            serde_json::json!({
+                "version": 1,
+                "fencing": { "version": 1, "targets": [target(4), target(4)] },
+            }),
+            // An issued identifier longer than one the controller can mint.
+            serde_json::json!({
+                "version": 1,
+                "fencing": {
+                    "version": 1,
+                    "targets": [{
+                        "worker_id": 4,
+                        "generation": 2,
+                        "attempt_id": "a".repeat(MAX_ATTEMPT_ID_CHARS + 1),
+                        "state": "pending",
+                    }],
+                },
+            }),
+            // A target state this build does not have.
+            serde_json::json!({
+                "version": 1,
+                "fencing": {
+                    "version": 1,
+                    "targets": [{ "worker_id": 4, "generation": 2, "state": "revoked" }],
+                },
+            }),
+            // Not a record at all.
+            serde_json::json!({ "version": 1, "fencing": 7 }),
+        ] {
+            let mut row = job_row("");
+            row.state = Some("Running".to_string());
+            row.state_context = broken.clone();
+            assert!(
+                classify_polled_job(row).is_none(),
+                "a fencing record this build cannot read must skip the job rather than be                  dropped from it: {broken}"
+            );
+        }
+
+        // The control, through the same entry point: a record this build *can* read is
+        // carried, and carrying it does not disturb the execution selector beside it.
+        let mut row = job_row("");
+        row.state = Some("Running".to_string());
+        row.state_context = serde_json::json!({
+            "version": 1,
+            "execution_selector": "stateengine",
+            "fencing": {
+                "version": 1,
+                "targets": [{
+                    "worker_id": 4,
+                    "generation": 2,
+                    "attempt_id": "0".repeat(MAX_ATTEMPT_ID_CHARS),
+                    "state": "acknowledged",
+                }],
+                "candidate_root": "candidates/9/root.json",
+            },
+        });
+        let (polled, status) = classify_polled_job(row).expect("a usable record must classify");
+        assert_eq!(
+            polled.execution_selector,
+            StateBackendSelector::StateEngine,
+            "the selector is decided beside the fencing record, not by it"
+        );
+        let fencing = status
+            .state_context
+            .fencing
+            .as_ref()
+            .expect("the record must be carried");
+        assert_eq!(fencing.version(), 1);
+        assert_eq!(fencing.targets().len(), 1);
+        assert_eq!(fencing.targets()[0].worker_id, 4);
+        assert_eq!(fencing.targets()[0].generation, 2);
+        assert_eq!(
+            fencing.targets()[0].state,
+            arroyo_rpc::fencing::FenceTargetState::Acknowledged
+        );
+        assert_eq!(fencing.candidate_root(), Some("candidates/9/root.json"));
     }
 
     /// Round 3's durability property, now enforced where the row is read: a refused row

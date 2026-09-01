@@ -12,8 +12,8 @@
 use super::*;
 /// Runs one scheduling attempt through the M11.D39b phase graph.
 ///
-/// Reached only from a job whose lifecycle mechanism is M11.D39a's single writer, which no
-/// production job has through M11.T25.
+/// Reached only from a job whose lifecycle mechanism is M11.D39a's single writer, which every
+/// production job has had since M11.T26h.
 pub(crate) async fn schedule(ctx: &mut JobContext<'_>) -> Result<Transition, StateError> {
     let ctx = PhaseContext::new(ctx);
     if let Some(stop) = ctx.stop_if_desired() {
@@ -22,8 +22,10 @@ pub(crate) async fn schedule(ctx: &mut JobContext<'_>) -> Result<Transition, Sta
     match run(ctx).await {
         Ok(transition) => Ok(transition),
         // An interruption is not always a failure: the job's writer may have answered it by
-        // asking the job to stop, and a stop ends where a stop ends.
-        Err(interrupted) => interrupted.reconcile_and_report(),
+        // asking the job to stop, and a stop ends where a stop ends. It is also where the
+        // obligation this attempt leaves behind becomes durable (M11.T26f) — see
+        // `Interrupted::reconcile_and_report`, which is `async` for exactly that reason.
+        Err(interrupted) => interrupted.reconcile_and_report().await,
     }
 }
 
@@ -53,10 +55,13 @@ async fn preamble<'a, 'ctx>(
         Advanced::To(preamble) => preamble,
         Advanced::Left(transition) => return Ok(Advanced::Left(transition)),
     };
+    let preamble = preamble.adopt_lifecycle_authority().await?;
+    let preamble = preamble.discharge_recovered_fencing().await?;
     let preamble = preamble.persist_generation().await?;
     let preamble = preamble.tear_down_existing_cluster().await?;
     let preamble = preamble.start_replacement_workers().await?;
     let preamble = preamble.prepare_recovery_checkpoint().await?;
+    let preamble = preamble.publish_metadata_root().await?;
     Ok(Advanced::To(preamble.release()))
 }
 

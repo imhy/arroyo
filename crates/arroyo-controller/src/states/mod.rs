@@ -28,7 +28,7 @@ use self::leader_running::LeaderRunning;
 use self::leader_stopping::LeaderStopping;
 use self::lifecycle::{
     ConsumptionPoint, IntentWakeup, JobLifecycle, JobWait, LifecycleActor, LifecycleIntent,
-    ObservedIntent,
+    ObservedIntent, UnfencedAuthority,
 };
 use self::recovering::Recovering;
 use self::rescaling::Rescaling;
@@ -721,8 +721,9 @@ pub(crate) enum RunningConfigAction {
 /// # Why this exists rather than three steps written out at each site
 ///
 /// A configuration reaches a running job two ways: as a [`JobMessage::ConfigUpdate`] on the
-/// landed M11.T08 path — which is what production runs — and, for a job whose lifecycle the
-/// M11.D39a single writer decides, as an [`ObservedIntent::Adopted`] that writer published.
+/// landed M11.T08 path — which a job built in the pre-flag-day peer mode runs — and, for a job
+/// whose lifecycle the M11.D39a single writer decides, which every production job's is since
+/// M11.T26h, as an [`ObservedIntent::Adopted`] that writer published.
 /// The two must not come to mean different things, and "must not" is not a property of anyone
 /// remembering: it is a property of there being one function. PR #160 review comment
 /// `5365261487` is what the other arrangement produced — the adopted route reported only
@@ -837,22 +838,35 @@ pub struct JobContext<'a> {
     pub db: DatabaseSource,
     pub scheduler: Arc<dyn Scheduler>,
     pub rx: &'a mut Receiver<JobMessage>,
-    /// The refusal this task must apply before its next state runs, if any.
+    /// This job's lifecycle authority, which one region of irreversible scheduling work is
+    /// admitted under at a time.
     ///
-    /// Not `pub`, unlike the rest: no state reads it. [`execute_state`] consults it on every
-    /// state's behalf precisely because a state that had to remember to consult it would be
-    /// a state that could forget — which is the shape of the bug this exists for.
-    pub(crate) refusal_gate: RefusalGate,
-    /// This job's D39a single writer, or `None` under
-    /// [`LifecycleMode::LegacyT08`](lifecycle::LifecycleMode::LegacyT08) — which is what
-    /// production runs through M11.T25, so in production this is always `None` and
-    /// [`refusal_gate`](Self::refusal_gate) above is the mechanism.
+    /// Not `pub`, unlike the rest: no state takes it for itself.
+    /// [`Self::admit_irreversible_scheduling`] is the one acquisition, and the phases that
+    /// need the [`Admission`] are handed it.
+    pub(crate) admission: AdmissionLock,
+    /// This job's D39a single writer. `Some` for every production job since M11.T26h's
+    /// activation change, and `None` only for a context built in
+    /// [`LifecycleMode::LegacyT08`](lifecycle::LifecycleMode::LegacyT08) — the pre-flag-day
+    /// peer, which nothing in production is.
     ///
-    /// Not `pub`, for the same reason the gate is not: no state reaches for it. It is read
+    /// Not `pub`: no state reaches for it. It is read
     /// by [`Self::observe_lifecycle_intent`], which the state boundary and the
     /// interruptible waits call, so a state that had to remember to consult it cannot
     /// forget to.
     pub(crate) lifecycle_actor: Option<LifecycleActor>,
+    /// This job's cancellation-resistant settlement owner. `Some` for every production job
+    /// since M11.T26h's activation change, and `None` only for a context built in
+    /// [`LifecycleMode::LegacyT08`](lifecycle::LifecycleMode::LegacyT08), where an interrupted
+    /// fan-out has nobody to transfer to and settles in place.
+    ///
+    /// Built from the job's own [`JobLifecycle`](lifecycle::JobLifecycle) beside
+    /// [`lifecycle_actor`](Self::lifecycle_actor) and from the same arm of it, so the two cannot
+    /// disagree about which mechanism this job runs.
+    ///
+    /// Not `pub`, like the two above: no state reaches for it. The phase graph asks
+    /// [`Self::settlement_owner`], which is the one place the answer is read.
+    pub(crate) settlement: Option<Arc<lifecycle::JobSettlementOwner>>,
     pub retries_attempted: usize,
     pub job_controller: Option<JobController>,
     pub leader_manager: Option<LeaderManager>,
@@ -953,64 +967,141 @@ impl JobContext<'_> {
         handle_unhandled_message(&self.config.id, &self.pipeline_info.pipeline_id, msg)
     }
 
-    /// Admits this state to one region of irreversible scheduling work, or fails the job
-    /// because its configuration has been refused.
+    /// Admits this state to one region of irreversible scheduling work.
     ///
     /// [`Scheduling`] is not one long region. It alternates: a stretch of irreversible work
     /// with no `recv` in it, then an interruptible phase that waits on the job's channel,
     /// then the next irreversible stretch. This is called at every *crossing* — every point
-    /// where an interruptible phase gives way to irreversible work — and it does two things
-    /// there that only work together:
+    /// where an interruptible phase gives way to irreversible work.
     ///
-    /// * it re-reads the gate, which is the authoritative record of what the state machine
-    ///   has refused, rather than trusting that a refusal has reached the front of the job's
-    ///   queue. The interruptible phases end on a *queued* message — enough worker connects,
-    ///   enough task starts — and a refusal published while they were waiting can be sitting
-    ///   behind those messages, unread, when they break. Channel order is delivery; the gate
-    ///   is the decision.
-    /// * it takes the job's publication lock, so for as long as the caller holds the returned
-    ///   [`Admission`] no refusal can be published at all. Without that, the re-read would be
-    ///   just another snapshot, and there would again be a last check and a first effect after
-    ///   it.
+    /// Hold it across the irreversible work and drop it before the next `recv`. Holding it
+    /// across a `recv` would leave a job that waits minutes for its workers unable to observe
+    /// a stop for exactly as long. Each region must also drop before the next is entered —
+    /// the guard does not re-enter, so a shadowed live one would wedge the job on its own
+    /// lock, which is deliberately how a nesting mistake surfaces.
     ///
-    /// So hold it across the irreversible work and drop it before the next `recv`. Dropping it
-    /// early reopens the window; holding it across a `recv` would leave a job that waits
-    /// minutes for its workers unable to be refused for exactly as long. Each region must also
-    /// drop before the next is entered — the guard does not re-enter, so a shadowed live one
-    /// would wedge the job on its own lock.
-    ///
-    /// # Errors
-    ///
-    /// Returns the same fatal [`StateError`] the queued [`JobMessage::ConfigRefused`] would
-    /// produce, through the same [`handle_unhandled_message`] policy — including its
-    /// superseded-version check, so a row repaired since the refusal was published lets the
-    /// job schedule instead of failing it.
-    pub(crate) async fn admit_irreversible_scheduling(&mut self) -> Result<Admission, StateError> {
-        let (admission, refusal) = self.refusal_gate.admit_scheduling().await;
-        if let Some(refusal) = refusal {
-            self.handle(JobMessage::ConfigRefused(refusal))?;
-        }
-        Ok(admission)
+    /// **It reads no refusal, and before M11.T26h it did.** M11.T08's gate was consulted here
+    /// because the configuration-update thread could publish a refusal into a job the state
+    /// task was already scheduling. Under M11.D39a nothing but this task decides anything
+    /// about this job, so what stops an irreversible region is the intent its own actor
+    /// consumes at [`ConsumptionPoint::BeforeIrreversiblePhase`] — the same boundary, one
+    /// owner fewer, and no second reader that could disagree with it.
+    pub(crate) async fn admit_irreversible_scheduling(&mut self) -> Admission {
+        self.admission.admit().await
     }
 
     /// Whether this job's lifecycle transitions are decided by the M11.D39a single writer.
     ///
     /// The existence of an actor *is* that fact: `JobLifecycle::actor` returns `None` for the
-    /// landed M11.T08 mechanism, so there is nothing to consult and nothing that could
+    /// pre-flag-day peer's mechanism, so there is nothing to consult and nothing that could
     /// disagree with the selection. Asked here rather than by matching on a mode so that the
     /// mode itself stays named in exactly one production place —
-    /// `no_production_path_selects_the_fenced_v2_lifecycle` counts those, and a second one
+    /// `every_production_path_selects_the_fenced_v2_lifecycle` counts those, and a second one
     /// would be a second thing that could choose differently.
     pub(crate) fn runs_fenced_lifecycle(&self) -> bool {
         self.lifecycle_actor.is_some()
     }
 
+    /// The party an interrupted fan-out of this job hands its whole obligation to, if this job
+    /// has one (M11.T26e, design M11.D39b).
+    ///
+    /// `Some` for every production job since M11.T26h. `None` only for a context built in the
+    /// pre-flag-day peer mode, where there is nobody to transfer to and both seams settle in
+    /// place.
+    ///
+    /// The *same* owner on every call, because it is a value this job holds rather than one
+    /// built here. The fan-out reads it twice — once for the ledger the region rescue captures,
+    /// once for the phase's own return path — and two owners would mean the two paths were
+    /// speaking to different parties about one obligation.
+    ///
+    /// An owned handle rather than a borrow: the rescue that needs it runs after this context
+    /// has been dropped.
+    pub(crate) fn settlement_owner(
+        &self,
+    ) -> Option<Arc<dyn crate::states::scheduling::fanout::SettlementOwner>> {
+        self.settlement
+            .clone()
+            .map(|owner| owner as Arc<dyn crate::states::scheduling::fanout::SettlementOwner>)
+    }
+
+    /// The same owner, as the concrete type, for the fencing reconciliation that tells it what
+    /// it observed.
+    ///
+    /// One field, two readings. [`Self::settlement_owner`] is the transfer seam's view — the
+    /// M11.T25 trait, which is all a transfer needs — and this is the view of the party that has
+    /// to *say* something to the owner afterwards. Deriving both from one field is what keeps
+    /// "there is an owner" from being two answers.
+    pub(crate) fn settlement(&self) -> Option<&Arc<lifecycle::JobSettlementOwner>> {
+        self.settlement.as_ref()
+    }
+
+    /// The lifecycle-fence protocol this job's directives to its workers are issued under
+    /// (M11.T26c, design M11.D39e).
+    ///
+    /// Derived from the job's own mechanism and its durable authority, in one place, so that
+    /// what a `StartExecution` carries, what a `CommitReq` carries and what the fan-out's retry
+    /// table reads cannot be three answers. The mode comes from
+    /// [`Self::runs_fenced_lifecycle`] — the same fact that decides which scheduling body runs —
+    /// rather than from a second reading of `LifecycleMode::SELECTED`, because a job whose
+    /// transitions the D39a writer decides and whose starts carry no fence would be the
+    /// half-activated state M11.T26h exists to make unreachable.
+    ///
+    /// The fence itself is read from [`JobStatus::authority`], which M11.T26b made
+    /// unconstructible from loose values: a directive therefore carries a fence that this job's
+    /// own row produced, paired with the generation this attempt raised it to.
+    ///
+    /// # Errors
+    ///
+    /// [`UnfencedAuthority`] only under the fenced mechanism, and only when this controller
+    /// holds no adopted fence or the job addresses no launched generation. Under the selected
+    /// mechanism this cannot fail: see [`FenceProtocol::for_job`].
+    pub(crate) fn fence_protocol(&self) -> Result<lifecycle::FenceProtocol, UnfencedAuthority> {
+        lifecycle::FenceProtocol::for_job(
+            self.lifecycle_mode(),
+            self.status.authority(),
+            self.status.generation,
+        )
+    }
+
+    /// The lifecycle mechanism this job runs under.
+    ///
+    /// One derivation, from [`Self::runs_fenced_lifecycle`] — the same fact that decides which
+    /// scheduling body runs and which directives this job's workers receive. Everything that
+    /// needs the mode asks here rather than reading
+    /// [`LifecycleMode::SELECTED`](lifecycle::LifecycleMode::SELECTED) again, because a second
+    /// reading is a second thing that could answer differently for a job whose mechanism was
+    /// fixed when its state machine was built.
+    pub(crate) fn lifecycle_mode(&self) -> lifecycle::LifecycleMode {
+        lifecycle::LifecycleMode::of_job(self.runs_fenced_lifecycle())
+    }
+
+    /// Publishes this job's status to its row, through the one funnel (M11.D39d).
+    ///
+    /// Every state that publishes a status calls this and nothing else, which is what made
+    /// "the fence is activated in one change" true of the status write:
+    /// [`lifecycle::publish_status`] held the choice and
+    /// `the_production_status_write_is_conditional_since_the_activation_change` counts the
+    /// call sites. Since M11.T26h there is one write form, and it is conditional on this
+    /// job's durable lifecycle authority.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthorityWriteError`](lifecycle::fence::AuthorityWriteError) when the write could not
+    /// be performed at all. A conditional write that matched no row is not an error but
+    /// [`StatusPublication::Superseded`](lifecycle::StatusPublication::Superseded), which the
+    /// caller answers with [`lifecycle::stand_down`] rather than by retrying.
+    pub(crate) async fn publish_status(
+        &self,
+    ) -> Result<lifecycle::StatusPublication, lifecycle::fence::AuthorityWriteError> {
+        lifecycle::publish_status(self.status, &self.db).await
+    }
+
     /// Reads the job's lifecycle intent and publishes whatever it decides, if this job runs
     /// the D39a path.
     ///
-    /// A no-op under [`LifecycleMode::LegacyT08`](lifecycle::LifecycleMode::LegacyT08) —
-    /// production through M11.T25 — where there is no actor and the cross-task
-    /// [`RefusalGate`] is the mechanism.
+    /// A no-op only for a context built in
+    /// [`LifecycleMode::LegacyT08`](lifecycle::LifecycleMode::LegacyT08), the pre-flag-day
+    /// peer, which has no actor. Every production job has one.
     ///
     /// It is a plain `fn` and not `async`, which is not an accident: the interruptible
     /// waits call it on every turn, and the source-level pin
@@ -1030,9 +1121,9 @@ impl JobContext<'_> {
     /// a stop delivered as a [`JobMessage::ConfigUpdate`] cannot come to mean different
     /// things.
     ///
-    /// Under [`LifecycleMode::LegacyT08`](lifecycle::LifecycleMode::LegacyT08) — production
-    /// through M11.T25 — there is no actor, so the answer is always
-    /// [`ObservedIntent::Continue`] and every guard built on it is unreachable.
+    /// Under [`LifecycleMode::LegacyT08`](lifecycle::LifecycleMode::LegacyT08) — the
+    /// pre-flag-day peer, which no production job is — there is no actor, so the answer is
+    /// always [`ObservedIntent::Continue`] and every guard built on it is unreachable.
     ///
     /// # Errors
     ///
@@ -1164,9 +1255,10 @@ impl JobContext<'_> {
     /// Taken as an owned handle before the wait, because the other arms of the same `select!`
     /// borrow this context mutably.
     ///
-    /// Never completes for a job whose lifecycle the configuration poll decides, which is
-    /// every production job through M11.T25: there is no mailbox, the poll publishes to the
-    /// [`RefusalGate`] and the job's queue, and the wait already selects on that queue.
+    /// Never completes for a job whose lifecycle the configuration poll decides — a
+    /// [`LifecycleMode::LegacyT08`](lifecycle::LifecycleMode::LegacyT08) context, which no
+    /// production job is since M11.T26h: there is no mailbox, the poll publishes to the job's
+    /// queue, and the wait already selects on that queue.
     pub(crate) fn lifecycle_wakeup(&self) -> IntentWakeup {
         match &self.lifecycle_actor {
             Some(actor) => actor.wakeup(),
@@ -1465,29 +1557,17 @@ async fn execute_state<'a>(
         config = format!("{:?}", ctx.config)
     );
 
-    // A refusal the job is *already* under is applied here, before the state body, and not
-    // somewhere inside it. Queueing it ahead of the state is not enough: `Compiling` never
-    // reads the job's channel, and `Scheduling` increments and persists the generation,
-    // stops the job's workers, starts replacements and prepares checkpoint recovery before
-    // its first `recv`. Doing this once, for every state, is what makes "a refused
-    // configuration is adopted nowhere" a property of the loop rather than of each state
-    // remembering to receive before it acts.
+    // This boundary is D39a's first consumption point: `Compiling` never receives, and
+    // `Scheduling` does its generation write, worker teardown, worker start and checkpoint
+    // recovery before its first `recv`, so a state boundary is "before an irreversible
+    // phase". Doing it once, for every state, is what makes "a refused configuration is
+    // adopted nowhere" a property of the loop rather than of each state remembering to
+    // receive before it acts.
     //
-    // The refusal is applied through the same [`handle_unhandled_message`] policy the queued
-    // message goes through, including its superseded-version check, so a row repaired while
-    // the previous state was running still saves the job.
-    let known_refusal = ctx.refusal_gate.take();
-    let gated = match known_refusal {
-        Some(refusal) => ctx.handle(JobMessage::ConfigRefused(refusal)),
-        None => Ok(()),
-    };
-
-    // The same boundary is D39a's first consumption point, for exactly the reason above:
-    // `Compiling` never receives, and `Scheduling` does its generation write, worker
-    // teardown, worker start and checkpoint recovery before its first `recv`, so a state
-    // boundary is "before an irreversible phase". Under `LifecycleMode::LegacyT08` —
-    // production through M11.T25 — there is no actor, this is a no-op, and the gate above
-    // is the mechanism, unchanged.
+    // M11.T08 read a cross-task refusal gate here as well, because a second task could
+    // publish a refusal into a job this one was already scheduling. M11.T26h removed the
+    // gate: there is one decider now, its decision is the intent consumed below, and a
+    // second reader would be a second thing that could answer differently about one job.
     //
     // What is consumed here is consumed *from* the state that runs next: an intent is decided
     // once, so a stop read at this boundary is one the state's own consumption points will
@@ -1505,8 +1585,7 @@ async fn execute_state<'a>(
     // stop standing on the job's writer, so the state's own waits and the next state's boundary
     // are offered it again. That is what makes `Stays` a routing decision rather than a
     // discard — PR #160 review comment `5362488017`.
-    let observed = gated
-        .and_then(|()| ctx.observe_lifecycle_intent(ConsumptionPoint::BeforeIrreversiblePhase));
+    let observed = ctx.observe_lifecycle_intent(ConsumptionPoint::BeforeIrreversiblePhase);
 
     let leaving = match observed {
         Err(refused) => Err(refused),
@@ -1526,13 +1605,13 @@ async fn execute_state<'a>(
     };
 
     // One place a state body is entered from, and everything that stands before a job's next
-    // irreversible work stands before it: the gate, the writer, and the state's own answer to
+    // irreversible work stands before it: the writer and the state's own answer to
     // what the writer decided. Which body it is, is the job's lifecycle mechanism's to choose,
     // and choosing it here rather than inside each state is the same argument as the reads
     // above — a state that had to remember to ask would be a state that could forget.
-    // Production takes the legacy branch for every state of every job:
-    // `runs_fenced_lifecycle` is false unless the job was built with the D39a single writer,
-    // which no production construction site does.
+    // Since M11.T26h every production job takes the fenced branch: `runs_fenced_lifecycle`
+    // is true unless the job was deliberately built in the pre-flag-day peer mode, which no
+    // production construction site does.
     let outcome = match leaving {
         Err(refused) => Err(refused),
         Ok(LeavingForStop::Leaves(transition)) => Ok(transition),
@@ -1597,10 +1676,6 @@ async fn execute_state<'a>(
                     "retries": 0,
                 }
             );
-            // The job is failing; there is nothing left for the gate to protect, and a
-            // refusal a state has just turned fatal through its own channel must not be
-            // turned fatal a second time before `Failing` gets to run.
-            ctx.refusal_gate.disarm();
             ctx.status.failure_message = Some(message);
             ctx.status.failure_domain = Some(domain.as_str().to_string());
             ctx.status.finish_time = Some(OffsetDateTime::now_utc());
@@ -1676,10 +1751,19 @@ async fn execute_state<'a>(
     if let Some(s) = &next {
         ctx.status.state = s.name().to_string();
 
-        ctx.status
-            .update_db(&ctx.db)
-            .await
-            .expect("Failed to update status");
+        match ctx.publish_status().await {
+            Ok(lifecycle::StatusPublication::Published) => {}
+            // Another controller holds this job. There is nothing to publish and nothing to
+            // retry: this task ends, and the answer this function gives is the answer a stop
+            // gives, so the state machine's loop breaks without writing anything further.
+            Ok(lifecycle::StatusPublication::Superseded(stale)) => {
+                lifecycle::stand_down(stale);
+                return (None, ctx);
+            }
+            // The landed behaviour for a write that could not be performed, message for
+            // message.
+            Err(e) => panic!("Failed to update status: {e:?}"),
+        }
     }
 
     (next, ctx)
@@ -1711,12 +1795,17 @@ async fn run_to_completion(
     job_config_and_status: Arc<RwLock<(JobConfig, AppliedStatus)>>,
     execution_selector: StateBackendSelector,
     cluster_id: Arc<String>,
-    refusal_gate: RefusalGate,
+    admission: AdmissionLock,
     // The job's D39a single writer, or `None` under `LifecycleMode::LegacyT08`. Built by
     // `StateMachine::start` from the job's own `JobLifecycle`, so a task and its actor have
     // the same lifetime: the watermark of what has been decided belongs to the task that
     // decided it.
     lifecycle_actor: Option<LifecycleActor>,
+    // The job's settlement owner, or `None` under `LifecycleMode::LegacyT08`. Per *job* rather
+    // than per task, unlike the actor above: a state task that is restarted must not be given a
+    // fresh owner that has forgotten what the previous one was answerable for, so this comes
+    // from the same `JobLifecycle` the machine holds for the job's whole life.
+    settlement: Option<Arc<lifecycle::JobSettlementOwner>>,
     pipeline_info: Arc<PipelineInfo>,
     mut program: LogicalProgram,
     mut status: JobStatus,
@@ -1766,8 +1855,9 @@ async fn run_to_completion(
         db: db.clone(),
         scheduler,
         rx: &mut rx,
-        refusal_gate,
+        admission,
         lifecycle_actor,
+        settlement,
         retries_attempted: 0,
         job_controller: None,
         leader_manager,
@@ -1788,8 +1878,9 @@ async fn run_to_completion(
         // D39a: under `FencedV2` this task is the only writer of the job's configuration.
         // The shared cell is the *other* writer's — the configuration poll's — and under
         // that mode the poll deliberately never writes it, so refreshing from it here would
-        // undo whatever the actor has just published. Under `LegacyT08`, which is what
-        // production runs, the refresh is exactly as M11.T08 landed it.
+        // undo whatever the actor has just published. Under `LegacyT08` — the
+        // pre-flag-day peer, which no production job is — the refresh is exactly as M11.T08
+        // landed it.
         if ctx.lifecycle_actor.is_none() {
             let refreshed = job_config_and_status.read().unwrap().0.clone();
             if let Some(adopted) = adopt_refreshed_config(
@@ -1881,96 +1972,78 @@ enum RefusalDelivery {
     AnsweredByStop,
 }
 
-/// The refusal a job's state task must apply *before* it runs a state.
+/// One job's lifecycle authority: the exclusive right to run a region of its irreversible
+/// scheduling work.
 ///
-/// A refusal reaches the state task two ways, and only one of them is prompt. The queued
-/// [`JobMessage::ConfigRefused`] wakes a state that is already blocked on the job's channel
-/// — which is what fails a long-running [`Running`] job — but a state that acts before it
-/// receives never sees it. [`Compiling`] does not receive at all, and [`Scheduling`]
-/// increments and persists the job's generation, stops its workers, starts replacements and
-/// prepares checkpoint recovery before its first `ctx.rx.recv`. Queueing a refusal ahead of
-/// such a state is therefore not the same as applying it: "the refusal is applied before the
-/// job is rescheduled" is a claim about the operation, not about a queue position.
+/// # What this is, and what it deliberately is no longer
 ///
-/// So every refusal the state machine intends to *fail* the job with is published here as
-/// well, and [`execute_state`] applies it ahead of every state body it runs — including the
-/// very first state of a task that the refused row's own poll started.
+/// M11.T08 held this mutex inside a `RefusalGate` that also carried the job's published
+/// refusal and a per-task `acted` watermark, because two tasks decided a job's lifecycle:
+/// the configuration-update thread published refusals while the job's state task consumed
+/// them, and the mutex was what made "publish a refusal" and "enter an irreversible region"
+/// alternatives rather than a race. **M11.T26h removed all of that** — the refusal slot, the
+/// watermark, and the four gate operations (`admit_publication`, `admit_scheduling`,
+/// `publish`, `withdraw`) plus `take` and `disarm` — because under M11.D39a the job's state
+/// task is the only party that decides or publishes anything about the job, so there is
+/// nothing left to exclude. A refusal now reaches the state that must apply it as a
+/// [`LifecycleIntent`] its own actor consumes at
+/// [`ConsumptionPoint::BeforeIrreversiblePhase`], which is the same boundary the gate was
+/// read at and one owner fewer.
 ///
-/// Only refusals that are to be delivered as failures are published. One a stop is
-/// answering ([`RefusalDelivery::AnsweredByStop`]) is withdrawn instead, because failing the
-/// job would destroy exactly the final-checkpoint semantics that stop exists for.
+/// # Why the mutex outlived the gate
 ///
-/// Held per job and cloned into that job's state task. There is no registry, no static and
-/// no global, for the same reason [`StateMachine::execution_selector`] has none.
+/// [`Admission`] is M11.D39b's typestate token: an irreversible effect is a method that
+/// *consumes* it, so an effect can only be written where one is in scope. What a token alone
+/// cannot say is whether a job's authority is currently *held*, and that is a question the
+/// crate really asks — an interrupted fan-out hands its admission to the job's settlement
+/// owner, which keeps it until every issued attempt is accounted for, and "the authority has
+/// not been released" is the property M11.D39e(v) rests on. A mutex makes that a fact about a
+/// value rather than a flag somebody maintains. It also turns a nested region — a second
+/// `admit` while the first is live — into a hang at the point of the mistake instead of two
+/// concurrently admitted regions.
 ///
-/// # Publishing a refusal and doing irreversible scheduling work are one another's alternatives
-///
-/// Reading the gate once, at the state boundary, is a *snapshot*: [`Self::take`] clones what
-/// it finds and releases the lock, and [`Scheduling`] then runs a long, irreversible preamble
-/// — persist the incremented generation, tear the live cluster down, start replacements,
-/// prepare checkpoint recovery — with several awaits in it and no further reference to the
-/// gate. A refusal published anywhere in that interval would be seen only by the *next* state
-/// boundary, which is after all of it. Adding a second read somewhere inside the preamble
-/// only moves the interval; there is always a last check and a first effect after it.
-///
-/// So the two are made mutually exclusive instead of merely ordered. [`Self::admission`] is
-/// the job's serialization point: [`JobContext::admit_irreversible_scheduling`] holds it
-/// across each region of irreversible work, and [`StateMachine::refuse_config`] must take it
-/// — without waiting — to publish. Whichever gets it first decides the outcome for that whole
-/// region:
-///
-/// * the publisher first, and the gate is read *under the admission* the region then
-///   acquires, so the region is refused before its first effect; or
-/// * the region first, and publication finds the admission taken, changes nothing at all,
-///   and is offered again by the next poll — reaching the job strictly after the region it
-///   could no longer have stopped, where the *next* crossing reads it from the gate.
-///
-/// There is no third interleaving, which is what makes this a property of the operation
-/// rather than of how many places remembered to re-check.
-///
-/// # The gate is the decision; the channel is only delivery
-///
-/// [`Scheduling`] has more than one such region, separated by phases that wait on the job's
-/// message channel. Those phases end as soon as *enough* messages have arrived — enough
-/// worker connects for the slots, enough task starts for the tasks — and they end on the
-/// message that made the count, not on the last message in the queue. A refusal published
-/// while such a phase was waiting can therefore be sitting behind the messages it just
-/// consumed, still unread, when it breaks.
-///
-/// Draining or scanning the queue at that point would be the weaker answer, and not only
-/// because it is more work: a refusal that could not be *delivered* at all — the job's queue
-/// was full, so [`RefusalDelivery::Pending`] — is not in the queue to be found, and the same
-/// poll that could not deliver it did publish it here. `refuse_config` writes the gate before
-/// it offers the message and regardless of what becomes of it, so the gate is the record that
-/// exists in every case. Every crossing reads *that*, which is what makes the outcome
-/// independent of queue capacity and queue order alike.
+/// There is exactly one production acquisition, [`JobContext::admit_irreversible_scheduling`],
+/// and nothing in this crate reads a refusal from here.
 #[derive(Clone, Default)]
-pub(crate) struct RefusalGate {
-    /// The refusal the state machine is under now, shared with the job's state task so a
-    /// refusal raised after the task started is seen at its next state boundary.
-    current: Arc<RwLock<Option<RefusedConfig>>>,
-    /// Exclusive access to the job's destructive scheduling work, shared with the job's
-    /// state task. See the type's documentation: this is what makes publishing a refusal
-    /// and entering [`Scheduling`]'s preamble alternatives rather than a race.
+pub(crate) struct AdmissionLock {
+    /// The job's one admission, shared with whatever is holding it: the state task's current
+    /// region, or the settlement owner an interrupted region handed it to.
     ///
     /// A `tokio` mutex rather than a `std` one for two reasons that both matter here: the
     /// guard is held across the preamble's awaits and so must be `Send`, and it does not
     /// poison, so a state body that panics under it leaves the next attempt able to acquire
     /// it rather than wedging the job for the life of the controller.
     admission: Arc<tokio::sync::Mutex<()>>,
-    /// The highest refusal version this task has already turned fatal.
+}
+
+impl AdmissionLock {
+    /// Takes the job's admission for one region of irreversible scheduling work.
     ///
-    /// Per task rather than shared. It is what stops the gate from failing the job a second
-    /// time on its way through [`Failing`] to [`Failed`], while a task started later still
-    /// applies a refusal an earlier one already did.
-    acted: u64,
+    /// Waiting here is bounded and safe: the only other holder is a region held by this same
+    /// task, which must have dropped before the next is entered, or the job's settlement
+    /// owner holding an interrupted region's authority until it is discharged.
+    async fn admit(&self) -> Admission {
+        Admission {
+            _guard: Arc::clone(&self.admission).lock_owned().await,
+        }
+    }
+
+    /// Whether the job's authority is free — nothing is holding an [`Admission`] for it.
+    ///
+    /// Test-only, and that is the point: production never asks. Every production reader of
+    /// "is this region still running" reads the region itself, and the one thing that used to
+    /// ask this — a refusal publication from another task — no longer exists.
+    #[cfg(test)]
+    pub(crate) fn is_free(&self) -> bool {
+        self.admission.try_lock().is_ok()
+    }
 }
 
 /// Exclusive access to one region of a job's irreversible scheduling work.
 ///
-/// Held by [`Scheduling`] across each such region, and taken — without ever waiting — by
-/// [`StateMachine::refuse_config`] for the instant it publishes. See [`RefusalGate`] for why
-/// those two are the same lock.
+/// Held by [`Scheduling`] across each such region, and minted only by
+/// [`AdmissionLock::admit`]. See [`AdmissionLock`] for what this used to be shared with and
+/// why it no longer is.
 ///
 /// The guard is what makes the region rather than any individual statement the unit: every
 /// effect between the acquisition and the drop is inside it, including effects added later,
@@ -2002,277 +2075,6 @@ impl Admission {
             "performing an irreversible scheduling effect under admission"
         );
         effect.await
-    }
-}
-
-/// Runs a region that has issued work the controller cannot revoke, and does not release its
-/// [`Admission`] until that work has settled — including when this future is dropped.
-///
-/// # Why a region cannot simply be cancelled
-///
-/// Round 11 made the `StartExecution` fan-out's requests children of the state task rather than
-/// spawned tasks, so that every exit from the region took the requests with it. That is true of
-/// the *client* futures and only of them. Dropping a `tonic` client future resets its stream; it
-/// does not revoke work the server has already begun. The production worker's handler takes a
-/// `std::sync::Mutex` as its first statement and, on the `Idle` branch, sets the phase to
-/// `Initializing` and spawns initialization without reaching a single `.await`
-/// (`arroyo-worker/src/lib.rs`, `WorkerGrpc::start_execution`). A future blocked *inside* `poll`
-/// cannot be dropped, so a handler that was waiting for that lock when the controller gave up on
-/// it still runs to completion, and still starts the worker, after the reset.
-///
-/// So "the request was cancelled" is not an observation the controller can make, and the safety
-/// claim must not rest on it. What the controller *can* know is whether an RPC it issued has
-/// come back with an outcome. This type turns that into the invariant: **the admission is not
-/// released while any work the region issued is still unsettled**, so at the first instant a
-/// refusal can be published every worker's answer is already in hand and there is nothing left
-/// in flight for the refusal to race.
-///
-/// # What happens when the region is dropped
-///
-/// The job's state task is dropped as a whole when the controller's shutdown token fires — see
-/// `ShutdownGuard::into_spawn_task`, whose `select!` drops `run_to_completion` mid-flight — and
-/// then the admission would go at the same instant as the requests. The region is therefore
-/// owned by this future, and on drop it is moved into a task that finishes it. The task is
-/// detached, but the round-10 hole it might look like is precisely the one it cannot reopen:
-/// what round 10 detached was a *request*, which then outlived the admission that authorised it;
-/// what is detached here is the *admission itself*, wrapped around those requests. A refusal
-/// cannot be published while that task lives, because the task is holding the lock a publication
-/// needs — and [`RefusalGate::admit_publication`] never waits, so contention with it defers a
-/// refusal to the next poll rather than blocking anything (round 6's rule).
-///
-/// # Where the rescued authority goes
-///
-/// Holding the admission until the requests settle is only half of what a dropped region owes.
-/// The other half is *who ends up with it*: the phase that raised the region has gone with the
-/// task, so if this rescue simply dropped what it rescued, a controller that has a per-job
-/// settlement owner would be handed nothing on the one path where the phase cannot hand
-/// anything over itself. `rescue` is that seam. It is `None` for a caller with no owner —
-/// every caller through M11.T25, including the selected M11.T08 path, for which this behaves
-/// exactly as it did before the parameter existed — and otherwise it is given the settled
-/// [`Admission`] to pass to the job's owner together with the inventory of what was issued.
-/// See `scheduling::fanout::AttemptLedger::settlement_rescue`.
-///
-/// What a rescue must *not* do is release that admission on behalf of a phase that no longer
-/// exists. It is handed the authority precisely because there is nobody else left holding it,
-/// so an owner that declines leaves the obligation with nobody — see
-/// `scheduling::fanout::settlement::retain_without_a_phase`, which is why the rescue answers
-/// every arm of what the hand-over returns rather than dropping it.
-///
-/// # What bounds the region
-///
-/// Not the RPC deadline alone. The worker channels are built with `Endpoint::timeout` (90s in
-/// `handle_worker_connect`), but the fan-out treats an ambiguous transport outcome as a reason
-/// to *retry* the same attempt ID, so one deadline expiring only started another wait: this
-/// paragraph used to claim a 90s bound that the retry loop had already made false, and a worker
-/// that stayed unreachable held the region — and with it the deferral of any refusal for that
-/// job — indefinitely.
-///
-/// The bound is now the fan-out's own terminal path: at most
-/// `START_EXECUTION_RECONCILE_ATTEMPTS` further attempts, each bounded by that same deadline,
-/// after which the attempt is given up and the region ends. See `start_execution_on_workers`
-/// for why ending it is a statement about the peer's handler rather than about elapsed time.
-///
-/// # Two cases it does not cover, both deliberate
-///
-/// * **A panic inside the region.** Its future is poisoned and cannot be resumed, so unwinding
-///   drops the requests with the admission, exactly as before this type existed. A `Scheduling`
-///   that panics is failing the job anyway, and the fan-out's own path has no panicking
-///   operation left on it.
-/// * **No Tokio runtime at drop time.** Then the controller is already gone and nothing is left
-///   that could publish a refusal.
-pub(crate) async fn settle_under_admission<T, F>(
-    admission: Admission,
-    region: impl FnOnce(Admission) -> F,
-    rescue: Option<SettlementRescue>,
-) -> (Admission, T)
-where
-    F: std::future::Future<Output = (Admission, T)> + Send + 'static,
-    T: Send + 'static,
-{
-    SettlingUnderAdmission {
-        region: Some(Box::pin(region(admission))),
-        rescue,
-    }
-    .await
-}
-
-/// What a rescued region hands the job's lifecycle authority to, once its requests have
-/// settled and the phase that issued them is gone.
-///
-/// Owned and `'static` on purpose: the rescue runs in a detached task, so anything borrowed
-/// from the phase — which is what was dropped — could not be named here. That is the whole
-/// reason `PhaseContext::settlement_owner` answers with an `Arc` rather than a borrow.
-///
-/// Taking the [`Admission`] by value makes the rescue the last party that can decide anything
-/// about it: there is no path on which this returns and the authority is still somewhere a
-/// phase could reach. What the rescue owes in exchange is a decision for *every* way the
-/// hand-over can end, including the one where nobody takes the obligation.
-pub(crate) type SettlementRescue = Box<dyn FnOnce(Admission) + Send>;
-
-/// The owner [`settle_under_admission`] wraps a region in. Constructed only there.
-///
-/// The region hands the [`Admission`] back as part of its output rather than merely borrowing
-/// it, which is what makes "the admission is inside the thing that gets rescued" a fact of the
-/// type rather than a convention: a future that did not own an admission could not produce one.
-struct SettlingUnderAdmission<T: Send + 'static> {
-    /// `None` once the region has settled, which is what tells [`Drop`] there is nothing left
-    /// to rescue.
-    region: Option<
-        std::pin::Pin<Box<dyn std::future::Future<Output = (Admission, T)> + Send + 'static>>,
-    >,
-    /// Where a rescued admission goes. `None` releases it, which is what every caller through
-    /// M11.T25 asks for.
-    rescue: Option<SettlementRescue>,
-}
-
-impl<T: Send + 'static> std::future::Future for SettlingUnderAdmission<T> {
-    type Output = (Admission, T);
-
-    fn poll(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        let this = &mut *self;
-        let region = this
-            .region
-            .as_mut()
-            .expect("a region that has settled is not polled again");
-        match region.as_mut().poll(cx) {
-            std::task::Poll::Ready(settled) => {
-                this.region = None;
-                std::task::Poll::Ready(settled)
-            }
-            std::task::Poll::Pending => std::task::Poll::Pending,
-        }
-    }
-}
-
-impl<T: Send + 'static> Drop for SettlingUnderAdmission<T> {
-    fn drop(&mut self) {
-        let Some(region) = self.region.take() else {
-            // Settled: the admission has already been handed back to the caller, which drops it
-            // where it means to.
-            return;
-        };
-
-        if std::thread::panicking() {
-            // A poisoned future cannot be resumed. See the type's documentation.
-            return;
-        }
-
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            error!(
-                "a region of irreversible scheduling work was dropped with no Tokio runtime to \
-                 finish it in; its admission is released with it"
-            );
-            return;
-        };
-
-        warn!(
-            "a region of irreversible scheduling work was dropped while the requests it issued \
-             were still unsettled; holding the job's admission until they are, so that no \
-             refusal can be published behind them"
-        );
-        let rescue = self.rescue.take();
-        runtime.spawn(async move {
-            // The admission is inside `region`, so this is the first moment it exists as a
-            // value again — and the last moment anything can be done with it.
-            let (admission, _outcome) = region.await;
-            match rescue {
-                // The obligation reaches the job's settlement owner even here. This is the
-                // only path on which it can: the phase that issued the requests went with the
-                // state task, so nothing else is left that could hand its authority over.
-                Some(rescue) => rescue(admission),
-                None => drop(admission),
-            }
-        });
-    }
-}
-
-impl RefusalGate {
-    /// Takes the job's scheduling admission for a publication, if the job is not in the
-    /// middle of a region of irreversible scheduling work.
-    ///
-    /// Never waits, and must never be made to: the update thread calls
-    /// [`StateMachine::refuse_config`] while it holds the global job map, so blocking here
-    /// would block every other job's poll — the failure mode round 4 removed from this path
-    /// and the reason `refuse_config` is not `async`. `None` means such a region is in flight
-    /// and the caller must leave the refusal [`RefusalDelivery::Pending`], changing *nothing*
-    /// — not the refusal version, not the recorded delivery — so the next poll offers exactly
-    /// the same refusal again.
-    ///
-    /// How long `None` can persist is bounded by the region in flight, and the longest of them
-    /// is the preamble's wait for slots (`pipeline.worker-startup-time`). The deferral is the
-    /// price of the interlock and is paid by one job's refusal latency only: nothing here
-    /// blocks the caller, no other job is affected, and the refusal itself is untouched.
-    fn admit_publication(&self) -> Option<Admission> {
-        Arc::clone(&self.admission)
-            .try_lock_owned()
-            .ok()
-            .map(|guard| Admission { _guard: guard })
-    }
-
-    /// Admits the caller to one region of the job's irreversible scheduling work, and reports
-    /// the refusal that must stop it.
-    ///
-    /// Waiting here is bounded and safe: the only other holder is a publication, which is
-    /// synchronous and does not await, or a region held by this same task, which must have
-    /// dropped before the next is entered. The refusal is read *after* the admission is held,
-    /// so it is the last thing any publisher can have said before this region became closed to
-    /// them — and it is read from the gate rather than from the job's queue, so a refusal a
-    /// preceding receive phase left unread, or that no queue ever took, stops this region all
-    /// the same.
-    async fn admit_scheduling(&mut self) -> (Admission, Option<RefusedConfig>) {
-        let guard = Arc::clone(&self.admission).lock_owned().await;
-        let refusal = self.take();
-        (Admission { _guard: guard }, refusal)
-    }
-
-    /// Publishes a refusal for the job's state task to apply before its next state.
-    ///
-    /// Only callable with the job's scheduling admission in hand, which is the whole of the
-    /// interlock: a refusal cannot appear while a region of irreversible work is running, so
-    /// a region that started with the gate clear can never be overtaken by one.
-    fn publish(&self, _admission: &Admission, refusal: RefusedConfig) {
-        *self.current.write().unwrap() = Some(refusal);
-    }
-
-    /// Withdraws whatever was published, because it no longer describes the job or is being
-    /// answered by a stop rather than by a failure.
-    ///
-    /// Deliberately not admitted. Withdrawal only ever *removes* a reason to stop the job, so
-    /// it cannot make a preamble run for a configuration that is refused; and it has to work
-    /// while a preamble is in flight, because the row the operator has just repaired is
-    /// exactly the one that must stop gating the states after it.
-    fn withdraw(&self) {
-        *self.current.write().unwrap() = None;
-    }
-
-    /// The refusal this task must apply before it runs another state, if any.
-    ///
-    /// Each refusal is returned at most once. `is_current` is checked here as well as in
-    /// [`RefusedConfig::into_current_error`], so a row the operator repaired while the
-    /// previous state was running is never failed for a refusal that no longer exists.
-    fn take(&mut self) -> Option<RefusedConfig> {
-        let refusal = self.current.read().unwrap().clone()?;
-        if !refusal.is_current() || refusal.version() <= self.acted {
-            return None;
-        }
-        self.acted = refusal.version();
-        Some(refusal)
-    }
-
-    /// Records that the job is already failing, so a refusal one of its own states has just
-    /// turned fatal is not turned fatal again before [`Failing`] runs.
-    ///
-    /// The gate and the job's message channel are two routes to one policy, and the job may
-    /// only be failed once per refusal whichever route reached it first. A refusal raised
-    /// *after* this — at a higher version — still gates, which is what keeps a job that
-    /// restarts out of [`Failed`] from restarting into a configuration that is refused now.
-    fn disarm(&mut self) {
-        if let Some(refusal) = self.current.read().unwrap().as_ref() {
-            self.acted = self.acted.max(refusal.version());
-        }
     }
 }
 
@@ -2351,17 +2153,20 @@ pub struct StateMachine {
     /// The job's queue and this cell are two routes to one policy. The queue is the prompt
     /// one — it wakes a state already blocked on `recv` — and this one is the safe one: it
     /// is consulted before every state body, so a refusal that is known when a state is
-    /// about to run stops it, whether or not that state ever receives. See [`RefusalGate`].
-    refusal_gate: RefusalGate,
+    /// The job's lifecycle authority, shared with whatever state task is running it.
+    ///
+    /// Cloned into every task the machine starts, so a region admitted by one task and an
+    /// obligation an interrupted one handed to the job's settlement owner are held against
+    /// the same lock. See [`AdmissionLock`].
+    admission: AdmissionLock,
     /// Which mechanism decides this job's lifecycle transitions (M11.T25f).
     ///
     /// Fixed when the state machine is created, from
     /// [`LifecycleMode::SELECTED`](lifecycle::LifecycleMode::SELECTED), so a job cannot
     /// change hands halfway through its own lifecycle. Production is
-    /// [`JobLifecycle::LegacyT08`] for the whole of M11.T25 and every field above stays
-    /// exactly as M11.T08 landed it; the alternative is reachable only by constructing a
-    /// state machine with [`JobLifecycle::for_mode`] directly, which nothing outside a test
-    /// module does.
+    /// [`JobLifecycle::FencedV2`] since M11.T26h's activation change;
+    /// [`JobLifecycle::LegacyT08`] is reachable only by constructing a state machine with
+    /// [`JobLifecycle::for_mode`] directly, which nothing outside a test module does.
     lifecycle: JobLifecycle,
     pub(crate) state: Arc<RwLock<String>>,
     metrics: Arc<tokio::sync::RwLock<HashMap<Arc<String>, JobMetrics>>>,
@@ -2394,10 +2199,10 @@ impl StateMachine {
     ) -> Self {
         let job_id = Arc::clone(&status.id);
         // The one production site at which a job's lifecycle mechanism is chosen. It is
-        // `LifecycleMode::SELECTED`, which is derived exhaustively from the enum and is
-        // `LegacyT08` for the whole of M11.T25, so no production job runs the D39a path.
-        // `no_production_path_selects_the_fenced_v2_lifecycle` pins that this is the only
-        // such site and what it passes.
+        // `LifecycleMode::SELECTED`, which is derived exhaustively from the enum and has been
+        // `FencedV2` since M11.T26h's activation change, so every production job runs the D39a
+        // path. `every_production_path_selects_the_fenced_v2_lifecycle` pins that this is the
+        // only such site and what it passes.
         let lifecycle = JobLifecycle::for_mode(lifecycle::LifecycleMode::SELECTED, job_id);
 
         let PolledJob {
@@ -2413,7 +2218,7 @@ impl StateMachine {
             cluster_id,
             refusal: None,
             refusal_version: Arc::new(AtomicU64::new(0)),
-            refusal_gate: RefusalGate::default(),
+            admission: AdmissionLock::default(),
             lifecycle,
             state: Arc::new(RwLock::new(status.state.clone())),
             metrics,
@@ -2433,12 +2238,10 @@ impl StateMachine {
         // [`Compiling`], which advances to [`Scheduling`] without ever reading the job's
         // channel — and `Scheduling` increments and persists the generation, stops the live
         // workers, starts replacements and prepares checkpoint recovery before its first
-        // `recv`. So a refusal recorded after the start could not stop any of it. Recording
-        // it here publishes it to [`RefusalGate`], which the task consults before its first
-        // state body.
+        // `recv`. So a refusal recorded after the start could not stop any of it.
         //
-        // D39a says the same thing with one owner instead of two: under `FencedV2` the poll
-        // decides nothing at all, and its whole contribution is the classified intent left
+        // D39a says the same thing with one owner instead of two: under `FencedV2` — which
+        // every production job is since M11.T26h — the poll decides nothing at all, and its whole contribution is the classified intent left
         // here — before the state task exists — for that task's actor to read at its first
         // consumption point. The ordering requirement is identical, and
         // `both_paths_that_start_a_job_are_written_to_record_the_refusal_first` pins it for
@@ -2528,6 +2331,25 @@ impl StateMachine {
         })
     }
 
+    /// Publishes a job's status from the state machine itself, through the one funnel
+    /// (M11.D39d).
+    ///
+    /// The state machine writes a status exactly once — the state a job is *recovered into*,
+    /// before its task exists and therefore before there is a [`JobContext`] to ask. That is
+    /// still a lifecycle publication, so it goes through [`lifecycle::publish_status`] like
+    /// every other one, and under the same durable authority.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthorityWriteError`](lifecycle::fence::AuthorityWriteError) when the write could not
+    /// be performed at all.
+    async fn publish_status(
+        &self,
+        status: &JobStatus,
+    ) -> Result<lifecycle::StatusPublication, lifecycle::fence::AuthorityWriteError> {
+        lifecycle::publish_status(status, &self.db).await
+    }
+
     async fn start(&mut self, mut status: JobStatus, shutdown_guard: ShutdownGuard) {
         if !self.done() {
             // we're already running, don't do anything
@@ -2584,17 +2406,22 @@ impl StateMachine {
                 // The controller's own cluster identity, handed to the task for the same
                 // reason: a state is given what it stamps into its workers.
                 let cluster_id = self.cluster_id.clone();
-                // The task's half of the refusal gate. Cloned rather than re-derived, so a
-                // refusal already published when this task is created gates its very first
-                // state, and one raised later reaches it at the next state boundary.
-                let refusal_gate = self.refusal_gate.clone();
-                // The task's D39a single writer, or `None` under `LegacyT08` — which is
-                // production through M11.T25. One actor per task rather than per job: it
+                // The job's lifecycle authority. Cloned rather than re-derived, so a region
+                // this task admits and an obligation an interrupted one handed to the job's
+                // settlement owner are held against the same lock.
+                let admission = self.admission.clone();
+                // The task's D39a single writer, `None` only in the pre-flag-day peer mode.
+                // One actor per task rather than per job: it
                 // starts having decided nothing, so it reads whatever the poll left,
                 // including an intent submitted while this job had no state task at all.
                 let lifecycle_actor = self
                     .lifecycle
                     .actor(Arc::clone(&status.id), self.execution_selector);
+                // The job's settlement owner, from the same `JobLifecycle` and therefore from
+                // the same arm: a job has a single writer and a settlement owner together or
+                // neither. `Some` for every production job since M11.T26h's activation
+                // change, and `None` only under `LegacyT08`.
+                let settlement = self.lifecycle.settlement();
                 let db = self.db.clone();
                 let scheduler = self.scheduler.clone();
                 let metrics = self.metrics.clone();
@@ -2624,54 +2451,66 @@ impl StateMachine {
 
                 // The state itself is written either way, exactly as before: a recovered
                 // job's status must reflect the state it was recovered into whether or not
-                // its program could be loaded.
-                status.update_db(&self.db).await.unwrap();
+                // its program could be loaded. Through the same funnel every other status
+                // publication goes through, and under this task's own mechanism.
+                let published = self.publish_status(&status).await.unwrap();
 
-                started = match program {
-                    Ok(Some((program, pipeline_info))) => {
-                        let pipeline_info = Arc::new(pipeline_info);
-                        let pipeline_id = pipeline_info.pipeline_id.clone();
-                        shutdown_guard.into_spawn_task(async move {
-                            let id = { config.read().unwrap().0.id.clone() };
-                            info!(
-                                message = "starting state machine",
-                                job_id = %id,
-                                pipeline_id = *pipeline_id
-                            );
-                            run_to_completion(
-                                config,
-                                execution_selector,
-                                cluster_id,
-                                refusal_gate,
-                                lifecycle_actor,
-                                pipeline_info,
-                                program,
-                                status,
-                                initial_state,
-                                db,
-                                rx,
-                                scheduler,
-                                metrics,
-                            )
-                            .await;
-                            info!(
-                                message = "finished state machine",
-                                job_id = %id,
-                                pipeline_id = *pipeline_id
-                            );
-                            Ok(())
-                        });
-                        true
-                    }
-                    Ok(None) => {
-                        // this is a bad/old pipeline, skip it
+                started = match published {
+                    // Another controller holds this job. No state task is started for it and
+                    // the queue below is not installed, so nothing is left for a writer that
+                    // does not exist — and this process publishes nothing further about a job
+                    // it does not own.
+                    lifecycle::StatusPublication::Superseded(stale) => {
+                        lifecycle::stand_down(stale);
                         false
                     }
-                    Err(e) => {
-                        // something went wrong, we'll retry on the next go around
-                        warn!(job_id = %status.id, "Failed to start job: {:?}", e);
-                        false
-                    }
+                    lifecycle::StatusPublication::Published => match program {
+                        Ok(Some((program, pipeline_info))) => {
+                            let pipeline_info = Arc::new(pipeline_info);
+                            let pipeline_id = pipeline_info.pipeline_id.clone();
+                            shutdown_guard.into_spawn_task(async move {
+                                let id = { config.read().unwrap().0.id.clone() };
+                                info!(
+                                    message = "starting state machine",
+                                    job_id = %id,
+                                    pipeline_id = *pipeline_id
+                                );
+                                run_to_completion(
+                                    config,
+                                    execution_selector,
+                                    cluster_id,
+                                    admission,
+                                    lifecycle_actor,
+                                    settlement,
+                                    pipeline_info,
+                                    program,
+                                    status,
+                                    initial_state,
+                                    db,
+                                    rx,
+                                    scheduler,
+                                    metrics,
+                                )
+                                .await;
+                                info!(
+                                    message = "finished state machine",
+                                    job_id = %id,
+                                    pipeline_id = *pipeline_id
+                                );
+                                Ok(())
+                            });
+                            true
+                        }
+                        Ok(None) => {
+                            // this is a bad/old pipeline, skip it
+                            false
+                        }
+                        Err(e) => {
+                            // something went wrong, we'll retry on the next go around
+                            warn!(job_id = %status.id, "Failed to start job: {:?}", e);
+                            false
+                        }
+                    },
                 };
             }
 
@@ -2867,8 +2706,7 @@ impl StateMachine {
     /// and [`Scheduling`] increments and persists the generation, stops the job's workers,
     /// starts replacements and prepares checkpoint recovery before its first `recv` — so a
     /// task started before the refusal was recorded could reschedule a live execution for a
-    /// configuration that must be adopted nowhere. Recording it first publishes it to
-    /// [`RefusalGate`], which stops the restarted task at its very first state.
+    /// configuration that must be adopted nowhere, so recording comes first.
     async fn apply_refused_row(
         &mut self,
         error: StateBackendError,
@@ -2921,9 +2759,9 @@ impl StateMachine {
     /// so calling it twice around a start costs nothing.
     ///
     /// A row that also asks for a stop records the refusal as answered by that stop
-    /// ([`Self::note_refusal`]) and publishes *nothing* to [`RefusalGate`], because failing
-    /// the job would lose exactly the final-checkpoint semantics the stop asked for.
-    /// Everything else raises the refusal for delivery ([`Self::refuse_config`]).
+    /// ([`Self::note_refusal`]) and offers *nothing* to the job's queue, because failing the
+    /// job would lose exactly the final-checkpoint semantics the stop asked for. Everything
+    /// else raises the refusal for delivery ([`Self::refuse_config`]).
     fn note_refused_row(&mut self, error: StateBackendError, refused: &JobConfig) {
         if refused.stop_mode != StopMode::none {
             self.note_refusal(error);
@@ -3034,11 +2872,9 @@ impl StateMachine {
             version,
             delivery: RefusalDelivery::AnsweredByStop,
         });
-        // Nothing is published to the gate, and anything already there is withdrawn: this
-        // refusal is being answered by a stop, and a gate that failed the job first would
-        // destroy the final-checkpoint semantics the stop exists for. The version bump above
-        // already supersedes any queued message; this is its receiving-side counterpart.
-        self.refusal_gate.withdraw();
+        // Nothing is offered to the job's queue: this refusal is being answered by a stop,
+        // and failing the job first would destroy the final-checkpoint semantics the stop
+        // exists for. The version bump above supersedes any message already queued.
     }
 
     /// Supersedes whatever refusal the job was under, and returns the version that
@@ -3059,10 +2895,6 @@ impl StateMachine {
     fn clear_refusal(&mut self) {
         if self.refusal.take().is_some() {
             self.next_refusal_version();
-            // The gate is checked before every state, so a repaired row has to clear it as
-            // well as the queue. The version bump alone would already make the gate discard
-            // what it holds; withdrawing means it never holds a refusal the job is not under.
-            self.refusal_gate.withdraw();
         }
     }
 
@@ -3091,47 +2923,25 @@ impl StateMachine {
     /// and shutdown guard, and because this function must stay non-`async`: the update
     /// thread calls it while it holds the global job map.
     ///
-    /// Delivery is not the same as application, so the refusal is also published to the job's
-    /// [`RefusalGate`], which every state is checked against before it runs. A queued message
-    /// only reaches a state that receives, and [`Compiling`] never does while [`Scheduling`]
-    /// does its generation write, worker teardown, worker start and checkpoint restore first.
-    /// Publishing here, before the offer, is also what makes it safe for a caller to record a
-    /// refusal and only then restart the job.
-    ///
     /// Coalescing alone does not make the refusal safe to deliver late. Between the poll
     /// that queues it and the state that reads it, the operator can repair the row — the
     /// remedy the refusal itself asks for — and the queued message cannot be retracted. So
     /// every refusal is stamped with [`Self::refusal_version`], and a version the state
     /// machine has since moved past is discarded on receipt instead of failing the job.
     ///
-    /// # A refusal is never published into irreversible scheduling work that has already started
+    /// # What this no longer does, and why (M11.T26h)
     ///
-    /// Publishing takes the job's scheduling admission ([`RefusalGate::admit_publication`]),
-    /// which [`Scheduling`] holds across each region of irreversible work — its destructive
-    /// preamble, the `StartExecution` fan-out, and the publication of a restored checkpoint's
-    /// commits. Nothing waits for it — this function runs under the global job map — so a
-    /// refusal raised while one of those regions is in flight simply does not happen yet:
-    /// *nothing at all* is recorded, the refusal version is not advanced, and the next 500ms
-    /// poll offers the same refusal again, by which time the region has either finished or is
-    /// finishing. That is round 6's rule for an undeliverable refusal applied to an
-    /// unpublishable one, and it is why contention defers a refusal rather than losing one.
-    ///
-    /// Leaving the recorded state untouched is load-bearing rather than tidy. Advancing
-    /// [`Self::refusal_version`] on a poll that publishes nothing would supersede a refusal
-    /// already on the gate or in the queue, and a state reading it would discard it as stale
-    /// — a refusal silently dropped by the very contention that was supposed to defer it.
+    /// M11.T08 also published every refusal to a cross-task `RefusalGate` under the job's
+    /// scheduling admission, so that a refusal could not appear while an irreversible region
+    /// was in flight and so that a state which never receives was still stopped by it. That
+    /// interlock existed because two tasks decided one job. It was removed with the gate in
+    /// M11.T26h's activation change: this whole path is the pre-flag-day peer's mechanism —
+    /// [`LifecycleMode::LegacyT08`](lifecycle::LifecycleMode::LegacyT08) — and no production
+    /// job reaches it. What a production job gets instead is a
+    /// [`LifecycleIntent`](lifecycle::LifecycleIntent) its own state task consumes at the same
+    /// boundary the gate was read at.
     pub(crate) fn refuse_config(&mut self, error: StateBackendError) {
         let job_id = self.config.read().unwrap().0.id.clone();
-
-        // Taken before anything is decided, so a poll that cannot publish leaves no trace.
-        let Some(admission) = self.refusal_gate.admit_publication() else {
-            debug!(
-                job_id = %job_id,
-                "the job is in the middle of its scheduling work; keeping the refusal pending \
-                 so the next poll offers it again"
-            );
-            return;
-        };
 
         let version = match &self.refusal {
             // Already with the state machine, and unchanged. Nothing to say and nothing
@@ -3157,19 +2967,6 @@ impl StateMachine {
         };
 
         let refused = RefusedConfig::new(error.clone(), version, Arc::clone(&self.refusal_version));
-
-        // Published before the message is offered, and regardless of what becomes of it.
-        // Whether the job's queue took the refusal decides how *promptly* a state blocked on
-        // `recv` learns of it; it does not decide whether the next state may run. A refusal
-        // the queue was full for, or that has no queue at all, must still stop the next state
-        // — and this is also what lets a caller record the refusal and only then restart the
-        // job, so the task it starts is gated at its first state instead of after it has
-        // rescheduled a live execution.
-        //
-        // Under the admission taken at the head of this function, so a preamble that has not
-        // started yet reads this refusal before its first effect and one that is already
-        // running could not have reached here at all.
-        self.refusal_gate.publish(&admission, refused.clone());
 
         let delivery = match self.offer(JobMessage::ConfigRefused(refused)) {
             Delivery::Delivered => RefusalDelivery::Sent,
@@ -3252,30 +3049,33 @@ mod tests {
     };
     use super::stopping::StopBehavior;
     use super::{
-        Admission, AppliedStatus, CheckpointStopping, Compiling, Created, Failed, Failing,
+        AdmissionLock, AppliedStatus, CheckpointStopping, Compiling, Created, Failed, Failing,
         FatalProvenance, Finished, Finishing, JobContext, LeaderCheckpointStopping,
         LeaderFinishing, LeaderRescaling, LeaderRestarting, LeaderRunning, LeaderStopping,
-        LeavingForStop, Recovering, RefusalGate, Rescaling, Restarting, Running,
-        RunningConfigUpdate, State, StateMachine, Stopped, Stopping, Transition,
-        adopt_refreshed_config, check_config_update, classify_running_config_update,
-        controller_job_failure, errors, execute_state, fatal, fatal_refused_config,
-        handle_unhandled_message, lifecycle,
+        LeavingForStop, Recovering, Rescaling, Restarting, Running, RunningConfigUpdate, State,
+        StateMachine, Stopped, Stopping, Transition, adopt_refreshed_config, check_config_update,
+        classify_running_config_update, controller_job_failure, errors, execute_state, fatal,
+        fatal_refused_config, handle_unhandled_message, lifecycle,
     };
     use crate::job_controller::JobController;
     use crate::job_controller::checkpoint_store::DbCheckpointMetadataStore;
     use crate::job_controller::leader_manager::LeaderManager;
     use crate::schedulers::{Scheduler, SchedulerError, StartPipelineReq};
+    use crate::states::scheduling::Scheduling;
     use crate::states::scheduling::admission::PhaseContext;
     use crate::states::scheduling::fanout::IssuedAttempts;
-    use crate::states::scheduling::{START_EXECUTION_RECONCILE_ATTEMPTS, Scheduling};
     use crate::types::public::{RestartMode, StopMode};
     use crate::{
         JobConfig, JobMessage, JobStatus, PipelineInfo, PolledJob, RefusedConfig, StateContext,
         states::StateError,
     };
     use arroyo_datastream::logical::{LogicalNode, LogicalProgram, OperatorName};
+    use arroyo_rpc::fence_wire::{
+        CommitDirective, StartDirective, commit_directive, start_directive,
+    };
     use arroyo_rpc::grpc::api::ArrowProgram;
     use arroyo_rpc::grpc::rpc;
+    use arroyo_rpc::grpc::rpc::LifecycleOperation;
     use arroyo_rpc::grpc::rpc::job_status_grpc_server::{JobStatusGrpc, JobStatusGrpcServer};
     use arroyo_rpc::grpc::rpc::worker_grpc_server::{WorkerGrpc, WorkerGrpcServer};
     use arroyo_rpc::grpc::rpc::{
@@ -3286,9 +3086,9 @@ mod tests {
         JobControllerInitResp, JobFailure, JobFinishedReq, JobFinishedResp, JobState,
         JobStatus as LeaderJobStatus, JobStatusReq, JobStatusResp, JobStopMode,
         LoadCompactedDataReq, LoadCompactedDataRes, MetricsReq, MetricsResp,
-        OperatorCheckpointMetadata, OperatorMetadata, RegisterNodeReq, StartExecutionReq,
-        StartExecutionResp, StopExecutionReq, StopExecutionResp, StopJobReq, StopJobResp,
-        TableCheckpointMetadata, TableConfig, TableEnum, WorkerFinishedReq,
+        OperatorCheckpointMetadata, OperatorMetadata, RegisterNodeReq, StartExecutionOutcome,
+        StartExecutionReq, StartExecutionResp, StopExecutionReq, StopExecutionResp, StopJobReq,
+        StopJobResp, TableCheckpointMetadata, TableConfig, TableEnum, WorkerFinishedReq,
     };
     use arroyo_rpc::identity::worker_client;
     use arroyo_rpc::state_backend::validated::Validated;
@@ -3301,7 +3101,6 @@ mod tests {
     use arroyo_state::{BackingStore, StateBackend, StorageProviderFor};
     use arroyo_types::{JobId, MachineId, PipelineId, WorkerId};
     use cornucopia_async::DatabaseSource;
-    use futures::FutureExt as _;
     use prost::Message as _;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -3331,16 +3130,6 @@ mod tests {
         }
     }
 
-    /// The job's scheduling admission, for a test that publishes to the gate directly.
-    ///
-    /// A publication only ever happens under this, so a test that stands in for one takes it
-    /// too. It is never contended in the tests that use this helper, which is why they can
-    /// insist on getting it.
-    fn admitted(gate: &RefusalGate) -> Admission {
-        gate.admit_publication()
-            .expect("nothing is scheduling in this test, so the admission must be free")
-    }
-
     fn selector_error(err: &StateError) -> &StateBackendError {
         let StateError::FatalError { source, .. } = err else {
             panic!("expected a fatal error, got {err:?}");
@@ -3357,10 +3146,22 @@ mod tests {
     /// [`Scheduling`] clears whatever is there before it schedules (`None`). Only the second
     /// is destructive to a running execution, so a test that must prove nothing was
     /// rescheduled has to be able to see the difference.
-    #[derive(Default)]
     struct RecordingScheduler {
         stopped: Mutex<Vec<(String, Option<u64>)>>,
         started: Mutex<Vec<(String, u64)>>,
+        /// The worker generations this scheduler reports as still live (M11.T26f).
+        ///
+        /// Empty by default, which is what every landed row wants — none of them recovers an
+        /// obligation, so nothing asks. A row about a *partition* fills it, because "the
+        /// scheduler still lists this worker" is exactly the difference between a target that
+        /// is unreachable and one that is gone.
+        live: Mutex<Vec<(u64, WorkerId)>>,
+        /// Whether this scheduler can report a worker generation as terminated at all.
+        ///
+        /// `true` by default so the landed rows keep the semantics they had; the rows that
+        /// prove the fail-closed answer set it to `false`, which is what `ManualScheduler` and
+        /// `KubernetesScheduler` answer in production.
+        tracks_generations: bool,
         /// Panics instead of starting the cluster, after recording the request.
         ///
         /// This is how the tests that need a panic *inside* the admitted region get one they
@@ -3375,6 +3176,28 @@ mod tests {
         barriers: Option<Arc<SchedulingBarriers>>,
     }
 
+    /// Written out rather than derived, because the honest default is the fail-closed one and it
+    /// has to be stated.
+    ///
+    /// This scheduler records the *request* to start a cluster and keeps no registry of the
+    /// workers that result, so it cannot say whether a particular worker generation has
+    /// terminated — the same answer `ManualScheduler` gives in production, and for the same
+    /// reason. A derive would have made it answer `false` here anyway; writing it out is what
+    /// keeps the reason attached. A row that needs a scheduler which *can* answer says so, with
+    /// [`RecordingScheduler::watching_with_live`].
+    impl Default for RecordingScheduler {
+        fn default() -> Self {
+            Self {
+                stopped: Mutex::new(Vec::new()),
+                started: Mutex::new(Vec::new()),
+                live: Mutex::new(Vec::new()),
+                tracks_generations: false,
+                panic_on_start: false,
+                barriers: None,
+            }
+        }
+    }
+
     impl RecordingScheduler {
         fn panicking() -> Self {
             Self {
@@ -3386,6 +3209,23 @@ mod tests {
         fn watching(barriers: Arc<SchedulingBarriers>) -> Self {
             Self {
                 barriers: Some(barriers),
+                ..Default::default()
+            }
+        }
+
+        /// The same, for a run whose recovered obligation must find its target still running.
+        ///
+        /// M11.T26f: a target the scheduler no longer lists has been observed terminated, which
+        /// settles it. A row about a *partition* needs the opposite answer — the generation is
+        /// alive and unreachable — and this is where the fixture says so.
+        fn watching_with_live(
+            barriers: Arc<SchedulingBarriers>,
+            live: Vec<(u64, WorkerId)>,
+        ) -> Self {
+            Self {
+                barriers: Some(barriers),
+                live: Mutex::new(live),
+                tracks_generations: true,
                 ..Default::default()
             }
         }
@@ -3424,8 +3264,32 @@ mod tests {
                 .push((job_id.to_string(), generation));
             Ok(())
         }
-        async fn workers_for_job(&self, _: &str, _: Option<u64>) -> anyhow::Result<Vec<WorkerId>> {
-            Ok(vec![])
+        async fn workers_for_job(
+            &self,
+            _: &str,
+            generation: Option<u64>,
+        ) -> anyhow::Result<Vec<WorkerId>> {
+            Ok(self
+                .live
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(g, _)| generation.is_none_or(|generation| generation == *g))
+                .map(|(_, worker)| *worker)
+                .collect())
+        }
+
+        fn generation_termination_reporting(
+            &self,
+        ) -> crate::schedulers::GenerationTerminationReporting {
+            match self.tracks_generations {
+                true => crate::schedulers::GenerationTerminationReporting::Authoritative,
+                false => crate::schedulers::GenerationTerminationReporting::Untracked {
+                    scheduler: "recording",
+                    why: "this fixture was asked to answer the way a scheduler that keeps no \
+                          worker registry answers",
+                },
+            }
         }
     }
 
@@ -3466,7 +3330,13 @@ mod tests {
                     wasm_path TEXT,
                     run_id INTEGER DEFAULT 0 NOT NULL,
                     restart_nonce INTEGER DEFAULT 0 NOT NULL,
-                    state_context TEXT DEFAULT '{\"version\": 1}' NOT NULL
+                    state_context TEXT DEFAULT '{\"version\": 1}' NOT NULL,
+                    -- The M11.D39d authority columns, with the defaults V34/V12 give them.
+                    -- Stated here because the conditional write names them: a fixture without
+                    -- them would make every fenced row fail on the schema rather than on the
+                    -- property it is about.
+                    lifecycle_fence INTEGER DEFAULT 0 NOT NULL,
+                    controller_epoch TEXT DEFAULT '' NOT NULL
                 );
                 CREATE TABLE pipelines (
                     id INTEGER PRIMARY KEY,
@@ -3496,9 +3366,28 @@ mod tests {
                     state TEXT NOT NULL,
                     run_id INTEGER NOT NULL
                 );
+                CREATE TABLE authority_writes (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    lifecycle_fence INTEGER NOT NULL,
+                    run_id INTEGER NOT NULL
+                );
+                -- Two triggers, because a job's row is written by two different operations
+                -- and a test that could not tell them apart would read one as the other.
+                -- A *status publication* leaves the authority columns alone; the M11.D39d
+                -- adoption CAS writes nothing but them. So `state_writes` still means exactly
+                -- what it meant before the fence existed, and `authority_writes` is where the
+                -- adoption shows up — with the generation the row held when it happened,
+                -- which is what makes 'adoption came first' assertable.
                 CREATE TRIGGER record_state_writes AFTER UPDATE ON job_statuses
+                WHEN NEW.lifecycle_fence = OLD.lifecycle_fence
                 BEGIN
                     INSERT INTO state_writes (state, run_id) VALUES (NEW.state, NEW.run_id);
+                END;
+                CREATE TRIGGER record_authority_writes AFTER UPDATE ON job_statuses
+                WHEN NEW.lifecycle_fence <> OLD.lifecycle_fence
+                BEGIN
+                    INSERT INTO authority_writes (lifecycle_fence, run_id)
+                        VALUES (NEW.lifecycle_fence, NEW.run_id);
                 END;",
             )
             .unwrap();
@@ -3571,6 +3460,29 @@ mod tests {
     /// sequence answers both halves of "did the job schedule anything": whether it ever
     /// entered `Scheduling` at all, and whether the generation it would have rescheduled
     /// under was ever persisted.
+    /// Every adoption of the job's durable lifecycle authority, in order, with the scheduling
+    /// generation the row held at the moment it happened (M11.D39d).
+    ///
+    /// The generation is the load-bearing half: cold adoption must precede every effect, and
+    /// the first effect after it raises the generation — so an adoption recorded at the *old*
+    /// generation is one that ran before the preamble's first other effect, and one recorded at
+    /// the new one is not.
+    fn authority_writes(db: &DatabaseSource) -> Vec<(u64, u64)> {
+        let DatabaseSource::Sqlite(connection) = db else {
+            unreachable!("the fixture is always sqlite")
+        };
+        let connection = connection.lock().unwrap();
+        let mut statement = connection
+            .prepare("SELECT lifecycle_fence, run_id FROM authority_writes ORDER BY seq")
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64))
+            })
+            .unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    }
+
     fn state_writes(db: &DatabaseSource) -> Vec<(String, u64)> {
         let DatabaseSource::Sqlite(connection) = db else {
             unreachable!("the fixture is always sqlite")
@@ -3645,7 +3557,10 @@ mod tests {
                 version: 1,
                 leader: None,
                 execution_selector: None,
+                fencing: None,
+                metadata_root: None,
             },
+            authority: crate::LifecycleAuthority::unadopted("job_abc"),
         }
     }
 
@@ -3679,14 +3594,17 @@ mod tests {
         db: DatabaseSource,
         /// Where the job's checkpoints live, for the tests that restore from one.
         state_url: Option<String>,
-        /// Owned here rather than made inside [`Self::ctx`], so a test can publish to the
-        /// same gate the state runs under and can ask, afterwards, whether the job's
-        /// scheduling admission was left free.
-        refusal_gate: RefusalGate,
+        /// Owned here rather than made inside [`Self::ctx`], so a row can ask, afterwards,
+        /// whether the job's lifecycle authority was left free.
+        admission: AdmissionLock,
         /// The D39a actor the context runs with, for the tests of the `FencedV2` path.
         /// `None` — the production selection — for every other test in this module, whose
         /// contexts therefore behave exactly as they did before M11.T25a.
         lifecycle_actor: Option<LifecycleActor>,
+        /// The settlement owner the context runs with, for the M11.T26e rows. `None` — the
+        /// production selection — everywhere else, which is what makes those contexts offer an
+        /// interrupted fan-out's obligation to nobody, exactly as they did before M11.T26e.
+        settlement: Option<Arc<lifecycle::JobSettlementOwner>>,
         /// A live controller for the rows that run a state's *body* rather than its answer to
         /// the boundary. `None` everywhere else, which is what makes a body that dereferences
         /// it panic rather than run — the second half of every `leave_for_stop` row.
@@ -3706,8 +3624,9 @@ mod tests {
                 scheduler: Arc::new(RecordingScheduler::default()),
                 db: unused_db(),
                 state_url: None,
-                refusal_gate: RefusalGate::default(),
+                admission: AdmissionLock::default(),
                 lifecycle_actor: None,
+                settlement: None,
                 job_controller: None,
                 leader_manager: None,
             }
@@ -3766,9 +3685,30 @@ mod tests {
         /// row that uses this would see the phase graph run instead of the landed body.
         fn install_production_lifecycle(&mut self) {
             let job_id = Arc::new("job_abc".to_string());
-            self.lifecycle_actor =
-                JobLifecycle::for_mode(lifecycle::LifecycleMode::SELECTED, Arc::clone(&job_id))
-                    .actor(job_id, StateBackendSelector::Parquet);
+            let lifecycle =
+                JobLifecycle::for_mode(lifecycle::LifecycleMode::SELECTED, Arc::clone(&job_id));
+            // Derived from the same value, and both halves of it, so that a production
+            // selection which supplied a settlement owner would arrive here as one.
+            self.settlement = lifecycle.settlement();
+            self.lifecycle_actor = lifecycle.actor(job_id, StateBackendSelector::Parquet);
+        }
+
+        /// A harness whose context carries **both** halves of the fenced mechanism for
+        /// `job_abc`: the D39a single writer and the M11.T26e settlement owner.
+        ///
+        /// Derived from one `JobLifecycle::for_mode(FencedV2, ..)` rather than assembled from
+        /// two, so a row that uses this runs the mechanism the activation change will select
+        /// rather than a hand-built approximation of it — and the owner it gets is the one the
+        /// job's own lifecycle would have given it.
+        fn install_fenced_lifecycle(&mut self) -> Arc<lifecycle::JobSettlementOwner> {
+            let job_id = Arc::new("job_abc".to_string());
+            let lifecycle =
+                JobLifecycle::for_mode(lifecycle::LifecycleMode::FencedV2, Arc::clone(&job_id));
+            self.settlement = lifecycle.settlement();
+            self.lifecycle_actor = lifecycle.actor(job_id, StateBackendSelector::Parquet);
+            self.settlement
+                .clone()
+                .expect("the fenced mechanism supplies a settlement owner")
         }
 
         /// The same, for a harness a fixture has already built.
@@ -3804,8 +3744,9 @@ mod tests {
                 db: self.db.clone(),
                 scheduler: self.scheduler.clone(),
                 rx: &mut self.rx,
-                refusal_gate: self.refusal_gate.clone(),
+                admission: self.admission.clone(),
                 lifecycle_actor: self.lifecycle_actor.take(),
+                settlement: self.settlement.clone(),
                 retries_attempted: 0,
                 job_controller: self.job_controller.take(),
                 leader_manager: self.leader_manager.take(),
@@ -3829,6 +3770,18 @@ mod tests {
         )
     }
 
+    /// A state machine on M11.T08's mechanism — the pre-flag-day peer.
+    ///
+    /// This named `LifecycleMode::SELECTED` until M11.T26h, when `SELECTED` moved to
+    /// `FencedV2`. The rows that go through it are M11.T08's *behavioural* rows: what the
+    /// configuration poll decides, what it offers to the job's queue, and how a repaired row
+    /// supersedes a refusal already in flight. M11.D75 retains that behaviour — only the
+    /// refusal gate, the settlement rescue and the source-level admission regression were
+    /// removed at the flag day — so those rows keep running against the mechanism they are
+    /// about, and they now say which one that is instead of inheriting it.
+    ///
+    /// The D39a counterparts of the same requirements are named rows of their own, and they
+    /// are the ones that describe production: D96 rows 5, 6, 7, 9, 10 and 11.
     fn state_machine_with(
         config: JobConfig,
         execution_selector: StateBackendSelector,
@@ -3836,7 +3789,7 @@ mod tests {
         db: DatabaseSource,
     ) -> StateMachine {
         state_machine_in_mode(
-            LifecycleMode::SELECTED,
+            LifecycleMode::LegacyT08,
             config,
             execution_selector,
             tx,
@@ -3847,11 +3800,9 @@ mod tests {
 
     /// The same, in a named lifecycle mode and with a scheduler the caller can inspect.
     ///
-    /// Every test that predates M11.T25a goes through [`state_machine_with`] and therefore
-    /// runs `LifecycleMode::SELECTED`, which is what production runs. The `FencedV2` rows
-    /// name the mode here, which is the only way to reach that path: no production
-    /// construction site takes anything but `SELECTED` — see
-    /// [`no_production_path_selects_the_fenced_v2_lifecycle`].
+    /// Every mode a row runs under is named here or in [`state_machine_with`]; nothing in this
+    /// module infers one. The production selection has exactly one construction site — see
+    /// [`every_production_path_selects_the_fenced_v2_lifecycle`], which counts it.
     fn state_machine_in_mode(
         mode: LifecycleMode,
         config: JobConfig,
@@ -3868,7 +3819,7 @@ mod tests {
             cluster_id: test_cluster_id(),
             refusal: None,
             refusal_version: Arc::new(AtomicU64::new(0)),
-            refusal_gate: RefusalGate::default(),
+            admission: AdmissionLock::default(),
             lifecycle: JobLifecycle::for_mode(mode, job_id),
             state: Arc::new(RwLock::new("Running".to_string())),
             metrics: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
@@ -5208,93 +5159,6 @@ mod tests {
         );
     }
 
-    /// The delivery half of the same route. A refusal offered to a job with no state task
-    /// is not delivered, so it must not be recorded as delivered: it stays pending and is
-    /// offered again until something can receive it.
-    ///
-    /// The version matters as much as the message. The refusal that finally arrives has to
-    /// be one the state machine still holds, or `handle_unhandled_message` discards it and
-    /// the job keeps running under a row the controller has already rejected.
-    ///
-    /// This drives no state task by construction: it injects a sender so it can read the
-    /// message off the queue and inspect it, which a real task would consume instead. That
-    /// is why it also checks the refusal is on the job's [`RefusalGate`] the whole time —
-    /// the queue is what a state blocked on `recv` gets, and the gate is what a state that
-    /// does not receive gets, and a pending refusal has to be on both. What the gate then
-    /// does to a running task is covered behaviourally by
-    /// `a_known_refusal_fails_the_restarted_task_before_it_can_reschedule_the_job`.
-    #[tokio::test]
-    async fn a_refusal_with_no_state_task_gates_it_and_is_delivered_once_it_has_one() {
-        let current = running_config(StateBackendSelector::Parquet);
-        let mut sm = state_machine_with(
-            current.clone(),
-            StateBackendSelector::Parquet,
-            None,
-            sqlite_startable_job("Running", 1),
-        );
-
-        for poll in 0..3 {
-            sm.update(
-                polled(
-                    StateBackendSelector::Parquet,
-                    current.clone(),
-                    Some(selector_changed()),
-                ),
-                job_status(current.restart_nonce),
-                &shutdown_guard(),
-            )
-            .await;
-            assert!(
-                sm.done(),
-                "poll {poll}: the program still cannot be loaded, so nothing can receive \
-                 the refusal"
-            );
-            assert_eq!(
-                sm.refusal_gate
-                    .clone()
-                    .take()
-                    .and_then(RefusedConfig::into_current_error),
-                Some(selector_changed()),
-                "poll {poll}: a refusal nothing can receive must still stop the first state \
-                 of whatever task comes up next"
-            );
-        }
-
-        // The job's state machine comes back up, as `start` promised it would, and the
-        // same unchanged row is polled again.
-        let (tx, mut rx) = channel(16);
-        sm.tx = Some(tx);
-        sm.update(
-            polled(
-                StateBackendSelector::Parquet,
-                current.clone(),
-                Some(selector_changed()),
-            ),
-            job_status(current.restart_nonce),
-            &shutdown_guard(),
-        )
-        .await;
-
-        assert_eq!(
-            refusal_if_current(
-                rx.try_recv()
-                    .expect("the refusal must reach the state task that can finally act on it")
-            ),
-            Some(selector_changed()),
-            "and at a version the state machine still holds, so the job is failed rather \
-             than left running under a row the controller rejected"
-        );
-        assert!(
-            rx.try_recv().is_err(),
-            "one unusable row still produces one refusal, not one per poll it was pending"
-        );
-        assert_eq!(
-            sm.config.read().unwrap().0,
-            current,
-            "and the refused row is still adopted nowhere"
-        );
-    }
-
     /// Pending must not mean immortal. Keeping an undelivered refusal alive across polls is
     /// only safe because a repair supersedes it exactly as it supersedes a delivered one —
     /// otherwise round 6's fix would reintroduce round 5's: a job that comes back up after
@@ -5374,6 +5238,14 @@ mod tests {
     /// the four things it must not have done: no generation advance, no `Scheduling`
     /// teardown, no worker start, and no checkpoint restore — the last because the job never
     /// enters the state that prepares one.
+    ///
+    /// **On the production mechanism, since M11.T26h.** Round 7's answer was the cross-task
+    /// refusal gate, read by `execute_state` on every state's behalf; the activation change
+    /// removed it, and what stands before the first state body now is the job's own actor
+    /// consuming the intent the poll left at `ConsumptionPoint::BeforeIrreversiblePhase`. The
+    /// row is therefore built from `LifecycleMode::SELECTED` — which is what production runs —
+    /// rather than from the mechanism whose guard is gone, and the property it asserts is
+    /// unchanged.
     #[tokio::test]
     async fn a_known_refusal_fails_the_restarted_task_before_it_can_reschedule_the_job() {
         let db = sqlite_startable_job("Running", 2);
@@ -5385,11 +5257,13 @@ mod tests {
         // An inactive state machine for a job whose status says it is still running: what a
         // controller is left with after `start` could not load the program, and what round
         // 6's `restart_if_needed` exists to bring back up.
-        let mut sm = state_machine_with(
+        let mut sm = state_machine_in_mode(
+            LifecycleMode::SELECTED,
             current.clone(),
             StateBackendSelector::Parquet,
             None,
             db.clone(),
+            Arc::new(RecordingScheduler::default()),
         );
         sm.scheduler = scheduler.clone();
         assert!(sm.done(), "the job starts with no state task");
@@ -5556,262 +5430,6 @@ mod tests {
         );
     }
 
-    /// The poll thread reaching the job in the one instant round 7's gate did not cover: the
-    /// snapshot [`execute_state`] takes before the state body has already been read, and
-    /// `Scheduling`'s preamble has not yet done anything.
-    ///
-    /// This is a barrier, not a race. The publication happens at a point this state controls,
-    /// strictly after the gate snapshot and strictly before the first statement of the real
-    /// [`Scheduling::next`] it then delegates to, so the interleaving under test is the one
-    /// that runs, every time, on any runtime. It is also the *latest* such point: a
-    /// publication that lands here has beaten the preamble by nothing at all, and must still
-    /// stop it.
-    #[derive(Debug)]
-    struct PublishesAfterTheGateSnapshot(RefusedConfig);
-
-    #[async_trait::async_trait]
-    impl State for PublishesAfterTheGateSnapshot {
-        /// Stays: this fixture exists to publish a refusal at a chosen instant, and the rows
-        /// that use it build no lifecycle actor, so the boundary never asks.
-        fn leave_for_stop(self: Box<Self>, _config: &JobConfig) -> LeavingForStop {
-            LeavingForStop::Stays(self)
-        }
-
-        fn name(&self) -> &'static str {
-            "PublishesAfterTheGateSnapshot"
-        }
-
-        async fn next(self: Box<Self>, ctx: &mut JobContext) -> Result<Transition, StateError> {
-            assert!(
-                ctx.refusal_gate.clone().take().is_none(),
-                "the state body starts with the gate clear: `execute_state`'s snapshot is \
-                 spent, which is the whole premise of this test"
-            );
-            ctx.refusal_gate
-                .publish(&admitted(&ctx.refusal_gate), self.0.clone());
-            Box::new(Scheduling {}).next(ctx).await
-        }
-    }
-
-    /// A refusal published after the gate snapshot must still stop the scheduling preamble.
-    ///
-    /// Round 7 made [`execute_state`] apply a known refusal before every state body, and
-    /// argued that covered a job whose state task was already live. It did not: `take`
-    /// clones under its lock and releases it, and `Scheduling` then persists an incremented
-    /// generation, tears down the live cluster, starts replacements and prepares checkpoint
-    /// recovery — awaiting throughout — without looking at the gate again. A refusal raised
-    /// anywhere in there was not read until the next state, which is after all of it.
-    ///
-    /// The four things the reviewer named are asserted here, and all four are `zero`: no
-    /// generation was persisted, no unscoped teardown (`stop_workers(_, None, _)`) was asked
-    /// for, no replacement workers were started, and no recovery was prepared — the last
-    /// because preparing it is strictly after starting workers, which never happened.
-    ///
-    /// Without the interlock this test does not merely mis-assert: the preamble runs on
-    /// through `start_workers` into the checkpoint recovery this fixture has laid nothing
-    /// down for, and can die there. The unwind is caught so that the failure reports what was
-    /// done to the job rather than wherever the preamble happened to stop.
-    #[tokio::test]
-    async fn a_refusal_published_after_the_gate_snapshot_still_stops_the_scheduling_preamble() {
-        let db = sqlite_startable_job("Scheduling", 2);
-        let refusal = RefusedConfig::new(selector_changed(), 1, Arc::new(AtomicU64::new(1)));
-
-        let mut harness = Harness::new(3).with_db(db.clone());
-        harness.status.state = "Scheduling".to_string();
-        let scheduler = harness.scheduler.clone();
-        let ctx = harness.ctx(
-            running_config(StateBackendSelector::Parquet),
-            StateBackendSelector::Parquet,
-        );
-
-        let outcome = std::panic::AssertUnwindSafe(async {
-            let (next, ctx) =
-                execute_state(Box::new(PublishesAfterTheGateSnapshot(refusal)), ctx).await;
-            (next.map(|s| s.name().to_string()), ctx.status.generation)
-        })
-        .catch_unwind()
-        .await;
-
-        let Ok((next, generation)) = outcome else {
-            panic!(
-                "the preamble ran for a refused configuration and got as far as \
-                 `start_workers`; it persisted {:?} and asked for the teardowns {:?}",
-                state_writes(&db),
-                scheduler.stopped.lock().unwrap()
-            );
-        };
-
-        assert_eq!(
-            next.as_deref(),
-            Some("Failing"),
-            "a refusal published after the gate snapshot must still fail the job"
-        );
-        assert_eq!(
-            generation, 1,
-            "and the generation this scheduling attempt would have run under must not even \
-             be incremented in memory"
-        );
-        assert_eq!(
-            state_writes(&db),
-            [("Failing".to_string(), 1)],
-            "the only status write is the failure itself: no generation was ever persisted"
-        );
-        assert_eq!(
-            scheduler.stopped.lock().unwrap().as_slice(),
-            [],
-            "no unscoped teardown — `Scheduling`'s `stop_workers(_, None, _)` is what \
-             destroys a live execution"
-        );
-        assert_eq!(
-            scheduler.started.lock().unwrap().as_slice(),
-            [],
-            "no replacement workers, and so no checkpoint recovery either: preparing it is \
-             strictly after starting them"
-        );
-    }
-
-    /// The control for the interlock, and for the two properties an interlock can break.
-    ///
-    /// An ordinary job must still run its scheduling preamble — the admission must not stall
-    /// or deadlock it — and the assertions above must be about the refusal rather than about
-    /// a harness in which nothing schedules anyway. So the same path is run with the gate
-    /// clear, and it must reach the effects the refused job reached none of.
-    ///
-    /// It gets as far as the scheduler's `start_workers`, which this test asks to panic; that
-    /// panic is the proof the preamble ran, and is also the second thing checked here. A
-    /// `tokio` mutex does not poison, so a state body that panics under the admission leaves
-    /// the job refusable rather than wedged for the life of the controller — which a `std`
-    /// mutex would not have.
-    ///
-    /// The panic is asked for explicitly, from the scheduler, rather than being inherited from
-    /// whatever the preamble happened to trip over. It used to come from `start_workers`
-    /// reading a process-wide cluster identity no test had populated — a premise that any
-    /// test which populated it would silently remove, depending on the order the binary ran
-    /// them in. That identity is now handed to the state ([`JobContext::cluster_id`]) and no
-    /// test populates anything process-wide, but the explicit panic stays: what this test
-    /// asserts is that a panic *under the admission* releases it, so it has to own the panic
-    /// rather than depend on one.
-    #[tokio::test]
-    async fn an_unrefused_job_still_schedules_and_a_panic_under_the_admission_releases_it() {
-        let db = sqlite_startable_job("Scheduling", 2);
-
-        let mut harness = Harness::new(3)
-            .with_db(db.clone())
-            .with_scheduler(RecordingScheduler::panicking());
-        harness.status.state = "Scheduling".to_string();
-        let scheduler = harness.scheduler.clone();
-        let gate = harness.refusal_gate.clone();
-        let ctx = harness.ctx(
-            running_config(StateBackendSelector::Parquet),
-            StateBackendSelector::Parquet,
-        );
-
-        let outcome = std::panic::AssertUnwindSafe(async {
-            execute_state(Box::new(Scheduling {}), ctx).await;
-        })
-        .catch_unwind()
-        .await;
-
-        assert!(
-            outcome.is_err(),
-            "the control only means anything if the unrefused job really ran the preamble \
-             through to `start_workers`; it wrote {:?}",
-            state_writes(&db)
-        );
-        assert_eq!(
-            state_writes(&db),
-            [("Scheduling".to_string(), 2)],
-            "an unrefused job advances and persists its generation exactly as before: the \
-             admission is an interlock, not a stall"
-        );
-        assert_eq!(
-            scheduler.stopped.lock().unwrap().as_slice(),
-            [("job_abc".to_string(), None)],
-            "and clears the cluster it is replacing"
-        );
-        assert!(
-            gate.admit_publication().is_some(),
-            "and a state body that panics under the admission releases it: a refusal raised \
-             after this must still be publishable"
-        );
-    }
-
-    /// The other half of the interlock: a refusal that arrives *during* a preamble.
-    ///
-    /// Publication takes the same admission `Scheduling` holds across its preamble, and takes
-    /// it without ever waiting — the update thread calls `refuse_config` under the global job
-    /// map. So a refusal raised mid-preamble is not published, not queued, and above all not
-    /// recorded: round 6's rule for a refusal nothing can receive, applied to one nothing can
-    /// publish. The next 500ms poll offers the same refusal, at the same version, and by then
-    /// the preamble is over and the job's own `recv` is what acts on it.
-    ///
-    /// The version is the part that has to be left alone rather than merely re-derived.
-    /// Advancing it on a poll that publishes nothing would supersede whatever refusal is
-    /// already on the gate or in the queue, and a state reading that one would discard it as
-    /// stale — losing the refusal to the very contention that was meant to defer it.
-    #[tokio::test]
-    async fn a_refusal_raised_during_a_scheduling_preamble_is_deferred_rather_than_lost() {
-        let current = running_config(StateBackendSelector::Parquet);
-        let (mut sm, mut rx) = state_machine(current.clone(), StateBackendSelector::Parquet);
-        let mut gate = sm.refusal_gate.clone();
-
-        // `Scheduling`, in its preamble: it holds the job's admission from before its first
-        // effect until after its last.
-        let (preamble, refusal) = gate.admit_scheduling().await;
-        assert!(
-            refusal.is_none(),
-            "the preamble was admitted with the gate clear, which is the interleaving \
-             this test is about"
-        );
-
-        sm.refuse_config(selector_changed());
-
-        assert!(
-            sm.refusal_gate.clone().take().is_none(),
-            "nothing may be published into a preamble that has already started: the states \
-             after it read the gate, and the preamble itself is past reading anything"
-        );
-        assert!(
-            rx.try_recv().is_err(),
-            "and nothing is queued for it either, so the poll leaves no trace at all"
-        );
-        assert!(
-            sm.refusal.is_none(),
-            "and nothing is recorded as delivered, so the next poll does not short-circuit \
-             on a refusal that was never raised"
-        );
-        assert_eq!(
-            sm.refusal_version.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "and the refusal version is untouched: advancing it here would supersede a \
-             refusal already on the gate or in the queue"
-        );
-
-        // The preamble finishes; the next poll finds the same row still bad.
-        drop(preamble);
-        sm.refuse_config(selector_changed());
-
-        assert_eq!(
-            sm.refusal_gate
-                .clone()
-                .take()
-                .and_then(RefusedConfig::into_current_error),
-            Some(selector_changed()),
-            "the deferred refusal is published the moment the preamble is over, so it gates \
-             every state after it"
-        );
-        assert_eq!(
-            refusal_if_current(rx.try_recv().expect("the refusal must be delivered too")),
-            Some(selector_changed()),
-            "and is delivered to the state that is now reading its channel"
-        );
-        assert_eq!(
-            sm.refusal_version.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "at the first version: this is the same refusal deferred, not a second one"
-        );
-    }
-
     // ---------------------------------------------------------------------------------------
     // Round 9: the crossings after the preamble.
     //
@@ -5844,14 +5462,40 @@ mod tests {
     /// What a worker was actually asked to do.
     #[derive(Default)]
     struct WorkerCalls {
+        /// Every lifecycle directive this worker was sent, in arrival order.
+        ///
+        /// One log rather than one counter per kind, because what M11.D96 row 21 asserts is an
+        /// *order*: the fence this generation acknowledged has to precede the start it was
+        /// admitted for, and two counters cannot say which came first.
+        protocol: Mutex<Vec<Directive>>,
+        /// The worker generation each arriving directive addressed, or 0 for none.
+        addressed: Mutex<Vec<u64>>,
+        /// Whether each arriving `StartExecution` was byte-identical to the request a
+        /// controller predating the lifecycle fields would have sent.
+        ///
+        /// Computed where the bytes are, against the same message with every lifecycle field
+        /// stamped back to its proto3 default, so it is a statement about the encoding rather
+        /// than about the struct: a field left set encodes its key and the comparison fails.
+        legacy_shaped: Mutex<Vec<bool>>,
         /// One entry per `StartExecution`, carrying the selector it was stamped with.
         start_execution: Mutex<Vec<String>>,
         /// One entry per `Commit`, carrying its epoch.
         commit: Mutex<Vec<u64>>,
+        /// One entry per `Commit`, carrying the fence and generation it addressed, if any.
+        commit_fences: Mutex<Vec<Option<(u64, u64)>>>,
         /// One entry per `StopExecution`, carrying the mode it asked for. This is what "the
         /// job was actually stopped" means for a controller-mode job: a request that arrived
         /// at a worker, not a function that returned.
         stop_execution: Mutex<Vec<i32>>,
+    }
+
+    /// One lifecycle directive a [`FakeWorker`] was sent, as the wire seam reads it.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum Directive {
+        /// A `FENCE_ONLY` directive under this fence: the active replacement handshake.
+        FenceOnly(u64),
+        /// A `START` under this fence, or `None` for the fence-less pre-flag-day start.
+        Start(Option<u64>),
     }
 
     impl WorkerCalls {
@@ -5859,8 +5503,28 @@ mod tests {
             self.start_execution.lock().unwrap().clone()
         }
 
+        /// Every directive this worker was sent, in arrival order.
+        fn protocol(&self) -> Vec<Directive> {
+            self.protocol.lock().unwrap().clone()
+        }
+
+        /// The generation each of those directives addressed.
+        fn addressed_generations(&self) -> Vec<u64> {
+            self.addressed.lock().unwrap().clone()
+        }
+
+        /// Whether each `StartExecution` was byte-identical to the pre-fence request.
+        fn legacy_shaped(&self) -> Vec<bool> {
+            self.legacy_shaped.lock().unwrap().clone()
+        }
+
         fn committed(&self) -> Vec<u64> {
             self.commit.lock().unwrap().clone()
+        }
+
+        /// The fence and generation each `Commit` addressed, or `None` for an unfenced one.
+        fn commit_fences(&self) -> Vec<Option<(u64, u64)>> {
+            self.commit_fences.lock().unwrap().clone()
         }
 
         fn stopped(&self) -> Vec<rpc::StopMode> {
@@ -5879,12 +5543,6 @@ mod tests {
         /// Records the call and accepts, which is what every round-9 test wants.
         #[default]
         Accepting,
-        /// Fails the RPC — but not before the paused worker is inside its own handler, so the
-        /// fan-out's failure always lands on a job that has another request outstanding.
-        FailingOnce(Arc<tokio::sync::Notify>),
-        /// Announces that it has been asked and then waits, so the controller has a
-        /// `StartExecution` in flight for as long as the test wants one.
-        Pausing(Arc<PausedWorker>),
         /// Blocks the thread *inside a single poll* until the test lets it go. This preserves
         /// the legacy/adversarial server shape that no client cancellation can reach; current
         /// production workers use `try_lock` and never create this window. See [`BlockedWorker`].
@@ -5916,6 +5574,14 @@ mod tests {
                 calls: AtomicU64::new(0),
                 expected_id: Mutex::new(None),
             })
+        }
+
+        /// The identifier every attempt replayed, read back from the worker.
+        ///
+        /// So a row can compare what a settlement owner says it is answerable for against what
+        /// arrived at the worker, rather than against an identifier the controller told it about.
+        fn attempt_id(&self) -> Option<String> {
+            self.expected_id.lock().unwrap().clone()
         }
 
         fn remember_or_check(&self, id: &str) {
@@ -5989,77 +5655,10 @@ mod tests {
         }
     }
 
-    /// A worker that has been asked to start executing and has not answered yet.
-    ///
-    /// This is the instrument for round 11: the question is whether a request the controller
-    /// has stopped waiting for can still reach its worker, and the only way to ask it is to
-    /// hold one open across the moment the controller gives up.
-    struct PausedWorker {
-        /// Fired from inside the handler, so no test has to guess when the request arrived.
-        asked: tokio::sync::Notify,
-        /// The same announcement, for the worker whose failure must land only once *this*
-        /// request is outstanding. Separate from [`Self::asked`] because a `Notify` permit
-        /// has one taker and these are two.
-        asked_relay: Arc<tokio::sync::Notify>,
-        /// Fired by a test to let the handler finish, if it still exists.
-        released: tokio::sync::Notify,
-        outcome: tokio::sync::watch::Sender<Option<PausedOutcome>>,
-    }
-
-    /// What became of a paused `StartExecution` handler.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum PausedOutcome {
-        /// Its stream was cut off before it could apply the request: the controller took the
-        /// call back.
-        CutOff,
-        /// It ran to completion, and the worker was told to start executing.
-        Applied,
-    }
-
-    impl PausedWorker {
-        fn new() -> Arc<Self> {
-            Arc::new(Self {
-                asked: tokio::sync::Notify::new(),
-                asked_relay: Arc::new(tokio::sync::Notify::new()),
-                released: tokio::sync::Notify::new(),
-                outcome: tokio::sync::watch::Sender::new(None),
-            })
-        }
-
-        /// The signal a [`StartsExecution::FailingOnce`] worker waits on before it fails.
-        fn asked_relay(&self) -> Arc<tokio::sync::Notify> {
-            self.asked_relay.clone()
-        }
-
-        fn announce(&self) {
-            self.asked.notify_one();
-            self.asked_relay.notify_one();
-        }
-
-        fn settle(&self, outcome: PausedOutcome) {
-            self.outcome.send_replace(Some(outcome));
-        }
-
-        /// Waits for the handler to have finished one way or the other.
-        ///
-        /// Both endings announce themselves — completion from the handler, cancellation from
-        /// [`CutOffOnDrop`] — and a `watch` rather than a one-shot signal so that asking twice,
-        /// or asking after the answer arrived, is the same question.
-        async fn outcome(&self) -> PausedOutcome {
-            let mut settled = self.outcome.subscribe();
-            loop {
-                if let Some(outcome) = *settled.borrow_and_update() {
-                    return outcome;
-                }
-                settled.changed().await.unwrap();
-            }
-        }
-    }
-
     /// A worker whose `StartExecution` handler blocks the thread inside one poll.
     ///
-    /// Round 11's [`PausedWorker`] holds its request open at `Notify::notified().await`, which
-    /// is a *cooperative* suspension point: the handler is parked between polls, so when the
+    /// Round 11's paused worker held its request open at `Notify::notified().await`, which is
+    /// a *cooperative* suspension point: the handler is parked between polls, so when the
     /// controller drops the client future `tonic` can drop the handler and the request really
     /// is taken back. That is why round 11's tests passed and the hole stayed open.
     ///
@@ -6080,12 +5679,15 @@ mod tests {
         /// fact the test observes rather than a delay it hopes is long enough.
         state: Mutex<BlockedState>,
         changed: std::sync::Condvar,
-        /// The signal a [`StartsExecution::FailingOnce`] sibling waits on. Fired by the test
-        /// once the handler is provably inside, not by the handler itself.
-        asked_relay: Arc<tokio::sync::Notify>,
-        /// The job's gate, so the handler can answer "had a refusal been published by the time
-        /// I started this worker?" from inside the worker. Set once the harness exists.
-        gate: std::sync::OnceLock<RefusalGate>,
+        /// The job's intent mailbox, so the handler can answer "had this job's writer been
+        /// told to refuse it by the time I started this worker?" from inside the worker. Set
+        /// once the harness exists.
+        ///
+        /// Before M11.T26h this read the cross-task refusal gate, which is where a refusal
+        /// was published from another task. Under M11.D39a the mailbox is where a refusal a
+        /// job is about to be stopped for stands, so it is the same question asked of the
+        /// mechanism that answers it now.
+        decided: std::sync::OnceLock<Arc<lifecycle::IntentMailbox>>,
         saw_refusal: std::sync::atomic::AtomicBool,
         started: std::sync::atomic::AtomicBool,
     }
@@ -6103,38 +5705,19 @@ mod tests {
             Arc::new(Self {
                 state: Mutex::new(BlockedState::default()),
                 changed: std::sync::Condvar::new(),
-                asked_relay: Arc::new(tokio::sync::Notify::new()),
-                gate: std::sync::OnceLock::new(),
+                decided: std::sync::OnceLock::new(),
                 saw_refusal: std::sync::atomic::AtomicBool::new(false),
                 started: std::sync::atomic::AtomicBool::new(false),
             })
         }
 
-        /// Gives the handler the gate it reports against. The harness owns the gate, and the
-        /// worker has to exist before the harness does.
-        fn watch(&self, gate: RefusalGate) {
-            self.gate.set(gate).ok().expect("the gate is set once");
-        }
-
-        fn asked_relay(&self) -> Arc<tokio::sync::Notify> {
-            self.asked_relay.clone()
-        }
-
-        /// Waits until the handler is inside its blocking wait.
-        ///
-        /// On a blocking thread, because that is what waiting on a `Condvar` is; the point of
-        /// the whole instrument is that this handler does not participate in async
-        /// cancellation.
-        async fn wait_until_inside(self: &Arc<Self>) {
-            let worker = Arc::clone(self);
-            tokio::task::spawn_blocking(move || {
-                let mut state = worker.state.lock().unwrap();
-                while !state.inside {
-                    state = worker.changed.wait(state).unwrap();
-                }
-            })
-            .await
-            .unwrap();
+        /// Gives the handler the mailbox it reports against. The job owns the mailbox, and
+        /// the worker has to exist before the harness does.
+        fn watch(&self, mailbox: Arc<lifecycle::IntentMailbox>) {
+            self.decided
+                .set(mailbox)
+                .ok()
+                .expect("the mailbox is set once");
         }
 
         /// Lets the handler out. Whatever the controller has done by now, it is about to
@@ -6179,29 +5762,6 @@ mod tests {
     /// microseconds, and the assertions are about a recorded order rather than about a time.
     const SETTLEMENT_GRACE: Duration = Duration::from_secs(3);
 
-    /// Records that a paused handler was dropped rather than resumed.
-    ///
-    /// `tonic` drops a request handler when its stream is reset or its connection closes, which
-    /// is what the controller dropping an in-flight request does to a worker that suspends
-    /// cooperatively. Round 11 asked for this to happen; since round 13 nothing may cut a
-    /// request off before it has answered, so this guard firing is a regression report rather
-    /// than the expected outcome.
-    struct CutOffOnDrop(Option<Arc<PausedWorker>>);
-
-    impl CutOffOnDrop {
-        fn disarm(mut self) {
-            self.0 = None;
-        }
-    }
-
-    impl Drop for CutOffOnDrop {
-        fn drop(&mut self) {
-            if let Some(worker) = self.0.take() {
-                worker.settle(PausedOutcome::CutOff);
-            }
-        }
-    }
-
     /// A worker, as far as the controller can tell.
     ///
     /// A real server on a real socket, because the claim under test is about real RPCs: the
@@ -6214,6 +5774,84 @@ mod tests {
         starts_execution: StartsExecution,
     }
 
+    /// What a fake worker answers an accepted `StartExecution` with.
+    ///
+    /// The doubles answer as the worker in this build does: it acknowledges no lifecycle fence,
+    /// so it reports none, and an `Ok` `StartExecutionResp` means the addressed attempt is
+    /// applied. See `arroyo_worker::applied_start_execution`, which this mirrors.
+    fn applied_start_execution() -> StartExecutionResp {
+        StartExecutionResp {
+            observed_lifecycle_fence: 0,
+            outcome: StartExecutionOutcome::Applied as i32,
+        }
+    }
+
+    /// The leader half of a fake worker (M11.T26g).
+    ///
+    /// A worker of this version serves `JobStatusGrpc` beside `WorkerGrpc`, and in worker-leader
+    /// mode the controller's handover polls exactly this before it will attach to the job. Two
+    /// of the three fields it answers are *derived from what this worker was actually sent*
+    /// rather than stated, so the handshake `LeaderManager::poll_leader_status` makes is not
+    /// vacuous:
+    ///
+    /// * `state_backend` is the selector the last `StartExecution` carried — which is what
+    ///   `WorkerState::state_backend` is in production, set from the request as the execution
+    ///   starts. A controller that handed over to a leader running another backend is refused
+    ///   here exactly as it is in production.
+    /// * `job_id` and `generation` are echoed from the request, because this worker is the
+    ///   leader of the generation the controller has just started: it is being asked about the
+    ///   generation it belongs to. The generation the controller asks about is separately
+    ///   asserted, against what arrived at `WorkerGrpc`, by `WorkerCalls::addressed_generations`.
+    #[tonic::async_trait]
+    impl JobStatusGrpc for FakeWorker {
+        async fn get_job_status(
+            &self,
+            request: tonic::Request<JobStatusReq>,
+        ) -> Result<tonic::Response<JobStatusResp>, tonic::Status> {
+            let request = request.into_inner();
+            let state_backend = self
+                .calls
+                .started()
+                .last()
+                .cloned()
+                .unwrap_or_else(|| "parquet".to_string());
+            Ok(tonic::Response::new(JobStatusResp {
+                job_id: request.job_id,
+                generation: request.generation,
+                job_status: Some(LeaderJobStatus::default()),
+                state_backend,
+            }))
+        }
+
+        async fn stop_job(
+            &self,
+            _: tonic::Request<StopJobReq>,
+        ) -> Result<tonic::Response<StopJobResp>, tonic::Status> {
+            Err(tonic::Status::unimplemented(
+                "no scheduling row stops the job it just started; a row that needs a leader to \
+                 be stopped uses `FakeLeader`, which records the stops it was sent",
+            ))
+        }
+
+        async fn get_job_checkpoints(
+            &self,
+            _: tonic::Request<GetJobCheckpointsReq>,
+        ) -> Result<tonic::Response<GetJobCheckpointsResp>, tonic::Status> {
+            Err(tonic::Status::unimplemented(
+                "this leader is only ever asked for its status",
+            ))
+        }
+
+        async fn get_checkpoint_details(
+            &self,
+            _: tonic::Request<GetCheckpointDetailsReq>,
+        ) -> Result<tonic::Response<GetCheckpointDetailsResp>, tonic::Status> {
+            Err(tonic::Status::unimplemented(
+                "this leader is only ever asked for its status",
+            ))
+        }
+    }
+
     #[tonic::async_trait]
     impl WorkerGrpc for FakeWorker {
         async fn start_execution(
@@ -6222,14 +5860,58 @@ mod tests {
         ) -> Result<tonic::Response<StartExecutionResp>, tonic::Status> {
             let request = request.into_inner();
             let selector = request.state_backend.clone();
+
+            // Read as one directive rather than field by field, exactly as the worker in this
+            // build does. A malformed one is a controller defect and is reported here rather
+            // than being answered, because every request these rows send is one this process
+            // stamped.
+            let directive =
+                start_directive(&request).expect("this controller sent a malformed directive");
+            let fenced_under = match directive {
+                StartDirective::Unfenced => None,
+                StartDirective::Fenced { address, .. } => Some(address.fence()),
+            };
+            self.calls.addressed.lock().unwrap().push(match directive {
+                StartDirective::Unfenced => 0,
+                StartDirective::Fenced { address, .. } => address.target().generation(),
+            });
+
+            // A fence-capable worker generation, as M11.T26d's guard is: a `FENCE_ONLY`
+            // directive advances this generation's fence and is acknowledged, and it applies no
+            // program — so it is answered above everything below, none of which is about
+            // starting an execution. Without this the double would read the handshake as an
+            // ordinary start and the rows would be testing a legacy worker.
+            if let StartDirective::Fenced {
+                address,
+                operation: LifecycleOperation::FenceOnly,
+                ..
+            } = directive
+            {
+                self.calls
+                    .protocol
+                    .lock()
+                    .unwrap()
+                    .push(Directive::FenceOnly(address.fence()));
+                return Ok(tonic::Response::new(StartExecutionResp {
+                    observed_lifecycle_fence: address.fence(),
+                    outcome: StartExecutionOutcome::FenceAcknowledged as i32,
+                }));
+            }
+            self.calls
+                .protocol
+                .lock()
+                .unwrap()
+                .push(Directive::Start(fenced_under));
+            let mut as_legacy = request.clone();
+            StartDirective::Unfenced.stamp(&mut as_legacy);
+            self.calls
+                .legacy_shaped
+                .lock()
+                .unwrap()
+                .push(as_legacy.encode_to_vec() == request.encode_to_vec());
+
             match &self.starts_execution {
                 StartsExecution::Accepting => {}
-                StartsExecution::FailingOnce(after) => {
-                    after.notified().await;
-                    return Err(tonic::Status::internal(
-                        "this worker cannot start executing",
-                    ));
-                }
                 StartsExecution::Blocking(blocked) => {
                     // No `.await` from here to the return. The thread is blocked inside this
                     // poll, so `tonic` cannot drop this future however the client's stream
@@ -6244,29 +5926,16 @@ mod tests {
 
                     // What the controller had already decided by the time this worker started.
                     let refused = blocked
-                        .gate
+                        .decided
                         .get()
-                        .expect("the blocked worker is given the job's gate")
-                        .current
-                        .read()
-                        .unwrap()
+                        .expect("the blocked worker is given the job's mailbox")
+                        .newer_than(lifecycle::intent::IntentVersion::NONE)
                         .is_some();
                     blocked.saw_refusal.store(refused, Ordering::SeqCst);
                     blocked.started.store(true, Ordering::SeqCst);
                     self.calls.start_execution.lock().unwrap().push(selector);
                     self.barriers.execution_started.notify_one();
-                    return Ok(tonic::Response::new(StartExecutionResp {}));
-                }
-                StartsExecution::Pausing(paused) => {
-                    paused.announce();
-                    let cut_off = CutOffOnDrop(Some(paused.clone()));
-                    paused.released.notified().await;
-                    // Only reached if the handler was not dropped while it waited.
-                    cut_off.disarm();
-                    self.calls.start_execution.lock().unwrap().push(selector);
-                    paused.settle(PausedOutcome::Applied);
-                    self.barriers.execution_started.notify_one();
-                    return Ok(tonic::Response::new(StartExecutionResp {}));
+                    return Ok(tonic::Response::new(applied_start_execution()));
                 }
                 StartsExecution::AmbiguousOnce(ambiguous) => {
                     ambiguous.remember_or_check(&request.start_execution_id);
@@ -6293,7 +5962,7 @@ mod tests {
                         self.calls.start_execution.lock().unwrap().push(selector);
                         self.barriers.execution_started.notify_one();
                     }
-                    return Ok(tonic::Response::new(StartExecutionResp {}));
+                    return Ok(tonic::Response::new(applied_start_execution()));
                 }
                 StartsExecution::BusyOnce(busy) => {
                     busy.remember_or_check(&request.start_execution_id);
@@ -6315,18 +5984,26 @@ mod tests {
             }
             self.calls.start_execution.lock().unwrap().push(selector);
             self.barriers.execution_started.notify_one();
-            Ok(tonic::Response::new(StartExecutionResp {}))
+            Ok(tonic::Response::new(applied_start_execution()))
         }
 
         async fn commit(
             &self,
             request: tonic::Request<CommitReq>,
         ) -> Result<tonic::Response<CommitResp>, tonic::Status> {
-            self.calls
-                .commit
-                .lock()
-                .unwrap()
-                .push(request.into_inner().epoch);
+            let request = request.into_inner();
+            // Read as one directive, as the worker does: the fence and the generation it
+            // addresses stand or fall together, and a commit that carried one without the other
+            // would be refused here rather than recorded.
+            self.calls.commit_fences.lock().unwrap().push(
+                match commit_directive(&request).expect("this controller sent a malformed commit") {
+                    CommitDirective::Unfenced => None,
+                    CommitDirective::Fenced(address) => {
+                        Some((address.fence(), address.target().generation()))
+                    }
+                },
+            );
+            self.calls.commit.lock().unwrap().push(request.epoch);
             Ok(tonic::Response::new(CommitResp {}))
         }
 
@@ -6397,6 +6074,17 @@ mod tests {
         tokio::spawn(
             tonic::transport::Server::builder()
                 .add_service(WorkerGrpcServer::new(FakeWorker {
+                    calls: calls.clone(),
+                    barriers: barriers.clone(),
+                    starts_execution: starts_execution.clone(),
+                }))
+                // The same process also answers as a worker *leader*, which is what a worker
+                // of this version is: `WorkerServer` serves both services on one port, and in
+                // `JobControllerMode::Worker` the controller's handover attaches to one of the
+                // workers it just started through `LeaderManager::connect`. A fixture serving
+                // only `WorkerGrpc` could not be that deployment at all — its handover fails to
+                // connect — which is why this is fixture setup rather than a second double.
+                .add_service(JobStatusGrpcServer::new(FakeWorker {
                     calls,
                     barriers,
                     starts_execution,
@@ -6438,6 +6126,40 @@ mod tests {
             rpc_address: rpc_address.to_string(),
             data_address: "127.0.0.1:1".to_string(),
             slots: 1,
+            reconciles_start_execution,
+        }
+    }
+
+    /// The `WorkerConnect` a worker of some *other* generation sends.
+    ///
+    /// A straggler from a previous cluster, or a worker whose registration raced this attempt's
+    /// generation bump. The controller ignores it, so such a worker never becomes one this
+    /// attempt may address — which is what makes it the fixture for "a generation this
+    /// controller has not seen register".
+    fn worker_connect_at_generation(
+        worker_id: WorkerId,
+        rpc_address: &str,
+        generation: u64,
+    ) -> JobMessage {
+        let JobMessage::WorkerConnect {
+            worker_id,
+            machine_id,
+            rpc_address,
+            data_address,
+            slots,
+            reconciles_start_execution,
+            ..
+        } = worker_connect_from(worker_id, rpc_address)
+        else {
+            unreachable!("`worker_connect_from` builds a `WorkerConnect`")
+        };
+        JobMessage::WorkerConnect {
+            worker_id,
+            machine_id,
+            generation,
+            rpc_address,
+            data_address,
+            slots,
             reconciles_start_execution,
         }
     }
@@ -6617,6 +6339,22 @@ mod tests {
         _checkpoints: CheckpointDir,
     }
 
+    /// The durable lifecycle fence every [`SchedulingRun`] runs under.
+    ///
+    /// It is what the scheduling preamble's cold adoption **installs**, not what the fixture
+    /// states: the row is seeded one below it, so the CAS the preamble performs is the thing
+    /// that produces this value. Any non-zero value would do — adoption stores
+    /// `lifecycle_fence + 1` and so never installs zero — and naming it once is what lets a row
+    /// assert the fence a worker was sent in closed form.
+    const ADOPTED_FENCE: u64 = 4;
+
+    /// The controller epoch the fixture's row carries *before* the preamble adopts it.
+    ///
+    /// The epoch adoption installs is minted and random, so it is never asserted; what this is
+    /// for is the CAS predicate — a controller adopts by presenting the authority it read, and
+    /// this is what it read.
+    const EPOCH_BEFORE_ADOPTION: &str = "epoch-before-adoption";
+
     impl SchedulingRun {
         /// One worker that accepts, which is what the round-9 tests want.
         async fn new(name: &str) -> Self {
@@ -6645,6 +6383,41 @@ mod tests {
                 .with_state_url(checkpoints.url())
                 .with_scheduler(RecordingScheduler::watching(barriers.clone()));
             harness.status.state = "Scheduling".to_string();
+            // The authority this job's row carries *before* the controller adopts it
+            // (M11.D39d). The M11.D39b preamble's first effect is the adoption CAS, which
+            // presents this and installs [`ADOPTED_FENCE`] — so the fence the directives carry
+            // is one this run's own preamble raised, not one the fixture asserted into
+            // existence. Under the legacy protocol nothing reads either column, so every landed
+            // row here is unaffected.
+            {
+                let DatabaseSource::Sqlite(connection) = &db else {
+                    unreachable!("the fixture is always sqlite")
+                };
+                connection
+                    .lock()
+                    .unwrap()
+                    .execute(
+                        "UPDATE job_statuses SET lifecycle_fence = ?1, controller_epoch = ?2
+                         WHERE id = 'job_abc'",
+                        cornucopia_async::rusqlite::params![
+                            (ADOPTED_FENCE - 1) as i64,
+                            EPOCH_BEFORE_ADOPTION
+                        ],
+                    )
+                    .unwrap();
+                // Seeding is fixture setup, not a write under test: the log starts empty so
+                // that `authority_writes` holds exactly what the run itself did.
+                connection
+                    .lock()
+                    .unwrap()
+                    .execute("DELETE FROM authority_writes", [])
+                    .unwrap();
+            }
+            harness.status.authority = crate::LifecycleAuthority::from_parts(
+                "job_abc",
+                ADOPTED_FENCE - 1,
+                EPOCH_BEFORE_ADOPTION,
+            );
 
             Self {
                 db,
@@ -6661,6 +6434,58 @@ mod tests {
             self.worker_addresses[n].clone()
         }
 
+        /// Leaves this job's row carrying a fencing obligation an earlier attempt did not
+        /// discharge (M11.T26f, M11.D39d).
+        ///
+        /// Written to the row *and* onto the status the run starts from, because the two are
+        /// what a restarted controller would have: the row is the durable fact, and the status
+        /// is what the poll built out of it.
+        ///
+        /// The scheduler is replaced at the same time, because the two are one fixture: a
+        /// recorded obligation whose scheduler no longer lists its target is an obligation the
+        /// very first recovery pass settles, and a row about anything else would never reach
+        /// the property it is named for.
+        fn owing(&mut self, record: arroyo_rpc::fencing::Fencing, live: Vec<(u64, WorkerId)>) {
+            self.harness.status.record_fencing_obligation(Some(record));
+            let DatabaseSource::Sqlite(connection) = &self.db else {
+                unreachable!("the fixture is always sqlite")
+            };
+            connection
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE job_statuses SET state_context = ?1 WHERE id = 'job_abc'",
+                    cornucopia_async::rusqlite::params![
+                        serde_json::to_string(&self.harness.status.state_context)
+                            .expect("the fixture context serializes")
+                    ],
+                )
+                .expect("the fixture obligation must be written");
+            // Seeding is fixture setup, not a write under test: the trigger records it like any
+            // other status write, and a row asserting what the *attempt* wrote has to start from
+            // an empty log. The same rule `with_workers` follows for `authority_writes`.
+            connection
+                .lock()
+                .unwrap()
+                .execute("DELETE FROM state_writes", [])
+                .expect("the fixture's own write must not count as the run's");
+            self.reports_terminations(live);
+        }
+
+        /// Gives this run a scheduler that *can* report a worker generation as terminated, and
+        /// says which generations are still live.
+        ///
+        /// The default fixture scheduler cannot — it records the request to start a cluster and
+        /// keeps no registry of the result, which is the honest answer and the fail-closed one.
+        /// A row about an observed termination has to say so explicitly, and a row that leaves
+        /// this alone is a row in which no target is ever settled by one.
+        fn reports_terminations(&mut self, live: Vec<(u64, WorkerId)>) {
+            self.harness.scheduler = Arc::new(RecordingScheduler::watching_with_live(
+                Arc::clone(&self.barriers),
+                live,
+            ));
+        }
+
         /// Runs the real `Scheduling::next` against the real worker.
         async fn schedule(&mut self) -> Result<Transition, StateError> {
             let mut ctx = self.harness.ctx(
@@ -6675,7 +6500,14 @@ mod tests {
         ///
         /// The assertion inside is the point of the fixture rather than a precondition of it:
         /// `run_state_body`'s only question is `runs_fenced_lifecycle()`, and this is where a
-        /// harness that has been given production's own `JobLifecycle` answers it.
+        /// harness that has been given production's own `JobLifecycle` answers it. Since
+        /// M11.T26h that answer is *yes*, so this is the entry that reaches the M11.D39b phase
+        /// graph rather than the landed body — which is the whole of what the activation change
+        /// did to the seam.
+        ///
+        /// The caller must have installed production's lifecycle first
+        /// ([`Harness::install_production_lifecycle`]); a harness that has not is a
+        /// pre-flag-day peer, and [`Self::schedule_through_the_legacy_route`] is its entry.
         async fn schedule_through_the_production_route(
             &mut self,
         ) -> Result<Transition, StateError> {
@@ -6684,9 +6516,30 @@ mod tests {
                 StateBackendSelector::Parquet,
             );
             assert!(
+                ctx.runs_fenced_lifecycle(),
+                "a job built from `LifecycleMode::SELECTED` has the D39a writer, so the seam \
+                 must send it to the M11.D39b phase graph"
+            );
+            super::scheduling::run_state_body(Box::new(Scheduling {}), &mut ctx).await
+        }
+
+        /// The same run, entered through the same seam, for a job on the pre-flag-day peer's
+        /// mechanism.
+        ///
+        /// M11.D75's compatibility window is a real deployment state and these rows are what
+        /// describe it: a controller that has not crossed the flag day sends the fence-less
+        /// shape and records no durable obligation. The default `Harness` builds exactly such a
+        /// job — `lifecycle_actor` is `None` — and the assertion says so rather than leaving it
+        /// implied.
+        async fn schedule_through_the_legacy_route(&mut self) -> Result<Transition, StateError> {
+            let mut ctx = self.harness.ctx(
+                running_config(StateBackendSelector::Parquet),
+                StateBackendSelector::Parquet,
+            );
+            assert!(
                 !ctx.runs_fenced_lifecycle(),
-                "a job built from `LifecycleMode::SELECTED` has no D39a writer, so the seam \
-                 must send it to the landed `Scheduling::next`"
+                "this fixture is about the pre-flag-day peer, and with an actor it would \
+                 silently run the phase graph instead"
             );
             super::scheduling::run_state_body(Box::new(Scheduling {}), &mut ctx).await
         }
@@ -6711,6 +6564,25 @@ mod tests {
         }
     }
 
+    /// Whether this process is configured for the worker-leader controller topology
+    /// (M11.T26g).
+    ///
+    /// The same expression `PhaseContext::new` and `StateMachine::start` derive `leader_mode`
+    /// from, read here so a fixture can state what *it* should observe in the topology the
+    /// process is actually in. `scripts/m11-d39-matrix.sh` varies it between the two cells of
+    /// every D96 row by setting `ARROYO__JOB_CONTROLLER`, one process each.
+    ///
+    /// A row using this still asserts one closed-form value per topology. It is not a licence
+    /// to accept either answer, and it is deliberately *not* an internal loop over both: the
+    /// topology is process-wide — see `PhaseContext::run_as_leader_on` — and the runner is what
+    /// varies it.
+    fn worker_leader_topology() -> bool {
+        matches!(
+            super::config().job_controller,
+            super::JobControllerMode::Worker
+        )
+    }
+
     /// The name of the state a transition advances to.
     fn advanced_to(outcome: &Result<Transition, StateError>) -> Option<&'static str> {
         match outcome {
@@ -6724,160 +6596,6 @@ mod tests {
         Arc::new(lifecycle::IntentMailbox::new(Arc::new(
             "job_abc".to_string(),
         )))
-    }
-
-    /// Publishes `refusal` to `gate` at the first instant a publication is possible, exactly as
-    /// a poll that found the admission taken would when it came round again.
-    ///
-    /// Spinning on `admit_publication` is not a timing hack: it is the only outcome
-    /// `refuse_config` has while a region is in flight — it changes nothing and the next poll
-    /// tries again — so the first success is by construction the first moment the region ended.
-    async fn publish_when_admitted(gate: &RefusalGate, refusal: RefusedConfig) {
-        loop {
-            if let Some(admission) = gate.admit_publication() {
-                gate.publish(&admission, refusal);
-                return;
-            }
-            tokio::task::yield_now().await;
-        }
-    }
-
-    /// A refusal that reaches the gate while the job waits for its workers, with the connect
-    /// that ends that wait queued *ahead* of it, must stop the `StartExecution` RPCs.
-    ///
-    /// This is the reviewer's scenario for the first receive loop, and it is deterministic
-    /// rather than raced. The refusal is published the instant the preamble's admission is
-    /// released — the earliest a poll could have published it at all — and only then is the
-    /// `WorkerConnect` queued, with the refusal message behind it. The loop breaks on the
-    /// connect the moment the slots add up, so the refusal is still sitting unread in the job's
-    /// queue when the crossing is reached; nothing about the outcome may depend on that.
-    ///
-    /// Before the fix the fan-out ran here and a worker was told to start executing a
-    /// configuration the controller had already refused. It is a real gRPC call to a real
-    /// server, so what is asserted is what the worker received.
-    #[tokio::test]
-    async fn a_refusal_queued_behind_the_worker_connects_stops_the_execution_rpcs() {
-        let mut run = SchedulingRun::new("connects-refusal").await;
-        let gate = run.harness.refusal_gate.clone();
-        let queue = run.harness.queue();
-        let barriers = run.barriers.clone();
-        let address = run.address(0);
-
-        let version = Arc::new(AtomicU64::new(1));
-        let refusal = RefusedConfig::new(selector_changed(), 1, version);
-
-        let poll = tokio::spawn(async move {
-            // Strictly inside the preamble: the cluster has been asked for, so the preamble
-            // still holds the admission and nothing can be published yet.
-            barriers.workers_started.notified().await;
-            publish_when_admitted(&gate, refusal.clone()).await;
-            // Only now the messages, in the order that hides the refusal from the loop.
-            queue.send(worker_connect(&address)).await.unwrap();
-            queue
-                .send(JobMessage::ConfigRefused(refusal))
-                .await
-                .unwrap();
-        });
-
-        let outcome = run.schedule().await;
-        poll.await.unwrap();
-
-        assert_eq!(
-            run.calls.started(),
-            Vec::<String>::new(),
-            "no worker may be told to start executing a configuration the controller has \
-             refused — the refusal was on the gate before this crossing, whatever position it \
-             had reached in the job's queue"
-        );
-        assert_eq!(
-            run.calls.committed(),
-            Vec::<u64>::new(),
-            "and so nothing is committed either: the commits come after the execution that \
-             never started"
-        );
-
-        let Err(err) = outcome else {
-            panic!("a refused job must not be scheduled into an execution");
-        };
-        assert!(
-            matches!(
-                selector_error(&err),
-                StateBackendError::JobSelectorChanged { .. }
-            ),
-            "and must fail for the refusal itself, not for something the attempt hit: {err:?}"
-        );
-        assert_eq!(
-            state_writes(&run.db),
-            [("Scheduling".to_string(), 2)],
-            "the preamble did run — it was admitted with the gate clear — so this test is \
-             about the crossing after it and not about a job that never got started"
-        );
-    }
-
-    /// The same, one phase later: a refusal that reaches the gate while the job waits for its
-    /// tasks, with the `TaskStarted` that ends that wait queued ahead of it, must stop the
-    /// recovered commits.
-    ///
-    /// The barrier here is the worker's own `StartExecution` handler, which fires from inside
-    /// the second region — so the refusal is published strictly after that region's gate read
-    /// (execution is allowed to start, and does) and strictly before the `TaskStarted` that
-    /// makes the second loop exit. The refusal message is queued behind that `TaskStarted` and
-    /// is never read.
-    ///
-    /// Before the fix the job then published the restored checkpoint's commits: a two-phase
-    /// commit finished against the job's sinks, for a configuration the controller had refused,
-    /// and not something a later failure can take back.
-    #[tokio::test]
-    async fn a_refusal_queued_behind_the_task_starts_stops_the_recovered_commits() {
-        let mut run = SchedulingRun::new("task-starts-refusal").await;
-        let gate = run.harness.refusal_gate.clone();
-        let queue = run.harness.queue();
-        let barriers = run.barriers.clone();
-
-        // The connect is already in the queue, so the first loop is satisfied without the
-        // poll thread doing anything: this test is about the second one.
-        queue.send(worker_connect(&run.address(0))).await.unwrap();
-
-        let version = Arc::new(AtomicU64::new(1));
-        let refusal = RefusedConfig::new(selector_changed(), 1, version);
-
-        let poll = tokio::spawn(async move {
-            barriers.execution_started.notified().await;
-            publish_when_admitted(&gate, refusal.clone()).await;
-            queue.send(task_started()).await.unwrap();
-            queue
-                .send(JobMessage::ConfigRefused(refusal))
-                .await
-                .unwrap();
-        });
-
-        let outcome = run.schedule().await;
-        poll.await.unwrap();
-
-        assert_eq!(
-            run.calls.started(),
-            ["parquet".to_string()],
-            "execution did start, because nothing was refused when that crossing read the \
-             gate — which is what makes this test about the crossing after it"
-        );
-        assert_eq!(
-            run.calls.committed(),
-            Vec::<u64>::new(),
-            "but the restored checkpoint's commits are externally visible and must not be \
-             published for a refused configuration, however far behind the `TaskStarted` the \
-             refusal was queued"
-        );
-
-        let Err(err) = outcome else {
-            panic!("a refused job must not publish a checkpoint's commits");
-        };
-        assert!(
-            matches!(
-                selector_error(&err),
-                StateBackendError::JobSelectorChanged { .. }
-            ),
-            "and must fail for the refusal itself: {err:?}"
-        );
     }
 
     /// The control for both, and for every property an interlock at these crossings could
@@ -6950,183 +6668,6 @@ mod tests {
     // cancelled — so that the answer does not depend on the handler's shape.
     // ---------------------------------------------------------------------------------------
 
-    /// A worker still inside its `StartExecution` must be *waited for* when a sibling request
-    /// fails, so that no refusal can be published while its answer is still outstanding.
-    ///
-    /// Round 11 asserted the opposite here — that the request was cut off — and round 13
-    /// replaced that claim rather than strengthening it. Cutting a request off is the most a
-    /// client can do and it is not enough: a stream reset stops nobody, it only stops anyone
-    /// listening. The scenario is unchanged (two workers, one that fails and one held inside its
-    /// handler when the failure lands, the failure held back until the second is provably
-    /// inside); what is asked of the controller is now settlement instead of cancellation.
-    ///
-    /// This worker suspends cooperatively, so the fan-out *could* still take its request away.
-    /// The point of keeping it alongside
-    /// `a_sibling_failure_cannot_release_the_admission_while_a_blocked_worker_is_unsettled` is
-    /// that both now get the same answer: the guarantee no longer depends on which kind of
-    /// handler the worker happens to have.
-    #[tokio::test]
-    async fn a_sibling_failure_waits_for_the_request_it_used_to_cut_off() {
-        let paused = PausedWorker::new();
-        let mut run = SchedulingRun::with_workers(
-            "sibling-failure",
-            vec![
-                StartsExecution::FailingOnce(paused.asked_relay()),
-                StartsExecution::Pausing(paused.clone()),
-            ],
-        )
-        .await;
-
-        let gate = run.harness.refusal_gate.clone();
-        let queue = run.harness.queue();
-        for (n, worker_id) in [WorkerId(7), WorkerId(8)].into_iter().enumerate() {
-            queue
-                .send(worker_connect_from(worker_id, &run.address(n)))
-                .await
-                .unwrap();
-        }
-
-        let version = Arc::new(AtomicU64::new(1));
-        let refusal = RefusedConfig::new(selector_changed(), 1, version);
-
-        let watching = paused.clone();
-        let poll = tokio::spawn(async move {
-            // Not before the fan-out has begun. A publication that succeeded during the
-            // receive phase ahead of it would stop the fan-out at its own gate read — round
-            // 9's scenario, covered by round 9's tests — and this test is about what is left
-            // running once the fan-out has already been entered and has failed.
-            watching.asked.notified().await;
-
-            // Publishing is impossible for as long as a region is in flight, so this asks
-            // directly whether the fan-out kept its admission across a sibling's failure. See
-            // `SETTLEMENT_GRACE` for why establishing that it did needs a deadline.
-            let published_while_unsettled =
-                tokio::time::timeout(SETTLEMENT_GRACE, publish_when_admitted(&gate, refusal))
-                    .await
-                    .is_ok();
-
-            // However that went, let the worker out so the assertions can run.
-            watching.released.notify_one();
-            published_while_unsettled
-        });
-
-        let outcome = run.schedule().await;
-        let published_while_unsettled = poll.await.unwrap();
-
-        assert!(
-            !published_while_unsettled,
-            "a refusal was published while a `StartExecution` this job had issued was still \
-             unsettled: the fan-out gave its admission up on a sibling's failure, and a request \
-             it has stopped waiting for is not a request the worker has stopped serving"
-        );
-        assert_eq!(
-            paused.outcome().await,
-            PausedOutcome::Applied,
-            "and the request must have been waited for rather than taken back: round 11 cut \
-             this one off, which is all a client can do to a handler and says nothing about \
-             what the handler did"
-        );
-        assert_eq!(
-            run.calls.started(),
-            ["parquet".to_string()],
-            "so the surviving worker did start executing — under a configuration that was \
-             unrefused when it was admitted, which is the order this test is about"
-        );
-        assert_eq!(
-            run.calls.committed(),
-            Vec::<u64>::new(),
-            "and nothing is committed: the commits come after a fan-out that succeeded"
-        );
-
-        let Err(err) = outcome else {
-            panic!("a fan-out in which a worker refused the request cannot have succeeded");
-        };
-        assert!(
-            format!("{err:?}").contains("failed to initialize workers"),
-            "and draining the siblings must still report the worker that refused: {err:?}"
-        );
-    }
-
-    /// Cancelling the job's state task must not release its admission while an outstanding
-    /// `StartExecution` is unanswered, because nothing else can speak for that request now.
-    ///
-    /// The other ordering, and the one no error path reaches: the state task is simply dropped —
-    /// `ShutdownGuard::into_spawn_task` drops `run_to_completion` when the shutdown token fires
-    /// — while the fan-out is in flight. Round 10 left the requests detached and running past
-    /// the admission; round 11 made them die with the task, which is the right thing to do with
-    /// a client future and still no answer at all about the handler behind it.
-    ///
-    /// So round 13 sends the admission with them instead: the region owns it, and a region
-    /// dropped with work outstanding is finished in a task that carries the admission inside it.
-    /// A publication is therefore impossible the instant after the state task is gone, and
-    /// becomes possible only once the worker has answered.
-    #[tokio::test]
-    async fn a_cancelled_fan_out_holds_its_admission_until_the_request_it_issued_settles() {
-        let paused = PausedWorker::new();
-        let mut run = SchedulingRun::with_workers(
-            "cancelled-fan-out",
-            vec![StartsExecution::Pausing(paused.clone())],
-        )
-        .await;
-
-        let gate = run.harness.refusal_gate.clone();
-        let queue = run.harness.queue();
-        queue
-            .send(worker_connect_from(WorkerId(7), &run.address(0)))
-            .await
-            .unwrap();
-
-        {
-            let mut scheduling = std::pin::pin!(run.schedule());
-            tokio::select! {
-                _ = &mut scheduling => {
-                    panic!("the state cannot have finished: a worker is still holding its \
-                            `StartExecution` open")
-                }
-                _ = paused.asked.notified() => {}
-            }
-            // The job's state task, cancelled with a request in flight.
-        }
-
-        // Deterministic, and the assertion round 11 had backwards: the admission is inside the
-        // rescued region, so it is still held the instant the task that opened it is gone.
-        assert!(
-            gate.admit_publication().is_none(),
-            "the admission must have outlived the cancelled state task, because the request it \
-             authorised has: a refusal published now would be published behind a worker that is \
-             still deciding what to do with its `StartExecution`"
-        );
-
-        paused.released.notify_one();
-        assert_eq!(
-            paused.outcome().await,
-            PausedOutcome::Applied,
-            "the rescued region must carry its request through to an answer, not merely hold a \
-             lock for a while"
-        );
-
-        tokio::time::timeout(
-            SETTLEMENT_GRACE,
-            publish_when_admitted(
-                &gate,
-                RefusedConfig::new(selector_changed(), 1, Arc::new(AtomicU64::new(1))),
-            ),
-        )
-        .await
-        .expect(
-            "and it must be released once that answer is in — holding it any longer would wedge \
-             the job's next scheduling attempt on a task nobody is waiting for",
-        );
-
-        assert_eq!(
-            run.calls.started(),
-            ["parquet".to_string()],
-            "the worker did start executing: it was asked under an admitted, unrefused \
-             configuration, and the guarantee is that no refusal was published while that was \
-             still in doubt"
-        );
-    }
-
     // ---------------------------------------------------------------------------------------
     // Round 13: settlement, not cancellation.
     //
@@ -7148,185 +6689,6 @@ mod tests {
     // this side.
     // ---------------------------------------------------------------------------------------
 
-    /// A sibling request failing must not release the admission while a worker that cannot be
-    /// cancelled is still inside its `StartExecution`.
-    ///
-    /// The reviewer's counterexample, made deterministic. Two workers: one fails, and one is
-    /// blocked inside its handler in a way no stream reset can reach. The failure is held back
-    /// until the blocked handler is provably inside, so "a request was outstanding" is enforced
-    /// rather than hoped for; a refusal is then published at the first instant a publication is
-    /// possible.
-    ///
-    /// Before the fix the fan-out left on the first error, dropped the sibling's client future,
-    /// and released the admission. The publication then succeeded — and the worker, which had
-    /// never stopped, went on to start executing the configuration that had just been refused.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_sibling_failure_cannot_release_the_admission_while_a_blocked_worker_is_unsettled() {
-        let blocked = BlockedWorker::new();
-        // Declared first, so it is dropped last: whatever fails below, the worker is let go
-        // before the runtime is torn down. See `ReleasedOnDrop`.
-        let _released = ReleasedOnDrop(blocked.clone());
-        let mut run = SchedulingRun::with_workers(
-            "blocked-sibling-failure",
-            vec![
-                StartsExecution::FailingOnce(blocked.asked_relay()),
-                StartsExecution::Blocking(blocked.clone()),
-            ],
-        )
-        .await;
-        blocked.watch(run.harness.refusal_gate.clone());
-
-        let gate = run.harness.refusal_gate.clone();
-        let queue = run.harness.queue();
-        for (n, worker_id) in [WorkerId(7), WorkerId(8)].into_iter().enumerate() {
-            queue
-                .send(worker_connect_from(worker_id, &run.address(n)))
-                .await
-                .unwrap();
-        }
-
-        let refusal = RefusedConfig::new(selector_changed(), 1, Arc::new(AtomicU64::new(1)));
-        let watching = blocked.clone();
-        let relay = blocked.asked_relay();
-        let probe = tokio::spawn(async move {
-            // Only once the blocked handler is past the point of no return: from here on the
-            // controller cannot stop it, whatever it does with the request.
-            watching.wait_until_inside().await;
-            relay.notify_one();
-
-            // A publication succeeds at the first instant a region is not in flight, so this
-            // asks directly whether the admission survived the sibling's failure. See
-            // `SETTLEMENT_GRACE` for why establishing a negative needs a deadline.
-            let published_while_unsettled =
-                tokio::time::timeout(SETTLEMENT_GRACE, publish_when_admitted(&gate, refusal))
-                    .await
-                    .is_ok();
-
-            // However that went, let the worker out so the assertions can run.
-            watching.release();
-            published_while_unsettled
-        });
-
-        let outcome = run.schedule().await;
-        let published_while_unsettled = probe.await.unwrap();
-
-        assert!(
-            !published_while_unsettled,
-            "a refusal was published while a `StartExecution` this job had issued was still \
-             unsettled: the fan-out gave the admission up on a sibling's failure, and the \
-             request it stopped waiting for was one no cancellation could reach"
-        );
-        assert!(
-            blocked.started(),
-            "the blocked handler must have run to completion — past the point at which the \
-             unfixed fan-out had already given up on it — or this test proves nothing"
-        );
-        assert!(
-            !blocked.saw_refusal(),
-            "and it must have started the worker before any refusal existed: a worker that \
-             cannot be cancelled must have its answer in hand before a refusal can be published"
-        );
-        assert_eq!(
-            run.calls.started(),
-            ["parquet".to_string()],
-            "the blocked worker did start executing, which is the point: it accepted a \
-             configuration that was unrefused when it was admitted, and the guarantee is about \
-             the order of that against the refusal, not about revoking it"
-        );
-
-        let Err(err) = outcome else {
-            panic!("a fan-out in which a worker refused the request cannot have succeeded");
-        };
-        assert!(
-            format!("{err:?}").contains("failed to initialize workers"),
-            "and draining the siblings must still report the worker that refused: {err:?}"
-        );
-    }
-
-    /// Cancelling the job's state task must not release the admission while a worker that
-    /// cannot be cancelled is still inside its `StartExecution`.
-    ///
-    /// The other ordering, and the one no error path reaches: the state task is dropped whole —
-    /// `ShutdownGuard::into_spawn_task` drops `run_to_completion` when the shutdown token fires
-    /// — while the fan-out is in flight. Round 11 made the requests die with it, which is the
-    /// right thing to do with a client future and no answer at all about the handler behind it.
-    ///
-    /// So the admission goes with the requests instead of before them: the region owns it, and
-    /// a region dropped with work outstanding is finished in a task that carries the admission
-    /// inside it. This asserts that directly — a publication is impossible the instant after
-    /// the task is gone, and becomes possible only once the worker has been let out.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn dropping_the_scheduling_task_keeps_the_admission_until_its_blocked_request_settles() {
-        let blocked = BlockedWorker::new();
-        // Declared first, so it is dropped last. The assertion below fires on unfixed code
-        // while the worker is still blocked, and without this the suite would hang there
-        // rather than report. See `ReleasedOnDrop`.
-        let _released = ReleasedOnDrop(blocked.clone());
-        let mut run = SchedulingRun::with_workers(
-            "blocked-cancelled-fan-out",
-            vec![StartsExecution::Blocking(blocked.clone())],
-        )
-        .await;
-        blocked.watch(run.harness.refusal_gate.clone());
-
-        let gate = run.harness.refusal_gate.clone();
-        let queue = run.harness.queue();
-        queue
-            .send(worker_connect_from(WorkerId(7), &run.address(0)))
-            .await
-            .unwrap();
-
-        {
-            let mut scheduling = std::pin::pin!(run.schedule());
-            let mut inside = std::pin::pin!(blocked.wait_until_inside());
-            tokio::select! {
-                _ = &mut scheduling => {
-                    panic!("the state cannot have finished: the worker is still blocked inside \
-                            its `StartExecution`")
-                }
-                _ = &mut inside => {}
-            }
-            // The job's state task, cancelled with a request in flight that nothing can recall.
-        }
-
-        assert!(
-            gate.admit_publication().is_none(),
-            "the admission must have outlived the cancelled state task, because the request it \
-             authorised has: the worker is inside a handler that no stream reset can drop, and \
-             a refusal published now would be published behind it"
-        );
-
-        blocked.release();
-
-        tokio::time::timeout(
-            SETTLEMENT_GRACE,
-            publish_when_admitted(
-                &gate,
-                RefusedConfig::new(selector_changed(), 1, Arc::new(AtomicU64::new(1))),
-            ),
-        )
-        .await
-        .expect(
-            "and it must be released once the request settles — holding it past that would \
-             wedge the job's next scheduling attempt on a task nobody is waiting for",
-        );
-
-        assert!(
-            blocked.started(),
-            "the blocked handler must have run to completion, or this test proves nothing"
-        );
-        assert!(
-            !blocked.saw_refusal(),
-            "and it started the worker before any refusal existed"
-        );
-        assert_eq!(
-            run.calls.started(),
-            ["parquet".to_string()],
-            "the worker did start: a request the controller could not recall was answered \
-             before the refusal, which is the order the invariant is about"
-        );
-    }
-
     /// A client-side deadline is not a worker answer. The first handler here escapes the
     /// failed RPC and remains able to apply the request, as a legacy handler blocked inside
     /// `phase.lock()` could. The controller must retain the admission, retry the same execution
@@ -7340,7 +6702,7 @@ mod tests {
         )
         .await;
 
-        let gate = run.harness.refusal_gate.clone();
+        let authority = run.harness.admission.clone();
         let queue = run.harness.queue();
         let execution_started = run.barriers.clone();
         let calls = run.calls.clone();
@@ -7363,7 +6725,7 @@ mod tests {
         }
 
         assert!(
-            gate.admit_publication().is_none(),
+            !authority.is_free(),
             "the admission must remain held after the client deadline while the original \
              server work can still apply the request"
         );
@@ -7388,41 +6750,6 @@ mod tests {
             calls.started(),
             ["parquet".to_string()],
             "the stable execution ID makes the retry idempotent"
-        );
-    }
-
-    /// A busy worker phase is a definitive non-application, but it is transient. The worker
-    /// returns `Aborted` without parking a handler inside its mutex, and the controller retries
-    /// the same execution ID while the admission remains held.
-    #[tokio::test]
-    async fn a_busy_worker_phase_is_retried_under_the_same_start_admission() {
-        let busy = BusyStart::new();
-        let mut run = SchedulingRun::with_workers(
-            "busy-start-execution",
-            vec![StartsExecution::BusyOnce(busy.clone())],
-        )
-        .await;
-        let queue = run.harness.queue();
-        queue
-            .send(worker_connect_from(WorkerId(7), &run.address(0)))
-            .await
-            .unwrap();
-        queue.send(task_started()).await.unwrap();
-
-        let outcome = run.schedule().await;
-        let Ok(Transition::Advance(next)) = outcome else {
-            panic!("a transient busy phase must be retried rather than fail scheduling");
-        };
-        assert_eq!(next.state.name(), "Running");
-        assert_eq!(
-            busy.calls.load(Ordering::SeqCst),
-            2,
-            "the Aborted response must be retried exactly once in this fixture"
-        );
-        assert_eq!(
-            run.calls.started(),
-            ["parquet".to_string()],
-            "only the accepted retry starts the worker"
         );
     }
 
@@ -7458,68 +6785,6 @@ mod tests {
     /// terminates" is reported as a failure instead of hanging the suite.
     const TERMINAL_PATH_GRACE: Duration = Duration::from_secs(60);
 
-    /// A `StartExecution` that never settles must end the fan-out, not hold the admission for
-    /// the life of the controller.
-    ///
-    /// The worker here is reachable and capable — it advertised the contract — and answers
-    /// `Unavailable` to every attempt, which is what a partition or a half-dead peer looks
-    /// like from the controller. Before the fix the loop retried that at 250ms with no exit:
-    /// the admission was never released, so the job could neither be rescheduled nor be
-    /// refused, and the "bounded by the RPC deadline" claim on `settle_under_admission` was
-    /// false because each expiry started another attempt.
-    ///
-    /// What is asserted is the pair: the attempt is given up after a bounded number of
-    /// *replays of the same ID* (not a new attempt each time, which would be a second way to
-    /// start a worker twice), and a refusal can be published the moment it is.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_permanently_unsettled_start_execution_ends_the_fan_out_and_releases_the_admission() {
-        let never = NeverSettles::new();
-        let mut run = SchedulingRun::with_workers(
-            "never-settling-start-execution",
-            vec![StartsExecution::NeverSettling(never.clone())],
-        )
-        .await;
-        let gate = run.harness.refusal_gate.clone();
-        run.harness
-            .queue()
-            .send(worker_connect_from(WorkerId(7), &run.address(0)))
-            .await
-            .unwrap();
-
-        let outcome = tokio::time::timeout(TERMINAL_PATH_GRACE, run.schedule())
-            .await
-            .expect(
-                "the fan-out must give an unsettleable attempt up: with no terminal path the \
-                 loop retries at 250ms forever and the job can never reschedule or be refused",
-            );
-
-        let Err(err) = outcome else {
-            panic!("a fan-out no worker ever accepted cannot have succeeded");
-        };
-        assert!(
-            format!("{err:?}").contains("failed to initialize workers"),
-            "and it must fail as a retryable scheduling error, so the next attempt raises the \
-             generation and tears the old one down: {err:?}"
-        );
-        assert_eq!(
-            never.calls.load(Ordering::SeqCst) as usize,
-            START_EXECUTION_RECONCILE_ATTEMPTS + 1,
-            "the first request plus a bounded number of reconciliation attempts, every one of \
-             them a replay of the same attempt ID"
-        );
-        assert!(
-            gate.admit_publication().is_some(),
-            "and the admission must be free once the attempt is over: holding it past the last \
-             request the controller will ever issue defers every refusal for this job forever"
-        );
-        assert_eq!(
-            run.calls.started(),
-            Vec::<String>::new(),
-            "nothing started: this worker never applied anything, which is why giving the \
-             attempt up loses knowledge rather than safety"
-        );
-    }
-
     /// A worker predating the reconciliation contract must never be sent a `StartExecution` at
     /// all.
     ///
@@ -7544,7 +6809,7 @@ mod tests {
             vec![StartsExecution::Blocking(blocked.clone())],
         )
         .await;
-        blocked.watch(run.harness.refusal_gate.clone());
+        blocked.watch(intent_mailbox());
         run.harness
             .queue()
             .send(legacy_worker_connect_from(WorkerId(7), &run.address(0)))
@@ -7578,25 +6843,30 @@ mod tests {
         );
     }
 
-    /// Replacing the controller must not leave a legacy handler behind a fresh refusal gate.
+    /// Replacing the controller must not leave a legacy handler behind a fresh decision.
     ///
-    /// The reviewer's scenario, and the one the in-memory admission cannot answer on its own: a
-    /// `RefusalGate` lives in the `StateMachine`, so a replacement controller builds a new one
-    /// and its `admit_publication` succeeds immediately, however many handlers the previous
-    /// controller left parked in a worker.
+    /// The reviewer's scenario, and the one the in-memory admission cannot answer on its own:
+    /// a controller's lifecycle state is per process, so a replacement builds a brand-new one
+    /// and can decide the job's next transition immediately, however many handlers the
+    /// previous controller left parked in a worker.
     ///
-    /// The fix does not make that gate durable. It removes what the durability would have been
-    /// for: a controller of this version never issues a `StartExecution` to a worker that could
-    /// park one, so after any number of controller replacements there is no parked legacy
-    /// handler for a fresh gate to be raced by. This runs that end to end — schedule under the
-    /// first controller, drop it whole, publish a refusal on the replacement's brand-new gate,
-    /// and only then let the handler out — and asserts the handler was never entered by either.
+    /// The fix does not make that state durable. It removes what the durability would have
+    /// been for: a controller of this version never issues a `StartExecution` to a worker that
+    /// could park one, so after any number of controller replacements there is no parked legacy
+    /// handler for a fresh decision to be raced by. This runs that end to end — schedule under
+    /// the first controller, drop it whole, decide a refusal on the replacement's brand-new
+    /// mechanism, and only then let the handler out — and asserts the handler was never
+    /// entered by either.
+    ///
+    /// M11.T26h rewrote the two halves that named the removed mechanism: the replacement's
+    /// freedom to act is now read from its own lifecycle authority, and the refusal it decides
+    /// is the intent its single writer stands behind. What is asserted is unchanged.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_controller_replacement_leaves_no_legacy_start_execution_handler_behind_its_gate() {
         let blocked = BlockedWorker::new();
         let _released = ReleasedOnDrop(blocked.clone());
 
-        // The first controller, with its own gate, which goes away with it.
+        // The first controller, with its own lifecycle authority, which goes away with it.
         let mut first = SchedulingRun::with_workers(
             "legacy-across-controller-replacement",
             vec![StartsExecution::Blocking(blocked.clone())],
@@ -7618,15 +6888,17 @@ mod tests {
         );
 
         // The controller process is replaced: a different `StateMachine`, and with it a
-        // different `RefusalGate` and a different admission mutex. Nothing in memory survives.
+        // different lifecycle authority and a different intent mailbox. Nothing in memory
+        // survives.
         drop(first);
         let mut replacement = SchedulingRun::with_workers(
             "legacy-across-controller-replacement-2",
             vec![StartsExecution::Blocking(blocked.clone())],
         )
         .await;
-        let fresh_gate = replacement.harness.refusal_gate.clone();
-        blocked.watch(fresh_gate.clone());
+        let fresh_authority = replacement.harness.admission.clone();
+        let fresh_mailbox = intent_mailbox();
+        blocked.watch(Arc::clone(&fresh_mailbox));
         replacement
             .harness
             .queue()
@@ -7642,14 +6914,12 @@ mod tests {
         assert!(replacement_outcome.is_err());
 
         // The refusal the old handler was supposed to be able to start behind.
-        let admission = fresh_gate
-            .admit_publication()
-            .expect("the replacement's gate is free: nothing was ever issued under it");
-        fresh_gate.publish(
-            &admission,
-            RefusedConfig::new(selector_changed(), 1, Arc::new(AtomicU64::new(1))),
+        assert!(
+            fresh_authority.is_free(),
+            "the replacement's lifecycle authority is free: nothing was ever issued under it, \
+             so it can decide this job's next transition at once"
         );
-        drop(admission);
+        fresh_mailbox.submit(LifecycleIntent::Refused(selector_changed()));
 
         // And now let the handler out, which is where the hazard would materialise.
         blocked.release();
@@ -7682,260 +6952,6 @@ mod tests {
         &source[..source
             .find("\n#[cfg(test)]")
             .expect("scheduling.rs has a test module")]
-    }
-
-    /// The same, with line comments removed, so a needle found in it is code.
-    fn scheduling_source_without_comments() -> String {
-        scheduling_source()
-            .lines()
-            .map(|line| match line.find("//") {
-                // Sound only while no string literal in this half of the file contains `//`,
-                // which `the_region_audits_comment_stripper_is_sound_for_scheduling_rs` checks.
-                Some(at) => &line[..at],
-                None => line,
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    /// The body of a function in `scheduling.rs`, by its signature, comments removed.
-    fn scheduling_body(source: &str, signature: &str) -> String {
-        let start = source
-            .find(signature)
-            .unwrap_or_else(|| panic!("{signature} has been renamed"));
-        let rest = &source[start..];
-        let end = rest
-            .find("\n    }\n")
-            .or_else(|| rest.find("\n}\n"))
-            .expect("unterminated function body");
-        rest[..end].to_string()
-    }
-
-    /// `Scheduling::next`, split into the stretches an [`Admission`] is held across and the
-    /// stretches it is not.
-    ///
-    /// A region opens at `ctx.admit_irreversible_scheduling(` and closes at `drop(admission)`.
-    /// They must strictly alternate, which is itself checked: two opens in a row would be the
-    /// state taking a lock it already holds, and `tokio`'s mutex does not re-enter — the job
-    /// would wedge on itself rather than fail.
-    fn admitted_and_interruptible(body: &str) -> (Vec<String>, Vec<String>) {
-        const OPEN: &str = "ctx.admit_irreversible_scheduling(";
-        const CLOSE: &str = "drop(admission)";
-
-        let mut marks: Vec<(usize, bool)> = body
-            .match_indices(OPEN)
-            .map(|(i, _)| (i, true))
-            .chain(body.match_indices(CLOSE).map(|(i, _)| (i, false)))
-            .collect();
-        marks.sort_unstable();
-        assert!(
-            marks
-                .iter()
-                .enumerate()
-                .all(|(n, (_, is_open))| *is_open == (n % 2 == 0)),
-            "every admitted region must be opened and then closed before the next is opened; \
-             found {:?}",
-            marks.iter().map(|(_, o)| *o).collect::<Vec<_>>()
-        );
-        assert!(
-            marks.len().is_multiple_of(2),
-            "an admitted region was opened and never closed"
-        );
-
-        let mut admitted = vec![];
-        let mut interruptible = vec![];
-        let mut prev = 0;
-        for pair in marks.chunks(2) {
-            let (open, close) = (pair[0].0, pair[1].0);
-            interruptible.push(body[prev..open].to_string());
-            admitted.push(body[open..close].to_string());
-            prev = close + CLOSE.len();
-        }
-        interruptible.push(body[prev..].to_string());
-        (admitted, interruptible)
-    }
-
-    /// The regions, and everything in them, pinned on source text rather than on behaviour.
-    ///
-    /// **This is a structural source pin, and the name says so.** What it asserts is where the
-    /// words are in `scheduling.rs`, not what the job does; the behaviour is covered by
-    /// `a_refusal_published_after_the_gate_snapshot_still_stops_the_scheduling_preamble`,
-    /// `a_refusal_queued_behind_the_worker_connects_stops_the_execution_rpcs`,
-    /// `a_refusal_queued_behind_the_task_starts_stops_the_recovered_commits` and their control.
-    ///
-    /// It exists because the guarantee is a property of a *region*: every irreversible effect
-    /// between an `admit_irreversible_scheduling` and its `drop` is covered without anyone
-    /// remembering anything. What no test of behaviour can notice is an effect added *outside*
-    /// every region — which is exactly how rounds 7, 8 and 9 each found the next unguarded
-    /// phase — so the boundaries are pinned here together with the whole inventory of effects
-    /// they contain, and with the inventory of what the *interruptible* stretches are allowed
-    /// to await. A new `await` outside a region fails this test, and its author then has to say
-    /// whether what it waits on is an effect. That is the intended reading of a failure here:
-    /// not "the test is stale", but "decide which side of the boundary this belongs on".
-    #[test]
-    fn the_source_of_scheduling_next_keeps_every_irreversible_effect_inside_an_admitted_region() {
-        let source = scheduling_source_without_comments();
-        let body = scheduling_body(
-            &source,
-            "    async fn next(mut self: Box<Self>, ctx: &mut JobContext)",
-        );
-        let (admitted, interruptible) = admitted_and_interruptible(&body);
-
-        assert_eq!(
-            admitted.len(),
-            3,
-            "three regions: the destructive preamble, the `StartExecution` fan-out, and the \
-             publication of a restored checkpoint's commits"
-        );
-
-        let count = |regions: &[String], needle: &str| -> usize {
-            regions.iter().map(|r| r.matches(needle).count()).sum()
-        };
-
-        // Every irreversible effect of this state, by the call that performs it. Each must
-        // appear, and every occurrence of it must be inside a region.
-        for effect in [
-            "ctx.status.generation += 1",
-            "ctx.status.update_db(",
-            "stop_workers(",
-            "self.start_workers(",
-            "get_and_register_checkpoint_info_leader(",
-            "get_checkpoint_info_legacy(",
-            "start_execution_on_workers(",
-            "send_commit_messages(",
-        ] {
-            assert_eq!(
-                count(&admitted, effect),
-                1,
-                "`{effect}` is irreversible and must appear exactly once, inside an admitted \
-                 region: a refusal published before it would otherwise not be read until the \
-                 next state, or not at all"
-            );
-            assert_eq!(
-                count(&interruptible, effect),
-                0,
-                "`{effect}` must not also appear outside every region"
-            );
-        }
-
-        // And the converse: the interruptible stretches wait, and do nothing else. Anything
-        // they await is listed here.
-        let interruptible_awaits = [
-            ("handle_worker_connect(", 1),
-            ("h.await", 1),
-            ("ctx.handle_task_error(", 1),
-            ("LeaderManager::connect(", 2),
-            ("poll_leader_status(", 1),
-            ("ctx.handle_job_failure(", 1),
-            ("ctx.metrics", 1),
-        ];
-        for (waited_on, times) in interruptible_awaits {
-            assert_eq!(
-                count(&interruptible, waited_on),
-                times,
-                "the interruptible phases are pinned to what they wait on, and `{waited_on}` \
-                 is no longer awaited {times} time(s) outside a region"
-            );
-        }
-        assert_eq!(
-            count(&interruptible, ".await"),
-            interruptible_awaits.iter().map(|(_, n)| n).sum::<usize>(),
-            "an `.await` appeared in `Scheduling` outside every admitted region. If it waits \
-             on something irreversible or externally visible it belongs inside one — that is \
-             the failure this pin exists to force a decision about — and if it does not, add \
-             it to the list above"
-        );
-
-        assert_eq!(
-            count(&admitted, "ctx.rx.recv()"),
-            0,
-            "and no admission is ever held across a wait on the job's channel: that would make \
-             the job unrefusable for as long as it waited, and could not terminate if what it \
-             waited for was the refusal"
-        );
-
-        // The names, which are the enumeration itself. Two of them are performed by helpers
-        // that take an `&Admission`, so they are named there rather than in `next`; the whole
-        // file's inventory is what is pinned.
-        let mut effects: Vec<&str> = source
-            .match_indices(".effect(")
-            .map(|(i, _)| {
-                let rest = &source[i + ".effect(".len()..];
-                let name = &rest[rest.find('"').expect("an effect is named") + 1..];
-                &name[..name.find('"').expect("an unterminated effect name")]
-            })
-            .collect();
-        effects.sort_unstable();
-        assert_eq!(
-            effects,
-            [
-                "persist the incremented scheduling generation",
-                "prepare the legacy recovery checkpoint",
-                "publish the restored checkpoint's commits",
-                "register the generation and prepare its recovery checkpoint",
-                "send every worker its StartExecution",
-                "start the job's replacement workers",
-                "tear down the job's existing cluster",
-            ],
-            "these are the irreversible effects of `Scheduling`; adding one means deciding, \
-             here, which region it belongs in"
-        );
-
-        // The one effect whose call is a helper rather than a statement: the RPCs must be
-        // inside the helper's own `effect`, not merely inside the function that owns it.
-        let fan_out = scheduling_body(&source, "async fn start_execution_on_workers(");
-        let effect_at = fan_out
-            .find(".effect(")
-            .expect("the fan-out must go through `Admission::effect`");
-        assert!(
-            fan_out
-                .match_indices(".start_execution(")
-                .all(|(i, _)| i > effect_at),
-            "the `StartExecution` RPCs must be issued inside the effect, not before it"
-        );
-
-        // And the lifetime half of the same guarantee, which no region boundary can express.
-        //
-        // Round 11 read this as "the requests must not outlive the region", and made them
-        // children of the state task so that every exit took them with it. That is all a
-        // *client* future can be made to do. Dropping one resets its stream; it does not stop a
-        // server handler that has already been entered. The current worker uses `try_lock` so
-        // it never parks there, but the fan-out still has to tolerate legacy or independently
-        // implemented handlers that block inside one poll and ignore the reset.
-        //
-        // So the fan-out no longer ends its requests: it waits for them, and owns the admission
-        // while it does. `settle_under_admission` is what makes that survive the state task
-        // being dropped — the region and its admission are rescued together, so the one thing
-        // that outlives cancellation is the interlock itself.
-        assert!(
-            fan_out.contains("settle_under_admission("),
-            "the `StartExecution` fan-out must own its admission through \
-             `settle_under_admission`, so that neither a sibling's failure nor the job's state \
-             task being dropped can release the admission while a request it issued is still \
-             unsettled. Taking an `&Admission` again would put the guarantee back on the \
-             caller's drop order, which says nothing about a worker that is already running"
-        );
-
-        // A region covers the work *this task* does between its boundaries. `tokio::spawn`
-        // hands its child an independent lifetime — dropping a `JoinHandle` detaches the task
-        // rather than cancelling it — so a spawned effect is precisely an effect the region
-        // cannot end. The one spawn left in this file is `handle_worker_connect`'s channel
-        // setup, which is outside every region, does nothing irreversible, and is awaited to
-        // completion by the phase that started it. A second one means someone has given a
-        // piece of `Scheduling` a life of its own, and has to say which region ends it.
-        //
-        // `settle_under_admission` does spawn, on the cancellation path, and it lives in
-        // `states/mod.rs` rather than here for exactly that reason: what it detaches is the
-        // *admission*, wrapped around the unsettled requests, which is the opposite of what
-        // round 10 detached and is why this count can stay honest at one.
-        assert_eq!(
-            source.matches("tokio::spawn").count(),
-            1,
-            "`Scheduling` may spawn exactly one thing — the worker channel setup in \
-             `handle_worker_connect`. Anything else spawned here can outlive the admission \
-             that authorised it, because dropping its handle detaches it rather than \
-             cancelling it, and can then reach a worker after a refusal has been published"
-        );
     }
 
     /// The assumption [`scheduling_source_without_comments`] rests on.
@@ -8050,223 +7066,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// A refused row that asks for a stop must still be answered by the stop, not by the
-    /// gate.
-    ///
-    /// The gate fails the job wherever it is, which is the right policy for a refusal that
-    /// has no other answer and the wrong one for a refusal that does: a `checkpoint` or
-    /// `graceful` stop exists to take a final checkpoint, and a job failed on its way into
-    /// [`Stopping`] would end in `Failed` without one. So a refusal recorded as answered by
-    /// a stop publishes nothing to the gate, and supersedes anything already published.
-    #[tokio::test]
-    async fn a_refusal_a_stop_is_answering_never_reaches_the_gate() {
-        for stop_mode in [
-            StopMode::checkpoint,
-            StopMode::graceful,
-            StopMode::immediate,
-            StopMode::force,
-        ] {
-            let current = running_config(StateBackendSelector::Parquet);
-            let (mut sm, _rx) = state_machine(current.clone(), StateBackendSelector::Parquet);
-
-            // First the row is only bad, so a refusal is published for the gate to apply.
-            sm.update(
-                polled(
-                    StateBackendSelector::Parquet,
-                    current.clone(),
-                    Some(selector_changed()),
-                ),
-                job_status(current.restart_nonce),
-                &shutdown_guard(),
-            )
-            .await;
-            assert!(
-                sm.refusal_gate.clone().take().is_some(),
-                "{stop_mode:?}: a refusal with no other answer must gate the next state"
-            );
-
-            // Then the operator applies the remedy the refusal itself documents.
-            let mut stopping = running_config(StateBackendSelector::Parquet);
-            stopping.stop_mode = stop_mode;
-            sm.update(
-                polled(
-                    StateBackendSelector::Parquet,
-                    stopping,
-                    Some(selector_changed()),
-                ),
-                job_status(current.restart_nonce),
-                &shutdown_guard(),
-            )
-            .await;
-
-            assert!(
-                sm.refusal_gate.clone().take().is_none(),
-                "{stop_mode:?}: once a stop is answering the refusal, the gate must let the \
-                 job reach `Stopping` — failing it first is what loses the final checkpoint"
-            );
-            assert_eq!(
-                sm.config.read().unwrap().0.stop_mode,
-                stop_mode,
-                "{stop_mode:?}: and the stop is the thing that was actually issued"
-            );
-        }
-    }
-
-    /// A repaired row clears the gate as well as the queue.
-    ///
-    /// Round 5's versioning saves a repaired job from a refusal already sitting in its queue.
-    /// The gate is a second holder of the same refusal and must be superseded by the same
-    /// repair — otherwise the gate would fail a job for a configuration that no longer
-    /// exists, which is round 5's bug reintroduced on a new route.
-    #[tokio::test]
-    async fn a_repair_supersedes_the_refusal_the_gate_is_holding() {
-        let current = running_config(StateBackendSelector::Parquet);
-        let (mut sm, _rx) = state_machine(current.clone(), StateBackendSelector::Parquet);
-
-        sm.update(
-            polled(
-                StateBackendSelector::Parquet,
-                current.clone(),
-                Some(selector_changed()),
-            ),
-            job_status(current.restart_nonce),
-            &shutdown_guard(),
-        )
-        .await;
-        assert!(
-            sm.refusal_gate.clone().take().is_some(),
-            "the refusal must gate the next state while the row is bad"
-        );
-
-        sm.update(
-            polled(StateBackendSelector::Parquet, current.clone(), None),
-            job_status(current.restart_nonce),
-            &shutdown_guard(),
-        )
-        .await;
-        assert!(
-            sm.refusal_gate.clone().take().is_none(),
-            "and must stop gating the moment the operator repairs the row"
-        );
-
-        // The control: the gate is still live, so a row that goes bad again gates afresh.
-        sm.update(
-            polled(
-                StateBackendSelector::Parquet,
-                current.clone(),
-                Some(selector_changed()),
-            ),
-            job_status(current.restart_nonce),
-            &shutdown_guard(),
-        )
-        .await;
-        assert!(
-            sm.refusal_gate.clone().take().is_some(),
-            "the test would not detect the supersession if the gate never fired again"
-        );
-    }
-
-    /// A state that stands in for one already blocked on the job's channel when a refusal
-    /// arrives: the poll thread reaches the job while the state is running, so the refusal is
-    /// published to the gate *and* queued, and the state reads it off the channel itself.
-    ///
-    /// That is the prompt route the gate does not replace, and the only way to reach
-    /// [`execute_state`]'s fatal handling with a refusal the gate has not already applied.
-    /// The real states that take it — `Running`, `Scheduling`'s worker loop, `LeaderRunning`
-    /// — all need a live scheduler, worker set and `JobController` to run.
-    #[derive(Debug)]
-    struct ReadsItsRefusal(RefusedConfig);
-
-    #[async_trait::async_trait]
-    impl State for ReadsItsRefusal {
-        /// Stays, for the same reason: the row that uses it is about a refusal a state reads
-        /// off its own channel, and its context carries no lifecycle actor.
-        fn leave_for_stop(self: Box<Self>, _config: &JobConfig) -> LeavingForStop {
-            LeavingForStop::Stays(self)
-        }
-
-        fn name(&self) -> &'static str {
-            "ReadsItsRefusal"
-        }
-
-        async fn next(self: Box<Self>, ctx: &mut JobContext) -> Result<Transition, StateError> {
-            ctx.refusal_gate
-                .publish(&admitted(&ctx.refusal_gate), self.0.clone());
-            ctx.handle(JobMessage::ConfigRefused(self.0))?;
-            unreachable!("a current refusal fails the job")
-        }
-    }
-
-    /// One refusal fails the job once, whichever of its two routes reached the job first.
-    ///
-    /// The gate is consulted before every state, so a refusal a state has already read off
-    /// its own channel would otherwise be applied a second time — failing the job again
-    /// before [`Failing`] could tear the cluster down, and reporting the same fatal error
-    /// twice on the way to `Failed`.
-    #[tokio::test]
-    async fn a_refusal_a_state_read_itself_does_not_gate_the_failure_that_follows_it() {
-        let db = sqlite_startable_job("Running", 2);
-        let refusal = RefusedConfig::new(selector_changed(), 1, Arc::new(AtomicU64::new(1)));
-
-        let mut harness = Harness::new(3).with_db(db.clone());
-        let ctx = harness.ctx(
-            running_config(StateBackendSelector::Parquet),
-            StateBackendSelector::Parquet,
-        );
-
-        let (next, ctx) = execute_state(Box::new(ReadsItsRefusal(refusal)), ctx).await;
-        assert_eq!(
-            next.as_ref().map(|s| s.name()),
-            Some("Failing"),
-            "a refusal a state reads for itself still fails the job"
-        );
-
-        let (next, _ctx) = execute_state(next.unwrap(), ctx).await;
-        assert_eq!(
-            next.as_ref().map(|s| s.name()),
-            Some("Failed"),
-            "and the gate must then let the failure run: one refusal is one failure, \
-             whichever of its two routes reached the job first"
-        );
-        assert_eq!(
-            state_writes(&db),
-            [("Failing".to_string(), 1), ("Failed".to_string(), 1)],
-            "so the job goes to `Failed` through one `Failing`, not two"
-        );
-    }
-
-    /// The same rule at the level of the gate itself, including that a *later* refusal is a
-    /// different fact about the job and still applies.
-    #[test]
-    fn the_gate_applies_each_refusal_once_and_a_later_one_afresh() {
-        let mut gate = RefusalGate::default();
-        let version = Arc::new(AtomicU64::new(7));
-        gate.publish(
-            &admitted(&gate),
-            RefusedConfig::new(selector_changed(), 7, Arc::clone(&version)),
-        );
-
-        // What a state that read the refusal off its own channel leaves behind.
-        gate.disarm();
-        assert!(
-            gate.take().is_none(),
-            "a refusal a state has already turned fatal must not be turned fatal again"
-        );
-
-        // A *later* refusal is a different fact about the job and still gates, which is what
-        // keeps a job restarting out of `Failed` from restarting into a refused row.
-        version.store(8, std::sync::atomic::Ordering::SeqCst);
-        gate.publish(
-            &admitted(&gate),
-            RefusedConfig::new(selector_changed(), 8, version),
-        );
-        assert!(gate.take().is_some());
-        assert!(
-            gate.take().is_none(),
-            "and each refusal is applied at most once"
-        );
     }
 
     /// Round 5 left the accepted-update `Inactive` branch without a roll-back and argued it
@@ -8474,22 +7273,26 @@ mod tests {
     // intent and the decision alone live beside their modules, in `states/lifecycle/tests.rs`.
     // ---------------------------------------------------------------------------------------
 
-    /// No production path can select the D39a lifecycle (M11.T25f, DoD M11.T25l).
+    /// Every production path selects the D39a lifecycle, and there is one of them
+    /// (M11.T26h, DoD M11.T26z).
     ///
     /// **A structural source pin, and the name says so.** Its companion
-    /// `production_selects_only_the_legacy_t08_lifecycle` proves that the *selection* names
-    /// `LegacyT08` exhaustively over the enum; what no test of that selection can notice is
-    /// a second construction site that never consults it. `JobLifecycle::for_mode` takes the
-    /// mode as an argument — which is what lets a test build the new path directly — so the
-    /// claim "production is `LegacyT08`" is a claim about call sites, and this is where they
-    /// are counted.
+    /// `production_selects_only_the_fenced_v2_lifecycle` proves that the *selection* names
+    /// `FencedV2` exhaustively over the enum; what no test of that selection can notice is a
+    /// second construction site that never consults it. `JobLifecycle::for_mode` takes the
+    /// mode as an argument — which is what lets a test build the pre-flag-day peer directly —
+    /// so the claim "production is `FencedV2`" is a claim about call sites, and this is where
+    /// they are counted.
     ///
-    /// The intended reading of a failure here is not "the test is stale" but "say why a
-    /// second production path is choosing a lifecycle mechanism". M11.T26 is the owner that
-    /// changes the answer, together with the durable fence and worker protocol that make the
-    /// new path's settlement claim true.
+    /// M11.T25's version of this row was `no_production_path_selects_the_fenced_v2_lifecycle`
+    /// and asserted the same two structural facts with the opposite selection. The activation
+    /// change inverted the answer and kept the requirement: **the mode is named in exactly one
+    /// production place, and that place passes the selection rather than a literal.**
+    ///
+    /// The intended reading of a failure here is not "the test is stale" but "say why a second
+    /// production path is choosing a lifecycle mechanism".
     #[test]
-    fn no_production_path_selects_the_fenced_v2_lifecycle() {
+    fn every_production_path_selects_the_fenced_v2_lifecycle() {
         /// Everything in a file before its test module, so a mention inside a test does not
         /// count as a production one.
         fn production_half(source: &'static str) -> &'static str {
@@ -8511,7 +7314,7 @@ mod tests {
         assert!(
             states.contains("JobLifecycle::for_mode(lifecycle::LifecycleMode::SELECTED"),
             "and it passes the selection rather than a literal, so it inherits the exhaustive \
-             `LegacyT08` result that `production_selects_only_the_legacy_t08_lifecycle` pins"
+             `FencedV2` result that `production_selects_only_the_fenced_v2_lifecycle` pins"
         );
 
         for (file, source) in [
@@ -8521,8 +7324,9 @@ mod tests {
             assert_eq!(
                 source.matches("LifecycleMode::FencedV2").count(),
                 0,
-                "{file}: the D39a mode is never named on a production path outside the module \
-                 that defines it — naming it is how it would come to be selected"
+                "{file}: the mode is never named on a production path outside the module that \
+                 defines it — a second naming is a second thing that could answer differently \
+                 for a job whose mechanism was fixed when its state machine was built"
             );
         }
 
@@ -8535,9 +7339,12 @@ mod tests {
              own match arm, which is what makes the mode a seam rather than a switch"
         );
         assert!(
-            include_str!("lifecycle/mode.rs").contains("LifecycleMode::FencedV2 => false,"),
-            "and the selection's exhaustive answer for it is `false`: M11.T25 builds the \
-             substrate and M11.T26 activates it"
+            lifecycle::fence_tests::function_body(
+                include_str!("lifecycle/mode.rs"),
+                "const fn is_available_in_production(self) -> bool {",
+            )
+            .contains("LifecycleMode::FencedV2 => true,"),
+            "and the selection's exhaustive answer for it is `true`: M11.T26h activated it"
         );
     }
 
@@ -8593,10 +7400,8 @@ mod tests {
             "and it published nothing to the job either — a decision is the state task's"
         );
         assert!(
-            sm.refusal.is_none()
-                && sm.refusal_version.load(Ordering::SeqCst) == 0
-                && sm.refusal_gate.clone().take().is_none(),
-            "and the M11.T08 cross-task machinery is untouched: the two mechanisms are \
+            sm.refusal.is_none() && sm.refusal_version.load(Ordering::SeqCst) == 0,
+            "and the M11.T08 cross-task bookkeeping is untouched: the two mechanisms are \
              alternatives, not layers"
         );
         assert_eq!(
@@ -8708,6 +7513,15 @@ mod tests {
                 scheduler.clone(),
             );
             let mailbox = mailbox_of(&sm);
+            // The row is a *running* job, so in worker-leader mode it has a leader and its
+            // record says which one. See `leader_context_for_this_topology`; `None` in
+            // controller mode, where a running job has no leader to record.
+            let leader = leader_context_for_this_topology(1).await;
+            let polled_status = || {
+                let mut status = job_status(current.restart_nonce);
+                status.state_context.leader = leader.clone();
+                status
+            };
 
             let mut refused = running_config(StateBackendSelector::Parquet);
             refused.stop_mode = stop_mode;
@@ -8720,12 +7534,8 @@ mod tests {
             };
 
             for poll in 0..3 {
-                sm.update(
-                    refused_poll(),
-                    job_status(current.restart_nonce),
-                    shutdown.guard(),
-                )
-                .await;
+                sm.update(refused_poll(), polled_status(), shutdown.guard())
+                    .await;
 
                 assert!(
                     sm.done(),
@@ -8764,12 +7574,8 @@ mod tests {
 
             // The dependency recovers, so the retry finally brings a writer up.
             program_loadable(&db, true);
-            sm.update(
-                refused_poll(),
-                job_status(current.restart_nonce),
-                shutdown.guard(),
-            )
-            .await;
+            sm.update(refused_poll(), polled_status(), shutdown.guard())
+                .await;
             assert!(
                 !sm.done(),
                 "{stop_mode:?}: once the program loads the job must finally be adopted — a \
@@ -8785,9 +7591,27 @@ mod tests {
                  destroy exactly the final checkpoint the stop exists for, and rescheduling \
                  it would run the refused configuration; wrote {writes:?}"
             );
+            // The two states a stop ends in, one closed-form pair per topology.
+            //
+            // In controller mode every stop mode funnels through `Stopping` before `Stopped`:
+            // a checkpoint stop takes its final checkpoint in `CheckpointStopping` and then
+            // hands over to `Stopping`, which is what tears the workers down. In worker-leader
+            // mode the *leader* does that teardown, so `LeaderCheckpointStopping` waits for it
+            // to report `JobStopped` and goes straight to `Stopped` — one hop fewer. The other
+            // three stop modes reach `LeaderStopping`, which is named `Stopping`, so their tail
+            // is the same in both topologies.
+            let ends_with = if worker_leader_topology() && stop_mode == StopMode::checkpoint {
+                [
+                    ("CheckpointStopping".to_string(), 1),
+                    ("Stopped".to_string(), 1),
+                ]
+            } else {
+                [("Stopping".to_string(), 1), ("Stopped".to_string(), 1)]
+            };
             assert!(
-                writes.ends_with(&[("Stopping".to_string(), 1), ("Stopped".to_string(), 1)]),
-                "{stop_mode:?}: and it ends stopped; wrote {writes:?}"
+                writes.ends_with(&ends_with),
+                "{stop_mode:?}: and it ends stopped, through this topology's own last state \
+                 {ends_with:?}; wrote {writes:?}"
             );
             assert!(
                 scheduler
@@ -9124,10 +7948,8 @@ mod tests {
                  belongs to the job's state task"
             );
             assert!(
-                sm.refusal.is_none()
-                    && sm.refusal_version.load(Ordering::SeqCst) == 0
-                    && sm.refusal_gate.clone().take().is_none(),
-                "{shape}: and M11.T08's cross-task machinery is untouched: the two \
+                sm.refusal.is_none() && sm.refusal_version.load(Ordering::SeqCst) == 0,
+                "{shape}: and M11.T08's cross-task bookkeeping is untouched: the two \
                  mechanisms are alternatives, not layers"
             );
             assert_eq!(
@@ -9212,6 +8034,1020 @@ mod tests {
         );
     }
     // ---------------------------------------------------------------------------------------
+    // M11.T26c — the controller half of the worker fence protocol, driven through the
+    // controller's own scheduling row against real worker servers. The mechanism rows — what a
+    // handshake sends, what it does with each kind of answer, and the definitive/ambiguous
+    // taxonomy — live beside their modules in `states/lifecycle/{handshake,protocol}_tests.rs`.
+    // ---------------------------------------------------------------------------------------
+
+    /// **D96 row 21.** Registration and the active fence handshake both precede start admission.
+    ///
+    /// Three claims, in the order the protocol requires them (M11.D39e(i), M11.D75):
+    ///
+    /// * a generation that has not registered is sent nothing at all — not a fenced start, and
+    ///   not a fence-less one;
+    /// * the generation that did register is advanced to this controller's fence and
+    ///   acknowledges it **before** the first `StartExecution` exists; and
+    /// * the start that follows carries that same fence, addressed to that same generation.
+    ///
+    /// This runs the real scheduling row through the M11.D39b phase graph against a real worker
+    /// server, so what is asserted is what arrived over a socket rather than what a helper
+    /// returned. M11.T26d's guard closes the *worker's* half of this window; the controller
+    /// cannot rely on that — a worker that has never been sent a fence goes on admitting
+    /// fence-less starts — which is why the advance is active and why it is here.
+    #[tokio::test]
+    async fn registration_and_fence_handshake_precede_start_admission() {
+        // Half one: a generation this controller has not seen register is never addressed.
+        //
+        // The `WorkerConnect` carries a generation this attempt did not raise the job to, so
+        // the controller ignores it exactly as it would ignore a straggler from a previous
+        // cluster — and the worker therefore never becomes addressable.
+        let mut unregistered = SchedulingRun::new("row21-unregistered").await;
+        let mailbox = intent_mailbox();
+        unregistered.harness.install_actor(&mailbox);
+        let address = unregistered.address(0);
+        unregistered
+            .harness
+            .queue()
+            .send(worker_connect_at_generation(WorkerId(7), &address, 99))
+            .await
+            .unwrap();
+        let calls = unregistered.calls.clone();
+        let scheduling = tokio::time::timeout(
+            NOTHING_REACHES_AN_UNREGISTERED_WORKER,
+            unregistered.schedule_through_the_phase_graph(),
+        );
+        assert!(
+            scheduling.await.map(|_| ()).is_err(),
+            "a scheduling attempt whose workers never register waits for them"
+        );
+        assert!(
+            calls.protocol().is_empty(),
+            "and nothing was sent to a generation this controller has not seen register — no \
+             fence to advance, and no start: {:?}",
+            calls.protocol()
+        );
+
+        // Half two: the generation that did register is handshaked, then started.
+        let mut run = SchedulingRun::new("row21-handshake").await;
+        let mailbox = intent_mailbox();
+        run.harness.install_actor(&mailbox);
+        let queue = run.harness.queue();
+        queue
+            .send(worker_connect_from(WorkerId(7), &run.address(0)))
+            .await
+            .unwrap();
+        queue.send(task_started()).await.unwrap();
+
+        let outcome = run.schedule_through_the_phase_graph().await;
+        assert_eq!(
+            advanced_to(&outcome),
+            Some("Running"),
+            "a job whose worker acknowledges the fence schedules"
+        );
+        assert_eq!(
+            run.calls.protocol(),
+            vec![
+                Directive::FenceOnly(ADOPTED_FENCE),
+                Directive::Start(Some(ADOPTED_FENCE)),
+            ],
+            "the fence is advanced and acknowledged first, and only then is the generation \
+             asked to start — under the same fence"
+        );
+        assert_eq!(
+            run.calls.addressed_generations(),
+            vec![2, 2],
+            "and both directives address the generation this attempt raised the job to, which \
+             is the generation its workers registered under"
+        );
+        assert_eq!(
+            run.calls.legacy_shaped(),
+            vec![false],
+            "the start a fenced controller sends is not the request a controller predating the \
+             fields sends"
+        );
+        // The restored checkpoint's commits, and which topology publishes them at all.
+        //
+        // In controller mode the handover builds the job's `JobController` holding its
+        // `FenceProtocol`, so the commits go out from this process under the fence this attempt
+        // adopted, addressed to the generation it raised the job to: a controller that has lost
+        // the job must not be able to finish its two-phase commit.
+        //
+        // In worker-leader mode `prepare_handover` returns before building one, so this
+        // controller publishes no commit at all — the job's leader commits under the
+        // `CommitAuthority` its own fenced start conferred, which is D96 row 24's claim. One
+        // closed-form value per topology, neither of them "either".
+        assert_eq!(
+            run.calls.commit_fences(),
+            if worker_leader_topology() {
+                Vec::new()
+            } else {
+                vec![Some((ADOPTED_FENCE, 2))]
+            },
+            "the restored checkpoint's commits belong to whichever party this topology gives \
+             the job's controller to, and to nobody else"
+        );
+        assert_eq!(
+            run.harness.status.state_context.leader.is_some(),
+            worker_leader_topology(),
+            "and the attempt really took this topology's own route rather than falling short \
+             of it: a worker-leader execution ends by attaching to the leader it started and \
+             recording which worker, at which generation, that is — which is the only thing a \
+             restarted controller has to find it again with — and a controller-mode execution \
+             has no leader to record. Without this the empty commit list above could be a \
+             fan-out that simply never got that far"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // M11.T26f — durable fencing recovery, driven through the controller's own scheduling row.
+    // The mechanism rows — what a recovery pass settles, what it refuses, and what it publishes
+    // — live beside their module in `states/lifecycle/recovery_tests.rs`.
+    // ---------------------------------------------------------------------------------------
+
+    /// The fencing obligation a fixture job owes: one target of `generation`, at `address`,
+    /// holding one issued identifier and never acknowledged.
+    fn owed(generation: u64, worker: WorkerId, address: &str) -> arroyo_rpc::fencing::Fencing {
+        arroyo_rpc::fencing::Fencing::record(
+            vec![arroyo_rpc::fencing::FenceTarget {
+                worker_id: worker.0,
+                generation,
+                attempt_id: Some("0123456789abcdef0123456789abcdef".to_string()),
+                rpc_address: Some(address.to_string()),
+                state: arroyo_rpc::fencing::FenceTargetState::Pending,
+            }],
+            None,
+            arroyo_rpc::fencing::Fencing::record(vec![], None, None)
+                .ok()
+                .and(None),
+        )
+        .expect("the fixture obligation is writable")
+    }
+
+    /// An address nothing is listening on.
+    ///
+    /// Port 1 on loopback, which refuses a connection immediately. The partition this models is
+    /// the one the controller actually sees: a target it cannot open a channel to, whose worker
+    /// generation the scheduler still reports as running. It fails fast, so the row is about the
+    /// obligation rather than about a retry budget elapsing.
+    const UNREACHABLE: &str = "http://127.0.0.1:1";
+
+    /// **D96 row 20.** A partition holds one job in `Fencing` while another schedules normally.
+    ///
+    /// The two jobs run **concurrently**, against their own rows, their own workers and their own
+    /// schedulers, because the claim is about a lock that does not exist: M11.D39g's *"a
+    /// permanent unobservable partition has the explicit liveness result `Fencing` remains
+    /// pending while other jobs progress"*. A sequential pair would say nothing about it — the
+    /// first job would simply have finished.
+    ///
+    /// The fenced job owes an acknowledgement to a worker generation it cannot reach and that
+    /// its scheduler still lists as running, so neither of M11.D39e(v)'s two non-response facts
+    /// is observed. What that must cost it is precisely: it stays in fencing, it persists no
+    /// replacement generation, and it starts nothing. What it must **not** cost is the other
+    /// job, which schedules to `Running` in the same moment.
+    ///
+    /// It deliberately instantiates M11.T25's `Fencing`: the fence is the mechanism under test
+    /// and the token-free substrate is what it is being tested through.
+    #[tokio::test]
+    async fn partition_keeps_one_job_fencing_without_blocking_others() {
+        let mut fencing = SchedulingRun::new("row20-fencing").await;
+        let fencing_mailbox = intent_mailbox();
+        fencing.harness.install_actor(&fencing_mailbox);
+        // The obligation a controller that is gone left behind, naming a generation this one
+        // cannot reach and which the scheduler still lists.
+        fencing.owing(
+            owed(GENERATION_BEFORE, WorkerId(11), UNREACHABLE),
+            vec![(GENERATION_BEFORE, WorkerId(11))],
+        );
+        let fencing_db = fencing.db.clone();
+
+        let mut ordinary = SchedulingRun::new("row20-ordinary").await;
+        let ordinary_mailbox = intent_mailbox();
+        ordinary.harness.install_actor(&ordinary_mailbox);
+        let queue = ordinary.harness.queue();
+        queue
+            .send(worker_connect_from(WorkerId(7), &ordinary.address(0)))
+            .await
+            .unwrap();
+        queue.send(task_started()).await.unwrap();
+
+        let (fenced_outcome, ordinary_outcome) = tokio::join!(
+            fencing.schedule_through_the_phase_graph(),
+            ordinary.schedule_through_the_phase_graph(),
+        );
+
+        assert_eq!(
+            advanced_to(&ordinary_outcome),
+            Some("Running"),
+            "the ordinary job schedules while the other is fencing: the fence is per job, and \
+             nothing about a partitioned worker of one job is a lock any other takes"
+        );
+        assert!(
+            !ordinary.calls.started().is_empty(),
+            "and it really started its workers, rather than reporting a transition it did not \
+             earn"
+        );
+
+        assert!(
+            matches!(fenced_outcome, Err(StateError::RetryableError { .. })),
+            "the fencing job ends retryably — not failed, because failing it would publish this \
+             controller's opinion about a job whose previous generation may still be applying a \
+             StartExecution: it advanced to {:?} instead",
+            advanced_to(&fenced_outcome)
+        );
+        assert_eq!(
+            state_writes(&fencing_db),
+            vec![("Scheduling".to_string(), 1)],
+            "and the only status it wrote is the obligation it republished, at the generation \
+             the row already carried: `persist_generation` would have written this row's state \
+             at generation 2, and it is the step *after* the discharge that never ran"
+        );
+        assert_eq!(
+            fencing.calls.protocol(),
+            Vec::<Directive>::new(),
+            "nothing was sent to the job's own workers either — it never reached the fan-out"
+        );
+        let still: arroyo_rpc::fencing::Fencing =
+            serde_json::from_value(stored_state_context(&fencing_db)["fencing"].clone())
+                .expect("the obligation is still in the row");
+        assert_eq!(
+            still.targets()[0].state,
+            arroyo_rpc::fencing::FenceTargetState::Pending,
+            "and the obligation stands, with its target exactly as unacknowledged as it was"
+        );
+    }
+
+    /// The scheduling generation a fixture job's *previous* attempt addressed.
+    ///
+    /// One below the generation this attempt would raise it to, which is what makes the
+    /// recovered obligation an earlier attempt's rather than this one's.
+    const GENERATION_BEFORE: u64 = 1;
+
+    /// **D96 row 28, the fenced assertion.** A start nothing ever settles enters durable
+    /// `Fencing`.
+    ///
+    /// M11.T26m made `a_permanently_unsettled_start_execution_ends_the_fan_out_and_releases_the_admission`
+    /// a **pre-activation control only**, and M11.T26h's activation change removed it: it
+    /// asserted that budget exhaustion *releases* the job's lifecycle authority, and after
+    /// activation it must enter durable `Fencing` and keep it. This row is what carries D96 row
+    /// 28 from here on. Under M11.D39e(v) the identifier is not settled by the reconcile budget
+    /// running out, so the obligation it belongs to has to survive the process — and this is the
+    /// row that says it reaches the job's row.
+    ///
+    /// The worker answers `Unavailable` to every attempt, forever, and applies nothing. What is
+    /// asserted is the durable record: the target the fan-out addressed, the identifier the
+    /// worker actually received, and `Pending` — because nothing has accounted for it.
+    #[tokio::test]
+    async fn permanently_unsettled_start_enters_durable_fencing() {
+        let never = NeverSettles::new();
+        let mut run = SchedulingRun::with_workers(
+            "row28-durable",
+            vec![StartsExecution::NeverSettling(never.clone())],
+        )
+        .await;
+        let mailbox = intent_mailbox();
+        run.harness.install_actor(&mailbox);
+        let queue = run.harness.queue();
+        queue
+            .send(worker_connect_from(WorkerId(7), &run.address(0)))
+            .await
+            .unwrap();
+
+        let outcome = run.schedule_through_the_phase_graph().await;
+        assert!(
+            matches!(outcome, Err(StateError::RetryableError { .. })),
+            "a fan-out whose only worker never settles ends the attempt, and it advanced to \
+             {:?} instead",
+            advanced_to(&outcome)
+        );
+
+        let recorded: arroyo_rpc::fencing::Fencing =
+            serde_json::from_value(stored_state_context(&run.db)["fencing"].clone())
+                .expect("the interrupted attempt recorded its obligation durably");
+        assert_eq!(
+            recorded
+                .targets()
+                .iter()
+                .map(|t| (t.worker_id, t.generation, t.attempt_id.clone(), t.state))
+                .collect::<Vec<_>>(),
+            vec![(
+                7,
+                2,
+                never.attempt_id(),
+                arroyo_rpc::fencing::FenceTargetState::Pending
+            )],
+            "the record names the target this attempt addressed, the identifier the worker \
+             actually received, and the fact that nothing has accounted for it — read back from \
+             the row rather than from anything this process is holding"
+        );
+        assert_eq!(
+            recorded.targets()[0].rpc_address.as_deref(),
+            Some(run.address(0).as_str()),
+            "with the address a replacement controller reaches it at, which is what makes the \
+             obligation dischargeable by a process that never spoke to this worker"
+        );
+        assert!(
+            recorded.fencing_since_millis().is_some(),
+            "and the instant it began, so the age an operator sees survives this controller"
+        );
+    }
+
+    /// A generation the scheduler has reclaimed is recorded as terminated, not as pending.
+    ///
+    /// The positive control for the second of the two real observation sources, and the one that
+    /// makes `permanently_unsettled_start_enters_durable_fencing` a statement about the fence
+    /// rather than about a fixture that could not answer. The same interruption, the same
+    /// unsettled identifier, and one thing changed: the scheduler can say which of the job's
+    /// worker generations are still running, and it says this one is not.
+    ///
+    /// M11.D39e(v) allows exactly that as settlement — *"observed target worker-generation
+    /// termination"* — so the record names the target `Terminated`, and a replacement controller
+    /// reading the row has nothing left to fence at it.
+    #[tokio::test]
+    async fn a_generation_the_scheduler_has_reclaimed_is_recorded_as_terminated() {
+        let never = NeverSettles::new();
+        let mut run = SchedulingRun::with_workers(
+            "reclaimed-generation",
+            vec![StartsExecution::NeverSettling(never.clone())],
+        )
+        .await;
+        let mailbox = intent_mailbox();
+        run.harness.install_actor(&mailbox);
+        // The scheduler owns its workers and lists none of this job's as running.
+        run.reports_terminations(vec![]);
+        let queue = run.harness.queue();
+        queue
+            .send(worker_connect_from(WorkerId(7), &run.address(0)))
+            .await
+            .unwrap();
+
+        let outcome = run.schedule_through_the_phase_graph().await;
+        assert!(
+            matches!(outcome, Err(StateError::RetryableError { .. })),
+            "the attempt still ends: a terminated generation settles the obligation, it does \
+             not start the job"
+        );
+        let recorded: arroyo_rpc::fencing::Fencing =
+            serde_json::from_value(stored_state_context(&run.db)["fencing"].clone())
+                .expect("the interrupted attempt recorded its obligation durably");
+        assert_eq!(
+            recorded
+                .targets()
+                .iter()
+                .map(|t| (t.worker_id, t.state))
+                .collect::<Vec<_>>(),
+            vec![(7, arroyo_rpc::fencing::FenceTargetState::Terminated)],
+            "the scheduler's answer reached the record: this target is gone, and nothing has to \
+             fence it"
+        );
+    }
+
+    /// A legacy scheduling attempt records no durable fencing obligation.
+    ///
+    /// M11.D75's compatibility window at this end: a controller that has not crossed the flag
+    /// day writes nothing durable about fencing, whatever happens to its fan-out. The landed
+    /// `Scheduling::next` is driven against a worker that never settles — the same interruption
+    /// the row above turns into a durable record on the fenced path — and the job's row must
+    /// come out of it with no `fencing` field at all.
+    ///
+    /// Both entries are covered, because the mode is what makes them the same body: the landed
+    /// `next` and the seam that chooses it for a job in that mode.
+    #[tokio::test]
+    async fn a_legacy_scheduling_attempt_records_no_durable_fencing_obligation() {
+        for route in ["next", "legacy-seam"] {
+            let never = NeverSettles::new();
+            let mut run = SchedulingRun::with_workers(
+                &format!("legacy-no-record-{route}"),
+                vec![StartsExecution::NeverSettling(never.clone())],
+            )
+            .await;
+            let queue = run.harness.queue();
+            queue
+                .send(worker_connect_from(WorkerId(7), &run.address(0)))
+                .await
+                .unwrap();
+
+            let outcome = match route {
+                "next" => run.schedule().await,
+                _ => run.schedule_through_the_legacy_route().await,
+            };
+            assert!(
+                matches!(outcome, Err(StateError::RetryableError { .. })),
+                "{route}: the landed body ends the same interruption the same way"
+            );
+            assert_eq!(
+                stored_state_context(&run.db).get("fencing"),
+                None,
+                "{route}: and a controller on the pre-flag-day side of M11.D75's window records \
+                 no durable fencing obligation, which is what makes rolling one back to it safe \
+                 while no generation has entered strict mode"
+            );
+        }
+    }
+
+    /// A stop decided while a recovered obligation is pending ends the job as a stop.
+    ///
+    /// Intent coalescing, at the one point M11.T26f adds. The recovery pass cannot discharge the
+    /// obligation, so the attempt ends — and *how* it ends is not the recovery's to decide: the
+    /// job's single writer has since been told to stop it, and a job an operator asked to stop
+    /// must end in a stop rather than in the retryable reason the partition produced. That is
+    /// D96 row 7 read at this end of the mechanism.
+    ///
+    /// It also pins the ordering that makes it work: the intent is coalesced on the way out of
+    /// the attempt, which is after the discharge has already failed, so a stop submitted at any
+    /// point up to then is honoured.
+    #[tokio::test]
+    async fn a_stop_decided_while_a_recovered_obligation_is_pending_ends_the_job_as_a_stop() {
+        let mut run = SchedulingRun::new("recovery-stop").await;
+        let mailbox = intent_mailbox();
+        run.harness.install_actor(&mailbox);
+        run.owing(
+            owed(GENERATION_BEFORE, WorkerId(11), UNREACHABLE),
+            vec![(GENERATION_BEFORE, WorkerId(11))],
+        );
+
+        let mut stopping = running_config(StateBackendSelector::Parquet);
+        stopping.stop_mode = StopMode::immediate;
+        mailbox.submit(LifecycleIntent::Adopt(Box::new(stopping)));
+
+        let outcome = run.schedule_through_the_phase_graph().await;
+        assert_eq!(
+            advanced_to(&outcome),
+            Some("Stopping"),
+            "the job stops, rather than being reported as failing to fence"
+        );
+        assert!(
+            serde_json::from_value::<arroyo_rpc::fencing::Fencing>(
+                stored_state_context(&run.db)["fencing"].clone()
+            )
+            .is_ok(),
+            "and the obligation is still in the row: a stop ends this attempt, and it does not \
+             discharge what the job still owes its workers"
+        );
+    }
+
+    /// How long a row waits to establish that an unregistered generation is sent *nothing*.
+    ///
+    /// A negative, so it is the one deadline the fixed code is expected to reach. It cannot turn
+    /// a violation into a pass: a controller that addressed the worker would do it over loopback
+    /// in microseconds, and the worker records the request before it decides how to answer.
+    const NOTHING_REACHES_AN_UNREGISTERED_WORKER: Duration = Duration::from_secs(2);
+
+    /// A controller on the pre-flag-day side of M11.D75's window sends the bytes it sent
+    /// before the fence existed.
+    ///
+    /// The compatibility claim M11.T26c rests on, measured rather than asserted: the request
+    /// that arrives at the worker is compared, *as encoded bytes*, against the same request with
+    /// every lifecycle field stamped back to its proto3 default. A field left set would encode
+    /// its key and the comparison would fail, so this is a statement about the wire and not
+    /// about the struct.
+    ///
+    /// M11.T26h renamed this row from `the_selected_mechanism_sends_the_start_it_sent_before_
+    /// the_fence_existed`: the selected mechanism now sends a *fenced* start, which
+    /// `the_production_route_runs_the_phase_graph` and D96 row 21 assert. What the row measures
+    /// is unchanged and is still needed — it is the compatibility window a worker-first rollout
+    /// runs in, and `arroyo-worker`'s `lifecycle_fence::rollout_tests` drives a real
+    /// fence-capable worker against exactly these bytes.
+    ///
+    /// Both routes are covered — the landed `Scheduling::next` and the seam that chooses it for
+    /// a job in that mode — because the mode is what makes them the same, and a change that
+    /// fenced one of them would leave the other alone.
+    #[tokio::test]
+    async fn a_pre_flag_day_controller_sends_the_start_it_sent_before_the_fence_existed() {
+        for route in ["next", "legacy-seam"] {
+            let mut run = SchedulingRun::new(&format!("legacy-bytes-{route}")).await;
+            let queue = run.harness.queue();
+            queue
+                .send(worker_connect_from(WorkerId(7), &run.address(0)))
+                .await
+                .unwrap();
+            queue.send(task_started()).await.unwrap();
+
+            let outcome = match route {
+                "next" => run.schedule().await,
+                _ => run.schedule_through_the_legacy_route().await,
+            };
+            assert_eq!(advanced_to(&outcome), Some("Running"), "{route}");
+            assert_eq!(
+                run.calls.protocol(),
+                vec![Directive::Start(None)],
+                "{route}: no fence is advanced and the start carries none — the whole of the \
+                 pre-flag-day protocol"
+            );
+            assert_eq!(
+                run.calls.legacy_shaped(),
+                vec![true],
+                "{route}: and the request is byte-identical to the one a controller predating \
+                 the lifecycle fields would have sent"
+            );
+            assert_eq!(
+                run.calls.commit_fences(),
+                vec![None],
+                "{route}: and the restored checkpoint's commits carry no fence either — every \
+                 lifecycle field of every message this row sends stays at its proto3 default"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // M11.T26e — the cancellation-resistant settlement owner, reached through the fan-out's own
+    // seams. The mechanism rows — what accounts for an identifier, what discharge is gated on,
+    // and the owner's drop paths — live beside the owner in
+    // `states/lifecycle/settlement_tests.rs`.
+    // ---------------------------------------------------------------------------------------
+
+    /// **D96 row 26, final assertion.** A busy worker's `Aborted` is definitive settlement, and
+    /// nothing reconciles it.
+    ///
+    /// M11.T26m made `a_busy_worker_phase_is_retried_under_the_same_start_admission` a
+    /// **pre-activation control only**, and M11.T26h's activation change removed it: under
+    /// `LifecycleMode::LegacyT08` the fan-out retried the same identifier under the same
+    /// admission, which was M11.T08's behaviour and production's, and it is neither now. Under
+    /// M11.D39e(iii) `Aborted` means "nothing was applied, and this generation has decided":
+    /// the identifier is settled by the worker's own answer, only a *later scheduling attempt*
+    /// may try again, and re-offering it under the same admission would be a second start this
+    /// controller could not account for. This row is what carries D96 row 26's controller half
+    /// from here on.
+    ///
+    /// So what is asserted is the absence of the reconciliation as much as the presence of the
+    /// settlement:
+    ///
+    /// * one `START` reaches the worker, not two — the same fixture the landed control uses,
+    ///   which answers `Aborted` once and would accept a retry;
+    /// * the identifier is accounted for by an authoritative response, so the obligation the
+    ///   interrupted fan-out hands over is discharged and the job's lifecycle authority is
+    ///   released rather than retained; and
+    /// * nothing was started, and the attempt ends as a retryable scheduling error — which is
+    ///   what "only a later scheduling attempt may retry" looks like from here.
+    #[tokio::test]
+    async fn busy_aborted_settles_no_apply_without_ambiguous_reconcile() {
+        // The taxonomy this row rests on. There is one reading of `Aborted` since the
+        // activation change, and it is the settling one.
+        assert_eq!(
+            lifecycle::protocol::transport_settlement(tonic::Code::Aborted),
+            lifecycle::TransportSettlement::Definitive,
+            "a definitive no-apply that this attempt does not re-offer"
+        );
+
+        let busy = BusyStart::new();
+        let mut run = SchedulingRun::with_workers(
+            "row26-aborted-settles",
+            vec![StartsExecution::BusyOnce(busy.clone())],
+        )
+        .await;
+        let owner = run.harness.install_fenced_lifecycle();
+        let authority = run.harness.admission.clone();
+        let queue = run.harness.queue();
+        queue
+            .send(worker_connect_from(WorkerId(7), &run.address(0)))
+            .await
+            .unwrap();
+
+        let outcome = run.schedule_through_the_phase_graph().await;
+        let Err(err) = outcome else {
+            panic!(
+                "a generation that answered `Aborted` started nothing, so the attempt cannot \
+                    have advanced"
+            )
+        };
+        assert!(
+            format!("{err:?}").contains("failed to initialize workers"),
+            "and it ends as a retryable scheduling error, so a *later* attempt raises the \
+             generation and tries again: {err:?}"
+        );
+        assert_eq!(
+            busy.calls.load(Ordering::SeqCst),
+            1,
+            "the `Aborted` is not reconciled: the identifier was settled by it, and re-offering \
+             the same one under the same admission is the ambiguous-transport behaviour that \
+             M11.D39e(iv) does not extend to `Aborted`"
+        );
+        assert_eq!(
+            run.calls.protocol(),
+            vec![
+                Directive::FenceOnly(ADOPTED_FENCE),
+                Directive::Start(Some(ADOPTED_FENCE)),
+            ],
+            "one fence handshake and one start, and no second start under the same admission"
+        );
+        assert_eq!(
+            run.calls.started(),
+            Vec::<String>::new(),
+            "nothing was applied, which is what `Aborted` says"
+        );
+        assert_eq!(
+            owner.outstanding(),
+            None,
+            "the obligation the interrupted fan-out handed over owed nothing: the worker's own \
+             answer accounted for the identifier it was issued"
+        );
+        assert!(
+            authority.is_free(),
+            "so the job's lifecycle authority is released rather than retained — a definitive \
+             refusal is settlement, and settlement is what entitles anybody to release it"
+        );
+    }
+
+    /// Fan-out budget exhaustion transfers the whole obligation into token-free fencing, and
+    /// publishes, reschedules and commits nothing (M11.D39e(v)).
+    ///
+    /// The worker acknowledges this controller's fence and then never settles the start it is
+    /// sent, so the fan-out spends its reconcile budget and gives the attempt up — the one case
+    /// in which the controller *stopped hearing* rather than heard something. Under M11.T25 the
+    /// interrupted phase released the admission into token-free `Fencing` and carried the
+    /// unaccounted identifier there with it. Under M11.T26e the obligation moves instead: the
+    /// job's settlement owner takes the inventory and the authority as one unit and does not
+    /// release it, because releasing it is what would make a refusal publishable behind a
+    /// `StartExecution` this worker may still apply.
+    ///
+    /// What must *not* have happened is the rest of the sentence: no refusal is published, no
+    /// second start is issued, and no commit goes out. And what ends it is the reconciliation
+    /// M11.D39e(v) names — the acknowledged fence at the end of this row, whose arrival is the
+    /// first thing that entitles anybody to release the authority.
+    #[tokio::test]
+    async fn budget_exhaustion_transfers_into_token_free_fencing_without_publishing_or_rescheduling()
+     {
+        let never = NeverSettles::new();
+        let mut run = SchedulingRun::with_workers(
+            "t26e-budget-exhaustion",
+            vec![StartsExecution::NeverSettling(never.clone())],
+        )
+        .await;
+        let owner = run.harness.install_fenced_lifecycle();
+        let authority = run.harness.admission.clone();
+        run.harness
+            .queue()
+            .send(worker_connect_from(WorkerId(7), &run.address(0)))
+            .await
+            .unwrap();
+
+        let outcome =
+            tokio::time::timeout(TERMINAL_PATH_GRACE, run.schedule_through_the_phase_graph())
+                .await
+                .expect(
+                    "the fan-out gives an unsettleable attempt up rather than retrying forever",
+                );
+        let Err(err) = outcome else {
+            panic!("a fan-out no worker ever accepted cannot have succeeded")
+        };
+        assert!(
+            format!("{err:?}").contains("failed to initialize workers"),
+            "it ends as the retryable scheduling error the landed path produces, not as a \
+             publication and not as a stop: {err:?}"
+        );
+
+        assert_eq!(
+            run.calls.protocol(),
+            std::iter::once(Directive::FenceOnly(ADOPTED_FENCE))
+                .chain(std::iter::repeat_n(
+                    Directive::Start(Some(ADOPTED_FENCE)),
+                    super::scheduling::START_EXECUTION_RECONCILE_ATTEMPTS + 1,
+                ))
+                .collect::<Vec<_>>(),
+            "one handshake, then the first request and a bounded number of reconciliation \
+             attempts — every one of them a replay of the same identifier, which the worker \
+             itself asserts"
+        );
+        assert_eq!(
+            run.calls.started(),
+            Vec::<String>::new(),
+            "nothing was started"
+        );
+        assert_eq!(
+            run.calls.commit_fences(),
+            Vec::<Option<(u64, u64)>>::new(),
+            "and nothing was committed: the fan-out never reached the commit publication, so no \
+             effect of the phases beyond it exists"
+        );
+
+        // The obligation survived the interruption, whole and unreleased.
+        assert_eq!(
+            owner.holding(),
+            Some(vec![(
+                7,
+                never
+                    .attempt_id()
+                    .expect("the worker recorded what it was sent"),
+                None
+            )]),
+            "the settlement owner is answerable for the identifier the worker was actually \
+             sent, and nothing has accounted for it — the controller stopped offering it, which \
+             is a loss of knowledge and not an answer"
+        );
+        assert!(
+            !authority.is_free(),
+            "so the job's lifecycle authority is not released: a refusal published now would be \
+             published behind a StartExecution this worker may still apply"
+        );
+
+        // And what ends it is the reconciliation M11.D39e(v) names, not the passage of time.
+        let Some(lifecycle::settlement::Progress::Discharged(discharged)) = Some(owner.observe(
+            &super::scheduling::fanout::Observed::acknowledged_fence(
+                &lifecycle::handshake::FenceAcknowledgement::reported(
+                    WorkerId(7),
+                    2,
+                    ADOPTED_FENCE + 1,
+                ),
+            ),
+        )) else {
+            panic!("an acknowledged fence makes the identifier permanently inapplicable")
+        };
+        assert_eq!(discharged.count(), 1);
+        assert!(
+            authority.is_free(),
+            "and only then is the authority released"
+        );
+    }
+
+    /// A fencing reconciliation tells the job's settlement owner what it observed.
+    ///
+    /// The wiring, in the direction that is easy to leave out. After a hand-over the interrupted
+    /// phase's own inventory lists nothing — the identifiers are the owner's — so an
+    /// acknowledgement or a termination the fencing reconciliation observes would account for
+    /// nothing at all unless it reached the party holding them. The job would then hold its own
+    /// publication lock for the life of the process behind identifiers a fence had already made
+    /// inapplicable.
+    ///
+    /// Both of the two facts a fencing job can learn are driven, through `Fencing`'s own methods
+    /// rather than by calling the owner directly, because what is being tested is the route.
+    #[tokio::test]
+    async fn a_fencing_reconciliation_tells_the_settlement_owner_what_it_observed() {
+        for acknowledged in [true, false] {
+            let mut harness = Harness::new(3);
+            let owner = harness.install_fenced_lifecycle();
+            let generation = harness.status.generation;
+            let authority = harness.admission.clone();
+            let admission = authority.admit().await;
+
+            // The obligation is issued under a fence this controller has adopted, so the
+            // acknowledgement below is measured against something: one at or below
+            // `ADOPTED_FENCE` revokes nothing this attempt issued (M11.T26f), and a row whose
+            // inventory carried fence zero could be settled by any acknowledgement at all.
+            harness.status.authority =
+                crate::LifecycleAuthority::from_parts("job_abc", ADOPTED_FENCE, "epoch-wiring");
+            let mut issued =
+                super::scheduling::fanout::IssuedAttempts::issued_under(generation, ADOPTED_FENCE);
+            issued.issued(WorkerId(1), "id-1".to_string());
+            let super::scheduling::fanout::settlement::SettlementOutcome::Transferred(_) =
+                super::scheduling::fanout::hand_over(
+                    super::scheduling::fanout::SettlementBundle::new(admission, issued),
+                    Some(owner.as_ref()),
+                )
+            else {
+                panic!("{acknowledged}: this owner takes an obligation offered to it")
+            };
+            assert_eq!(owner.outstanding(), Some(1));
+
+            let mut ctx = harness.ctx(
+                running_config(StateBackendSelector::Parquet),
+                StateBackendSelector::Parquet,
+            );
+            let mut phase = super::scheduling::admission::PhaseContext::new(&mut ctx);
+            // The target this attempt would reconcile with. A phase that reached the fan-out has
+            // its workers; this one is built directly, so it is given the one it addressed.
+            phase.run_as_leader_on(WorkerId(1), "http://127.0.0.1:1".to_string());
+            let reason = phase.retryable(
+                "failed to initialize workers",
+                anyhow::anyhow!("the fixture's interruption"),
+                10,
+            );
+            let mut interrupted =
+                phase.into_fencing(reason, super::scheduling::fanout::IssuedAttempts::default());
+
+            let changed = if acknowledged {
+                interrupted.fencing_mut().observe_fence_acknowledged(
+                    &lifecycle::handshake::FenceAcknowledgement::reported(
+                        WorkerId(1),
+                        generation,
+                        ADOPTED_FENCE + 1,
+                    ),
+                )
+            } else {
+                interrupted.fencing_mut().observe_generation_terminated(
+                    &lifecycle::recovery::ObservedTermination::observed(WorkerId(1), generation),
+                )
+            };
+            assert!(changed, "{acknowledged}: the target was reconciled");
+            assert_eq!(
+                owner.outstanding(),
+                None,
+                "{acknowledged}: and the owner holding the identifier that observation accounts \
+                 for was told, so its obligation is discharged"
+            );
+            assert!(
+                authority.is_free(),
+                "{acknowledged}: which is what releases the job's lifecycle authority"
+            );
+        }
+    }
+
+    /// An observation about another worker generation settles nothing this attempt issued.
+    ///
+    /// The generation is checked before the target set is touched, on both facts. A worker id is
+    /// not an identity on its own: the same endpoint reused by a restarted worker is a different
+    /// generation, and an answer from the successor must not settle its predecessor's obligation
+    /// (M11.D39d). The positive control follows the two negatives through the same call, so the
+    /// refusals are about the generation and not about a value that refuses everything.
+    #[tokio::test]
+    async fn an_observation_about_another_generation_settles_nothing_this_attempt_issued() {
+        let mut harness = Harness::new(3);
+        let _owner = harness.install_fenced_lifecycle();
+        let generation = harness.status.generation;
+        harness.status.authority =
+            crate::LifecycleAuthority::from_parts("job_abc", ADOPTED_FENCE, "epoch-generation");
+        let mut ctx = harness.ctx(
+            running_config(StateBackendSelector::Parquet),
+            StateBackendSelector::Parquet,
+        );
+        let mut phase = super::scheduling::admission::PhaseContext::new(&mut ctx);
+        phase.run_as_leader_on(WorkerId(1), "http://127.0.0.1:1".to_string());
+        let reason = phase.retryable(
+            "failed to initialize workers",
+            anyhow::anyhow!("the fixture's interruption"),
+            10,
+        );
+        let mut interrupted =
+            phase.into_fencing(reason, super::scheduling::fanout::IssuedAttempts::default());
+
+        assert!(
+            !interrupted.fencing_mut().observe_fence_acknowledged(
+                &lifecycle::handshake::FenceAcknowledgement::reported(
+                    WorkerId(1),
+                    generation + 1,
+                    ADOPTED_FENCE + 1,
+                )
+            ),
+            "an acknowledgement from the successor generation is not about this attempt's target"
+        );
+        assert!(
+            !interrupted.fencing_mut().observe_generation_terminated(
+                &lifecycle::recovery::ObservedTermination::observed(WorkerId(1), generation + 1)
+            ),
+            "and neither is a termination of it"
+        );
+        assert_eq!(
+            interrupted.fencing_mut().targets().pending(),
+            1,
+            "so the target this attempt addressed is exactly as pending as it was"
+        );
+
+        assert!(
+            interrupted.fencing_mut().observe_generation_terminated(
+                &lifecycle::recovery::ObservedTermination::observed(WorkerId(1), generation)
+            ),
+            "the same termination, at the generation this attempt addressed, settles it"
+        );
+        assert_eq!(interrupted.fencing_mut().targets().pending(), 0);
+    }
+
+    /// An observation offered to an owner that is not holding what it names accounts for nothing.
+    ///
+    /// The two quiet answers, which are quiet for different reasons and must not become one. An
+    /// owner holding *nothing* is what a job whose fan-out settled normally looks like; an owner
+    /// holding *another attempt's* obligation must not have it discharged by an observation about
+    /// this one, because the identifiers behind that obligation are still applicable. Both are
+    /// driven through the fencing reconciliation rather than by calling the owner directly,
+    /// because the route is what carries them.
+    #[tokio::test]
+    async fn an_observation_reaching_an_owner_that_is_not_holding_it_accounts_for_nothing() {
+        for held in [None, Some(())] {
+            let mut harness = Harness::new(3);
+            let owner = harness.install_fenced_lifecycle();
+            let generation = harness.status.generation;
+            let authority = harness.admission.clone();
+            harness.status.authority =
+                crate::LifecycleAuthority::from_parts("job_abc", ADOPTED_FENCE, "epoch-elsewhere");
+
+            if held.is_some() {
+                // An obligation from a *different* scheduling generation of the same job: the
+                // identifiers in it were issued to workers this attempt is not addressing.
+                let admission = authority.admit().await;
+                let mut issued = super::scheduling::fanout::IssuedAttempts::issued_under(
+                    generation + 1,
+                    ADOPTED_FENCE,
+                );
+                issued.issued(WorkerId(1), "id-elsewhere".to_string());
+                let super::scheduling::fanout::settlement::SettlementOutcome::Transferred(_) =
+                    super::scheduling::fanout::hand_over(
+                        super::scheduling::fanout::SettlementBundle::new(admission, issued),
+                        Some(owner.as_ref()),
+                    )
+                else {
+                    panic!("this owner takes an obligation offered to it")
+                };
+            }
+            assert_eq!(owner.outstanding(), held.map(|()| 1));
+
+            let mut ctx = harness.ctx(
+                running_config(StateBackendSelector::Parquet),
+                StateBackendSelector::Parquet,
+            );
+            let mut phase = super::scheduling::admission::PhaseContext::new(&mut ctx);
+            phase.run_as_leader_on(WorkerId(1), "http://127.0.0.1:1".to_string());
+            let reason = phase.retryable(
+                "failed to initialize workers",
+                anyhow::anyhow!("the fixture's interruption"),
+                10,
+            );
+            let mut interrupted =
+                phase.into_fencing(reason, super::scheduling::fanout::IssuedAttempts::default());
+
+            assert!(
+                interrupted.fencing_mut().observe_fence_acknowledged(
+                    &lifecycle::handshake::FenceAcknowledgement::reported(
+                        WorkerId(1),
+                        generation,
+                        ADOPTED_FENCE + 1,
+                    )
+                ),
+                "{held:?}: the target this attempt addressed did acknowledge"
+            );
+            assert_eq!(
+                owner.outstanding(),
+                held.map(|()| 1),
+                "{held:?}: and the owner is answerable for exactly what it was before"
+            );
+            assert_eq!(
+                authority.is_free(),
+                held.is_none(),
+                "{held:?}: an observation the owner cannot account for releases nothing"
+            );
+        }
+    }
+
+    /// The handover builds a fenced job's controller in controller mode and nothing in leader
+    /// mode — in both topologies, and for both mechanisms.
+    ///
+    /// This is the one place M11.T26c behaves differently under `JobControllerMode::Worker`: the
+    /// controller builds no `JobController` there, so it publishes no commits and stamps no
+    /// commit directive; the job's leader does. Both are covered so that a change which made the
+    /// handover depend on a fence in leader mode — where there is no fence-bearing controller to
+    /// be superseded, and no fence to read before the workers register — would be caught here
+    /// rather than only in a deployment that runs that topology.
+    ///
+    /// The topology is set on the phase rather than through `config().job_controller`, which is
+    /// process-wide and is being read by every other scheduling row in this binary at the same
+    /// time; that is the same reason `run_as_leader_on` exists.
+    #[tokio::test]
+    async fn the_handover_builds_a_controller_only_outside_worker_leader_mode() {
+        for fenced in [false, true] {
+            let mailbox = intent_mailbox();
+            let mut harness = Harness::new(3);
+            harness.status.generation = 2;
+            if fenced {
+                harness.install_actor(&mailbox);
+                harness.status.authority =
+                    crate::LifecycleAuthority::from_parts("job_abc", ADOPTED_FENCE, "epoch-1");
+            }
+            let mut ctx = harness.ctx(
+                running_config(StateBackendSelector::Parquet),
+                StateBackendSelector::Parquet,
+            );
+            assert_eq!(
+                ctx.runs_fenced_lifecycle(),
+                fenced,
+                "the fixture's mechanism is what decides its protocol"
+            );
+            assert!(
+                ctx.fence_protocol().is_ok(),
+                "fenced={fenced}: an adopted controller can address its generations"
+            );
+
+            // Worker-leader mode: the leader owns the job's checkpointing, so the handover
+            // builds no controller and there is no commit for this controller to fence. It also
+            // returns before reading the job's fence, which is why a leader-mode job whose
+            // preamble has not adopted anything still hands over.
+            let (_, address) = fake_leader(2, "parquet").await;
+            let mut leader_phase = PhaseContext::new(&mut ctx);
+            leader_phase.run_as_leader_on(WorkerId(7), address);
+            leader_phase
+                .prepare_handover()
+                .await
+                .expect("the leader-mode handover builds no controller and cannot fail");
+            assert!(
+                !leader_phase.built_job_controller(),
+                "fenced={fenced}: in worker-leader mode the controller builds none"
+            );
+
+            // Controller mode: it builds one, under the job's own protocol, and that is what
+            // stamps every commit it later publishes.
+            let mut phase = PhaseContext::new(&mut ctx);
+            assert!(
+                !phase.leader_mode(),
+                "fenced={fenced}: the default fixture is an ordinary controller-mode job"
+            );
+            phase
+                .prepare_handover()
+                .await
+                .expect("an adopted controller can address its generations");
+            assert!(
+                phase.built_job_controller(),
+                "fenced={fenced}: in controller mode the handover builds the job's controller"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------
     // M11.T25b — the D39b phase graph, run against the same workers the landed body is run
     // against. The rows that need no job at all — the issued-attempt inventory, the fence
     // target set, the transfer interface, and the two source pins over `Fencing` — live beside
@@ -9271,10 +9107,332 @@ mod tests {
              admitted region does the same externally visible thing"
         );
         assert_eq!(
-            state_writes(&fenced.db),
             state_writes(&legacy.db),
-            "and the job's status row records the same scheduling generation, written in the \
-             same preamble"
+            [("Scheduling".to_string(), 2)],
+            "the landed body persists the raised generation once"
+        );
+        assert_eq!(
+            state_writes(&fenced.db),
+            [("Scheduling".to_string(), 2), ("Scheduling".to_string(), 2)],
+            "and the phase graph persists the same generation, in the same preamble, and then \
+             writes the row a second time to install that generation's authoritative metadata \
+             root (M11.D39d) — an effect the landed body has no equivalent of. Both writes name \
+             the same state and the same generation, which is the parity this row is about"
+        );
+        assert_eq!(
+            authority_writes(&legacy.db),
+            [],
+            "the landed body adopts nothing: under `LegacyT08` the authority columns are never \
+             written, and this is the byte-level half of that claim"
+        );
+        assert_eq!(
+            authority_writes(&fenced.db),
+            [(ADOPTED_FENCE, 0)],
+            "and the phase graph adopts exactly once, while the row still holds the generation \
+             the fixture created it with — so the adoption CAS ran before the preamble's first \
+             other effect wrote a generation at all, which is M11.D39d's 'before any effect'"
+        );
+    }
+
+    /// Every candidate metadata object under a job's checkpoint directory, sorted.
+    ///
+    /// Read from the filesystem rather than from the controller, because the claim is about
+    /// what a *store* holds after a run: a candidate is an object M11.D39d writes before
+    /// anything points at it, so nothing in the controller can be asked whether it is there.
+    fn candidate_objects(checkpoints: &CheckpointDir) -> Vec<String> {
+        fn walk(root: &std::path::Path, at: &std::path::Path, into: &mut Vec<String>) {
+            for entry in std::fs::read_dir(at).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(root, &path, into);
+                } else {
+                    into.push(
+                        path.strip_prefix(root)
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                }
+            }
+        }
+        let root = std::path::Path::new(&checkpoints.0);
+        let mut keys = Vec::new();
+        walk(root, root, &mut keys);
+        keys.retain(|key| key.contains("/candidates/"));
+        keys.sort();
+        keys
+    }
+
+    /// The job's `state_context` as the row holds it.
+    fn stored_state_context(db: &DatabaseSource) -> serde_json::Value {
+        let DatabaseSource::Sqlite(connection) = db else {
+            unreachable!("the fixture is always sqlite")
+        };
+        let raw: String = connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT state_context FROM job_statuses WHERE id = 'job_abc'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    /// A controller that has already lost the job causes **no effect at all** (M11.D39d).
+    ///
+    /// Cold adoption is the scheduling preamble's first effect, and this is what that buys: the
+    /// row's authority has moved on since this controller read it, so the adoption CAS matches
+    /// nothing and the attempt ends before the generation is persisted, before the job's
+    /// cluster is torn down, before a replacement one is started, and before any candidate
+    /// object is written.
+    ///
+    /// The attempt ends by *standing down* rather than by failing: a controller that no longer
+    /// holds a job has no business publishing an opinion about it, and every publication it
+    /// could attempt would be refused by the same predicate anyway. `Transition::Stop` is what
+    /// `execute_state` turns into "this task ends".
+    #[tokio::test]
+    async fn a_superseded_controller_stands_down_before_its_first_effect() {
+        let mut run = SchedulingRun::new("superseded-preamble").await;
+        let mailbox = intent_mailbox();
+        run.harness.install_actor(&mailbox);
+        // Another controller adopts the job between this one's read and its preamble.
+        {
+            let DatabaseSource::Sqlite(connection) = &run.db else {
+                unreachable!("the fixture is always sqlite")
+            };
+            connection
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE job_statuses SET lifecycle_fence = ?1, controller_epoch = 'elsewhere'
+                     WHERE id = 'job_abc'",
+                    [ADOPTED_FENCE as i64],
+                )
+                .unwrap();
+            connection
+                .lock()
+                .unwrap()
+                .execute("DELETE FROM authority_writes", [])
+                .unwrap();
+        }
+        // The workers would connect if the attempt ever got that far, so a run that ends early
+        // ends because it decided to and not because it was starved.
+        let queue = run.harness.queue();
+        queue
+            .send(worker_connect_from(WorkerId(7), &run.address(0)))
+            .await
+            .unwrap();
+        queue.send(task_started()).await.unwrap();
+
+        let outcome = run.schedule_through_the_phase_graph().await;
+        assert!(
+            matches!(outcome, Ok(Transition::Stop)),
+            "a superseded controller stands down; it does not fail the job and does not retry: \
+             {:?}",
+            advanced_to(&outcome)
+        );
+
+        assert_eq!(
+            authority_writes(&run.db),
+            [],
+            "the adoption matched no row, so nothing was adopted"
+        );
+        assert_eq!(
+            state_writes(&run.db),
+            [],
+            "and no generation was persisted: adoption is the first effect, so a lost one \
+             precedes every other"
+        );
+        assert_eq!(
+            run.harness.scheduler.stopped.lock().unwrap().as_slice(),
+            [],
+            "the job's cluster was not torn down"
+        );
+        assert_eq!(
+            run.harness.scheduler.started.lock().unwrap().as_slice(),
+            [],
+            "and no replacement cluster was started"
+        );
+        assert_eq!(
+            run.calls.protocol(),
+            vec![],
+            "nothing was sent to a worker: no fence, and no start"
+        );
+        assert_eq!(
+            candidate_objects(&run._checkpoints),
+            Vec::<String>::new(),
+            "and no candidate metadata object was written"
+        );
+        assert_eq!(
+            stored_state_context(&run.db).get("metadata_root"),
+            None,
+            "so the row names no root either"
+        );
+    }
+
+    /// A controller superseded *after* it published its candidate leaves that candidate
+    /// unrooted, and cannot replace the root (M11.D39d).
+    ///
+    /// The other half of `a_superseded_controller_stands_down_before_its_first_effect`: there
+    /// the duel is lost at the adoption and nothing happens at all; here it is lost between the
+    /// two steps of the publication, which is the interleaving M11.D39d's two-step protocol
+    /// exists for. Another controller adopts the job while this one is starting its cluster, so
+    /// the candidate object is written under an authority the row no longer carries and the
+    /// conditional update that would root it matches nothing.
+    ///
+    /// What is left behind is exactly what the design says: an immutable object nobody points
+    /// at. It is not deleted — a losing controller has no authority to delete anything, and the
+    /// object may be the one a *third* controller is about to root — and it is not rolled back,
+    /// because there is nothing to roll back: the row was never written.
+    #[tokio::test]
+    async fn a_controller_superseded_after_publishing_leaves_an_unrooted_candidate() {
+        let mut run = SchedulingRun::new("unrooted-candidate").await;
+        let mailbox = intent_mailbox();
+        run.harness.install_actor(&mailbox);
+        let barriers = run.barriers.clone();
+        let db = run.db.clone();
+        let queue = run.harness.queue();
+        let address = run.address(0);
+
+        let rival = tokio::spawn(async move {
+            // Strictly after the adoption and the generation write, and strictly before the
+            // metadata root: the cluster has been asked for, which is the preamble's third
+            // effect, and the root is its fifth.
+            barriers.workers_started.notified().await;
+            let DatabaseSource::Sqlite(connection) = &db else {
+                unreachable!("the fixture is always sqlite")
+            };
+            connection
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE job_statuses
+                        SET lifecycle_fence = lifecycle_fence + 1, controller_epoch = 'rival'
+                      WHERE id = 'job_abc'",
+                    [],
+                )
+                .unwrap();
+            // The workers would have connected, so the attempt does not merely time out.
+            queue
+                .send(worker_connect_from(WorkerId(7), &address))
+                .await
+                .unwrap();
+            queue.send(task_started()).await.unwrap();
+        });
+
+        let outcome = run.schedule_through_the_phase_graph().await;
+        rival.await.unwrap();
+
+        assert!(
+            matches!(outcome, Ok(Transition::Stop)),
+            "the superseded controller stands down rather than failing the job: {:?}",
+            advanced_to(&outcome)
+        );
+
+        let candidates = candidate_objects(&run._checkpoints);
+        assert_eq!(
+            candidates.len(),
+            1,
+            "the candidate object was published before the duel was lost, and is still there: \
+             {candidates:?}"
+        );
+        assert!(
+            candidates[0].contains(&format!("fence-{ADOPTED_FENCE:020}")),
+            "and it is scoped to the fence this controller had adopted: {candidates:?}"
+        );
+        assert_eq!(
+            stored_state_context(&run.db).get("metadata_root"),
+            None,
+            "but the row names no root: the candidate is unrooted, which is what leaves it for \
+             the grace collector"
+        );
+        assert!(
+            arroyo_rpc::fencing::Fencing::record(vec![], Some(candidates[0].clone()), None).is_ok(),
+            "and the reference fits the durable fencing record's own bound, so the obligation \
+             M11.T26f persists can name it: {candidates:?}"
+        );
+        assert_eq!(
+            run.calls.started(),
+            Vec::<String>::new(),
+            "nothing was started under an authority this controller had already lost"
+        );
+    }
+
+    /// A completed fenced attempt publishes exactly one candidate and roots exactly it, and the
+    /// landed body publishes none at all.
+    ///
+    /// The pair is the M11.T26 delivery rule at the level of *objects*: under the selected
+    /// mechanism a scheduling attempt writes the objects it wrote before this todo existed, and
+    /// the candidate/root protocol is reachable only from the M11.D39b preamble no production
+    /// job runs.
+    #[tokio::test]
+    async fn only_the_fenced_preamble_publishes_a_candidate_and_roots_it() {
+        async fn prime(run: &SchedulingRun) {
+            let queue = run.harness.queue();
+            queue
+                .send(worker_connect_from(WorkerId(7), &run.address(0)))
+                .await
+                .unwrap();
+            queue.send(task_started()).await.unwrap();
+        }
+
+        // The control: the landed body, which is what every production job runs.
+        let mut legacy = SchedulingRun::new("candidate-legacy").await;
+        prime(&legacy).await;
+        assert_eq!(
+            advanced_to(&legacy.schedule().await),
+            Some("Running"),
+            "the landed body schedules this fixture"
+        );
+        assert_eq!(
+            candidate_objects(&legacy._checkpoints),
+            Vec::<String>::new(),
+            "and writes no candidate metadata object: under `LegacyT08` the objects a \
+             scheduling attempt writes are exactly the objects it wrote before M11.T26"
+        );
+        assert_eq!(
+            stored_state_context(&legacy.db).get("metadata_root"),
+            None,
+            "and installs no root, so the durable record is byte-identical to the one the \
+             landed path has always written"
+        );
+        assert_eq!(authority_writes(&legacy.db), [], "and adopts nothing");
+
+        // The fenced preamble, which publishes one candidate and roots exactly it.
+        let mailbox = intent_mailbox();
+        let mut fenced = SchedulingRun::new("candidate-fenced").await;
+        fenced.harness.install_actor(&mailbox);
+        prime(&fenced).await;
+        assert_eq!(
+            advanced_to(&fenced.schedule_through_the_phase_graph().await),
+            Some("Running")
+        );
+
+        let candidates = candidate_objects(&fenced._checkpoints);
+        assert_eq!(
+            candidates.len(),
+            1,
+            "one attempt publishes one candidate: {candidates:?}"
+        );
+        let root = stored_state_context(&fenced.db)
+            .get("metadata_root")
+            .cloned()
+            .expect("the fenced preamble installs a root");
+        let root: arroyo_rpc::metadata_root::MetadataRoot =
+            serde_json::from_value(root).expect("the row's root decodes");
+        assert_eq!(
+            root.object(),
+            candidates[0],
+            "and the root names the candidate that was published, not another object"
+        );
+        assert_eq!(root.fence(), ADOPTED_FENCE, "scoped to the adopted fence");
+        assert_eq!(root.generation(), 2, "and to this attempt's generation");
+        assert_eq!(
+            root.epoch(),
+            fenced.harness.status.authority().epoch(),
+            "and to the epoch this attempt's own adoption installed"
         );
     }
 
@@ -9801,14 +9959,14 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------------------
-    // M11.T25f — legacy-path parity. What these rows are for, and what they deliberately are
-    // not.
+    // M11.T26h — production-path parity. What these rows are for, and what they deliberately
+    // are not.
     //
-    // DoD M11.T25l is one claim in two halves: production selects `LegacyT08`, and the guards
-    // M11.T08 landed under it are still there and still doing their work. The first half is
-    // already pinned twice — `production_selects_only_the_legacy_t08_lifecycle` quantifies the
-    // selection over the whole enum, and `no_production_path_selects_the_fenced_v2_lifecycle`
-    // counts the production construction sites — and neither is restated here.
+    // DoD M11.T26z is one claim in two halves: production selects `FencedV2`, and the M11.T08
+    // mechanisms it supersedes are gone. The first half is already pinned twice —
+    // `production_selects_only_the_fenced_v2_lifecycle` quantifies the selection over the whole
+    // enum, and `every_production_path_selects_the_fenced_v2_lifecycle` counts the production
+    // construction sites — and neither is restated here.
     //
     // What was left unpinned is the *middle* of the chain those two do not meet in: a mode is
     // selected, and then a job is built from it, and then a body is chosen for that job. M11.T25b
@@ -9817,63 +9975,66 @@ mod tests {
     // are about that: what a job built from the selection actually has, which body it therefore
     // runs, and that the landed guards are still present and still called on the way there.
     //
-    // Deliberately not restated, because a pin that only repeats another adds a place to
-    // update rather than a thing that can fail:
+    // The M11.T08 guards this section used to name are two different things after M11.T26h,
+    // and the difference is the whole of the activation change:
     //
-    // * the admitted regions of `Scheduling::next` and its inventory of irreversible effects —
-    //   `the_source_of_scheduling_next_keeps_every_irreversible_effect_inside_an_admitted_region`;
-    // * `settle_under_admission` owning the `StartExecution` fan-out, structurally in that same
-    //   pin and behaviourally in `dropping_the_scheduling_task_keeps_the_admission_until_its_blocked_request_settles`,
-    //   `a_cancelled_fan_out_holds_its_admission_until_the_request_it_issued_settles` and
-    //   `a_sibling_failure_cannot_release_the_admission_while_a_blocked_worker_is_unsettled`,
-    //   all of which drive `Scheduling::next` itself;
-    // * the `reconciles_start_execution` capability gate, in
+    // * **removed**, because the D39 path supersedes them —
+    //   `the_activation_change_selects_the_fence_and_removes_every_superseded_t08_guard` is the
+    //   single co-occurrence that says so, and the rows that exercised them went with them;
+    // * **retained**, because M11.D75 keeps them: the `reconciles_start_execution` capability
+    //   gate and the worker-first ordering, in
     //   `a_worker_predating_the_reconciliation_contract_is_never_sent_a_start_execution` and
     //   `a_controller_replacement_leaves_no_legacy_start_execution_handler_behind_its_gate`,
-    //   which drive the same body against a worker that never advertised it.
+    //   which drive the landed body against a worker that never advertised it.
     // ---------------------------------------------------------------------------------------
 
-    /// A job built the way production builds one runs the landed `Scheduling` body, and reaches
-    /// the same place by the same effects (M11.T25f, DoD M11.T25l).
+    /// A job built the way production builds one runs the M11.D39b phase graph, and reaches
+    /// the same place by the same effects (M11.T26h, DoD M11.T26z).
     ///
-    /// The chain M11.T25 has to keep true has four links, and the two pins named above cover
-    /// only the first two:
+    /// The chain the activation change has to keep true has four links, and the two pins named
+    /// above cover only the first two:
     ///
     /// 1. the production construction site passes `LifecycleMode::SELECTED`;
-    /// 2. `SELECTED` is `LegacyT08`;
-    /// 3. **a `JobLifecycle` built from `LegacyT08` has no mailbox and no actor**;
-    /// 4. **a context with no actor runs `Scheduling::next`, not the phase graph.**
+    /// 2. `SELECTED` is `FencedV2`;
+    /// 3. **a `JobLifecycle` built from `FencedV2` has a mailbox, an actor and a settlement
+    ///    owner**;
+    /// 4. **a context with an actor runs the phase graph, not the landed `Scheduling::next`.**
     ///
-    /// Links 3 and 4 are what this asserts, and they are the ones M11.T25 introduced: before
-    /// this todo there was no second body for a state to run and no seam to choose between
-    /// them. Link 3 is checked on the real `JobLifecycle::for_mode` rather than on a literal,
-    /// so a future arm that handed `LegacyT08` a mailbox "for symmetry" fails here; link 4 is
-    /// checked by running the fixture through the seam with production's own lifecycle
+    /// Links 3 and 4 are what this asserts. M11.T25's version of this row asserted their
+    /// negation — `the_production_route_runs_the_landed_scheduling_body` — because `SELECTED`
+    /// was `LegacyT08` then; the activation change inverted the answer and kept the chain,
+    /// which is the requirement. Link 3 is checked on the real `JobLifecycle::for_mode` rather
+    /// than on a literal, so an arm that stopped handing `FencedV2` its writer fails here; link
+    /// 4 is checked by running the fixture through the seam with production's own lifecycle
     /// installed, which is the only thing `run_state_body` consults.
     ///
     /// The parity half is then the ordinary one: the same fixture — one restored checkpoint in
-    /// its committing phase, one worker, one operator — run once through the seam and once by
-    /// calling `Scheduling::next` directly, compared on what a job's owner can observe. The
-    /// landed body is unchanged by M11.T25 down to its source text, so "the same body ran" and
-    /// "nothing about the job's lifecycle changed" are the same statement.
+    /// its committing phase, one worker, one operator — run once through the production seam
+    /// and once through the phase graph directly, compared on what a job's owner can observe.
+    /// A control on the *pre-flag-day* body is deliberately not compared here: it sends
+    /// different bytes now, which is what
+    /// `a_pre_flag_day_controller_sends_the_start_it_sent_before_the_fence_existed` measures.
     #[tokio::test]
-    async fn the_production_route_runs_the_landed_scheduling_body() {
+    async fn the_production_route_runs_the_phase_graph() {
         // Link 3, on the production constructor itself.
         let job_id = Arc::new("job_abc".to_string());
         let production =
             JobLifecycle::for_mode(lifecycle::LifecycleMode::SELECTED, Arc::clone(&job_id));
         assert!(
-            production.intents().is_none(),
-            "a job on the selected mechanism has no intent mailbox, so the configuration poll \
-             has nowhere to leave a decision and keeps deciding for itself exactly as M11.T08 \
-             landed it"
+            production.intents().is_some(),
+            "a job on the selected mechanism has an intent mailbox, so the configuration poll \
+             has somewhere to leave a classification and decides nothing itself"
         );
         assert!(
             production
                 .actor(Arc::clone(&job_id), StateBackendSelector::Parquet)
-                .is_none(),
-            "and its state task has no single writer, which is the fact the seam reads: the \
-             D39a machinery is absent from a production job rather than present and bypassed"
+                .is_some(),
+            "and its state task has the single writer, which is the fact the seam reads"
+        );
+        assert!(
+            production.settlement().is_some(),
+            "and the settlement owner that comes with it, because `JobLifecycle` builds both \
+             or neither"
         );
 
         async fn prime(run: &SchedulingRun) {
@@ -9885,10 +10046,11 @@ mod tests {
             queue.send(task_started()).await.unwrap();
         }
 
-        // The control: the landed body, called the way every round-1-to-16 row calls it.
-        let mut landed = SchedulingRun::new("route-parity-landed").await;
-        prime(&landed).await;
-        let landed_outcome = landed.schedule().await;
+        // The control: the phase graph, entered the way every M11.D39b row enters it.
+        let mut fenced = SchedulingRun::new("route-parity-fenced").await;
+        fenced.harness.install_fenced_lifecycle();
+        prime(&fenced).await;
+        let fenced_outcome = fenced.schedule_through_the_phase_graph().await;
 
         // And link 4: the same fixture, entered through the seam `execute_state` enters, by a
         // job whose lifecycle came out of `LifecycleMode::SELECTED`.
@@ -9900,171 +10062,38 @@ mod tests {
             .await;
 
         assert_eq!(
-            advanced_to(&landed_outcome),
+            advanced_to(&fenced_outcome),
             Some("Running"),
-            "the control: `Scheduling::next` schedules this fixture into a running execution"
+            "the control: the phase graph schedules this fixture into a running execution"
         );
         assert_eq!(
             advanced_to(&production_outcome),
-            advanced_to(&landed_outcome),
+            advanced_to(&fenced_outcome),
             "and a job that reached the same body through the seam leaves `Scheduling` for the \
              same state"
         );
         assert_eq!(
             production_route.calls.started(),
-            landed.calls.started(),
+            fenced.calls.started(),
             "the worker is sent the same `StartExecution`, stamped with the same selector"
         );
         assert_eq!(
+            production_route.calls.protocol(),
+            fenced.calls.protocol(),
+            "under the same protocol — the fence handshake and the fenced start, which is what \
+             the seam now chooses"
+        );
+        assert_eq!(
             production_route.calls.committed(),
-            landed.calls.committed(),
+            fenced.calls.committed(),
             "the restored checkpoint's commits are published identically — the third \
              irreversible region does the same externally visible thing"
         );
         assert_eq!(
             state_writes(&production_route.db),
-            state_writes(&landed.db),
+            state_writes(&fenced.db),
             "and the job's status row records the same scheduling generation, written in the \
              same preamble"
-        );
-    }
-
-    /// Every guard M11.T08 landed on the production route is still there, and still on it
-    /// (M11.T25f, DoD M11.T25l).
-    ///
-    /// **A structural source pin, and the name says so.** Two things no behavioural row can
-    /// notice:
-    ///
-    /// * **The gate's inventory, and that every member of it is still reached from production.**
-    ///   `RefusalGate` is six methods that only make sense together — take the admission
-    ///   without waiting, take it and read what was published, publish under it, withdraw,
-    ///   apply once, and stop applying — so the set is pinned in the same idiom as
-    ///   `the_source_of_fencing_exposes_no_admission_and_no_irreversible_effect`: adding or
-    ///   removing one is a decision, and this is where it has to be made. The *caller* half is
-    ///   the part no other mechanism covers at all: `#[warn(dead_code)]` is silenced by a test
-    ///   that calls the method, and every one of these has such a test, so a guard that quietly
-    ///   lost its production call site would compile with no warning and keep passing its own
-    ///   unit row while guarding nothing. M11.T26 is the owner allowed to remove them, in the
-    ///   change that activates the durable fence; the intended reading of a failure here is
-    ///   "T26 has arrived", not "the test is stale".
-    /// * **Where the body is chosen.** M11.T25b moved the state body's call site: `execute_state`
-    ///   used to call `state.next(ctx)` and now calls `scheduling::run_state_body`. That fork is
-    ///   the only new thing between a job and its landed behaviour, and it cannot be reached
-    ///   behaviourally — the two bodies are built to be observably identical, which is what
-    ///   `the_fenced_lifecycle_schedules_a_job_through_the_phase_graph` asserts, so no run can
-    ///   tell you which one it took. What it is guarded by, and that the gate is still read
-    ///   *before* it, are therefore pinned here. A seam installed ahead of the gate would be a
-    ///   state body that runs before the refusal it is under is applied — the exact defect
-    ///   rounds 7 to 9 kept finding, reintroduced one level up.
-    #[test]
-    fn the_production_route_retains_every_t08_guard() {
-        /// Everything in a file before its test module, so a mention inside a test does not
-        /// count as a production one.
-        fn production_half(source: &'static str) -> &'static str {
-            match source.find("\n#[cfg(test)]") {
-                Some(at) => &source[..at],
-                None => source,
-            }
-        }
-        let states = production_half(include_str!("mod.rs"));
-
-        // The gate quartet, plus the two per-task methods that make "applied once" true.
-        let impl_at = states
-            .find("impl RefusalGate {")
-            .expect("the refusal gate's impl has been renamed");
-        let body =
-            &states[impl_at..impl_at + states[impl_at..].find("\n}\n").expect("unterminated impl")];
-        let mut methods: Vec<&str> = body
-            .match_indices("    fn ")
-            .chain(body.match_indices("    async fn "))
-            .map(|(i, m)| {
-                let rest = &body[i + m.len()..];
-                &rest[..rest.find('(').expect("a method has arguments")]
-            })
-            .collect();
-        methods.sort_unstable();
-        assert_eq!(
-            methods,
-            [
-                "admit_publication",
-                "admit_scheduling",
-                "disarm",
-                "publish",
-                "take",
-                "withdraw",
-            ],
-            "these six are the landed M11.T08 interlock, and M11.T25 keeps every one of them \
-             selected. Removing one is M11.T26's to do, in the change that makes the durable \
-             fence the mechanism instead"
-        );
-
-        // And none of them is merely compiled: each is still reached from a production path.
-        for method in methods {
-            let calls = states.matches(&format!("refusal_gate.{method}(")).count();
-            assert!(
-                calls > 0,
-                "`RefusalGate::{method}` has no production caller left. A guard nothing calls \
-                 guards nothing, and its removal would then look like tidying"
-            );
-        }
-
-        // Where a state's body is chosen, and what stands before that choice.
-        let execute = states
-            .find("async fn execute_state<'a>(")
-            .expect("`execute_state` has been renamed");
-        let execute = &states[execute
-            ..execute
-                + states[execute..]
-                    .find("\n}\n")
-                    .expect("unterminated function")];
-        let read_gate = execute
-            .find("refusal_gate.take()")
-            .expect("`execute_state` must read the gate on every state's behalf");
-        let run_body = execute
-            .find("scheduling::run_state_body(")
-            .expect("`execute_state` runs a state's body through the M11.T25b seam");
-        assert!(
-            read_gate < run_body,
-            "the gate is read before the body runs, not after it: a refusal the job is already \
-             under has to stop `Compiling`, which never receives, and `Scheduling`, which \
-             persists a generation and tears the job's cluster down before its first `recv`"
-        );
-        assert_eq!(
-            execute.matches("run_state_body(").count(),
-            1,
-            "and there is one place a state body is entered from. A second would be a second \
-             thing that could choose a body without reading the gate first"
-        );
-
-        // The seam itself: which job takes the new branch, and what every other job gets.
-        //
-        // Cut here rather than with `scheduling_body`, whose "first `\n    }\n`" rule ends a
-        // function at the close of its first indented block — which for this one is the
-        // `return` arm, leaving the fallthrough this row exists to read outside the slice.
-        let scheduling = scheduling_source_without_comments();
-        let seam_at = scheduling
-            .find("pub(crate) async fn run_state_body(")
-            .expect("`run_state_body` has been renamed");
-        let seam = &scheduling[seam_at
-            ..seam_at
-                + scheduling[seam_at..]
-                    .find("\n}\n")
-                    .expect("unterminated function")];
-        assert_eq!(
-            seam.matches("phases::schedule(").count(),
-            1,
-            "the M11.D39b phase graph is entered from exactly one place"
-        );
-        assert!(
-            seam.contains("ctx.runs_fenced_lifecycle()"),
-            "and only for a job that has a D39a single writer, which is what \
-             `the_production_route_runs_the_landed_scheduling_body` shows a production job \
-             does not have"
-        );
-        assert!(
-            seam.contains("state.next(ctx).await"),
-            "every other state of every other job runs its own landed body, unchanged. If this \
-             fell through to anything else, `LegacyT08` would no longer mean M11.T08's path"
         );
     }
 
@@ -10237,7 +10266,10 @@ mod tests {
              checkpoint epoch nobody asked for"
         );
 
-        phase.prepare_handover().await;
+        phase
+            .prepare_handover()
+            .await
+            .expect("this fixture's job runs the legacy protocol, whose handover cannot fail");
         assert!(
             !phase.needs_restored_commits(),
             "a leader-mode generation registers its recovery checkpoint through the leader and \
@@ -10321,7 +10353,10 @@ mod tests {
 
         let mut phase = PhaseContext::new(&mut ctx);
         phase.run_as_leader_on(WorkerId(7), address);
-        phase.prepare_handover().await;
+        phase
+            .prepare_handover()
+            .await
+            .expect("this fixture's job runs the legacy protocol, whose handover cannot fail");
 
         let Err((phase, reason)) = phase.into_transition().await else {
             panic!(
@@ -10344,6 +10379,7 @@ mod tests {
         let Err(reported) = phase
             .into_fencing(reason, IssuedAttempts::default())
             .reconcile_and_report()
+            .await
         else {
             panic!(
                 "nothing asked this job to stop, so fencing ends it on the reason it was \
@@ -10366,8 +10402,9 @@ mod tests {
     // ---------------------------------------------------------------------------------------
     // Review round 2 — the three defects the M11.T25 substrate carried into review.
     //
-    // None of these is reachable in production: `LifecycleMode::SELECTED` is `LegacyT08`, so no
-    // job has a `PhaseContext` at all. They are rows about what M11.T26 would activate.
+    // None of these was reachable in production when they were written: `LifecycleMode::SELECTED`
+    // was `LegacyT08`, so no job had a `PhaseContext` at all. M11.T26h's activation change made
+    // every one of them a row about the path production runs.
     // ---------------------------------------------------------------------------------------
 
     /// A fatal reason for fencing has been superseded once the job's writer adopts a newer
@@ -10397,6 +10434,7 @@ mod tests {
         let Err(reported) = phase
             .into_fencing(refusal_reason(), IssuedAttempts::default())
             .reconcile_and_report()
+            .await
         else {
             panic!("a job nobody has asked to stop does not end by stopping")
         };
@@ -10422,6 +10460,7 @@ mod tests {
         let Err(reported) = phase
             .into_fencing(refusal_reason(), IssuedAttempts::default())
             .reconcile_and_report()
+            .await
         else {
             panic!("an adoption that does not ask the job to stop is not a stop")
         };
@@ -10467,6 +10506,7 @@ mod tests {
             let Err(reported) = phase
                 .into_fencing(standing, IssuedAttempts::default())
                 .reconcile_and_report()
+                .await
             else {
                 panic!("an adoption that does not ask the job to stop is not a stop")
             };
@@ -10534,6 +10574,7 @@ mod tests {
         let Err(reported) = phase
             .into_fencing(standing, IssuedAttempts::default())
             .reconcile_and_report()
+            .await
         else {
             panic!("an adoption that does not ask the job to stop is not a stop")
         };
@@ -10629,7 +10670,8 @@ mod tests {
 
             let outcome = phase
                 .into_fencing(refusal_reason(), IssuedAttempts::default())
-                .reconcile_and_report();
+                .reconcile_and_report()
+                .await;
             assert_eq!(
                 advanced_to(&outcome),
                 Some("Stopping"),
@@ -11608,12 +11650,52 @@ mod tests {
             HashMap::from([(WorkerId(7), worker_client(channel, WorkerId(7)))]),
             None,
             None,
+            // The pre-flag-day protocol, which is what `LifecycleMode::SELECTED` produces and
+            // therefore what the landed leader rows are about.
+            lifecycle::FenceProtocol::Legacy,
         );
         (calls, controller)
     }
 
     /// The generation the fake leader and the fake controller both run the job at.
     const LEADER_GENERATION: u64 = 2;
+
+    /// The worker leader a running leader-mode job's row carries, or `None` in controller mode
+    /// (M11.T26g).
+    ///
+    /// Fixture setup, and only in the topology that needs it. `run_to_completion` rebuilds a
+    /// leader-mode job's [`LeaderManager`] from `status.state_context.leader` *before* the job's
+    /// first state runs, because `PhaseContext::into_transition` is what wrote it — that record
+    /// is the only thing a restarted controller has to find the job's leader again with. A
+    /// fixture for a job that is already `Running` and omitted it would put `LeaderRunning` in
+    /// front of a `None`, so supplying one is making the fixture the deployment it models rather
+    /// than relaxing anything.
+    ///
+    /// The leader reports `JobStopped`, which is the state both `LeaderStopping` and
+    /// `LeaderCheckpointStopping` wait for: the job this is for is one that has been asked to
+    /// stop. In controller mode nothing is served and the answer is `None`, so a controller-mode
+    /// run of the same row is exactly what it was.
+    async fn leader_context_for_this_topology(
+        generation: u64,
+    ) -> Option<arroyo_rpc::LeaderContext> {
+        if !worker_leader_topology() {
+            return None;
+        }
+        let (_polls, address) = fake_leader_reporting(
+            generation,
+            "parquet",
+            LeaderJobStatus {
+                job_state: JobState::JobStopped as i32,
+                ..Default::default()
+            },
+        )
+        .await;
+        Some(arroyo_rpc::LeaderContext {
+            worker_id: WorkerId(7),
+            rpc_address: address,
+            generation,
+        })
+    }
 
     /// A live [`LeaderManager`] attached to a leader that reports `job_state` forever.
     ///
@@ -12947,11 +13029,13 @@ mod tests {
         }
     }
 
-    /// The control: the landed mechanism still starts an inactive job for an accepted update,
-    /// exactly as it did.
+    /// The control: the pre-flag-day peer's mechanism still starts an inactive job for an
+    /// accepted update, exactly as it did.
     ///
-    /// Selects `LifecycleMode::SELECTED`, which is `LegacyT08` and is what production runs.
-    /// There is no mailbox on this path — the accepted row is stored into the shared cell and
+    /// Names `LifecycleMode::LegacyT08` explicitly. It named `LifecycleMode::SELECTED` until
+    /// M11.T26h, when the selection moved to `FencedV2` — and what the row is *for* is the
+    /// other mechanism, so the change is a rename of the constant and not of the claim. There
+    /// is no mailbox on this path — the accepted row is stored into the shared cell and
     /// `AppliedStatus::NotApplied` is stored with it — and nothing above may change that. The
     /// row is the same operator action as
     /// `an_inactive_stopped_job_is_started_for_a_cleared_stop_mode`, against the same fixture,
@@ -12962,7 +13046,7 @@ mod tests {
         let db = sqlite_startable_job("Stopped", 2);
         let scheduler = Arc::new(RecordingScheduler::panicking());
         let mut sm = state_machine_in_mode(
-            LifecycleMode::SELECTED,
+            LifecycleMode::LegacyT08,
             a_stopped_jobs_config(),
             StateBackendSelector::Parquet,
             None,
@@ -12971,8 +13055,8 @@ mod tests {
         );
         assert!(
             sm.lifecycle.intents().is_none(),
-            "the control's own precondition: the selected mechanism has no intent mailbox, so \
-             this row cannot be passing through the path the rows above exercise"
+            "the control's own precondition: this mechanism has no intent mailbox, so this row \
+             cannot be passing through the path the rows above exercise"
         );
 
         sm.update(

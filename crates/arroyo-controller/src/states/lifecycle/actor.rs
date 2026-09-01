@@ -274,14 +274,14 @@ impl LifecycleDecision {
 /// because there is only ever one publisher, and it is the same task that enters the
 /// phases.
 ///
-/// M11.T08's [`RefusalGate`](crate::states::RefusalGate) remains the selected production
-/// mechanism through M11.T25 and is not weakened by anything here; the two are
-/// alternatives, and which one a job runs under is [`LifecycleMode::SELECTED`](super::LifecycleMode::SELECTED).
+/// M11.T08's cross-task refusal gate was the selected production mechanism through M11.T25 and
+/// was removed by M11.T26h's activation change, which is what makes "only ever one publisher"
+/// true of the crate and not only of this module.
 ///
 /// # Deciding each intent once
 ///
-/// [`Self::decided`] is the watermark that does for this path what `RefusalGate::acted`
-/// does for the T08 one. A row that stays bad is re-polled every 500ms and re-submitted at
+/// [`Self::decided`] is the watermark that does for this path what M11.T08's per-task `acted`
+/// counter did for the cross-task one. A row that stays bad is re-polled every 500ms and re-submitted at
 /// the *same* version, so the actor decides it once; a row that changes gets a new version
 /// and is decided afresh. The watermark is per actor, so a task started later re-decides
 /// an intent an earlier task already did — which is what keeps a job restarting out of
