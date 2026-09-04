@@ -133,6 +133,19 @@ pub enum StateError {
     },
 }
 
+/// Whether a refusal this job's writer decided may be published yet (M11.D39d, PR #167 round 4).
+#[derive(Debug)]
+#[must_use = "publishing a refusal before its obligation is settled is the defect this answers"]
+pub(crate) enum BeforePublishing {
+    /// Nothing is owed: the refusal may be published, and the job may fail.
+    Settled,
+    /// Worker generations this job addressed have not acknowledged a superseding fence and have
+    /// not been observed terminated. The job stays where it is and the refusal stands.
+    StillOwed,
+    /// Another controller holds this job. Nothing further is published about it at all.
+    StoodDown,
+}
+
 /// A fatal reason that is *not* the job's configuration being refused.
 ///
 /// The fail-closed default. Use [`fatal_refused_config`] for a refusal, and nothing else: a
@@ -1155,6 +1168,187 @@ impl JobContext<'_> {
     /// # Errors
     ///
     /// The fatal [`StateError`] of a refused configuration, exactly as above.
+    /// The boundary's read of the job's writer, with a refusal kept whole rather than reported.
+    ///
+    /// M11.D39d makes a refusal *publication* reachable only after every worker generation this
+    /// job addressed has acknowledged a superseding fence or been observed terminated, and this
+    /// boundary is where a refusal that never enters the phase graph at all is read — it is
+    /// consumed before the state body runs, so the graph's own fencing never sees it. Handing it
+    /// back whole is what lets the caller settle first and then either publish it or leave it
+    /// standing for the next pass (PR #167 round 4).
+    ///
+    /// # Errors
+    ///
+    /// The refused configuration's own error, not the `StateError` it becomes: the caller may
+    /// still be about to defer it, and a reason turned into a failure is a reason that has
+    /// already been acted on.
+    pub(crate) fn observe_boundary_intent(
+        &mut self,
+        at: ConsumptionPoint,
+    ) -> Result<ObservedIntent, StateBackendError> {
+        let Some(decision) = self
+            .lifecycle_actor
+            .as_mut()
+            .and_then(|actor| actor.observe(at))
+        else {
+            return Ok(ObservedIntent::Continue);
+        };
+        if let lifecycle::actor::LifecycleDecision::Refuse(error) = decision {
+            return Err(error);
+        }
+        // Every other decision publishes exactly as it always has; only the refusal is deferred,
+        // and only because only the refusal has something outside the writer to wait for.
+        Ok(decision
+            .apply(&mut self.config, &self.pipeline_info.pipeline_id)
+            .unwrap_or_else(|_| {
+                unreachable!("the refusal arm is the only one `apply` reports an error for")
+            }))
+    }
+
+    /// Settles whatever this job owes, before a refusal may be published (M11.D39d, PR #167
+    /// round 4).
+    ///
+    /// M11.D39d: *"`Refused` (or a new scheduling generation) becomes reachable only after every
+    /// target generation has acked the fence/revokes or has been observed terminated."* A
+    /// refusal read at a state boundary skips the phase graph entirely — the body never runs, so
+    /// nothing fences and nothing discharges — and the boundary then transitions the job to
+    /// `Failing`, which tears its workers down best-effort *after* publishing and continues to
+    /// `Failed` even when that fails. A target partitioned at that moment is left able to apply
+    /// a delayed start when it heals, with nothing left to fence it.
+    ///
+    /// So this is the durable fencing transition that refusal goes through. In the order the
+    /// preamble runs the same two effects, and for the same reasons:
+    ///
+    /// 1. **take the authority**, reclaiming it from the job's settlement owner if an
+    ///    interrupted fan-out handed it there — that owner cannot settle what it holds by itself
+    ///    (PR #167 round 3), and waiting for it here would be the same deadlock;
+    /// 2. **adopt**, which raises the job's fence and is what makes an acknowledgement able to
+    ///    supersede anything an earlier attempt issued; and
+    /// 3. **discharge the recorded obligation**, advancing that fence at every target the row
+    ///    names and taking each acknowledgement or observed termination as settlement.
+    ///
+    /// An obligation that cannot be discharged is handed back to the owner exactly as it
+    /// arrived, whole, so the next pass finds it where this one did.
+    async fn settle_before_publishing_refusal(&mut self) -> BeforePublishing {
+        if !self.runs_fenced_lifecycle() {
+            // The landed mechanism records no obligation and has no owner, so there is nothing
+            // for a refusal to wait on and the pre-flag-day behaviour is unchanged.
+            return BeforePublishing::Settled;
+        }
+        let job_id = (*self.status.id).clone();
+
+        // The authority, taken the way the phase graph takes it.
+        let reclaimed = self.settlement().and_then(|owner| owner.reclaim());
+        let (admission, owed) = match reclaimed {
+            Some((admission, owed)) => (admission, Some(owed)),
+            None => (self.admit_irreversible_scheduling().await, None),
+        };
+        // Handing the obligation back is a decision each arm below makes for itself, so it is
+        // written once here and named rather than repeated.
+        let give_back = |admission, owed: Option<scheduling::fanout::IssuedAttempts>, owner| {
+            let Some(owed) = owed else { return };
+            // The outcome is read rather than dropped, because dropping it is the one way to
+            // release the job's authority behind attempts nothing is accounting for — which is
+            // what `SettlementOutcome` is `#[must_use]` about.
+            match scheduling::fanout::settlement::hand_over(
+                scheduling::fanout::SettlementBundle::new(admission, owed),
+                owner,
+            ) {
+                scheduling::fanout::settlement::SettlementOutcome::Transferred(_) => {}
+                // No owner, or an owner that declined: the obligation comes back whole and this
+                // pass is the last thing holding it. The row still names it, which is what the
+                // next pass — in this controller or another — works from.
+                scheduling::fanout::settlement::SettlementOutcome::SettledInPlace(
+                    admission,
+                    issued,
+                ) => {
+                    warn!(
+                        outstanding = issued.outstanding_count(),
+                        "this job's settlement owner did not take back the obligation its \
+                         refusal could not discharge; it stays on the job's row"
+                    );
+                    drop(admission);
+                }
+                scheduling::fanout::settlement::SettlementOutcome::Abandoned { outstanding } => {
+                    error!(
+                        outstanding,
+                        "this job's settlement owner dropped the obligation its refusal could \
+                         not discharge"
+                    );
+                }
+            }
+        };
+
+        match self.status.adopt_lifecycle_authority(&self.db).await {
+            Ok(AuthorityOutcome::Applied(())) => {}
+            Ok(AuthorityOutcome::Stale(stale)) => {
+                stand_down(stale);
+                give_back(admission, owed, self.settlement_owner().as_deref());
+                return BeforePublishing::StoodDown;
+            }
+            Err(e) => {
+                error!(
+                    job_id = %job_id,
+                    error = %e,
+                    "this job's refusal cannot be published until its fencing obligation is \
+                     discharged, and its authority could not be adopted to discharge one"
+                );
+                give_back(admission, owed, self.settlement_owner().as_deref());
+                return BeforePublishing::StillOwed;
+            }
+        }
+
+        let mode = self.lifecycle_mode();
+        let discharged =
+            discharge_recorded_obligation(self.status, &self.db, &self.scheduler, mode).await;
+        match discharged {
+            // Nothing owed, or everything settled. The fence this pass adopted supersedes every
+            // identifier an earlier attempt issued, so the inventory it reclaimed is discharged
+            // with it and the admission goes out of scope here.
+            Discharge::Inactive | Discharge::NothingRecorded | Discharge::Settled => {
+                BeforePublishing::Settled
+            }
+            Discharge::StillPending {
+                pending,
+                outstanding_attempts,
+            } => {
+                error!(
+                    job_id = %job_id,
+                    pending_targets = pending,
+                    outstanding_attempts,
+                    "this job's refusal is not published: worker generations it addressed have \
+                     neither acknowledged this controller's fence nor been observed terminated, \
+                     so the job stays fencing and the refusal stands"
+                );
+                give_back(admission, owed, self.settlement_owner().as_deref());
+                BeforePublishing::StillOwed
+            }
+            Discharge::Superseded(stale) => {
+                stand_down(stale);
+                give_back(admission, owed, self.settlement_owner().as_deref());
+                BeforePublishing::StoodDown
+            }
+            Discharge::Unusable(failure) => {
+                error!(
+                    job_id = %job_id,
+                    error = %failure,
+                    "this job's recorded fencing obligation could not be discharged, so its \
+                     refusal is not published"
+                );
+                give_back(admission, owed, self.settlement_owner().as_deref());
+                BeforePublishing::StillOwed
+            }
+        }
+    }
+
+    /// Leaves a refusal standing on this job's writer, to be offered again once it may be acted
+    /// on (M11.D39d, PR #167 round 4).
+    pub(crate) fn hand_refusal_to(&mut self, refusal: StateBackendError) {
+        if let Some(actor) = self.lifecycle_actor.as_mut() {
+            actor.leave_refusal_standing(refusal);
+        }
+    }
+
     pub(crate) fn observe_lifecycle_decision(
         &mut self,
         at: ConsumptionPoint,
@@ -1587,7 +1781,42 @@ async fn execute_state<'a>(
     // stop standing on the job's writer, so the state's own waits and the next state's boundary
     // are offered it again. That is what makes `Stays` a routing decision rather than a
     // discard — PR #160 review comment `5362488017`.
-    let observed = ctx.observe_lifecycle_intent(ConsumptionPoint::BeforeIrreversiblePhase);
+    // Read with the refusal kept whole rather than reported, because a refusal read *here* is
+    // the one that never enters the phase graph at all — the body below is skipped, so nothing
+    // fences and nothing discharges — and M11.D39d makes its publication reachable only after
+    // every worker generation this job addressed has acknowledged a superseding fence or been
+    // observed terminated (PR #167 round 4).
+    let observed = ctx.observe_boundary_intent(ConsumptionPoint::BeforeIrreversiblePhase);
+
+    let observed = match observed {
+        Ok(intent) => Ok(intent),
+        Err(refusal) => match ctx.settle_before_publishing_refusal().await {
+            BeforePublishing::Settled => Err(fatal_refused_config(
+                "the job's persisted configuration was refused",
+                refusal.into(),
+            )),
+            // The job owes. It stays exactly where it is — nothing is published, so neither
+            // `Failing` nor `Failed` reaches the row — and the refusal stands on the writer so
+            // the next pass is offered it again rather than running the configuration this
+            // controller has already refused. The pass above adopted and advanced this
+            // controller's fence at every target it could reach, so a partition that heals is
+            // settled by the next one.
+            BeforePublishing::StillOwed => {
+                ctx.hand_refusal_to(refusal);
+                state_backoff(
+                    ctx.retries_attempted,
+                    &ctx.config.id,
+                    &ctx.pipeline_info.pipeline_id,
+                )
+                .await;
+                ctx.retries_attempted += 1;
+                return (Some(state), ctx);
+            }
+            // Another controller holds the job. This one publishes nothing further about it,
+            // which is what every other supersession answer here does.
+            BeforePublishing::StoodDown => return (None, ctx),
+        },
+    };
 
     let leaving = match observed {
         Err(refused) => Err(refused),
@@ -8397,6 +8626,126 @@ mod tests {
     /// generation the scheduler still reports as running. It fails fast, so the row is about the
     /// obligation rather than about a retry budget elapsing.
     const UNREACHABLE: &str = "http://127.0.0.1:1";
+
+    /// **PR #167 round 4.** A refusal is not published while the job still owes.
+    ///
+    /// M11.D39d: *"`Refused` (or a new scheduling generation) becomes reachable only after every
+    /// target generation has acked the fence/revokes or has been observed terminated."* A refusal
+    /// read at a state *boundary* is the one that never enters the phase graph — the body is
+    /// skipped, so nothing fences and nothing discharges — and the boundary then transitions the
+    /// job to `Failing`, which tears its workers down best-effort *after* publishing and goes on
+    /// to `Failed` even when that fails. A target partitioned at that moment is left able to
+    /// apply a delayed start when it heals, with nothing left to fence it.
+    ///
+    /// The whole composition, through the real `execute_state`, so the boundary is the one under
+    /// test rather than the phase graph:
+    ///
+    ///   1. an ambiguous fan-out exhausts its budget, leaving its identifier owed by the job's
+    ///      settlement owner and named on the job's row;
+    ///   2. a refused configuration arrives, while the target is partitioned;
+    ///   3. the boundary publishes **nothing** — not `Failing`, not `Failed` — and the job stays
+    ///      where it was, with the refusal standing on its writer;
+    ///   4. the partition heals, and the next pass discharges the obligation and only then
+    ///      publishes the refusal.
+    ///
+    /// Step 3 is the assertion the finding is about, and it is made against the **row**: what a
+    /// controller published is what anything else can see.
+    #[tokio::test]
+    async fn a_refusal_is_not_published_while_the_job_still_owes_a_fencing_obligation() {
+        let partition = HealingPartition::partitioned();
+        let mut run = SchedulingRun::with_workers(
+            "refusal-while-owing",
+            vec![StartsExecution::HealingPartition(Arc::clone(&partition))],
+        )
+        .await;
+        let owner = run.harness.install_fenced_lifecycle();
+        run.harness
+            .queue()
+            .send(worker_connect_from(WorkerId(7), &run.address(0)))
+            .await
+            .unwrap();
+
+        // 1. The ambiguous fan-out, ending with its identifier owed.
+        assert!(
+            run.schedule_through_the_phase_graph().await.is_err(),
+            "an attempt whose fan-out never settled does not schedule"
+        );
+        assert!(
+            matches!(
+                owner.observe(
+                    &super::scheduling::fanout::Observed::authoritative_response(
+                        WorkerId(7),
+                        999,
+                        "an-identifier-of-another-generation",
+                    )
+                ),
+                lifecycle::settlement::Progress::NotThisObligation
+            ),
+            "the owner is holding this job's obligation"
+        );
+
+        // 2. The refusal, while the partition is total — so the settlement this refusal has to
+        //    clear cannot be made.
+        partition.deepen();
+        let mailbox = intent_mailbox();
+        mailbox.submit(LifecycleIntent::Refused(selector_changed()));
+        run.harness.install_actor(&mailbox);
+        let published_before = state_writes(&run.db);
+
+        let ctx = run.harness.ctx(
+            running_config(StateBackendSelector::Parquet),
+            StateBackendSelector::Parquet,
+        );
+        let (next, _ctx) = execute_state(Box::new(Scheduling {}), ctx).await;
+
+        // 3. Nothing published, and the job did not leave.
+        assert_eq!(
+            next.map(|state| state.name()),
+            Some("Scheduling"),
+            "the job stays where it was: a refusal it cannot yet act on is not a transition"
+        );
+        let published_after = state_writes(&run.db);
+        assert!(
+            published_after.len() > published_before.len(),
+            "the settlement pass does write: it republishes what the job still owes, which is \
+             what a later controller works from"
+        );
+        assert!(
+            published_after
+                .iter()
+                .all(|(state, _)| state == "Scheduling"),
+            "but no *transition* is published — in particular not `Failing`, whose teardown is \
+             best-effort and whose successor `Failed` is reached even when that teardown fails. \
+             The row has never named either: {published_after:?}"
+        );
+
+        // 4. The world heals. The next pass discharges what the job owed, and only then is the
+        //    refusal the writer decided in step 2 acted on — it stood on the writer meanwhile,
+        //    so it was neither lost nor published early.
+        partition.heal();
+        // The job's writer, which `ctx()` takes for the life of a state task. A fresh actor has
+        // decided nothing, so it reads the *same* mailbox the refusal is still in — which is how
+        // a refusal survives a state task ending, and why the standing slot only has to carry it
+        // within one.
+        run.harness.install_actor(&mailbox);
+        let ctx = run.harness.ctx(
+            running_config(StateBackendSelector::Parquet),
+            StateBackendSelector::Parquet,
+        );
+        let (next, _ctx) = execute_state(Box::new(Scheduling {}), ctx).await;
+        assert_eq!(
+            next.map(|state| state.name()),
+            Some("Failing"),
+            "once nothing is owed, the refusal this controller had already decided is acted on"
+        );
+        assert_eq!(
+            state_writes(&run.db)
+                .last()
+                .map(|(state, _)| state.as_str()),
+            Some("Failing"),
+            "and that is the first thing the row is told about it"
+        );
+    }
 
     /// **PR #167 round 3.** A healed partition releases a fencing job, without a controller
     /// restart.

@@ -17,10 +17,15 @@
 //! a job whose lifecycle is M11.D39a's single writer, and no production job has one through
 //! M11.T25.
 
+use anyhow::anyhow;
+
 use super::{PhaseContext, Scheduling};
 use crate::JobConfig;
 use crate::states::lifecycle::{ConsumptionPoint, ObservedIntent};
-use crate::states::{Admission, StateError, Transition, stop_if_desired_non_running};
+use crate::states::{
+    Admission, BeforePublishing, StateError, Transition, fatal, fatal_refused_config,
+    stop_if_desired_non_running,
+};
 
 /// What one turn of a token-free wait produced.
 ///
@@ -106,8 +111,50 @@ impl PhaseContext<'_, '_> {
     ///
     /// The fatal [`StateError`] of a refused configuration, from either mechanism.
     pub(crate) async fn admit(&mut self) -> Result<Admitted, StateError> {
-        if let PhaseWait::Leave(stop) = self.observe(ConsumptionPoint::BeforeIrreversiblePhase)? {
-            return Ok(Admitted::Leave(stop));
+        // The refusal is read whole rather than reported, and settled before it is acted on,
+        // for the reason `execute_state`'s boundary does the same (M11.D39d, PR #167 round 4):
+        // publishing a refusal is reachable only after every worker generation this job
+        // addressed has acknowledged a superseding fence or been observed terminated. Reading it
+        // here and reporting it is what left the settlement owner holding an obligation with
+        // nobody to reclaim it — the settlement pass below is what reclaims it.
+        match self
+            .ctx
+            .observe_boundary_intent(ConsumptionPoint::BeforeIrreversiblePhase)
+        {
+            Ok(intent) => {
+                if let PhaseWait::Leave(stop) = self.leaving_for(intent) {
+                    return Ok(Admitted::Leave(stop));
+                }
+            }
+            Err(refusal) => {
+                return Err(match self.ctx.settle_before_publishing_refusal().await {
+                    BeforePublishing::Settled => fatal_refused_config(
+                        "the job's persisted configuration was refused",
+                        refusal.into(),
+                    ),
+                    // Left standing, so the next pass is offered it again rather than running a
+                    // configuration this controller has already refused; and reported as
+                    // retryable, so nothing publishes `Failing` for a job whose targets have
+                    // not settled.
+                    BeforePublishing::StillOwed => {
+                        self.ctx.hand_refusal_to(refusal);
+                        self.retryable(
+                            "the job's configuration is refused and its fencing obligation is \
+                             not discharged",
+                            anyhow!(
+                                "the refusal stands until every worker generation this job \
+                                 addressed acknowledges this controller's fence or is observed \
+                                 terminated"
+                            ),
+                            10,
+                        )
+                    }
+                    BeforePublishing::StoodDown => fatal(
+                        "another controller holds this job's durable lifecycle authority",
+                        anyhow!("this controller publishes nothing further for it"),
+                    ),
+                });
+            }
         }
         // Reclaimed before the lock is awaited, and that ordering is the whole of PR #167
         // round 3. A predecessor whose fan-out gave up on an unsettled request handed its
@@ -194,7 +241,16 @@ impl PhaseContext<'_, '_> {
     /// this call just observed.
     fn observe(&mut self, at: ConsumptionPoint) -> Result<PhaseWait, StateError> {
         let observed = self.ctx.observe_lifecycle_intent(at)?;
-        Ok(match (observed, self.stop_if_desired()) {
+        Ok(self.leaving_for(observed))
+    }
+
+    /// Whether an observation the writer produced means this job is leaving `Scheduling`.
+    ///
+    /// Split out of [`Self::observe`] so that [`Self::admit`], which reads the writer through the
+    /// refusal-deferring door, decides the same question the same way rather than with a second
+    /// copy of this mapping.
+    fn leaving_for(&self, observed: ObservedIntent) -> PhaseWait {
+        match (observed, self.stop_if_desired()) {
             // Either reading is enough to leave, and the configuration is the one that names
             // the transition: that mapping lives in one macro and this is not a second copy of
             // it.
@@ -217,7 +273,7 @@ impl PhaseContext<'_, '_> {
                 ObservedIntent::Continue | ObservedIntent::Adopted(_) | ObservedIntent::Stop,
                 None,
             ) => PhaseWait::Continue,
-        })
+        }
     }
 }
 

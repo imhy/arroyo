@@ -300,6 +300,12 @@
           "name": "refusal_and_phase_entry_linearize_once",
           "kind": "test",
           "path": "crates/arroyo-controller/src/states/lifecycle/faults_tests.rs"
+        },
+        {
+          "crate": "arroyo-controller",
+          "name": "a_refusal_is_not_published_while_the_job_still_owes_a_fencing_obligation",
+          "kind": "test",
+          "path": "crates/arroyo-controller/src/states/mod.rs"
         }
       ]
     },

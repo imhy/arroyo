@@ -154,7 +154,17 @@ async fn refusal_and_phase_entry_linearize_once() {
          {after:?}"
     );
 
-    // ---- 3. The admitted region and the refusal publication exclude each other.
+    // ---- 3. An interrupted fan-out's obligation is held, and the authority with it.
+    //
+    // What this asserts, and what it does **not**. It asserts the retention: the obligation and
+    // the job's authority are held together while anything is outstanding. It does *not* assert
+    // that a refusal cannot be published meanwhile, and an earlier revision of this comment
+    // claimed it did — on the reasoning that a publication needs the same admission. Production
+    // publication does not take the admission at all, so the exclusion was never enforced here
+    // (PR #167 round 4). It is enforced by
+    // `states::tests::a_refusal_is_not_published_while_the_job_still_owes_a_fencing_obligation`,
+    // which drives the real `execute_state` and reads the job's **row**, and by the settlement a
+    // refusal has to clear before it may be published at all.
     let mut region = InterruptedFanOut::crashed_at(CrashPoint::FanOut, &[(WORKER, ATTEMPT)]).await;
     assert_eq!(
         region.outstanding(),
@@ -163,9 +173,8 @@ async fn refusal_and_phase_entry_linearize_once() {
     );
     assert!(
         !region.authority_released(),
-        "and while it is held, the job's refusal cannot be published: the admission the \
-         irreversible phase took is the same one a publication needs, so the two linearize on \
-         it rather than on an order the caller has to get right"
+        "and the authority is held with it, which is what a later attempt reclaims rather than \
+         waits for"
     );
 
     // A fence acknowledgement that was sent and never arrived releases nothing. This is the

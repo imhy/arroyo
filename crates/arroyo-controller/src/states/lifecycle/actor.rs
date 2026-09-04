@@ -341,6 +341,21 @@ pub(crate) struct LifecycleActor {
     /// offering it first is what keeps the pair of comparisons exact: the state answers
     /// "superseded against published" and only then reads whatever the poll has said since.
     standing_adoption: Option<Box<JobConfig>>,
+    /// A refusal this actor decided that the job may not act on yet, because it still owes a
+    /// fencing obligation (M11.D39d, PR #167 round 4).
+    ///
+    /// The same argument as [`Self::standing`] and [`Self::standing_adoption`], for the decision
+    /// that must wait on something outside the writer entirely. M11.D39d makes a refusal
+    /// publication reachable only after every worker generation this job addressed has
+    /// acknowledged a superseding fence or been observed terminated — so a refusal read while a
+    /// target is partitioned is a decision that has been *made* and cannot yet be *acted on*.
+    /// Consuming it would lose it: `observe` moves the watermark past the intent that produced
+    /// it, so nothing would ever offer it again and the job would go on running a configuration
+    /// this controller had already refused.
+    ///
+    /// Offered ahead of the mailbox for the same reason the other two are: it is older than
+    /// anything in it.
+    standing_refusal: Option<StateBackendError>,
 }
 
 impl LifecycleActor {
@@ -363,6 +378,7 @@ impl LifecycleActor {
             decided: IntentVersion::NONE,
             standing: None,
             standing_adoption: None,
+            standing_refusal: None,
             mailbox,
         }
     }
@@ -393,6 +409,19 @@ impl LifecycleActor {
                 "re-offering the stop the job's writer decided before the running state began"
             );
             return Some(LifecycleDecision::StopUnderRunningConfig(stop_mode));
+        }
+
+        // Then a refusal deferred because the job still owed a fencing obligation. Ahead of
+        // the mailbox and ahead of everything but the stop, because a stop the operator asked
+        // for outranks a configuration this controller will not run (M11.D39d, PR #167 round 4).
+        if let Some(refusal) = self.standing_refusal.take() {
+            info!(
+                job_id = %self.job_id,
+                at = at.as_str(),
+                "re-offering the refusal this job could not act on while it owed a fencing \
+                 obligation"
+            );
+            return Some(LifecycleDecision::Refuse(refusal));
         }
 
         // Then the adoption a boundary made and handed on, for the same reason and ahead of
@@ -447,6 +476,18 @@ impl LifecycleActor {
     /// Idempotent by construction: the field holds one adoption, and offering it takes it.
     pub(crate) fn leave_adoption_standing(&mut self, superseded: Box<JobConfig>) {
         self.standing_adoption = Some(superseded);
+    }
+
+    /// Records a refusal the job may not act on yet, so that it is offered again.
+    ///
+    /// Called where a refusal is read and the job still owes a fencing obligation. The refusal
+    /// is a decision that has been made; what it is waiting for is evidence about workers, not
+    /// about configuration, so it is neither withdrawn nor published — it stands until the
+    /// obligation is discharged.
+    ///
+    /// Idempotent by construction: the field holds one refusal, and offering it takes it.
+    pub(crate) fn leave_refusal_standing(&mut self, refusal: StateBackendError) {
+        self.standing_refusal = Some(refusal);
     }
 
     /// Turns one classified intent into the transition this job is to make.

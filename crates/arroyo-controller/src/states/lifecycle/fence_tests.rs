@@ -892,13 +892,15 @@ fn the_production_status_write_is_conditional_since_the_activation_change() {
     // (file, source, status publications, stand-down call sites).
     //
     // The last two are counted separately because a status publication is not the only way a
-    // controller learns it has lost a job. `states/mod.rs` has two more since PR #167 round 2:
-    // the cold worker-leader recovery path adopts for itself and discharges the obligation the
-    // row carries, and each of those has its own superseded outcome to answer. Counting them
-    // against a stated number rather than against the publications is what keeps the equality
-    // from being satisfied by a file that answers neither.
+    // controller learns it has lost a job. `states/mod.rs` has four more than its publications:
+    // two since PR #167 round 2, where the cold worker-leader recovery path adopts for itself
+    // and discharges the obligation the row carries, and two since round 4, where the settlement
+    // a refusal must clear before it may be published does the same pair. Each has its own
+    // superseded outcome to answer. Counting them against a stated number rather than against
+    // the publications is what keeps the equality from being satisfied by a file that answers
+    // neither.
     const PUBLISHING: [(&str, &str, usize, usize); 5] = [
-        ("states/mod.rs", include_str!("../mod.rs"), 2, 4),
+        ("states/mod.rs", include_str!("../mod.rs"), 2, 6),
         (
             "states/scheduling.rs",
             include_str!("../scheduling.rs"),
