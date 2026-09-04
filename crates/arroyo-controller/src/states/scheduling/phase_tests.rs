@@ -901,9 +901,18 @@ fn the_preamble_adopts_before_every_other_effect_and_roots_last() {
 /// Everything the crate outside those two modules may do with an obligation is on these lists,
 /// and each entry hands over all of it or none of it: build one, read what it lists, offer the
 /// whole of it to an owner, record what has been observed about it, discharge it, or retain it.
-/// Not one of them yields an `Admission` — the last two release and retain the authority *here*,
-/// inside the module that owns the coupling. Anything added has to answer the question the
-/// finding asked: what does the seam observe if the caller keeps only half of what this returns?
+/// One of them yields an `Admission`, and it is the one PR #167 round 3 added: `reclaim`. It has
+/// to answer the question the original finding asked — *what does the seam observe if the caller
+/// keeps only half of what this returns?* — and its answer is that it cannot be given half. It
+/// returns the authority and the inventory in one value, to a party that becomes answerable for
+/// both, which is `transfer_to` run in the other direction; and no receipt exists for it to
+/// contradict, because a reclaim settles nothing — the obligation has moved, not ended. Its
+/// counterpart `keep` stays private because its caller is the phase that never gave the
+/// obligation away, and a second public name for that would be a second way to release half.
+///
+/// The others yield no `Admission` at all: `discharge` and `retain_unsettled` release and retain
+/// the authority *here*, inside the module that owns the coupling. Anything added has to answer
+/// the same question.
 #[test]
 fn the_source_of_a_settlement_bundle_exposes_no_way_to_part_with_half_of_it() {
     let child = production_half(include_str!("fanout/settlement/observed.rs"));
@@ -911,7 +920,7 @@ fn the_source_of_a_settlement_bundle_exposes_no_way_to_part_with_half_of_it() {
         (
             "fanout/settlement.rs",
             production_half(include_str!("fanout/settlement.rs")),
-            vec!["issued", "new", "transfer_to"],
+            vec!["issued", "new", "reclaim", "transfer_to"],
         ),
         (
             "fanout/settlement/observed.rs",
@@ -938,9 +947,10 @@ fn the_source_of_a_settlement_bundle_exposes_no_way_to_part_with_half_of_it() {
         exposed.sort_unstable();
         assert_eq!(
             exposed, expected,
-            "{file}: a `SettlementBundle` may be built, read, offered to an owner whole, told \
-             what has been observed about it, discharged and retained. It may not be taken apart \
-             by anything that could then be issued a receipt for half of it"
+            "{file}: a `SettlementBundle` may be built, read, offered to an owner whole, \
+             reclaimed from one whole, told what has been observed about it, discharged and \
+             retained. It may not be taken apart by anything that could then be issued a receipt \
+             for half of it"
         );
     }
 

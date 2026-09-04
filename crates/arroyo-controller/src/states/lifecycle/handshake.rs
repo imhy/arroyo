@@ -13,13 +13,21 @@
 //! worker still cannot close from its side is the *other* half — a generation that has never been
 //! sent a fence goes on admitting fence-less starts.
 //!
-//! M11.D39e(i) closes it from this side instead, and actively: *"a replacement controller
+//! M11.D39e(i) closes it from this side instead, and actively: *"a replacement controller that
+//! schedules a replacement generation, publishes a refusal, or discharges a recorded obligation
 //! actively advances and receives fence acknowledgement from existing workers before any job
-//! effect or refusal publication, so there is no passive pre-first-message window."* This module
-//! is that advance. Every generation this controller is about to start is first sent a
-//! `FENCE_ONLY` directive under the job's own fence, and must answer with
+//! effect or refusal publication, so there is no passive pre-first-message window on those
+//! paths."* This module is that advance. Every generation this controller is about to start is
+//! first sent a `FENCE_ONLY` directive under the job's own fence, and must answer with
 //! `FENCE_ACKNOWLEDGED` reporting a fence at least that high, before any `StartExecution` is
 //! issued to it.
+//!
+//! The clause is qualified because one takeover is excluded, deliberately (PR #167 round 3):
+//! adopting an **already-running** execution admits no generation and issues no start, and in
+//! worker-leader mode holds no worker set to address — it reconnects to the leader the job's row
+//! names, and what makes it exclusive is the adoption CAS rather than anything sent here. That is
+//! also why `WorkerLifecycle::admit_commit` reads a commit's fence as a guard and not as an
+//! instruction: the workers such an adopter inherits have not heard its fence.
 //!
 //! # Why acknowledgement is a value and not a flag
 //!

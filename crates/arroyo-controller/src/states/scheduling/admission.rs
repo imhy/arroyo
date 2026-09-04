@@ -148,6 +148,29 @@ pub(crate) struct PhaseContext<'a, 'ctx> {
     /// scheduler that tracks its worker generations answering a listing successfully. See
     /// [`observe_terminations`](crate::states::lifecycle::recovery::observe_terminations).
     observed_terminations: Vec<ObservedTermination>,
+    /// The obligation this attempt reclaimed from the job's settlement owner, if it reclaimed
+    /// one (PR #167 round 3).
+    ///
+    /// A predecessor whose fan-out gave up on an unsettled request hands its inventory *and* the
+    /// job's authority to the owner, and the owner cannot settle either by itself: only an
+    /// acknowledgement of a fence above the one those identifiers were issued under supersedes
+    /// them, and raising the fence is this attempt's adoption. So this attempt takes the whole
+    /// obligation back when it takes the authority — see [`Self::admit`] — and what it took is
+    /// held here until it is settled or handed on.
+    ///
+    /// It settles where it must: the preamble adopts a higher fence and advances it at every
+    /// target the durable record names, and each acknowledgement supersedes every identifier
+    /// issued to that generation. What this field is for is the case where the attempt is
+    /// interrupted before that happens — [`Self::into_fencing`] carries it onto the fencing
+    /// record rather than dropping it, so an obligation reclaimed and not discharged is offered
+    /// to the owner again instead of disappearing.
+    ///
+    /// It is never *merged* with this attempt's own inventory. The two name different
+    /// generations, and an answer about one accounting for an identifier of the other is the
+    /// defect `JobSettlementOwner::keep` declines a second obligation to avoid. By the time this
+    /// attempt has an inventory of its own, the preamble that produced it has already superseded
+    /// this one.
+    inherited: Option<IssuedAttempts>,
 }
 
 impl<'a, 'ctx> PhaseContext<'a, 'ctx> {
@@ -172,6 +195,7 @@ impl<'a, 'ctx> PhaseContext<'a, 'ctx> {
             unrooted_candidate: None,
             observed_acknowledgements: Vec::new(),
             observed_terminations: Vec::new(),
+            inherited: None,
         }
     }
 
@@ -475,6 +499,17 @@ impl<'a, 'ctx> PhaseContext<'a, 'ctx> {
         // moved. It is what an acknowledgement is measured against: one at or below it revoked
         // nothing this attempt issued.
         let addressed_fence = self.addressed_fence();
+        // An obligation this attempt reclaimed and did not get as far as superseding is carried
+        // onto the fencing record rather than dropped, so it is offered to the owner again
+        // instead of disappearing with the attempt that took it. This attempt's own inventory
+        // wins whenever it has one: reaching a fan-out at all means the preamble adopted a
+        // higher fence and advanced it at the reclaimed obligation's targets, which is what
+        // supersedes those identifiers (PR #167 round 3).
+        let inherited = self.inherited.take();
+        let outstanding = match (outstanding.issued_count(), inherited) {
+            (0, Some(inherited)) => inherited,
+            _ => outstanding,
+        };
         let mut fencing = Fencing::new(self, targets, addressed_fence, outstanding);
         if let Some(stale) = superseded {
             fencing.note_superseded(stale);
@@ -563,6 +598,30 @@ impl<'ctx> PhaseContext<'_, 'ctx> {
             .iter()
             .map(|(id, status)| (*id, status.rpc_address.clone()))
             .collect()
+    }
+
+    /// Takes back the obligation the job's settlement owner holds, with the authority that came
+    /// with it (PR #167 round 3).
+    ///
+    /// `None` is the ordinary case: the owner holds nothing, because the previous fan-out
+    /// settled every identifier it issued. `Some` is a predecessor that gave up on one, and what
+    /// comes back is the whole obligation — the [`Admission`] this attempt then runs its regions
+    /// under, and the inventory it becomes answerable for, kept in
+    /// [`inherited`](Self::inherited) until the preamble's fence advance supersedes it or
+    /// [`Self::into_fencing`] offers it to the owner again.
+    ///
+    /// It is called from [`admit`](super::observation) rather than once at the head of the
+    /// attempt because that is where the authority is wanted, and because a reclaim that
+    /// happened anywhere else would be a second place the two halves could come apart.
+    fn reclaim_transferred_obligation(&mut self) -> Option<Admission> {
+        let owner = self.ctx.settlement()?;
+        let (admission, inherited) = owner.reclaim()?;
+        // Never merged: the two name different generations, so an answer about this attempt's
+        // own identifiers must not account for one of its predecessor's. A reclaim can only
+        // happen before this attempt has issued anything, so there is nothing here to merge with.
+        debug_assert!(self.inherited.is_none());
+        self.inherited = Some(inherited);
+        Some(admission)
     }
 
     /// The job this attempt is for, mutably.

@@ -551,6 +551,12 @@
           "name": "permanently_unsettled_start_enters_durable_fencing",
           "kind": "test",
           "path": "crates/arroyo-controller/src/states/mod.rs"
+        },
+        {
+          "crate": "arroyo-controller",
+          "name": "a_healed_partition_releases_a_fencing_job_without_a_controller_restart",
+          "kind": "test",
+          "path": "crates/arroyo-controller/src/states/mod.rs"
         }
       ],
       "note": "M11.T26m declared the control `a_permanently_unsettled_start_execution_ends_the_fan_out_and_releases_the_admission` a PRE-ACTIVATION CONTROL ONLY, and M11.T26h's activation change removed it. It asserted that budget exhaustion RELEASES the job's lifecycle authority \u2014 observed through `RefusalGate::admit_publication`, which the same change removed \u2014 and after activation budget exhaustion must enter durable `Fencing` instead, holding the authority until the obligation is discharged. The requirement 'a permanently unsettled start ends the fan-out safely' is carried whole by `permanently_unsettled_start_enters_durable_fencing`, which asserts the bounded terminal path AND the durable obligation the release used to skip; `budget_exhaustion_transfers_into_token_free_fencing_without_publishing_or_rescheduling` covers the same transfer at the phase seam."

@@ -2021,9 +2021,15 @@ pub(crate) struct AdmissionLock {
 impl AdmissionLock {
     /// Takes the job's admission for one region of irreversible scheduling work.
     ///
-    /// Waiting here is bounded and safe: the only other holder is a region held by this same
-    /// task, which must have dropped before the next is entered, or the job's settlement
-    /// owner holding an interrupted region's authority until it is discharged.
+    /// Waiting here is bounded, and PR #167 round 3 is what makes that true rather than hoped
+    /// for. The only other holder is a region held by this same task, which must have dropped
+    /// before the next is entered, or the job's settlement owner holding an interrupted region's
+    /// authority — and an attempt does not *wait* for the second one. It reclaims the whole
+    /// obligation before it reaches this call: nothing in this process can make the owner release
+    /// the authority by itself, because what supersedes an issued identifier is an
+    /// acknowledgement of a fence above the one it was issued under and raising the fence is the
+    /// next attempt's adoption, taken under this very lock. See
+    /// `PhaseContext::reclaim_transferred_obligation`.
     async fn admit(&self) -> Admission {
         Admission {
             _guard: Arc::clone(&self.admission).lock_owned().await,
@@ -5678,6 +5684,68 @@ mod tests {
         /// or a half-dead peer presents to the controller, and the one the retry loop used to
         /// spin on at 250ms for the life of the process.
         NeverSettling(Arc<NeverSettles>),
+        /// The same, until the partition heals — after which it answers normally.
+        ///
+        /// The one shape that separates "this job is fencing" from "this job is wedged": the
+        /// world gets better, and the question is whether the controller can still act on it
+        /// without being restarted (PR #167 round 3). It acknowledges a `FENCE_ONLY` throughout,
+        /// because a handshake that failed would end the attempt before it issued anything and
+        /// there would be no obligation to be stuck with.
+        HealingPartition(Arc<HealingPartition>),
+    }
+
+    /// A worker whose `StartExecution` never settles until a test heals it.
+    ///
+    /// Two depths, because a partition has two: one that swallows the start and lets the fence
+    /// handshake through, and a total one that answers nothing at all. The first is what leaves
+    /// an obligation outstanding; the second is what stops the next attempt discharging it.
+    struct HealingPartition {
+        healed: std::sync::atomic::AtomicBool,
+        total: std::sync::atomic::AtomicBool,
+        expected_id: Mutex<Option<String>>,
+    }
+
+    impl HealingPartition {
+        fn partitioned() -> Arc<Self> {
+            Arc::new(Self {
+                healed: std::sync::atomic::AtomicBool::new(false),
+                total: std::sync::atomic::AtomicBool::new(false),
+                expected_id: Mutex::new(None),
+            })
+        }
+
+        /// The partition deepens: this worker now answers nothing, the handshake included.
+        fn deepen(&self) {
+            self.total.store(true, Ordering::SeqCst);
+        }
+
+        /// The partition heals, at whatever depth it had reached.
+        fn heal(&self) {
+            self.total.store(false, Ordering::SeqCst);
+            self.healed.store(true, Ordering::SeqCst);
+        }
+
+        fn is_healed(&self) -> bool {
+            self.healed.load(Ordering::SeqCst)
+        }
+
+        fn is_total(&self) -> bool {
+            self.total.load(Ordering::SeqCst)
+        }
+
+        /// The identifier the partitioned attempts replayed, read back from the worker.
+        fn attempt_id(&self) -> Option<String> {
+            self.expected_id.lock().unwrap().clone()
+        }
+
+        fn remember_or_check(&self, id: &str) {
+            assert!(!id.is_empty(), "every new controller attempt has an ID");
+            let mut expected = self.expected_id.lock().unwrap();
+            match expected.as_deref() {
+                Some(expected) => assert_eq!(expected, id, "a retry must keep its attempt ID"),
+                None => *expected = Some(id.to_string()),
+            }
+        }
     }
 
     /// Counts the attempts a [`StartsExecution::NeverSettling`] worker refuses, and checks that
@@ -5995,6 +6063,17 @@ mod tests {
                 StartDirective::Fenced { address, .. } => address.target().generation(),
             });
 
+            // A total partition answers nothing — the fence handshake included — which is what
+            // stops an attempt discharging the obligation it inherited. Answered above the
+            // `FENCE_ONLY` arm below for exactly that reason.
+            if let StartsExecution::HealingPartition(partition) = &self.starts_execution
+                && partition.is_total()
+            {
+                return Err(tonic::Status::unavailable(
+                    "this worker answers nothing while the partition is total",
+                ));
+            }
+
             // A fence-capable worker generation, as M11.T26d's guard is: a `FENCE_ONLY`
             // directive advances this generation's fence and is acknowledged, and it applies no
             // program — so it is answered above everything below, none of which is about
@@ -6099,6 +6178,14 @@ mod tests {
                     return Err(tonic::Status::unavailable(
                         "this worker can never settle the request",
                     ));
+                }
+                StartsExecution::HealingPartition(partition) => {
+                    if !partition.is_healed() {
+                        partition.remember_or_check(&request.start_execution_id);
+                        return Err(tonic::Status::unavailable(
+                            "this worker cannot settle the request while the partition lasts",
+                        ));
+                    }
                 }
             }
             self.calls.start_execution.lock().unwrap().push(selector);
@@ -8310,6 +8397,154 @@ mod tests {
     /// generation the scheduler still reports as running. It fails fast, so the row is about the
     /// obligation rather than about a retry budget elapsing.
     const UNREACHABLE: &str = "http://127.0.0.1:1";
+
+    /// **PR #167 round 3.** A healed partition releases a fencing job, without a controller
+    /// restart.
+    ///
+    /// The composition the settlement owner's own rows cannot reach. `permanently_unsettled_start_enters_durable_fencing`
+    /// (D96 row 28) proves the fan-out *ends* safely when its budget runs out, but its fixture
+    /// installs only the job's writer, so there is no owner to transfer to and the obligation
+    /// settles in place. `settlement_tests` drives a real owner but tells it what it observed by
+    /// calling `observe` directly. Between them sits the question production actually asks: the
+    /// owner takes the obligation **and the job's lifecycle authority**, and then nothing in this
+    /// process can settle it — an issued identifier is superseded only by an acknowledgement of a
+    /// fence *above* the one it was issued under, raising the fence is an adoption, and an
+    /// adoption is the next attempt's first effect under the very authority the owner is holding.
+    /// The next attempt used to await that guard, forever, however the world healed.
+    ///
+    /// So this row heals the world and asserts the job moves. Two attempts of one job, in one
+    /// process, with one settlement owner between them:
+    ///
+    ///   1. the worker acknowledges the handshake and then never settles the start it is sent,
+    ///      so the fan-out spends its reconcile budget and hands its obligation to the owner;
+    ///   2. the partition heals — nothing else changes, and in particular nothing restarts;
+    ///   3. the second attempt reclaims the obligation instead of waiting for it, adopts a
+    ///      higher fence, advances it at the target the durable record names, and schedules.
+    ///
+    /// The deadline is what makes this a test rather than a hang: without the reclaim the second
+    /// attempt never returns at all.
+    #[tokio::test]
+    async fn a_healed_partition_releases_a_fencing_job_without_a_controller_restart() {
+        let partition = HealingPartition::partitioned();
+        let mut run = SchedulingRun::with_workers(
+            "healed-partition",
+            vec![StartsExecution::HealingPartition(Arc::clone(&partition))],
+        )
+        .await;
+        // The job's *own* lifecycle, so the obligation goes to the owner production gives it to
+        // rather than settling in place for want of one.
+        let owner = run.harness.install_fenced_lifecycle();
+        run.harness
+            .queue()
+            .send(worker_connect_from(WorkerId(7), &run.address(0)))
+            .await
+            .unwrap();
+
+        let fencing = run.schedule_through_the_phase_graph().await;
+        assert!(
+            fencing.is_err(),
+            "an attempt whose fan-out never settled does not schedule"
+        );
+        assert!(
+            matches!(
+                owner.observe(
+                    &super::scheduling::fanout::Observed::authoritative_response(
+                        WorkerId(7),
+                        999,
+                        "an-identifier-of-another-generation",
+                    )
+                ),
+                lifecycle::settlement::Progress::NotThisObligation
+            ),
+            "and the owner is holding this job's obligation: an observation about some other \
+             generation accounts for nothing *in it*, which is the answer only a held \
+             obligation gives — an owner holding nothing answers `NothingHeld`"
+        );
+
+        // An attempt in between, while the partition is *total*: it reclaims the obligation and
+        // then cannot discharge it, because the worker will not answer the handshake its
+        // preamble sends. What it must not do is lose it. The obligation goes onto this
+        // attempt's own fencing record, is reconciled there, and is written back to the row —
+        // rather than being dropped with the attempt that took it.
+        partition.deepen();
+        let unhealed_mailbox = intent_mailbox();
+        run.harness.install_actor(&unhealed_mailbox);
+        assert!(
+            tokio::time::timeout(
+                HEALED_PARTITION_DEADLINE,
+                run.schedule_through_the_phase_graph(),
+            )
+            .await
+            .expect("the attempt that reclaims must not wait for the guard either")
+            .is_err(),
+            "an attempt that cannot reach its inherited obligation's target does not schedule"
+        );
+        let carried = stored_state_context(&run.db);
+        assert_eq!(
+            carried["fencing"]["targets"][0]["worker_id"].as_u64(),
+            Some(7),
+            "and what it reclaimed is still owed, on the row, rather than gone with the attempt \
+             that took it: {carried}"
+        );
+
+        // The world heals. Nothing is restarted, no state is rebuilt.
+        partition.heal();
+        // The job's writer, which `ctx()` takes for the life of a state task, put back for the
+        // second attempt. The owner is deliberately *not* rebuilt — what this row is about is
+        // what the first attempt left with it.
+        let mailbox = intent_mailbox();
+        run.harness.install_actor(&mailbox);
+        // The generation the *last* attempt's preamble raises the job to; a connect from any
+        // other is a straggler the controller ignores. The first attempt raised it to 2, and the
+        // total-partition attempt fenced before `persist_generation`, so it raised it to none.
+        run.harness
+            .queue()
+            .send(worker_connect_at_generation(
+                WorkerId(7),
+                &run.address(0),
+                3,
+            ))
+            .await
+            .unwrap();
+        run.harness.queue().send(task_started()).await.unwrap();
+
+        let outcome = tokio::time::timeout(
+            HEALED_PARTITION_DEADLINE,
+            run.schedule_through_the_phase_graph(),
+        )
+        .await
+        .expect(
+            "the second attempt must not wait on the guard the owner is holding: nothing in \
+             this process can make the owner release it, so waiting is a job that never moves \
+             again however the world heals",
+        );
+
+        assert_eq!(
+            advanced_to(&outcome),
+            Some("Running"),
+            "a healed partition schedules the job, in the same controller process"
+        );
+        assert!(
+            partition.attempt_id().is_some(),
+            "and the worker had been offered a start while the partition lasted, so what this \
+             row healed is a request that really was outstanding"
+        );
+        assert!(
+            run.calls
+                .protocol()
+                .iter()
+                .any(|directive| matches!(directive, Directive::Start(_))),
+            "and a start reached it in the end"
+        );
+    }
+
+    /// How long the second attempt of `a_healed_partition_releases_a_fencing_job_without_a_controller_restart`
+    /// is given.
+    ///
+    /// Generous, because what it is distinguishing is *finishes* from *never finishes*: the
+    /// unfixed code awaits a `tokio` mutex nothing will unlock, so no amount of load turns a
+    /// pass into a failure or a failure into a pass.
+    const HEALED_PARTITION_DEADLINE: Duration = Duration::from_secs(30);
 
     /// **PR #167 round 2.** A state task killed mid-fan-out leaves its obligation in the row.
     ///

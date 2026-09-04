@@ -109,6 +109,22 @@ impl PhaseContext<'_, '_> {
         if let PhaseWait::Leave(stop) = self.observe(ConsumptionPoint::BeforeIrreversiblePhase)? {
             return Ok(Admitted::Leave(stop));
         }
+        // Reclaimed before the lock is awaited, and that ordering is the whole of PR #167
+        // round 3. A predecessor whose fan-out gave up on an unsettled request handed its
+        // inventory *and* this job's authority to the settlement owner, which retains the
+        // authority until every identifier is accounted for — and cannot account for one by
+        // itself: an issued identifier is superseded only by an acknowledgement of a fence above
+        // the one it was issued under, raising the fence is an adoption, and an adoption is this
+        // attempt's first effect under the very authority being held. Awaiting the lock there is
+        // a job that never moves again, however the world heals.
+        //
+        // Taking the obligation back is not taking a shortcut past it: the authority and the
+        // inventory move together, exactly as they did on the way out, so this attempt is
+        // answerable for both — and its preamble is what settles them, by advancing the fence it
+        // adopts at every target the durable record names.
+        if let Some(admission) = self.reclaim_transferred_obligation() {
+            return Ok(Admitted::Region(admission));
+        }
         Ok(Admitted::Region(
             self.ctx.admit_irreversible_scheduling().await,
         ))

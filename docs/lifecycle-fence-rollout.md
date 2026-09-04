@@ -88,10 +88,17 @@ Every one of those refusals is **definitive**: `FailedPrecondition`, `InvalidArg
 `DeadlineExceeded` or `Unavailable`, which are the only four codes a controller may retry the
 same attempt identifier under.
 
-A replacement controller does **not** wait for a worker's next message. It actively advances
-its fence at every worker generation the previous scheduling generation could address, and
-every one of those must acknowledge before the replacement causes any job effect or publishes a
-refusal. There is therefore no post-flag-day first-message gap.
+A replacement controller that schedules a replacement generation, publishes a refusal, or
+discharges a recorded fencing obligation does **not** wait for a worker's next message. It
+actively advances its fence at every worker generation the previous scheduling generation could
+address, and every one of those must acknowledge before it causes any job effect or publishes a
+refusal. There is therefore no post-flag-day first-message gap on those paths.
+
+Adopting an **already-running** execution is the excluded case. It admits no generation and issues
+no start, and in worker-leader mode it has no worker set to address at all — it reconnects to the
+leader the job's row names. What makes it exclusive is the adoption CAS on the job's row, not a
+handshake: a second controller that reads the same row loses that CAS and administers nothing. The
+workers it inherits learn its fence at the first directive that carries one.
 
 ## 5. The pre-flag-day verification — the operator precondition
 

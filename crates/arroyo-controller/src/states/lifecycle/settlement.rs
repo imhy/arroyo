@@ -48,8 +48,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use tracing::{error, info, warn};
 
+use crate::states::Admission;
 use crate::states::scheduling::fanout::{
-    Accounted, Discharged, Observed, SettlementBundle, SettlementOwner,
+    Accounted, Discharged, IssuedAttempts, Observed, SettlementBundle, SettlementOwner,
 };
 
 /// The job's owner of an interrupted fan-out's obligation.
@@ -169,6 +170,34 @@ impl JobSettlementOwner {
         // accounted for: the question that follows is the same one either way, and it is asked
         // in one place rather than answered here for one of the two.
         self.settle(&mut held)
+    }
+
+    /// Hands this job's obligation back to its next scheduling attempt, whole.
+    ///
+    /// **The other way the authority leaves this owner**, and the one that makes the wait on it
+    /// bounded (PR #167 round 3). This owner cannot settle what it holds by itself: an issued
+    /// identifier is superseded only by an acknowledgement of a fence *above* the one it was
+    /// issued under, raising the job's fence is an adoption, and an adoption is a scheduling
+    /// attempt's first effect under the very authority held here. So an owner waiting to be told
+    /// and an attempt waiting for the guard is a job that never moves again — which is what this
+    /// method exists to make unreachable.
+    ///
+    /// Nothing is released here that is not also handed over: [`SettlementBundle::reclaim`]
+    /// returns the authority and the inventory together, so the caller is answerable for both,
+    /// exactly as this owner was. `None` is an owner holding nothing, which is the ordinary case
+    /// for an attempt whose predecessor settled normally.
+    pub(crate) fn reclaim(&self) -> Option<(Admission, IssuedAttempts)> {
+        let bundle = self.held().take()?;
+        let outstanding = bundle.issued().outstanding_count();
+        let generation = bundle.issued().generation();
+        info!(
+            job_id = %self.job_id,
+            outstanding,
+            generation,
+            "this job's next scheduling attempt has reclaimed the obligation its settlement \
+             owner held, with the lifecycle authority that came with it"
+        );
+        Some(bundle.reclaim())
     }
 
     /// Discharges what the slot holds, if the obligation says every identifier is accounted for.

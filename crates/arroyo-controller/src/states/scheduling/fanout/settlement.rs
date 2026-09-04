@@ -359,6 +359,25 @@ impl SettlementBundle {
     fn keep(self) -> (Admission, IssuedAttempts) {
         self.into_parts()
     }
+
+    /// Gives the whole obligation back to the job's next scheduling attempt.
+    ///
+    /// The counterpart of [`Self::transfer_to`], and safe for the same reason that one is: the
+    /// authority and the inventory move **together**. What comes back is a caller that is
+    /// answerable for both, which is exactly what an owner is answerable for — so the obligation
+    /// has an owner at every instant and the release [`Drop`] guards against is never reached.
+    ///
+    /// It exists because an owner cannot settle what it holds by itself (PR #167 round 3). Only
+    /// an acknowledgement of a fence *above* the one the attempt issued under supersedes those
+    /// identifiers, and raising the job's fence is an adoption — which is a scheduling attempt's
+    /// first effect, taken under the very authority this bundle holds. An owner waiting for
+    /// somebody else to settle it, and a scheduling attempt waiting for the owner's guard, is a
+    /// job that never moves again. Handing it back is what breaks that: the attempt takes the
+    /// obligation, raises the fence, advances it at every target the durable record names, and
+    /// the acknowledgements settle what it took.
+    pub(crate) fn reclaim(self) -> (Admission, IssuedAttempts) {
+        self.into_parts()
+    }
 }
 
 /// Dropping an obligation is never settling it (M11.R59b).
