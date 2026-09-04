@@ -481,10 +481,13 @@ impl PhaseContext<'_, '_> {
     ///   built only by observing an acknowledgement, so a fenced start to a generation that did
     ///   not answer is not a check that was skipped but a value that cannot be built.
     ///
-    /// Every generation reached here has registered — the only way a worker enters
+    /// Every generation reached here has announced itself — the only way a worker enters
     /// [`workers`](Self::workers) and gets a channel is the `WorkerConnect` its registration
-    /// produced, and the connects were taken from that same set — so "registration and the
-    /// handshake precede start admission" is one statement about this method.
+    /// *request* produced, and the connects were taken from that same set — so "registration and
+    /// the handshake precede start admission" is one statement about this method. It is the
+    /// request and not the answer: `register_worker` enqueues that message before it replies, so
+    /// the handshake below may reach a generation whose answer is still in flight, which is the
+    /// window `WorkerLifecycle::announce` exists to make admissible.
     ///
     /// It is inside the admitted region because advancing a worker's fence is irreversible: the
     /// generation is in strict mode afterwards and refuses everything older, which is exactly

@@ -154,13 +154,21 @@ struct FenceState {
     /// generation runs under. A worker that reports one is a worker no fence can be addressed
     /// to, so it refuses every fenced directive rather than matching one by accident.
     identity: Option<LifecycleTarget>,
-    /// Whether registration has completed for this generation (M11.D39e(i)).
+    /// Whether this generation has announced itself to a controller (M11.D39e(i)).
+    ///
+    /// It turns on when the worker *issues* its `RegisterWorkerReq`, not when it applies the
+    /// answer, and the difference is the whole of what makes the fenced protocol usable:
+    /// `ControllerGrpc::register_worker` puts the `WorkerConnect` that makes this generation
+    /// schedulable on the job's queue **before** it returns `RegisterWorkerResp`, so the
+    /// controller's own fence handshake can reach this worker while that response is still in
+    /// flight. A gate on the answer refuses it, definitively, and fails an otherwise healthy
+    /// scheduling attempt.
     ///
     /// It gates the fenced protocol only. Both of the switches that turn [`Self::strict`] on —
     /// a registration response requiring fences, and acknowledging a fenced operation — are
-    /// reachable only once this is true, so strict mode implies registration and the two rules
-    /// cannot disagree about a generation.
-    registered: bool,
+    /// reachable only once this is true, so strict mode implies an announced generation and the
+    /// two rules cannot disagree about one.
+    announced: bool,
     /// Whether this generation requires a fence on every start (M11.D39e(i)).
     strict: bool,
     /// The highest fence this generation has acknowledged; zero means none.
@@ -201,14 +209,23 @@ enum AdmissionPlan<'a> {
     },
 }
 
+/// Proof that a generation announced itself to a controller before applying an answer from one.
+///
+/// Unconstructible outside this module and produced only by [`WorkerLifecycle::announce`], so
+/// "the fenced protocol opens when the registration request goes out, not when its answer comes
+/// back" is a property of the type rather than of the order two statements happen to be written
+/// in. A build that applies a registration answer has necessarily announced the generation.
+#[must_use = "the registration answer is applied through this proof"]
+pub(crate) struct Announced(());
+
 impl WorkerLifecycle {
-    /// An idle generation that has not registered and has acknowledged no fence.
+    /// An idle generation that has not announced itself and has acknowledged no fence.
     pub(crate) fn idle(worker_id: u64, generation: u64) -> Self {
         Self {
             execution: WorkerExecutionPhase::Idle,
             fence: FenceState {
                 identity: LifecycleTarget::addressed(worker_id, generation),
-                registered: false,
+                announced: false,
                 strict: false,
                 acknowledged: 0,
                 ids: AttemptIds::default(),
@@ -226,14 +243,26 @@ impl WorkerLifecycle {
         &mut self.execution
     }
 
-    /// Records that registration completed, and whether it activates strict mode.
+    /// Announces this generation to a controller: the fenced protocol opens here.
     ///
-    /// Both effects are monotone: registration does not un-complete, and strict mode does not
-    /// turn off — `requires_lifecycle_fence` can only add it, never clear it, so a later
-    /// registration against a legacy controller cannot take a fenced generation back out of
-    /// strict mode (M11.D39e(i)).
-    pub(crate) fn registered(&mut self, requires_lifecycle_fence: bool) {
-        self.fence.registered = true;
+    /// Called immediately before the worker issues its `RegisterWorkerReq`, because that request
+    /// is the only thing that tells a controller this generation exists and where it answers —
+    /// and a controller may address it from the moment it holds one, without waiting for its own
+    /// response to be applied. See [`FenceState::announced`].
+    pub(crate) fn announce(&mut self) -> Announced {
+        self.fence.announced = true;
+        Announced(())
+    }
+
+    /// Applies the registration answer, and whether it activates strict mode.
+    ///
+    /// Strict mode is monotone: `requires_lifecycle_fence` can only add it, never clear it, so a
+    /// later registration against a legacy controller cannot take a fenced generation back out
+    /// of strict mode (M11.D39e(i)).
+    ///
+    /// It does not open the fenced protocol — [`Self::announce`] did that, one round trip
+    /// earlier — and taking that proof by value is what says so.
+    pub(crate) fn registered(&mut self, _announced: Announced, requires_lifecycle_fence: bool) {
         self.fence.strict |= requires_lifecycle_fence;
     }
 
@@ -468,8 +497,9 @@ impl FenceState {
     /// it addresses are a single statement — "you, that generation, under my authority" — and
     /// answering it in two places is what would let a start and a commit disagree about which
     /// generation this worker is or which fences it has left behind. The checks are ordered
-    /// from the widest: an unregistered generation has no fenced protocol at all, one that
-    /// addresses no generation cannot be a target, one that is a *different* target is a
+    /// from the widest: a generation that has not announced itself has no fenced protocol at
+    /// all, one that addresses no generation cannot be a target, one that is a *different*
+    /// target is a
     /// different worker generation, and only then does the fence itself matter.
     ///
     /// # Errors
@@ -478,18 +508,28 @@ impl FenceState {
     /// about this generation that re-sending cannot change.
     #[allow(clippy::result_large_err)]
     fn addressed_to_this_generation(&self, address: FenceAddress) -> Result<(), Status> {
-        // M11.D39e(i)/M11.T26c: registration gates the *fenced* protocol, not the legacy route.
-        // A fenced directive cannot legitimately precede registration — the controller that
-        // sends one learns this worker's address from the registration request it is answering —
-        // so refusing it is fail-closed. A fence-less directive is the pre-flag-day route and is
-        // admitted exactly as it was before this protocol existed; refusing it here would turn a
-        // compatible increment into a live one, in the window between this worker answering the
-        // gRPC port and processing its own registration response. After the flag day the
-        // question does not arise: strict mode refuses fence-less directives, and strict mode
-        // implies registration because both of its on-switches are below this line.
-        if !self.registered {
+        // M11.D39e(i)/M11.T26c: announcing gates the *fenced* protocol, not the legacy route.
+        //
+        // The gate is the registration *request* and not its response. A controller learns this
+        // generation's identity and address from the `RegisterWorkerReq` it is answering, and
+        // `ControllerGrpc::register_worker` puts the `WorkerConnect` that makes the generation
+        // schedulable onto the job's queue before it returns that answer — so this controller's
+        // own `FENCE_ONLY` handshake legitimately arrives while the answer is still in flight.
+        // Refusing it there would fail a healthy scheduling attempt and would do it
+        // definitively, because `FailedPrecondition` is not in the controller's ambiguous table
+        // and nothing re-offers the directive.
+        //
+        // Before the request goes out nothing outside this process knows this generation exists,
+        // so refusing a fenced directive there is fail-closed. A fence-less directive is the
+        // pre-flag-day route and is admitted exactly as it was before this protocol existed;
+        // refusing it here would turn a compatible increment into a live one, in the window
+        // between this worker answering the gRPC port and announcing itself. After the flag day
+        // the question does not arise: strict mode refuses fence-less directives, and strict
+        // mode implies an announced generation because both of its on-switches are below this
+        // line.
+        if !self.announced {
             return Err(Status::failed_precondition(
-                "Worker generation has not completed registration",
+                "Worker generation has not begun registration",
             ));
         }
         let identity = self.identity.ok_or_else(|| {
@@ -569,9 +609,9 @@ impl WorkerLifecycle {
         self.fence.strict
     }
 
-    /// Whether registration has completed for this generation.
-    pub(crate) fn is_registered(&self) -> bool {
-        self.fence.registered
+    /// Whether this generation has announced itself to a controller.
+    pub(crate) fn is_announced(&self) -> bool {
+        self.fence.announced
     }
 
     /// What this generation has done about `id`.

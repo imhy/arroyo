@@ -5,7 +5,7 @@
 //! what reaches it.
 
 use crate::lifecycle_fence::attempt_ids::AttemptDisposition;
-use crate::lifecycle_fence::guard::WorkerLifecycle;
+use crate::lifecycle_fence::guard::{Announced, WorkerLifecycle};
 use crate::{WorkerExecutionPhase, WorkerServer};
 use arroyo_rpc::grpc::rpc::worker_grpc_server::WorkerGrpc;
 use arroyo_rpc::grpc::rpc::{
@@ -52,14 +52,43 @@ pub(super) fn registered(requires_lifecycle_fence: bool) -> (Shutdown, WorkerSer
     (shutdown, server)
 }
 
-/// Records the registration this worker's `start_async` records after `register_worker` returns.
+/// A [`WORKER`]/[`GENERATION`] worker whose registration request has gone out and whose answer
+/// has not come back.
+///
+/// The state a real worker is in for the whole of the window in which its controller may already
+/// be addressing it: `start_async` announces the generation, then awaits `register_worker`, and
+/// the controller made the generation schedulable before it replied. The proof is handed back
+/// so a test can finish the registration where a real worker would.
+pub(super) fn announced() -> (Shutdown, WorkerServer, Announced) {
+    let (shutdown, server) = generation(WORKER, GENERATION);
+    let proof = announce(&server);
+    (shutdown, server, proof)
+}
+
+/// Announces a generation, as `start_async` does immediately before issuing its registration.
+pub(super) fn announce(server: &WorkerServer) -> Announced {
+    server.state.lifecycle.lock().unwrap().announce()
+}
+
+/// Records the whole registration this worker's `start_async` performs: the announcement it makes
+/// before issuing `register_worker`, and the answer it applies when that call returns.
 pub(super) fn register(server: &WorkerServer, requires_lifecycle_fence: bool) {
+    let announced = announce(server);
+    apply_registration_response(server, announced, requires_lifecycle_fence);
+}
+
+/// Applies a registration answer to a generation that has already announced itself.
+pub(super) fn apply_registration_response(
+    server: &WorkerServer,
+    announced: Announced,
+    requires_lifecycle_fence: bool,
+) {
     server
         .state
         .lifecycle
         .lock()
         .unwrap()
-        .registered(requires_lifecycle_fence);
+        .registered(announced, requires_lifecycle_fence);
 }
 
 /// Calls the production handler, which never awaits — that is M11.D39e(iii)'s non-blocking
@@ -99,8 +128,8 @@ pub(super) fn strict(server: &WorkerServer) -> bool {
     read(server, WorkerLifecycle::is_strict)
 }
 
-pub(super) fn has_registered(server: &WorkerServer) -> bool {
-    read(server, WorkerLifecycle::is_registered)
+pub(super) fn has_announced(server: &WorkerServer) -> bool {
+    read(server, WorkerLifecycle::is_announced)
 }
 
 pub(super) fn idle(server: &WorkerServer) -> bool {

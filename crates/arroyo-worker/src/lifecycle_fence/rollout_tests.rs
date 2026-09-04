@@ -8,8 +8,9 @@
 //!
 //! * The **worker** is real: [`WorkerServer`](crate::WorkerServer) with its production
 //!   `WorkerGrpc::start_execution` handler, its one lock, its guard and its bounded identifier
-//!   record. `register` is the same call `start_async` makes with the registration response it
-//!   received, through the same lock.
+//!   record. `register` is the same pair of calls `start_async` makes — the announcement it makes
+//!   before issuing `register_worker`, and the answer it applies when that call returns — through
+//!   the same lock.
 //! * The **wire** is real: every request is stamped by [`StartDirective::stamp`] — the shared
 //!   `arroyo-rpc` writer that `arroyo-controller`'s `FenceProtocol` calls, and the only thing
 //!   allowed to write a lifecycle field — and then *encoded and decoded* before it is delivered,
@@ -42,7 +43,7 @@ use prost::Message;
 use tonic::{Code, Status};
 
 use super::tests::{
-    AMBIGUOUS, GENERATION, WORKER, acknowledged, applied, call, generation, has_registered, idle,
+    AMBIGUOUS, GENERATION, WORKER, acknowledged, applied, call, generation, has_announced, idle,
     register, strict,
 };
 
@@ -282,10 +283,10 @@ async fn nothing_is_admitted_before_the_step_of_the_rollout_that_admits_it() {
     let controller = Build::FenceCapable;
     let (_shutdown, server) = generation(WORKER, GENERATION);
 
-    // Stage 0 — the worker is up and has not registered. A fenced directive is refused, and
-    // definitively: a controller that retried it would be retrying something that can never
-    // become admissible without a registration only the controller can complete.
-    assert!(!has_registered(&server));
+    // Stage 0 — the worker is up and has not announced itself to any controller. A fenced
+    // directive is refused, and definitively: nothing outside this process can know this
+    // generation exists yet, so re-offering the directive could never make it admissible.
+    assert!(!has_announced(&server));
     let before_registration = deliver(&server, &controller.start("attempt-1", FENCE))
         .expect_err("an unregistered generation admits no fenced start");
     assert_eq!(before_registration.code(), Code::FailedPrecondition);
@@ -298,7 +299,7 @@ async fn nothing_is_admitted_before_the_step_of_the_rollout_that_admits_it() {
 
     // Stage 1 — registration completes. Strict mode is now on, monotonically.
     register(&server, controller.requires_lifecycle_fence());
-    assert!(strict(&server) && has_registered(&server));
+    assert!(strict(&server) && has_announced(&server));
 
     // Stage 2 — a fenced start is still refused, because this generation has acknowledged no
     // fence yet and the one it is being addressed under is above the floor it holds. The

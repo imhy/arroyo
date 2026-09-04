@@ -83,7 +83,7 @@ pub(crate) enum Fault {
     ControllerCrashMidCommit,
     /// A worker that never advertised the reconciliation contract.
     IncapableWorker,
-    /// A worker generation that has not completed registration.
+    /// A worker generation that has not announced itself to any controller.
     UnregisteredWorker,
     /// A controller and a worker on opposite sides of the flag day.
     PostFlagDaySkew,

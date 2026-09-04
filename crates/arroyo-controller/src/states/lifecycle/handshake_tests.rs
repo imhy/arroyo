@@ -17,7 +17,9 @@ use arroyo_rpc::grpc::rpc::{
     StopExecutionResp,
 };
 use arroyo_rpc::identity::{WorkerClient, worker_client};
-use arroyo_types::WorkerId;
+use arroyo_server_common::shutdown::{Shutdown, SignalBehavior};
+use arroyo_types::{JobId, MachineId, PipelineId, WorkerId};
+use arroyo_worker::WorkerServer;
 
 use super::LifecycleMode;
 use super::fence::LifecycleAuthority;
@@ -186,9 +188,81 @@ async fn worker(id: WorkerId, answers: Answers) -> (Arc<Received>, WorkerClient)
     (received, worker_client(channel, id))
 }
 
+/// Serves a **real** [`WorkerServer`] on a loopback port: the production `WorkerGrpc` guard, on
+/// the receiving end of the production handshake, in the state a worker generation is in before
+/// it has announced itself to any controller.
+async fn real_worker(id: WorkerId, generation: u64, shutdown: &Shutdown) -> WorkerClient {
+    let server = WorkerServer::new(
+        MachineId(Arc::new("machine_1".to_string())),
+        id,
+        PipelineId(Arc::new("pipeline_1".to_string())),
+        JobId(Arc::new("job_1".to_string())),
+        generation,
+        shutdown.guard("worker"),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(WorkerGrpcServer::new(server))
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+    );
+    let channel = tonic::transport::Endpoint::from_shared(address)
+        .unwrap()
+        .timeout(Duration::from_secs(90))
+        .connect()
+        .await
+        .unwrap();
+    worker_client(channel, id)
+}
+
 // ---------------------------------------------------------------------------------------------
 // The handshake itself
 // ---------------------------------------------------------------------------------------------
+
+/// A real generation that has announced itself to nobody refuses this controller's handshake, and
+/// that refusal ends the whole attempt (M11.D39e(i), D96 row 21).
+///
+/// The one row in either crate where the production worker guard is on the receiving end of the
+/// production [`advance_fence`], and it is here to price the gate rather than to celebrate it.
+/// The guard answers `FailedPrecondition`, which
+/// [`FenceProtocol::transport_settlement`](super::protocol::FenceProtocol::transport_settlement)
+/// classifies as definitive, so nothing re-offers the directive: one generation that will not
+/// answer refuses every target and the scheduling attempt fails.
+///
+/// That is exactly the cost an ordinary start must not pay, and it is why the worker's gate opens
+/// when the generation *issues* its `RegisterWorkerReq` rather than when it applies the answer.
+/// The ordering that makes the distinction load-bearing is this controller's own:
+/// `ControllerGrpc::register_worker` enqueues the `WorkerConnect` that makes a generation
+/// schedulable **before** it returns `RegisterWorkerResp`, so the handshake below is issued to
+/// workers whose answer may still be in flight. `arroyo-worker`'s
+/// `the_registration_request_opens_the_fenced_protocol_before_its_answer_arrives` is the other
+/// half of that pair.
+#[tokio::test]
+async fn a_generation_that_has_not_announced_itself_fails_this_controllers_whole_attempt() {
+    let shutdown = Shutdown::new("m11-t26-real-worker-handshake", SignalBehavior::None);
+    let unannounced = real_worker(WorkerId(1), GENERATION, &shutdown).await;
+    let (acknowledging, capable) = worker(WorkerId(2), Answers::FenceCapable).await;
+
+    let refusal = advance_fence(
+        fenced(FENCE, GENERATION),
+        HashMap::from([(WorkerId(1), unannounced), (WorkerId(2), capable)]),
+    )
+    .await
+    .expect_err("a generation that has announced itself to nobody does not acknowledge")
+    .to_string();
+
+    assert!(
+        refusal.contains("FailedPrecondition")
+            && refusal.contains("Worker generation has not begun registration"),
+        "the refusal this controller reports is the worker guard's own answer: {refusal}"
+    );
+    assert_eq!(
+        acknowledging.operations(),
+        vec![Some(LifecycleOperation::FenceOnly)],
+        "and it is all or nothing: the generation that did acknowledge is started by nobody"
+    );
+}
 
 /// Every generation is advanced to this controller's fence and answers before any start exists.
 ///

@@ -4,11 +4,14 @@
 //!
 //! # The window this closes
 //!
-//! M11.T26d's worker guard admits no *fenced* directive before registration completes, and both
-//! of the switches that put a generation into strict mode are behind that gate. So the worker
-//! cannot close the registration→admission window from its side: a generation that has not yet
-//! processed its registration response answers a fenced start with a definitive refusal, and one
-//! that has never been sent a fence at all goes on admitting fence-less starts.
+//! M11.T26d's worker guard admits no *fenced* directive from a generation that has not announced
+//! itself, and both of the switches that put a generation into strict mode are behind that gate.
+//! The gate opens when the worker *issues* its `RegisterWorkerReq`, not when it applies the
+//! answer, precisely so that this module's own first message is admissible: `register_worker`
+//! enqueues the `WorkerConnect` that makes a generation schedulable before it replies, so the
+//! handshake below can reach a worker whose registration answer is still in flight. What the
+//! worker still cannot close from its side is the *other* half — a generation that has never been
+//! sent a fence goes on admitting fence-less starts.
 //!
 //! M11.D39e(i) closes it from this side instead, and actively: *"a replacement controller
 //! actively advances and receives fence acknowledgement from existing workers before any job
@@ -269,7 +272,7 @@ pub(crate) enum NotAcknowledged {
     /// The generation answered, definitively, that it will not.
     ///
     /// Its own decision about this controller's fence: it has acknowledged a higher one, it is
-    /// not the generation being addressed, or it has not completed registration.
+    /// not the generation being addressed, or it has not announced itself to any controller.
     #[error("worker {worker} refused the fence handshake: {status}")]
     Refused {
         /// The worker that refused.

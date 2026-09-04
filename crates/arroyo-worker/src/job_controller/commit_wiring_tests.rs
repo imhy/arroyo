@@ -59,7 +59,11 @@ async fn live_worker(worker_id: u64, generation: u64) -> LiveWorker {
         generation,
         shutdown.guard("worker"),
     );
-    server.state.lifecycle.lock().unwrap().registered(false);
+    {
+        let mut lifecycle = server.state.lifecycle.lock().unwrap();
+        let announced = lifecycle.announce();
+        lifecycle.registered(announced, false);
+    }
 
     let (tx, control) = tokio::sync::mpsc::channel(8);
     *server.state.lifecycle.lock().unwrap().execution_mut() =

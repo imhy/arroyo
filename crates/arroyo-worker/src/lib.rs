@@ -9,6 +9,7 @@ use crate::network_manager::NetworkManager;
 use anyhow::{Context, Result, anyhow};
 
 use arroyo_rpc::fence_wire::CommitAuthority;
+use arroyo_rpc::grpc::rpc::controller_grpc_client::ControllerGrpcClient;
 use arroyo_rpc::grpc::rpc::worker_grpc_server::{WorkerGrpc, WorkerGrpcServer};
 use arroyo_rpc::grpc::rpc::{
     CheckpointManifest, CheckpointReq, CheckpointResp, CommitReq, CommitResp,
@@ -17,8 +18,8 @@ use arroyo_rpc::grpc::rpc::{
     JobControllerInitResp, JobFinishedReq, JobFinishedResp, JobMetricsReq, JobMetricsResp,
     JobStatus, JobStatusReq, JobStatusResp, JobStopMode, LoadCompactedDataReq,
     LoadCompactedDataRes, MetricFamily, MetricsReq, MetricsResp, NonfatalErrorReq,
-    RegisterWorkerReq, StartExecutionReq, StartExecutionResp, StopExecutionReq, StopExecutionResp,
-    StopJobReq, StopJobResp, TaskAssignment, TaskCheckpointCompletedReq,
+    RegisterWorkerReq, RegisterWorkerResp, StartExecutionReq, StartExecutionResp, StopExecutionReq,
+    StopExecutionResp, StopJobReq, StopJobResp, TaskAssignment, TaskCheckpointCompletedReq,
     TaskCheckpointCompletedResp, TaskCheckpointEventReq, TaskCheckpointEventResp, TaskFailedReq,
     TaskFailedResp, TaskFinishedReq, TaskFinishedResp, TaskStartedReq, WorkerErrorRes,
     WorkerInitializationCompleteReq, WorkerPhase, WorkerResources,
@@ -46,7 +47,7 @@ use tonic::{Request, Response, Status};
 use tracing::{debug, error, info, trace, warn};
 
 use crate::job_controller::controller::WorkerJobController;
-use crate::lifecycle_fence::guard::{StartAdmission, StartAdmitted, WorkerLifecycle};
+use crate::lifecycle_fence::guard::{Announced, StartAdmission, StartAdmitted, WorkerLifecycle};
 use crate::utils::{MAX_TASK_ERROR_FIELD_BYTES, maybe_truncate, to_d2};
 use arroyo_datastream::logical::LogicalProgram;
 use arroyo_planner::physical::new_registry;
@@ -907,8 +908,21 @@ impl WorkerServer {
         // ideally, get a signal when the server is started...
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let registration = client
-            .register_worker(Request::new(RegisterWorkerReq {
+        // M11.D39e(i): the registration *request* — not its answer — is what opens the fenced
+        // protocol for this generation, because it is the only thing that tells a controller
+        // this generation exists and where it answers. `ControllerGrpc::register_worker` makes
+        // the generation schedulable before it replies, so this controller's own fence handshake
+        // can arrive while the reply below is still in flight; a generation that had not
+        // announced itself would refuse it definitively and fail a healthy scheduling attempt.
+        //
+        // The proof travels through `issue_registration` and into `registered`, so neither half
+        // of this can be moved to the wrong side of the request.
+        let announced = lifecycle.lock().unwrap().announce();
+
+        let (announced, registration) = issue_registration(
+            &mut client,
+            announced,
+            RegisterWorkerReq {
                 time: to_micros(SystemTime::now()),
                 worker_context: Some(context.as_proto()),
                 rpc_address,
@@ -925,18 +939,18 @@ impl WorkerServer {
                 // authoritative phase with `failed_precondition`. A worker that does not
                 // set this is not sent a `StartExecution` at all.
                 reconciles_start_execution: true,
-            }))
-            .await?
-            .into_inner();
+            },
+        )
+        .await?;
 
-        // M11.D39e(i): registration is what admits starts at all, and its response is what may
-        // activate strict mode for this generation. Recording it here — after the response, and
-        // through the same lock that admits starts — is what makes "no start before registration
-        // completes" and "strict mode is monotonic" one decision rather than two.
+        // M11.D39e(i): the answer is what may activate strict mode for this generation.
+        // Applying it here — after the response, and through the same lock that admits starts —
+        // is what makes "strict mode is monotonic" a decision taken where starts are admitted
+        // rather than a second one taken somewhere else.
         lifecycle
             .lock()
             .unwrap()
-            .registered(registration.requires_lifecycle_fence);
+            .registered(announced, registration.requires_lifecycle_fence);
 
         Ok(())
     }
@@ -945,6 +959,27 @@ impl WorkerServer {
     pub async fn start(self) -> Result<()> {
         self.start_async().await
     }
+}
+
+/// Issues this generation's registration, under the announcement that makes issuing it
+/// legitimate (M11.D39e(i)).
+///
+/// The proof is taken by value and handed back, and that is the whole reason this is a function
+/// rather than a call: `WorkerLifecycle::announce` must happen before the request goes out — the
+/// controller can address this generation from the moment it holds one — and there is no way to
+/// reach this call without having made it. `WorkerLifecycle::registered` then consumes the proof
+/// on the other side, so the answer cannot be applied to a generation that never announced
+/// itself either. What used to be an ordering a comment asked for is now one the signatures make.
+async fn issue_registration(
+    client: &mut ControllerGrpcClient<tonic::transport::Channel>,
+    announced: Announced,
+    request: RegisterWorkerReq,
+) -> Result<(Announced, RegisterWorkerResp)> {
+    let response = client
+        .register_worker(Request::new(request))
+        .await?
+        .into_inner();
+    Ok((announced, response))
 }
 
 #[tonic::async_trait]
@@ -1772,7 +1807,11 @@ mod tests {
             1,
             shutdown.guard("worker"),
         );
-        server.state.lifecycle.lock().unwrap().registered(false);
+        {
+            let mut lifecycle = server.state.lifecycle.lock().unwrap();
+            let announced = lifecycle.announce();
+            lifecycle.registered(announced, false);
+        }
 
         // The exact request M11.T26c pinned as accepted unchanged.
         let misaddressed = StartExecutionReq {

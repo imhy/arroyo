@@ -132,9 +132,12 @@ protocol wrong.
 Under one non-blocking guard — the same lock the execution phase already lives behind, so there
 is no second lock and no validate-then-apply gap:
 
-1. **Registration gates the fenced protocol.** A generation that has not completed registration
-   refuses any *fenced* directive (`FailedPrecondition`) and still admits a fence-less one, which
-   is the compatibility window.
+1. **Registration gates the fenced protocol.** A generation that has not *issued* its
+   registration request refuses any *fenced* directive (`FailedPrecondition`) and still admits a
+   fence-less one, which is the compatibility window. The gate is the request and not its answer:
+   `register_worker` makes a generation schedulable before it replies, so a controller's fence
+   handshake legitimately arrives while that reply is still in flight, and a gate on the reply
+   would refuse it definitively and fail the scheduling attempt.
 2. **Strict mode is monotone.** It is activated by a registration response that requires it, or
    by acknowledging any fenced operation, and it is never turned off.
 3. **In strict mode, fence-less is refused.** So is a directive addressed to another worker id or

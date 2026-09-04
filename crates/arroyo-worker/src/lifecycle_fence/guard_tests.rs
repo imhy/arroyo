@@ -7,9 +7,10 @@
 //! [`super::tests`].
 
 use super::tests::{
-    AMBIGUOUS, GENERATION, WORKER, acknowledged, addressed_start, applied, call, disposition,
-    fence_only, fenced_start, generation, has_registered, idle, initializing, register, registered,
-    revoke, revoke_owned, settlement, strict, tracked, unfenced,
+    AMBIGUOUS, GENERATION, WORKER, acknowledged, addressed_start, announced, applied,
+    apply_registration_response, call, disposition, fence_only, fenced_start, generation,
+    has_announced, idle, initializing, register, registered, revoke, revoke_owned, settlement,
+    strict, tracked, unfenced,
 };
 use crate::lifecycle_fence::attempt_ids::{AttemptDisposition, MAX_TRACKED_ATTEMPT_IDS};
 use arroyo_rpc::fencing::{MAX_ATTEMPT_ID_CHARS, MAX_FENCE_TARGETS};
@@ -73,10 +74,12 @@ async fn strict_mode_is_monotonic_for_a_worker_generation() {
 
 /// Registration gates the fenced protocol and not the legacy route (M11.T26c).
 ///
-/// A fenced directive cannot legitimately precede registration, so all three of its shapes are
-/// refused before it and admitted after. A fence-less start is the pre-flag-day route and is not
-/// gated at all — see `a_legacy_fence_less_start_before_registration_is_admitted_unchanged` for
-/// what it does instead.
+/// A fenced directive cannot legitimately precede the registration *request*, so all three of its
+/// shapes are refused before it and admitted after — see
+/// `the_registration_request_opens_the_fenced_protocol_before_its_answer_arrives` for why the
+/// request and not its answer. A fence-less start is the pre-flag-day route and is not gated at
+/// all — see `a_legacy_fence_less_start_before_registration_is_admitted_unchanged` for what it
+/// does instead.
 #[tokio::test]
 async fn registration_gates_the_fenced_protocol_and_not_the_legacy_route() {
     for request in [
@@ -85,7 +88,7 @@ async fn registration_gates_the_fenced_protocol_and_not_the_legacy_route() {
         revoke(5, &["older_1"]),
     ] {
         let (_shutdown, server) = generation(WORKER, GENERATION);
-        assert!(!has_registered(&server));
+        assert!(!has_announced(&server));
         let refused = call(&server, request.clone()).unwrap_err();
         assert_eq!(refused.code(), Code::FailedPrecondition);
         assert!(!AMBIGUOUS.contains(&refused.code()));
@@ -95,37 +98,97 @@ async fn registration_gates_the_fenced_protocol_and_not_the_legacy_route() {
         assert!(idle(&server));
 
         register(&server, false);
-        assert!(has_registered(&server));
+        assert!(has_announced(&server));
         assert!(
             call(&server, request).is_ok(),
-            "the identical fenced request is admitted once registration has completed"
+            "the identical fenced request is admitted once the generation has announced itself"
         );
     }
 
     // Because a fenced directive is gated here, and a fenced directive is the only on-switch for
-    // strict mode other than the registration response itself, strict mode implies registration.
+    // strict mode other than the registration response itself, strict mode implies an announced
+    // generation.
     let (_shutdown, server) = generation(WORKER, GENERATION);
     assert_eq!(
         call(&server, fence_only(5)).unwrap_err().code(),
         Code::FailedPrecondition
     );
     assert!(!strict(&server));
-    assert!(!has_registered(&server));
+    assert!(!has_announced(&server));
 }
 
-/// The pre-flag-day compatibility guarantee: a fence-less start arriving before registration
-/// completes takes the route it took before M11.T26d existed.
+/// The fenced protocol opens at the registration *request*, not at its answer (M11.D39e(i)).
+///
+/// The controller does not wait for its own answer to be applied before it addresses a
+/// generation, and cannot: `ControllerGrpc::register_worker` puts the `WorkerConnect` that makes
+/// this generation schedulable onto the job's queue *before* it returns `RegisterWorkerResp`, so
+/// the `FENCE_ONLY` handshake `arroyo-controller`'s `advance_fence` issues can arrive while that
+/// answer is still in flight. A gate on the answer refuses it with `FailedPrecondition`, which
+/// the controller reads as definitive rather than as transport, so nothing re-offers the
+/// directive and an otherwise healthy scheduling attempt fails outright — see
+/// `a_generation_that_has_not_announced_itself_fails_this_controllers_whole_attempt` in
+/// `arroyo-controller`.
+///
+/// The two moments are varied independently, and that is the point: a build that holds them in
+/// one flag can never disagree with itself, so every test written against such a build passes
+/// whichever moment it meant. Here the announcement is made without an answer, the answer is
+/// applied without a preceding announcement — which `registered` will not let anyone write, since
+/// it consumes the proof `announce` returns — and each fenced shape is put through both.
+#[tokio::test]
+async fn the_registration_request_opens_the_fenced_protocol_before_its_answer_arrives() {
+    for request in [
+        fenced_start("attempt_1", 5),
+        fence_only(5),
+        revoke(5, &["older_1"]),
+    ] {
+        // The state a real worker is in for the whole of its registration round trip: it has
+        // asked to be registered and has been told nothing back.
+        let (_shutdown, server, proof) = announced();
+        assert!(!strict(&server));
+
+        assert!(
+            call(&server, request.clone()).is_ok(),
+            "a generation whose registration answer has not arrived still answers the \
+             controller that is answering it"
+        );
+        assert!(has_announced(&server));
+        assert_eq!(acknowledged(&server), 5);
+
+        // And the answer, when it does arrive, lands on a generation the handshake has already
+        // moved. Strict mode is monotone across both moments, so a legacy answer arriving after
+        // a fenced directive cannot take this generation back out of it.
+        apply_registration_response(&server, proof, false);
+        assert!(strict(&server));
+        assert_eq!(acknowledged(&server), 5);
+    }
+
+    // The other end of the same dimension, unchanged: a generation that has announced itself to
+    // nobody refuses every fenced shape, definitively.
+    let (_shutdown, server) = generation(WORKER, GENERATION);
+    let refused = call(&server, fence_only(5)).unwrap_err();
+    assert_eq!(refused.code(), Code::FailedPrecondition);
+    assert_eq!(
+        refused.message(),
+        "Worker generation has not begun registration"
+    );
+    assert!(!AMBIGUOUS.contains(&refused.code()));
+    assert_eq!(acknowledged(&server), 0);
+    assert!(!strict(&server));
+}
+
+/// The pre-flag-day compatibility guarantee: a fence-less start arriving before this generation
+/// announces itself takes the route it took before M11.T26d existed.
 ///
 /// This is M11.D75's declared compatibility window, and it is the path a worker-first rollout
 /// runs on between the worker upgrade and the controller upgrade — see
 /// `docs/lifecycle-fence-rollout.md` §3. The window is real in a second way too: the worker
-/// serves its gRPC port before it has processed the registration response. Every assertion here is a landed T08
+/// serves its gRPC port before it announces itself at all. Every assertion here is a landed T08
 /// behaviour, and the response is byte-identical to the one a worker predating the lifecycle
 /// fields sends, which is `StartExecutionResp::default()`.
 #[tokio::test]
 async fn a_legacy_fence_less_start_before_registration_is_admitted_unchanged() {
     let (_shutdown, server) = generation(WORKER, GENERATION);
-    assert!(!has_registered(&server));
+    assert!(!has_announced(&server));
     assert!(!strict(&server));
 
     let accepted = call(&server, unfenced("attempt_1")).unwrap();
@@ -149,7 +212,7 @@ async fn a_legacy_fence_less_start_before_registration_is_admitted_unchanged() {
     // Admitting it acknowledged nothing and activated nothing: the increment stays inactive.
     assert_eq!(acknowledged(&server), 0);
     assert!(!strict(&server));
-    assert!(!has_registered(&server));
+    assert!(!has_announced(&server));
 
     // A controller predating the idempotency key sends no identifier at all; that is still
     // accepted and still recorded under no identifier.

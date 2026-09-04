@@ -375,6 +375,18 @@
           "name": "registration_and_fence_handshake_precede_start_admission",
           "kind": "test",
           "path": "crates/arroyo-controller/src/states/mod.rs"
+        },
+        {
+          "crate": "arroyo-worker",
+          "name": "the_registration_request_opens_the_fenced_protocol_before_its_answer_arrives",
+          "kind": "test",
+          "path": "crates/arroyo-worker/src/lifecycle_fence/guard_tests.rs"
+        },
+        {
+          "crate": "arroyo-controller",
+          "name": "a_generation_that_has_not_announced_itself_fails_this_controllers_whole_attempt",
+          "kind": "test",
+          "path": "crates/arroyo-controller/src/states/lifecycle/handshake_tests.rs"
         }
       ],
       "distinct_path": "Asserts the restored checkpoint's commit fences as one closed-form value per topology: in controller mode [Some((adopted_fence, generation))], because prepare_handover builds the job's JobController holding its FenceProtocol; in worker-leader mode the empty list, because prepare_handover returns before building one and the leader commits under the CommitAuthority its own fenced start conferred (row 24). It then asserts status.state_context.leader.is_some() equals the topology, so the empty list is the leader route having been taken rather than a fan-out that never got that far."

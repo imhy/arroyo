@@ -64,7 +64,7 @@ pub(super) enum WorkerFault {
     Restart,
     /// A *new* generation answering at the endpoint its predecessor had.
     EndpointReuse,
-    /// A directive that reaches a generation which has not completed registration.
+    /// A directive that reaches a generation which has not announced itself to any controller.
     Unregistered,
     /// Post-flag-day skew: a fence-less directive from a controller predating the fields,
     /// arriving at a generation that has already acknowledged a fence.
@@ -140,17 +140,19 @@ impl Link {
         link
     }
 
-    /// **Injects [`WorkerFault::Unregistered`].** A link to a generation whose registration has
-    /// not completed.
+    /// **Injects [`WorkerFault::Unregistered`].** A link to a generation that has not announced
+    /// itself to any controller — it has not yet issued its `RegisterWorkerReq`.
     ///
     /// M11.T26c places an unregistered peer in the post-flag-day fail-closed set, and M11.T26d
     /// scopes that to the *fenced* arm: this generation still admits the legacy fence-less
-    /// shape, and refuses every fenced directive definitively.
+    /// shape, and refuses every fenced directive definitively. The gate is the request rather
+    /// than its answer, because a controller may address a generation from the moment it holds
+    /// one — see `WorkerLifecycle::announce`.
     pub(super) fn to_unregistered_generation() -> Self {
         Self::to_generation(WORKER, GENERATION)
     }
 
-    /// A link to an arbitrary, unregistered worker generation.
+    /// A link to an arbitrary worker generation that has not announced itself.
     fn to_generation(worker_id: u64, generation: u64) -> Self {
         let shutdown = Shutdown::new("m11-d39g-fault-link", SignalBehavior::None);
         let server = WorkerServer::new(
@@ -287,7 +289,8 @@ impl Link {
         self.replace_receiver(self.worker_id, generation);
     }
 
-    /// Puts a fresh, unregistered generation at this link's receiving end.
+    /// Puts a fresh generation, which has announced itself to nobody, at this link's receiving
+    /// end.
     fn replace_receiver(&mut self, worker_id: u64, generation: u64) {
         let replacement = Self::to_generation(worker_id, generation);
         // The predecessor's shutdown is dropped with the value it belongs to; the in-flight

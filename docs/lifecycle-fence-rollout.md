@@ -78,7 +78,7 @@ that could leave strict mode could be talked out of it by a stale peer.
 A generation in strict mode fails closed on:
 
 - a start carrying no fence (`lifecycle_fence = 0` or `target_worker_generation = 0`);
-- a start from a controller it has not completed registration with;
+- a start that reaches it before it has issued its own registration request;
 - a start addressed to another worker id or another generation (endpoint reuse);
 - a start under a fence below the highest it has acknowledged;
 - a revocation naming an identifier it has already applied.

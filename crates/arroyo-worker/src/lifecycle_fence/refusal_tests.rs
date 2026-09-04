@@ -180,7 +180,7 @@ async fn every_refusal_this_worker_gives_is_definitive() {
     {
         let (_shutdown, server) = generation(WORKER, GENERATION);
         codes.push((
-            "a fenced directive before registration",
+            "a fenced directive before registration begins",
             call(&server, fenced_start("attempt_1", 5))
                 .unwrap_err()
                 .code(),
@@ -326,7 +326,7 @@ async fn every_refusal_this_worker_gives_is_definitive() {
         vec![
             ("contended guard", Code::Aborted),
             (
-                "a fenced directive before registration",
+                "a fenced directive before registration begins",
                 Code::FailedPrecondition
             ),
             ("fence-less under strict mode", Code::FailedPrecondition),

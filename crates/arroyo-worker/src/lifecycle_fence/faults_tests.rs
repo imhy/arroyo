@@ -290,14 +290,14 @@ async fn a_restarted_generation_answers_for_nothing_its_predecessor_acknowledged
         !link.strict(),
         "and strict mode is not carried across either"
     );
-    // It has not registered, so the fenced protocol is closed to it until it does.
+    // It has not announced itself, so the fenced protocol is closed to it until it does.
     let unregistered = link
         .deliver(fenced_start(ATTEMPT, REFUSAL_FENCE))
-        .expect_err("a restarted generation has not completed registration");
+        .expect_err("a restarted generation has announced itself to nobody");
     assert_eq!(unregistered.code(), Code::FailedPrecondition);
     assert_eq!(
         unregistered.message(),
-        "Worker generation has not completed registration"
+        "Worker generation has not begun registration"
     );
 }
 
@@ -305,7 +305,7 @@ async fn a_restarted_generation_answers_for_nothing_its_predecessor_acknowledged
 ///
 /// M11.D39g's endpoint-reuse row. Identity is the (worker id, generation) pair: the address is
 /// not in the message and the worker id agrees in exactly the case that matters. The successor
-/// is registered here, so the refusal cannot be the registration one — it is the target
+/// has announced itself here, so the refusal cannot be the registration one — it is the target
 /// comparison and nothing else.
 #[tokio::test]
 async fn a_reused_endpoint_refuses_its_predecessors_delayed_start() {
@@ -348,18 +348,18 @@ async fn a_reused_endpoint_refuses_its_predecessors_delayed_start() {
 ///
 /// M11.D39g's incapable/unregistered peer, scoped as M11.T26c scopes it: unregistered is in the
 /// *post*-flag-day fail-closed set, so the fence-less pre-flag-day route stays open in the
-/// window between a worker answering its port and processing its own registration response.
+/// window between a worker answering its port and announcing itself to a controller.
 #[tokio::test]
 async fn an_unregistered_generation_refuses_the_fenced_protocol_and_keeps_the_legacy_one() {
     let mut link = Link::to_unregistered_generation();
 
     let refused = link
         .deliver(fenced_start(ATTEMPT, ISSUED_UNDER))
-        .expect_err("a fenced directive cannot legitimately precede registration");
+        .expect_err("a fenced directive cannot precede the registration request");
     assert_eq!(refused.code(), Code::FailedPrecondition);
     assert_eq!(
         refused.message(),
-        "Worker generation has not completed registration"
+        "Worker generation has not begun registration"
     );
     assert_eq!(link.acknowledged(), 0);
 

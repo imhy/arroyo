@@ -13,8 +13,8 @@
 //! this must not disturb lives.
 
 use super::tests::{
-    AMBIGUOUS, GENERATION, WORKER, acknowledged, applied, call, fence_only, fenced_start,
-    generation, register, registered, strict, unfenced,
+    AMBIGUOUS, GENERATION, WORKER, acknowledged, announced, applied, apply_registration_response,
+    call, fence_only, fenced_start, generation, register, registered, strict, unfenced,
 };
 use crate::{EngineState, WorkerExecutionPhase, WorkerServer};
 use arroyo_rpc::ControlMessage;
@@ -178,7 +178,7 @@ async fn a_legacy_commit_is_published_exactly_as_it_was_before_the_fence_existed
     assert!(!strict(&server), "and activates nothing");
 }
 
-/// A worker that has not registered still publishes a fence-less commit.
+/// A worker that has announced itself to nobody still publishes a fence-less commit.
 ///
 /// The same pre-flag-day rule the start path keeps: registration gates the *fenced* protocol,
 /// and refusing the legacy shape here would turn a compatible increment into a live change on
@@ -222,6 +222,31 @@ async fn a_fenced_commit_before_registration_is_refused() {
     let refused = commit(&server, fenced_commit(4, 5)).await.unwrap_err();
     assert_eq!(refused.code(), Code::FailedPrecondition);
     assert_eq!(drain(&mut rx), vec![]);
+}
+
+/// A fenced commit is admitted while this generation's registration answer is still in flight.
+///
+/// The commit half of `the_registration_request_opens_the_fenced_protocol_before_its_answer_arrives`.
+/// Both directives ask `addressed_to_this_generation` the same question, so the window the
+/// announcement closes is closed for both or for neither — and a commit refused in it would be a
+/// two-phase commit the job cannot finish, not merely a scheduling attempt lost.
+#[tokio::test]
+async fn a_fenced_commit_is_admitted_while_the_registration_answer_is_in_flight() {
+    let (shutdown, server, proof) = announced();
+    let mut rx = running(&shutdown, &server);
+
+    assert!(commit(&server, fenced_commit(4, 5)).await.is_ok());
+    assert_eq!(
+        drain(&mut rx),
+        vec![published(4)],
+        "the commit reaches the operators"
+    );
+
+    apply_registration_response(&server, proof, true);
+    assert!(
+        strict(&server),
+        "and the answer that arrives afterwards is applied to the same generation"
+    );
 }
 
 /// A commit addressed to another worker generation is refused, and the generation is the
@@ -452,7 +477,7 @@ async fn every_commit_refusal_this_worker_gives_is_definitive() {
         let (shutdown, server) = generation(WORKER, GENERATION);
         let _rx = running(&shutdown, &server);
         codes.push((
-            "a fenced commit before registration",
+            "a fenced commit before registration begins",
             commit(&server, fenced_commit(4, 5))
                 .await
                 .unwrap_err()
@@ -527,7 +552,7 @@ async fn every_commit_refusal_this_worker_gives_is_definitive() {
         codes,
         vec![
             (
-                "a fenced commit before registration",
+                "a fenced commit before registration begins",
                 Code::FailedPrecondition
             ),
             ("fence-less under strict mode", Code::FailedPrecondition),
@@ -620,7 +645,8 @@ fn the_authority_a_start_confers_is_the_address_it_was_admitted_under() {
     let nz = |v: u64| NonZeroU64::new(v).unwrap();
     let conferred = |req| {
         let mut lifecycle = WorkerLifecycle::idle(WORKER, GENERATION);
-        lifecycle.registered(false);
+        let announced = lifecycle.announce();
+        lifecycle.registered(announced, false);
         match lifecycle.admit_start(&req).expect("admitted") {
             StartAdmission::Apply(applied) => {
                 let mut seen = None;
