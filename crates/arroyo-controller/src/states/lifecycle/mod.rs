@@ -169,6 +169,16 @@ impl JobLifecycle {
         }
     }
 
+    /// The mechanism this job runs under.
+    ///
+    /// One derivation from the variant, so a caller outside a [`JobContext`] — the state-machine
+    /// boundary, which has no context yet — reads the same fact
+    /// [`JobContext::lifecycle_mode`](crate::states::JobContext::lifecycle_mode) reads rather
+    /// than a second copy of `LifecycleMode::SELECTED`.
+    pub(crate) fn mode(&self) -> LifecycleMode {
+        LifecycleMode::of_job(matches!(self, JobLifecycle::FencedV2 { .. }))
+    }
+
     /// The job's intent slot, or `None` when the configuration poll is itself the decider.
     ///
     /// `Some` is the whole test the configuration-update thread makes: it either has

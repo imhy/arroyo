@@ -233,6 +233,18 @@ impl StartTargets {
         }
     }
 
+    /// Every worker this fan-out will address, before any of them is addressed.
+    ///
+    /// Read by the fan-out to mint and record its identifiers up front: M11.D39d's obligation has
+    /// to name every target *before* the first request is polled, so the set has to be readable
+    /// without consuming the targets (PR #167 round 2).
+    pub(crate) fn worker_ids(&self) -> Vec<WorkerId> {
+        match &self.0 {
+            Addressed::Unfenced(connects) => connects.keys().copied().collect(),
+            Addressed::Fenced(_, targets) => targets.keys().copied().collect(),
+        }
+    }
+
     /// Every acknowledgement this handshake observed, each carrying the height its generation
     /// reported.
     ///

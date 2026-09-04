@@ -307,6 +307,26 @@ impl Link {
         register(&self.server, strict);
     }
 
+    /// Delivers the `FENCE_ONLY` handshake that authorises a start at `fence`, addressed to the
+    /// generation currently at this link's receiving end.
+    ///
+    /// A start is only ever issued out of an `AcknowledgedTarget`, so every row that delivers one
+    /// performs this first — including the ones whose whole point is that the start is *late*,
+    /// because being late is not the same as never having been authorised.
+    pub(super) fn handshake_receiver(&mut self, fence: u64) {
+        let directive = super::tests::addressed_fence_only(fence, self.worker_id, self.generation);
+        self.deliver(directive)
+            .expect("the handshake this generation needs before a start can be addressed to it");
+    }
+
+    /// A link to a [`WORKER`]/[`GENERATION`] generation that has registered and acknowledged
+    /// `fence` — the state a controller's own workers are in when it addresses them.
+    pub(super) fn handshaken_at(fence: u64) -> Self {
+        let mut link = Self::to_registered_generation(false);
+        link.handshake_receiver(fence);
+        link
+    }
+
     /// The highest fence this generation has acknowledged.
     pub(super) fn acknowledged(&self) -> u64 {
         read(&self.server, WorkerLifecycle::acknowledged_fence)

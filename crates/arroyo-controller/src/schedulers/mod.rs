@@ -13,7 +13,7 @@ use arroyo_types::{
 use futures::future::join_all;
 use lazy_static::lazy_static;
 use prometheus::{Gauge, register_gauge};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env::current_exe;
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -67,8 +67,8 @@ pub trait Scheduler: Send + Sync {
         generation: Option<u64>,
     ) -> anyhow::Result<Vec<WorkerId>>;
 
-    /// Whether [`Self::workers_for_job`] is authoritative about a specific worker generation
-    /// having **terminated** (M11.T26f, design M11.D39e(v)).
+    /// What this scheduler can say about one worker generation's live workers (M11.T26f,
+    /// design M11.D39e(v)).
     ///
     /// M11.D39e(v) allows exactly three facts to settle an issued `StartExecution`, and one of
     /// them is *observed target worker-generation termination*. The controller observes it here:
@@ -79,26 +79,56 @@ pub trait Scheduler: Send + Sync {
     /// *"they are gone"* would settle every target of every job the moment it was asked, which
     /// is precisely the false settlement the whole fence exists to prevent.
     ///
+    /// # Why the answer is per generation, and why the listing comes back inside it
+    ///
+    /// A process-local registry knows about the generations *this* scheduler value started and
+    /// nothing else. A process worker outlives the controller that spawned it — `kill_on_drop` is
+    /// opt-in, a `SIGKILL`ed controller never runs it, and orphaned workers are the thing
+    /// recovery exists for — and a node worker outlives it by construction. So a fresh
+    /// controller's empty registry means *"I do not know"* for every generation it did not
+    /// launch, and reading it as *"they are gone"* settles the exact target that is still able to
+    /// apply a delayed request. Asking "is this scheduler authoritative?" and "what does it list?"
+    /// as two questions is what allowed those two answers to come from different states of the
+    /// world; one value cannot (PR #167 round 2).
+    ///
     /// It has no default. A scheduler added later must say which of the two it is, because the
     /// safe answer is not the convenient one and an omission would inherit whichever was written
     /// here.
-    fn generation_termination_reporting(&self) -> GenerationTerminationReporting;
+    ///
+    /// # Errors
+    ///
+    /// Whatever the underlying listing failed with. Not knowing is never [`Untracked`]: an
+    /// `Untracked` answer is a statement about the scheduler, and an error is a statement about
+    /// this attempt to ask it.
+    ///
+    /// [`Untracked`]: GenerationObservation::Untracked
+    async fn observe_generation(
+        &self,
+        job_id: &str,
+        generation: u64,
+    ) -> anyhow::Result<GenerationObservation>;
 
     async fn shutdown(&self) {}
 }
 
-/// What a scheduler's live-worker listing says about termination.
+/// What a scheduler can say about one job generation's live workers.
 ///
-/// A value rather than a `bool` so that the negative arm carries what an operator needs: which
-/// scheduler could not answer, and why it cannot. A job that will not leave `Fencing` because
-/// its deployment's scheduler does not track worker identities is a very different report from
-/// one held by a partitioned worker, and a flag could not tell them apart.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum GenerationTerminationReporting {
-    /// The scheduler owns the worker processes and lists the live ones by worker id, so a
-    /// target it does not list has terminated.
-    Authoritative,
-    /// The scheduler cannot say whether a particular worker generation has terminated.
+/// One value rather than an authority flag beside a separate listing, because they are one
+/// observation: "this scheduler can answer for that generation" and "here is what it answered"
+/// have to come from the same state of the world, and asking them separately is what let a
+/// listing taken from a registry the scheduler had never populated be read as evidence of
+/// termination (PR #167 round 2).
+///
+/// The negative arm carries what an operator needs — which scheduler could not answer, and why —
+/// because a job that will not leave `Fencing` because its deployment keeps no worker registry is
+/// a very different report from one held by a partitioned worker, and a flag could not tell them
+/// apart.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GenerationObservation {
+    /// First-hand evidence: these worker ids are live now, so a target of this generation that is
+    /// **not** among them has terminated.
+    Live(Vec<WorkerId>),
+    /// The scheduler cannot say whether this generation's workers are live.
     Untracked {
         /// The scheduler, for the log.
         scheduler: &'static str,
@@ -118,6 +148,14 @@ pub struct ProcessWorker {
 /// This Scheduler starts new processes to run the worker nodes
 pub struct ProcessScheduler {
     workers: Arc<Mutex<HashMap<WorkerId, ProcessWorker>>>,
+    /// The `(job, generation)` pairs **this** scheduler value started.
+    ///
+    /// Termination evidence is scoped to it because [`Self::workers`] is: a process worker
+    /// outlives the controller that spawned it — `kill_on_drop` is opt-in
+    /// (`process_scheduler.shutdown_with_controller`) and a `SIGKILL`ed controller never runs it
+    /// — so a controller that restarts has an empty registry and a live cluster. Absence from
+    /// this set is the difference between "that generation finished" and "I never saw it".
+    launched: Arc<Mutex<HashSet<(String, u64)>>>,
     worker_counter: AtomicU64,
 }
 
@@ -125,8 +163,18 @@ impl ProcessScheduler {
     pub fn new() -> Self {
         Self {
             workers: Arc::new(Mutex::new(HashMap::new())),
+            launched: Arc::new(Mutex::new(HashSet::new())),
             worker_counter: AtomicU64::new(100),
         }
+    }
+
+    /// Whether this scheduler value started `generation`'s workers, and so can read its own
+    /// registry as evidence about them.
+    pub(crate) async fn started_generation(&self, job_id: &str, generation: u64) -> bool {
+        self.launched
+            .lock()
+            .await
+            .contains(&(job_id.to_string(), generation))
     }
 }
 
@@ -157,6 +205,16 @@ impl Scheduler for ProcessScheduler {
         &self,
         start_pipeline_req: StartPipelineReq,
     ) -> Result<(), SchedulerError> {
+        // Recorded before anything is spawned, and never removed: what it says is "this
+        // controller is the one that started that generation", which stays true after its workers
+        // exit and is what makes this scheduler's own registry readable as evidence about them.
+        // A generation this controller never attempted has no workers it could be wrong about;
+        // one it attempted and failed to spawn has none either, and the registry says so.
+        self.launched.lock().await.insert((
+            (*start_pipeline_req.job_id).clone(),
+            start_pipeline_req.generation,
+        ));
+
         let workers = (start_pipeline_req.slots as f32
             / config().process_scheduler.slots_per_process as f32)
             .ceil() as usize;
@@ -320,10 +378,28 @@ impl Scheduler for ProcessScheduler {
             .collect())
     }
 
-    /// Authoritative: this scheduler owns the worker *processes*, keys them by [`WorkerId`], and
-    /// removes an entry when its process is finished.
-    fn generation_termination_reporting(&self) -> GenerationTerminationReporting {
-        GenerationTerminationReporting::Authoritative
+    /// First-hand for the generations this value started, and nothing else.
+    ///
+    /// Inside one controller incarnation the registry is exact: this scheduler owns the worker
+    /// *processes*, keys them by [`WorkerId`], and removes an entry when its process is finished.
+    /// Across a restart it is empty while the cluster is not, which is why the answer is gated on
+    /// [`ProcessScheduler::started_generation`] rather than given for the type.
+    async fn observe_generation(
+        &self,
+        job_id: &str,
+        generation: u64,
+    ) -> anyhow::Result<GenerationObservation> {
+        if !self.started_generation(job_id, generation).await {
+            return Ok(GenerationObservation::Untracked {
+                scheduler: "process",
+                why: "this controller did not start that worker generation, and a process worker \
+                      outlives the controller that did, so an empty registry is not evidence that \
+                      the generation has terminated",
+            });
+        }
+        Ok(GenerationObservation::Live(
+            self.workers_for_job(job_id, Some(generation)).await?,
+        ))
     }
 
     async fn stop_workers(
@@ -510,14 +586,19 @@ impl Scheduler for ManualScheduler {
         Ok(vec![])
     }
 
-    /// Untracked. This scheduler's workers are started by a person in another terminal and it
-    /// keeps no registry of them at all, so its empty listing is not a statement about anything.
-    fn generation_termination_reporting(&self) -> GenerationTerminationReporting {
-        GenerationTerminationReporting::Untracked {
+    /// Untracked, for every generation. This scheduler's workers are started by a person in
+    /// another terminal and it keeps no registry of them at all, so its empty listing is not a
+    /// statement about anything.
+    async fn observe_generation(
+        &self,
+        _job_id: &str,
+        _generation: u64,
+    ) -> anyhow::Result<GenerationObservation> {
+        Ok(GenerationObservation::Untracked {
             scheduler: "manual",
             why: "its workers are started by an operator and it keeps no registry of them, so \
                   an empty listing says nothing about whether a generation has terminated",
-        }
+        })
     }
 
     async fn stop_workers(
@@ -600,6 +681,13 @@ struct NodeWorker {
 pub struct NodeSchedulerState {
     nodes: HashMap<MachineId, NodeStatus>,
     workers: HashMap<WorkerId, NodeWorker>,
+    /// The `(job, generation)` pairs **this** scheduler value scheduled onto nodes.
+    ///
+    /// A node worker outlives the controller that placed it by construction — it runs on another
+    /// machine — and a restarted controller's [`Self::workers`] is empty because nodes re-register
+    /// themselves and not the workers they are already running. So absence from this set is the
+    /// difference between "that generation finished" and "I never placed it".
+    launched: HashSet<(String, u64)>,
 }
 
 impl NodeSchedulerState {
@@ -799,10 +887,37 @@ impl Scheduler for NodeScheduler {
         }
     }
 
-    /// Authoritative: the node scheduler keys its live workers by [`WorkerId`] and removes one
-    /// when its node reports the worker finished.
-    fn generation_termination_reporting(&self) -> GenerationTerminationReporting {
-        GenerationTerminationReporting::Authoritative
+    /// First-hand for the generations this value placed, and nothing else.
+    ///
+    /// Two things separate this listing from [`Self::workers_for_job`], and both are the same
+    /// mistake read from different ends. The generation gate is the controller-restart half: a
+    /// fresh controller's registry is empty while the nodes are still running the cluster. The
+    /// `running` flag is the partition half: `stop_worker` sets it false when it *could not reach*
+    /// a worker, which is the opposite of evidence that the worker is gone — it names precisely
+    /// the worker that may still apply a delayed request — so this listing ignores it and only a
+    /// `worker_finished` report, which removes the entry outright, settles anything.
+    async fn observe_generation(
+        &self,
+        job_id: &str,
+        generation: u64,
+    ) -> anyhow::Result<GenerationObservation> {
+        let state = self.state.lock().await;
+        if !state.launched.contains(&(job_id.to_string(), generation)) {
+            return Ok(GenerationObservation::Untracked {
+                scheduler: "node",
+                why: "this controller did not place that worker generation on any node, and a \
+                      node worker outlives the controller that did, so an empty registry is not \
+                      evidence that the generation has terminated",
+            });
+        }
+        Ok(GenerationObservation::Live(
+            state
+                .workers
+                .iter()
+                .filter(|(_, w)| *w.job_id == job_id && w.generation == generation)
+                .map(|(id, _)| *id)
+                .collect(),
+        ))
     }
 
     async fn workers_for_job(
@@ -830,6 +945,15 @@ impl Scheduler for NodeScheduler {
     ) -> Result<(), SchedulerError> {
         // TODO: make this locking more fine-grained
         let mut state = self.state.lock().await;
+
+        // Recorded before any placement, and never removed: it says this controller is the one
+        // that placed that generation, which stays true after its workers exit and is what makes
+        // this registry readable as evidence about them. A generation this controller never
+        // attempted has no workers here it could be wrong about.
+        state.launched.insert((
+            (*start_pipeline_req.job_id).clone(),
+            start_pipeline_req.generation,
+        ));
 
         state.expire_nodes(Instant::now() - Duration::from_secs(30));
 
@@ -937,7 +1061,6 @@ impl Scheduler for NodeScheduler {
                     running: true,
                 },
             );
-
             slots_assigned.push((node.id, WorkerId(res.worker_id), slots_for_this_one));
 
             to_schedule -= slots_for_this_one;

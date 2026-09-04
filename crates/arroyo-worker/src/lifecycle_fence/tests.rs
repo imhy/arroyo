@@ -52,6 +52,29 @@ pub(super) fn registered(requires_lifecycle_fence: bool) -> (Shutdown, WorkerSer
     (shutdown, server)
 }
 
+/// A [`WORKER`]/[`GENERATION`] worker that has registered and acknowledged `fence`.
+///
+/// The state every fenced start production sends arrives at, and the reason a fixture cannot
+/// skip it: `arroyo-controller` cannot build a fenced start without an `AcknowledgedTarget`, and
+/// the only way to obtain one is the `FENCE_ONLY` handshake this performs. A generation that has
+/// acknowledged nothing authorises nothing — see
+/// `guard_tests::a_start_is_admitted_only_under_a_fence_this_generation_acknowledged`.
+pub(super) fn handshaken(fence: u64) -> (Shutdown, WorkerServer) {
+    let (shutdown, server) = registered(true);
+    acknowledge(&server, fence);
+    (shutdown, server)
+}
+
+/// Delivers the `FENCE_ONLY` directive the controller's handshake sends, through the production
+/// handler, and asserts the acknowledgement it must answer with.
+pub(super) fn acknowledge(server: &WorkerServer, fence: u64) {
+    assert_eq!(
+        call(server, fence_only(fence)).expect("a fence-only directive is acknowledged"),
+        settlement(fence, StartExecutionOutcome::FenceAcknowledged),
+        "the handshake this generation needs before any start can be addressed to it"
+    );
+}
+
 /// A [`WORKER`]/[`GENERATION`] worker whose registration request has gone out and whose answer
 /// has not come back.
 ///
@@ -176,10 +199,20 @@ pub(super) fn addressed_start(
 
 /// A fence advancement addressed to this worker generation, applying no program.
 pub(super) fn fence_only(fence: u64) -> StartExecutionReq {
+    addressed_fence_only(fence, WORKER, GENERATION)
+}
+
+/// A fence-only directive under `fence`, addressed to worker `to_worker` generation
+/// `to_generation`.
+pub(super) fn addressed_fence_only(
+    fence: u64,
+    to_worker: u64,
+    to_generation: u64,
+) -> StartExecutionReq {
     StartExecutionReq {
         lifecycle_fence: fence,
-        target_worker_id: WORKER,
-        target_worker_generation: GENERATION,
+        target_worker_id: to_worker,
+        target_worker_generation: to_generation,
         lifecycle_operation: LifecycleOperation::FenceOnly as i32,
         ..Default::default()
     }
@@ -221,8 +254,10 @@ pub(super) fn settlement(fence: u64, outcome: StartExecutionOutcome) -> StartExe
 /// guard applies nothing at all rather than landing in a gap between the two.
 #[tokio::test]
 async fn fence_ack_serializes_with_start_application() {
-    // Order A — the start linearizes first, and is reported applied.
-    let (_shutdown, server) = registered(false);
+    // Order A — the start linearizes first, and is reported applied. Its own controller's
+    // handshake at fence 5 precedes it, because that is what authorises a start at all; the
+    // acknowledgement it races is the *replacement* controller's, at fence 9.
+    let (_shutdown, server) = handshaken(5);
     assert_eq!(
         call(&server, fenced_start("attempt_a", 5)).unwrap(),
         settlement(5, StartExecutionOutcome::Applied)
@@ -302,7 +337,9 @@ async fn worker_generation_mismatch_rejects_delayed_start() {
         (WORKER + 1, GENERATION, false),
         (WORKER + 1, GENERATION - 1, false),
     ] {
-        let (_shutdown, server) = registered(false);
+        // Handshaken at the fence every row's directive names, and addressed to *this*
+        // generation, so the only thing that varies below is the address the start carries.
+        let (_shutdown, server) = handshaken(5);
         let req = addressed_start("attempt_1", 5, to_worker, to_generation);
         match (call(&server, req), admits) {
             (Ok(response), true) => {
@@ -313,7 +350,12 @@ async fn worker_generation_mismatch_rejects_delayed_start() {
             }
             (Err(status), false) => {
                 assert_eq!(status.code(), Code::FailedPrecondition);
-                assert_eq!(acknowledged(&server), 0);
+                assert_eq!(
+                    acknowledged(&server),
+                    5,
+                    "the misaddressed directive moved nothing: the fence is the one the \
+                     handshake left"
+                );
                 assert_eq!(applied(&server), None);
                 assert_eq!(tracked(&server), 0);
                 assert!(idle(&server));
@@ -353,7 +395,7 @@ async fn worker_generation_mismatch_rejects_delayed_start() {
 /// the identifier, and this proves it still can.
 #[tokio::test]
 async fn aborted_is_definitive_no_apply() {
-    let (_shutdown, server) = registered(true);
+    let (_shutdown, server) = handshaken(5);
     let request = fenced_start("attempt_1", 5);
 
     let busy = {
@@ -363,8 +405,9 @@ async fn aborted_is_definitive_no_apply() {
     assert_eq!(busy.code(), Code::Aborted);
     assert!(!AMBIGUOUS.contains(&busy.code()));
 
-    // Nothing applied: no fence advanced, no identifier recorded, no phase moved.
-    assert_eq!(acknowledged(&server), 0);
+    // Nothing applied: the fence is still the one the handshake left, no identifier was
+    // recorded, no phase moved.
+    assert_eq!(acknowledged(&server), 5);
     assert_eq!(applied(&server), None);
     assert_eq!(
         disposition(&server, "attempt_1"),

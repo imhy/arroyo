@@ -278,6 +278,12 @@
           "name": "fence_duel_installs_exactly_one_authoritative_root",
           "kind": "test",
           "path": "crates/arroyo-controller/src/states/lifecycle/fence_tests.rs"
+        },
+        {
+          "crate": "arroyo-controller",
+          "name": "two_cold_controllers_recovering_a_running_leader_job_do_not_both_administer_it",
+          "kind": "test",
+          "path": "crates/arroyo-controller/src/states/lifecycle/fence_tests.rs"
         }
       ]
     },
@@ -310,6 +316,30 @@
           "name": "replacement_cannot_publish_before_worker_fence_settlement",
           "kind": "test",
           "path": "crates/arroyo-controller/src/states/lifecycle/recovery_tests.rs"
+        },
+        {
+          "crate": "arroyo-controller",
+          "name": "a_state_task_killed_mid_fan_out_leaves_its_obligation_in_the_row",
+          "kind": "test",
+          "path": "crates/arroyo-controller/src/states/mod.rs"
+        },
+        {
+          "crate": "arroyo-controller",
+          "name": "every_scheduler_says_what_it_can_observe_about_a_generation_it_never_started",
+          "kind": "test",
+          "path": "crates/arroyo-controller/src/schedulers/reporting_tests.rs"
+        },
+        {
+          "crate": "arroyo-controller",
+          "name": "a_recreated_controller_reads_nothing_into_its_empty_registry",
+          "kind": "test",
+          "path": "crates/arroyo-controller/src/schedulers/reporting_tests.rs"
+        },
+        {
+          "crate": "arroyo-controller",
+          "name": "a_node_worker_the_controller_could_not_reach_is_not_reported_terminated",
+          "kind": "test",
+          "path": "crates/arroyo-controller/src/schedulers/reporting_tests.rs"
         }
       ]
     },
@@ -324,6 +354,12 @@
         {
           "crate": "arroyo-worker",
           "name": "delayed_start_after_refusal_rejected_by_acknowledged_fence",
+          "kind": "test",
+          "path": "crates/arroyo-worker/src/lifecycle_fence/faults_tests.rs"
+        },
+        {
+          "crate": "arroyo-worker",
+          "name": "a_restart_does_not_resurrect_the_start_a_refusal_superseded",
           "kind": "test",
           "path": "crates/arroyo-worker/src/lifecycle_fence/faults_tests.rs"
         }

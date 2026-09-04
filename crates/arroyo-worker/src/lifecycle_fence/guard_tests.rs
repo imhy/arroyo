@@ -7,10 +7,10 @@
 //! [`super::tests`].
 
 use super::tests::{
-    AMBIGUOUS, GENERATION, WORKER, acknowledged, addressed_start, announced, applied,
+    AMBIGUOUS, GENERATION, WORKER, acknowledge, acknowledged, addressed_start, announced, applied,
     apply_registration_response, call, disposition, fence_only, fenced_start, generation,
-    has_announced, idle, initializing, register, registered, revoke, revoke_owned, settlement,
-    strict, tracked, unfenced,
+    handshaken, has_announced, idle, initializing, register, registered, revoke, revoke_owned,
+    settlement, strict, tracked, unfenced,
 };
 use crate::lifecycle_fence::attempt_ids::{AttemptDisposition, MAX_TRACKED_ATTEMPT_IDS};
 use arroyo_rpc::fencing::{MAX_ATTEMPT_ID_CHARS, MAX_FENCE_TARGETS};
@@ -37,6 +37,7 @@ async fn strict_mode_is_monotonic_for_a_worker_generation() {
     let fence_less = call(&server, unfenced("attempt_1")).unwrap_err();
     assert_eq!(fence_less.code(), Code::FailedPrecondition);
     assert!(idle(&server));
+    acknowledge(&server, 4);
     assert_eq!(
         call(&server, fenced_start("attempt_1", 4)).unwrap(),
         settlement(4, StartExecutionOutcome::Applied)
@@ -99,6 +100,10 @@ async fn registration_gates_the_fenced_protocol_and_not_the_legacy_route() {
 
         register(&server, false);
         assert!(has_announced(&server));
+        // The handshake a live controller always performs first. It is what a `FENCE_ONLY`
+        // directive *is*, so the row that sends one performs it twice and is answered twice; the
+        // start row cannot be admitted without it at all.
+        acknowledge(&server, 5);
         assert!(
             call(&server, request).is_ok(),
             "the identical fenced request is admitted once the generation has announced itself"
@@ -136,15 +141,21 @@ async fn registration_gates_the_fenced_protocol_and_not_the_legacy_route() {
 /// it consumes the proof `announce` returns — and each fenced shape is put through both.
 #[tokio::test]
 async fn the_registration_request_opens_the_fenced_protocol_before_its_answer_arrives() {
-    for request in [
-        fenced_start("attempt_1", 5),
-        fence_only(5),
-        revoke(5, &["older_1"]),
+    for (needs_a_handshake, request) in [
+        (false, fence_only(5)),
+        (true, revoke(5, &["older_1"])),
+        (true, fenced_start("attempt_1", 5)),
     ] {
         // The state a real worker is in for the whole of its registration round trip: it has
         // asked to be registered and has been told nothing back.
         let (_shutdown, server, proof) = announced();
         assert!(!strict(&server));
+        // Nothing about the handshake needs the registration answer either, which is what the
+        // first row is: the rows below it are the directives that handshake authorises, so they
+        // are preceded by it exactly as a controller sends them.
+        if needs_a_handshake {
+            acknowledge(&server, 5);
+        }
 
         assert!(
             call(&server, request.clone()).is_ok(),
@@ -174,6 +185,53 @@ async fn the_registration_request_opens_the_fenced_protocol_before_its_answer_ar
     assert!(!AMBIGUOUS.contains(&refused.code()));
     assert_eq!(acknowledged(&server), 0);
     assert!(!strict(&server));
+}
+
+/// A start is admitted only under the fence this generation has itself acknowledged, and the two
+/// ways that can fail are told apart (M11.D39d, PR #167 round 2).
+///
+/// The requirement costs a live controller nothing: it cannot build a fenced start without an
+/// `AcknowledgedTarget`, so every start it sends is under a fence it has already heard this
+/// generation acknowledge. What it costs is the ability to forge one out of state this generation
+/// no longer holds — see
+/// `faults_tests::a_restart_does_not_resurrect_the_start_a_refusal_superseded`, which is why the
+/// rule exists.
+///
+/// Both refusals are worded for the operator who has to tell them apart: a generation that has
+/// acknowledged nothing at all is a fresh process, which is what a restart produces, and one
+/// holding a different fence is a controller sending a fence it never heard back.
+#[tokio::test]
+async fn a_start_is_admitted_only_under_a_fence_this_generation_acknowledged() {
+    let (_shutdown, server) = registered(true);
+    let unhandshaken = call(&server, fenced_start("attempt_1", 5)).unwrap_err();
+    assert_eq!(unhandshaken.code(), Code::FailedPrecondition);
+    assert_eq!(
+        unhandshaken.message(),
+        "this worker generation has acknowledged no lifecycle fence, so no handshake authorises \
+         a request under fence 5"
+    );
+    assert!(idle(&server) && acknowledged(&server) == 0);
+
+    // A *higher* fence, which the monotonicity check admits and this one does not. Nothing
+    // legitimate produces it: a controller at fence 6 handshakes before it starts, so a start at
+    // 6 reaching a generation holding 5 is one no handshake of this generation's authorises.
+    acknowledge(&server, 5);
+    let unheard = call(&server, fenced_start("attempt_1", 6)).unwrap_err();
+    assert_eq!(unheard.code(), Code::FailedPrecondition);
+    assert_eq!(
+        unheard.message(),
+        "lifecycle fence 6 is not fence 5, the one this worker generation acknowledged, so no \
+         handshake of that authority authorises this request"
+    );
+    assert!(!AMBIGUOUS.contains(&unheard.code()));
+    assert!(idle(&server) && acknowledged(&server) == 5);
+
+    // And the fence it did acknowledge applies, so what the rule refuses is the unauthorised
+    // start and not the worker.
+    assert_eq!(
+        call(&server, fenced_start("attempt_1", 5)).unwrap(),
+        settlement(5, StartExecutionOutcome::Applied)
+    );
 }
 
 /// The pre-flag-day compatibility guarantee: a fence-less start arriving before this generation
@@ -265,7 +323,10 @@ async fn duplicate_applied_and_revoked_identifiers_are_idempotent() {
     );
     assert_eq!(tracked(&server), 4);
 
-    // A retry delayed past a fence advance is still acknowledged, and still advances the fence.
+    // A retry re-offered under a *later* fence — after this generation has acknowledged that
+    // fence, which is the only way a start under it reaches here at all — is still acknowledged
+    // rather than replayed.
+    acknowledge(&server, 9);
     assert_eq!(
         call(&server, fenced_start("attempt_1", 9)).unwrap(),
         settlement(9, StartExecutionOutcome::Applied)
@@ -290,7 +351,7 @@ async fn duplicate_applied_and_revoked_identifiers_are_idempotent() {
 /// program and makes the named identifiers permanently non-applicable, and reports `APPLIED`.
 #[tokio::test]
 async fn a_start_may_carry_the_revocations_its_fence_supersedes() {
-    let (_shutdown, server) = registered(true);
+    let (_shutdown, server) = handshaken(5);
     let mut request = fenced_start("attempt_2", 5);
     request.revoked_execution_ids = vec!["attempt_1".to_string(), "attempt_0".to_string()];
 

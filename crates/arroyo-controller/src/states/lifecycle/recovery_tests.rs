@@ -35,9 +35,7 @@ use super::recovery::{
     Discharge, ObservedTermination, RecoveredObligation, RecoveryFailure,
     discharge_recorded_obligation, observe_terminations,
 };
-use crate::schedulers::{
-    GenerationTerminationReporting, Scheduler, SchedulerError, StartPipelineReq,
-};
+use crate::schedulers::{GenerationObservation, Scheduler, SchedulerError, StartPipelineReq};
 use crate::states::scheduling::fanout::Accounting;
 
 /// The scheduling generation the obligations below were addressed to.
@@ -205,13 +203,19 @@ impl Scheduler for TestScheduler {
             Lists::Untracked => Ok(vec![]),
         }
     }
-    fn generation_termination_reporting(&self) -> GenerationTerminationReporting {
+    async fn observe_generation(
+        &self,
+        job_id: &str,
+        generation: u64,
+    ) -> anyhow::Result<GenerationObservation> {
         match &self.0 {
-            Lists::Untracked => GenerationTerminationReporting::Untracked {
+            Lists::Untracked => Ok(GenerationObservation::Untracked {
                 scheduler: "test",
                 why: "this fixture answers the way a scheduler with no worker registry answers",
-            },
-            _ => GenerationTerminationReporting::Authoritative,
+            }),
+            _ => Ok(GenerationObservation::Live(
+                self.workers_for_job(job_id, Some(generation)).await?,
+            )),
         }
     }
 }

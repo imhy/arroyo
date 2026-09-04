@@ -309,17 +309,22 @@ async fn fan_out(
     attempts: Arc<AttemptLedger>,
 ) -> (Admission, anyhow::Result<HashMap<WorkerId, WorkerClient>>) {
     let ids = machine_ids(&connects.keys().copied().collect::<Vec<_>>());
+    // The landed rows are about the pre-flag-day fan-out, so they address their workers the way
+    // `LifecycleMode::LegacyT08` does: no fence, no addressed generation. The fenced shape has
+    // its own rows in `lifecycle::handshake_tests`.
+    let targets = StartTargets::without_a_handshake(FenceProtocol::Legacy, connects)
+        .expect("the legacy protocol needs no handshake");
+    // Minted and recorded before the fan-out, exactly as both production routes do it since
+    // PR #167 round 2: an identifier the fan-out minted for itself could not appear in a record
+    // written before its request existed.
+    let issued = super::IssuedFanOut::mint(targets, &attempts);
     super::start_execution_on_workers(
         admission,
         Arc::new("job_1".to_string()),
         PipelineId(Arc::new("pipeline_1".to_string())),
         plan(),
         ids,
-        // The landed rows are about the pre-flag-day fan-out, so they address their workers the
-        // way `LifecycleMode::LegacyT08` does: no fence, no addressed generation. The fenced
-        // shape has its own rows in `lifecycle::handshake_tests`.
-        StartTargets::without_a_handshake(FenceProtocol::Legacy, connects)
-            .expect("the legacy protocol needs no handshake"),
+        issued,
         attempts,
     )
     .await

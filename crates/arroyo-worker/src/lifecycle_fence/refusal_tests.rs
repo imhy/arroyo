@@ -8,8 +8,8 @@
 
 use super::tests::{
     AMBIGUOUS, GENERATION, WORKER, acknowledged, addressed_start, call, disposition, fence_only,
-    fenced_start, generation, idle, register, registered, revoke, revoke_owned, strict, tracked,
-    unfenced,
+    fenced_start, generation, handshaken, idle, register, registered, revoke, revoke_owned, strict,
+    tracked, unfenced,
 };
 use crate::lifecycle_fence::attempt_ids::AttemptDisposition;
 use crate::{EngineState, WorkerExecutionPhase};
@@ -136,7 +136,7 @@ async fn a_fence_a_target_and_an_operation_must_agree() {
     // The same rule against an identifier this generation has already applied: the whole
     // directive is refused, because the response cannot describe a partial revocation and
     // an applied attempt ends by observed teardown, not by revocation.
-    let (_shutdown, server) = registered(false);
+    let (_shutdown, server) = handshaken(5);
     call(&server, fenced_start("attempt_1", 5)).unwrap();
     let refused = call(&server, revoke(6, &["older_1", "attempt_1"])).unwrap_err();
     assert_eq!(refused.code(), Code::FailedPrecondition);
@@ -226,7 +226,7 @@ async fn every_refusal_this_worker_gives_is_definitive() {
         ));
     }
     {
-        let (_shutdown, server) = registered(true);
+        let (_shutdown, server) = handshaken(4);
         call(&server, fenced_start("attempt_1", 4)).unwrap();
         codes.push((
             "another execution already initializing",
@@ -247,7 +247,7 @@ async fn every_refusal_this_worker_gives_is_definitive() {
         ));
     }
     {
-        let (_shutdown, server) = registered(true);
+        let (_shutdown, server) = handshaken(4);
         call(&server, fenced_start("attempt_1", 4)).unwrap();
         codes.push((
             "revocation names the applied identifier",
@@ -301,6 +301,15 @@ async fn every_refusal_this_worker_gives_is_definitive() {
         ));
     }
 
+    {
+        let (_shutdown, server) = registered(true);
+        codes.push((
+            "a start under a fence no handshake of this generation's authorises",
+            call(&server, fenced_start("attempt_1", 5))
+                .unwrap_err()
+                .code(),
+        ));
+    }
     {
         // The poisoned-guard answer completes the enumeration. It is the one refusal that is not
         // about the request at all, and `Internal` keeps it out of the ambiguous table too.
@@ -358,6 +367,10 @@ async fn every_refusal_this_worker_gives_is_definitive() {
                 Code::InvalidArgument
             ),
             ("the identifier record is full", Code::ResourceExhausted),
+            (
+                "a start under a fence no handshake of this generation's authorises",
+                Code::FailedPrecondition
+            ),
             ("poisoned guard", Code::Internal),
         ]
     );
@@ -379,10 +392,14 @@ async fn every_response_the_guard_produces_decodes_as_one_settlement() {
     produced.push(call(&server, unfenced("attempt_0")).unwrap());
     produced.push(call(&server, unfenced("attempt_0")).unwrap());
 
+    // Each start is preceded by the handshake that authorises it, which is a producible
+    // response in its own right and so is collected too.
     let (_shutdown_b, server_b) = registered(true);
     produced.push(call(&server_b, fence_only(4)).unwrap());
     produced.push(call(&server_b, revoke(5, &["older_1"])).unwrap());
+    produced.push(call(&server_b, fence_only(6)).unwrap());
     produced.push(call(&server_b, fenced_start("attempt_1", 6)).unwrap());
+    produced.push(call(&server_b, fence_only(7)).unwrap());
     produced.push(call(&server_b, fenced_start("attempt_1", 7)).unwrap());
 
     let decoded: Vec<_> = produced
@@ -399,7 +416,9 @@ async fn every_response_the_guard_produces_decodes_as_one_settlement() {
             (None, StartExecutionOutcome::Applied),
             (Some(4), StartExecutionOutcome::FenceAcknowledged),
             (Some(5), StartExecutionOutcome::Revoked),
+            (Some(6), StartExecutionOutcome::FenceAcknowledged),
             (Some(6), StartExecutionOutcome::Applied),
+            (Some(7), StartExecutionOutcome::FenceAcknowledged),
             (Some(7), StartExecutionOutcome::Applied),
         ]
     );
@@ -424,7 +443,10 @@ async fn every_phase_that_cannot_admit_a_start_answers_definitively() {
         }
     }
 
-    let (shutdown, server) = registered(true);
+    // Handshaken at the fence the starts below carry, so each of them reaches the *phase*
+    // check. Without it every row would be refused one step earlier — for carrying a fence no
+    // handshake authorised — and this test would pass while asserting nothing about phases.
+    let (shutdown, server) = handshaken(5);
     for (label, phase) in [
         (
             "failed",
@@ -450,7 +472,16 @@ async fn every_phase_that_cannot_admit_a_start_answers_definitively() {
         let refused = call(&server, fenced_start("attempt_1", 5)).unwrap_err();
         assert_eq!(refused.code(), Code::FailedPrecondition, "{label}");
         assert!(!AMBIGUOUS.contains(&refused.code()), "{label}");
-        assert_eq!(acknowledged(&server), 0, "{label}");
+        assert_eq!(
+            refused.message(),
+            match label {
+                "failed" => "Worker is in failed state",
+                "running" => "Worker is already running",
+                _ => "Worker is waiting for leader",
+            },
+            "{label}: refused for its phase, and not one step earlier for its fence"
+        );
+        assert_eq!(acknowledged(&server), 5, "{label}");
         assert_eq!(tracked(&server), 0, "{label}");
     }
 }

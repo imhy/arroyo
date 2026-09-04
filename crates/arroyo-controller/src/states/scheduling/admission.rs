@@ -223,6 +223,114 @@ impl<'a, 'ctx> PhaseContext<'a, 'ctx> {
         }
     }
 
+    /// Makes this fan-out's obligation durable **before** the first request it names is polled
+    /// (M11.D39d, PR #167 round 2).
+    ///
+    /// # Why before, and why over-approximate
+    ///
+    /// The inventory the fan-out keeps is in-process. It is enough for an attempt that *ends* —
+    /// `Interrupted::persist_obligation` writes what that attempt still owed — and it is nothing
+    /// at all for an attempt that is never allowed to end: a cancelled state task runs no code
+    /// below its `await`, and a `SIGKILL`ed controller runs none anywhere. In both cases the row
+    /// would name no targets, the next controller would discharge nothing, admit a replacement
+    /// generation, and stop the old workers only best-effort — while a `StartExecution` this
+    /// attempt had already put on the wire was still able to arrive and be applied.
+    ///
+    /// So the record is written first, and it names **every** target and **every** identifier
+    /// this fan-out may use rather than the ones it has managed to send. Over-reporting costs a
+    /// later controller one fence advance per target it need not have made; under-reporting is a
+    /// worker nothing will ever fence, and the whole obligation exists to prevent exactly that.
+    /// It is the same asymmetry `AttemptLedger` is documented under, moved to where it survives
+    /// the process.
+    ///
+    /// The identifiers are minted by the caller, before this, for the same reason: an identifier
+    /// minted inside the request that carries it could not appear in a record written before that
+    /// request exists.
+    ///
+    /// # Errors
+    ///
+    /// Fail-closed and fatal-shaped: an obligation that cannot be described or cannot be written
+    /// is one no later controller could act on, so this attempt issues nothing rather than
+    /// issuing requests it could not record. A conditional write another controller's authority
+    /// refused stands the job down instead.
+    pub(super) async fn persist_issued_obligation(
+        &mut self,
+        a: &Admission,
+        issued: &IssuedAttempts,
+        targets: &[WorkerId],
+    ) -> Result<(), StateError> {
+        let generation = self.addressed_generation();
+        let addresses = self.target_addresses();
+        // No candidate: the metadata root is published by the preamble's last step, so by the
+        // time a fan-out exists this attempt has left none unrooted. An interruption below
+        // republishes through `Fencing`, which reads the candidate it actually holds.
+        let described = crate::states::lifecycle::fence::obligation::describe(
+            generation,
+            &FenceTargets::for_workers(targets.iter().copied()),
+            issued,
+            &addresses,
+            None,
+            crate::states::lifecycle::fence::metrics::now_millis(),
+        );
+        let obligation = match described {
+            Ok(Some(obligation)) => obligation,
+            // Nothing to owe: a fan-out addressing no worker can leave no request in flight.
+            Ok(None) => return Ok(()),
+            Err(refusal) => {
+                return Err(fatal(
+                    "this attempt's fan-out obligation cannot be recorded durably, so it issues                      nothing",
+                    anyhow!("{refusal}"),
+                ));
+            }
+        };
+        self.ctx.status.record_fencing_obligation(Some(obligation));
+        match a
+            .effect(
+                "record the fan-out's obligation before issuing it",
+                self.ctx.publish_status(),
+            )
+            .await
+        {
+            Ok(StatusPublication::Published) => Ok(()),
+            Ok(StatusPublication::Superseded(stale)) => Err(self.stand_down_from(stale)),
+            Err(e) => Err(fatal(
+                "this attempt's fan-out obligation could not be written, so it issues nothing",
+                anyhow!("{e}"),
+            )),
+        }
+    }
+
+    /// Clears the obligation this fan-out recorded, once nothing it issued is unsettled.
+    ///
+    /// The other half of [`Self::persist_issued_obligation`]: the record is an image of what is
+    /// outstanding, so leaving it behind after every request has an authoritative answer would
+    /// hand the next controller a fence advance it does not owe and hold the job's fencing alert
+    /// up for a job that is running. It is cleared only when the inventory says so, and a failed
+    /// clear is left for the next writer rather than reported — the obligation it describes is
+    /// discharged, so a stale record costs a redundant advance and never a missed one.
+    pub(super) async fn clear_settled_obligation(&mut self, a: &Admission) {
+        if self.ctx.status.recorded_fencing().is_none() {
+            return;
+        }
+        self.ctx.status.record_fencing_obligation(None);
+        match a
+            .effect(
+                "clear the fan-out's discharged obligation",
+                self.ctx.publish_status(),
+            )
+            .await
+        {
+            Ok(StatusPublication::Published) => {}
+            Ok(StatusPublication::Superseded(stale)) => stand_down(stale),
+            Err(e) => warn!(
+                error = %e,
+                "this attempt's discharged fan-out obligation could not be cleared from the \
+                 job's row; a later controller will advance its fence at targets that have \
+                 nothing outstanding, which costs a round trip and settles nothing wrongly"
+            ),
+        }
+    }
+
     /// Persists the scheduling generation this attempt raises the job to.
     ///
     /// # Errors

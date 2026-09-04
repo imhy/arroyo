@@ -247,6 +247,126 @@ async fn adoption_raises_the_fence_by_one_and_installs_a_fresh_epoch() {
     }
 }
 
+/// A scheduler that starts nothing and can vouch for nothing.
+///
+/// The cold-start rows below never reach a worker: what they are about is which of two
+/// controllers may begin administering the job at all, which is decided before any worker is
+/// addressed. `Untracked` is the honest answer for a value that has launched nothing, and it is
+/// the same answer a real `ProcessScheduler` gives about a generation it did not start.
+struct NoScheduler;
+
+#[async_trait::async_trait]
+impl crate::schedulers::Scheduler for NoScheduler {
+    async fn start_workers(
+        &self,
+        _: crate::schedulers::StartPipelineReq,
+    ) -> Result<(), crate::schedulers::SchedulerError> {
+        Ok(())
+    }
+    async fn register_node(&self, _: arroyo_rpc::grpc::rpc::RegisterNodeReq) {}
+    async fn heartbeat_node(
+        &self,
+        _: arroyo_rpc::grpc::rpc::HeartbeatNodeReq,
+    ) -> Result<(), tonic::Status> {
+        Ok(())
+    }
+    async fn worker_finished(&self, _: arroyo_rpc::grpc::rpc::WorkerFinishedReq) {}
+    async fn stop_workers(&self, _: &str, _: Option<u64>, _: bool) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn workers_for_job(&self, _: &str, _: Option<u64>) -> anyhow::Result<Vec<WorkerId>> {
+        Ok(vec![])
+    }
+    async fn observe_generation(
+        &self,
+        _: &str,
+        _: u64,
+    ) -> anyhow::Result<crate::schedulers::GenerationObservation> {
+        Ok(crate::schedulers::GenerationObservation::Untracked {
+            scheduler: "none",
+            why: "this fixture starts no workers, so it can vouch for none",
+        })
+    }
+}
+
+/// A controller that has just read `database` and is about to administer the job it found.
+async fn cold_controller(
+    database: &DatabaseSource,
+    shutdown: &arroyo_server_common::shutdown::Shutdown,
+) -> crate::states::StateMachine {
+    let (polled, status) = polled(database).await;
+    crate::states::StateMachine::new(
+        polled,
+        status,
+        database.clone(),
+        Arc::new(NoScheduler),
+        Arc::new("cluster".to_string()),
+        shutdown.guard("state-machine"),
+        Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+    )
+    .await
+}
+
+/// **PR #167 round 2.** Two cold controllers recovering the same running worker-leader job: one
+/// administers it, the other stands down.
+///
+/// A job recovered as `Running` in worker-leader mode goes straight to `LeaderRunning` and runs
+/// none of `Scheduling`'s preamble, so it is the one path whose authority is not won by the
+/// preamble's cold adoption. Reading the row is not winning it: `publish_status` is conditional
+/// on the (fence, epoch) the row carries, and two controllers that read the same row present the
+/// same pair, so **both** their publications match and both would reconnect to the leader and
+/// publish about the job. The duel below is therefore over `adopt_before_administering`, which
+/// is what that path now performs first.
+///
+/// The loser's answer is a value it must act on, not a log line: `false` starts no state task,
+/// so nothing further is published about a job this controller does not hold. The row afterwards
+/// carries exactly one adoption rather than a merge of two.
+#[tokio::test]
+async fn two_cold_controllers_recovering_a_running_leader_job_do_not_both_administer_it() {
+    let (database, connection) = migrated_job();
+    let shutdown = arroyo_server_common::shutdown::Shutdown::new(
+        "cold-leader-duel",
+        arroyo_server_common::shutdown::SignalBehavior::None,
+    );
+
+    let winner = cold_controller(&database, &shutdown).await;
+    let loser = cold_controller(&database, &shutdown).await;
+    // Read after both controllers exist, so the duel below is between two controllers holding
+    // one authority — which is what a restart produces and what the row cannot tell apart.
+    let mut winner_status = cold_status(&database).await;
+    let mut loser_status = cold_status(&database).await;
+    assert_eq!(
+        winner_status.authority(),
+        loser_status.authority(),
+        "both controllers must start from the same read, or this proves nothing"
+    );
+    let (fence_before, _) = stored_authority(&connection);
+    let held_before = loser_status.authority().clone();
+
+    assert!(
+        winner.adopt_before_administering(&mut winner_status).await,
+        "the controller that adopts the row administers the job"
+    );
+    assert!(
+        !loser.adopt_before_administering(&mut loser_status).await,
+        "and the one that did not must not: it starts no state task and publishes nothing \
+         further about a job another controller holds"
+    );
+
+    let (fence, epoch) = stored_authority(&connection);
+    assert_eq!(
+        fence,
+        fence_before + 1,
+        "exactly one of the two adoptions reached the row"
+    );
+    assert_eq!(epoch, winner_status.authority().epoch());
+    assert_eq!(
+        loser_status.authority(),
+        &held_before,
+        "and the loser holds the authority it read, never the one it would have installed"
+    );
+}
+
 /// The fence duel, at its smallest: two controllers read the same row, and exactly one of them
 /// adopts it. The loser is told so as a value it must handle, and the row it lost still carries
 /// the winner's authority rather than a merge of the two.
@@ -769,26 +889,45 @@ fn the_production_status_write_is_conditional_since_the_activation_change() {
     // how. `states/mod.rs` publishes twice: once at the state-machine boundary after every
     // transition, and once when a recovered job's state machine writes the state it came back
     // into — before its task, and therefore before any `JobContext`, exists.
-    const PUBLISHING: [(&str, &str, usize); 5] = [
-        ("states/mod.rs", include_str!("../mod.rs"), 2),
-        ("states/scheduling.rs", include_str!("../scheduling.rs"), 1),
-        ("states/running.rs", include_str!("../running.rs"), 1),
+    // (file, source, status publications, stand-down call sites).
+    //
+    // The last two are counted separately because a status publication is not the only way a
+    // controller learns it has lost a job. `states/mod.rs` has two more since PR #167 round 2:
+    // the cold worker-leader recovery path adopts for itself and discharges the obligation the
+    // row carries, and each of those has its own superseded outcome to answer. Counting them
+    // against a stated number rather than against the publications is what keeps the equality
+    // from being satisfied by a file that answers neither.
+    const PUBLISHING: [(&str, &str, usize, usize); 5] = [
+        ("states/mod.rs", include_str!("../mod.rs"), 2, 4),
+        (
+            "states/scheduling.rs",
+            include_str!("../scheduling.rs"),
+            1,
+            1,
+        ),
+        ("states/running.rs", include_str!("../running.rs"), 1, 1),
         (
             "states/leader_running.rs",
             include_str!("../leader_running.rs"),
             1,
+            1,
         ),
         (
+            // Three publications since PR #167 round 2 — the raised generation, the fan-out's
+            // obligation written before any request it names is polled, and the clearing of
+            // that obligation once every request has settled — answered by two stand-down
+            // sites, because two of them funnel through `stand_down_from`.
             "states/scheduling/admission.rs",
             include_str!("../scheduling/admission.rs"),
-            1,
+            3,
+            2,
         ),
     ];
     let funnel = include_str!("publication.rs");
 
     // 1. One funnel. No publishing state names either write form; each reaches exactly one
     //    status publication, and it goes through `JobContext::publish_status`.
-    for (name, source, publications) in PUBLISHING {
+    for (name, source, publications, _) in PUBLISHING {
         let source = production_half(source);
         assert_eq!(
             source.matches("status.update_db(").count(),
@@ -834,9 +973,17 @@ fn the_production_status_write_is_conditional_since_the_activation_change() {
             vec!["src/states/lifecycle/publication.rs"],
         ),
         (
+            // Two sites, and the second is the point rather than an exception. Every route into
+            // a job's lifecycle effects adopts before its first one; all but one of them reach
+            // it through `Scheduling`'s preamble, and the exception is a job recovered straight
+            // into `LeaderRunning`, which runs no preamble at all and so adopts for itself
+            // (PR #167 round 2,
+            // `two_cold_controllers_recovering_a_running_leader_job_do_not_both_administer_it`).
+            // A third site appearing here is a third path that begins administering a job, and
+            // it has to justify itself the same way.
             "lifecycle adoption",
             "status.adopt_lifecycle_authority(",
-            vec!["src/states/scheduling/admission.rs"],
+            vec!["src/states/mod.rs", "src/states/scheduling/admission.rs"],
         ),
         (
             "candidate publication",
@@ -860,7 +1007,7 @@ fn the_production_status_write_is_conditional_since_the_activation_change() {
     //    one arm per publication, and one stand-down per arm. Counting both against the number
     //    of publications rather than against each other is what stops the equality from being
     //    satisfied by a file that has neither.
-    for (name, source, publications) in PUBLISHING {
+    for (name, source, publications, stand_downs) in PUBLISHING {
         let source = production_half(source);
         assert_eq!(
             source.matches("StatusPublication::Superseded(").count(),
@@ -869,8 +1016,9 @@ fn the_production_status_write_is_conditional_since_the_activation_change() {
         );
         assert_eq!(
             source.matches("stand_down(").count(),
-            publications,
-            "{name}: and answers it by standing down, not by logging it and continuing"
+            stand_downs,
+            "{name}: and answers every superseded outcome it can reach by standing down, not \
+             by logging it and continuing"
         );
     }
 

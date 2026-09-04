@@ -51,7 +51,7 @@ const ATTEMPT: &str = "0123456789abcdef0123456789abcdef";
 #[tokio::test]
 async fn delayed_start_after_refusal_rejected_by_acknowledged_fence() {
     // ---- The control: the same delayed directive, delivered before the acknowledgement. ----
-    let mut control = Link::to_registered_generation(false);
+    let mut control = Link::handshaken_at(ISSUED_UNDER);
     control.hold("start-under-4", fenced_start(ATTEMPT, ISSUED_UNDER));
     assert_eq!(
         control.deliver_held("start-under-4").unwrap(),
@@ -62,8 +62,10 @@ async fn delayed_start_after_refusal_rejected_by_acknowledged_fence() {
     assert_eq!(control.applied(), Some(ATTEMPT.to_string()));
 
     // ---- The row. ----
-    let mut link = Link::to_registered_generation(false);
-    // In flight since before the replacement controller existed.
+    let mut link = Link::handshaken_at(ISSUED_UNDER);
+    // In flight since before the replacement controller existed, and issued under the handshake
+    // above — which is what makes it a start that *was* legitimate and is now stale, rather than
+    // one that was never authorised.
     link.hold("start-under-4", fenced_start(ATTEMPT, ISSUED_UNDER));
 
     // The replacement controller advances this generation. This response is the evidence
@@ -204,18 +206,22 @@ async fn a_revoked_identifier_stays_refused_under_a_fence_the_generation_accepts
 /// that makes the *controller's* obligation durable — see D96 row 20.
 #[tokio::test]
 async fn a_lost_fence_advance_leaves_the_generation_answering_for_the_old_fence() {
-    let mut link = Link::to_registered_generation(false);
+    // Handshaken by its own controller, which is what authorises the start below; the lost
+    // directive is the *replacement's* advance.
+    let mut link = Link::handshaken_at(ISSUED_UNDER);
+    let (before_fence, before_strict) = (link.acknowledged(), link.strict());
     link.lose("fence-only-7", fence_only(REFUSAL_FENCE));
 
     assert_eq!(link.lost(), ["fence-only-7"]);
     assert_eq!(
         link.acknowledged(),
-        0,
+        before_fence,
         "a directive that never arrived acknowledged nothing"
     );
-    assert!(
-        !link.strict(),
-        "and did not turn strict mode on: a worker cannot be moved by a message it never got"
+    assert_eq!(
+        link.strict(),
+        before_strict,
+        "and moved nothing else either: a worker cannot be moved by a message it never got"
     );
     assert_eq!(
         link.deliver(fenced_start(ATTEMPT, ISSUED_UNDER)).unwrap(),
@@ -301,6 +307,78 @@ async fn a_restarted_generation_answers_for_nothing_its_predecessor_acknowledged
     );
 }
 
+/// A **restart** does not resurrect the start a refusal superseded.
+///
+/// The composition PR #167 round 2 names, and the one `WorkerFault::Restart` alone does not
+/// reach: `a_restarted_generation_answers_for_nothing_its_predecessor_acknowledged` stops at the
+/// refusal a successor gives *before* it has announced itself, and everything the restart makes
+/// dangerous is on the other side of that.
+///
+/// Restart is defined as the same worker id and the same generation with none of the fence state
+/// (`WorkerFault::Restart`, `WorkerLifecycle::idle`), so the successor holds no acknowledged
+/// fence and no record of what was revoked. Under a rule that admitted any fence at least as
+/// high as the one it holds, this sequence would apply a start that a live controller had already
+/// revoked and fenced past, and had published a `Refused` on the strength of:
+///
+///   1. a start at fence 4 is issued and delayed in transit;
+///   2. the replacement controller advances the generation to 7, revokes that identifier, and
+///      publishes its refusal — M11.D39d's precondition, satisfied;
+///   3. the worker process restarts and re-announces itself, losing both facts;
+///   4. the delayed start arrives.
+///
+/// It is refused, because a start is admitted only under a fence this generation has itself
+/// acknowledged and this incarnation has acknowledged nothing. The discriminator at the end is
+/// what makes that the reason: the same incarnation, handshaken by the *live* controller, applies
+/// the live controller's start immediately — so a restart costs the predecessor's authority and
+/// nothing else.
+#[tokio::test]
+async fn a_restart_does_not_resurrect_the_start_a_refusal_superseded() {
+    let mut link = Link::handshaken_at(ISSUED_UNDER);
+    link.hold("start-under-4", fenced_start(ATTEMPT, ISSUED_UNDER));
+
+    // The replacement controller's advance and revocation: the evidence M11.D39d requires before
+    // `Refused` may be published at all.
+    assert_eq!(
+        link.deliver(revoke(REFUSAL_FENCE, &[ATTEMPT])).unwrap(),
+        settlement(REFUSAL_FENCE, StartExecutionOutcome::Revoked),
+    );
+
+    link.restart_generation();
+    assert_eq!(
+        link.acknowledged(),
+        0,
+        "the restarted process holds neither the fence its predecessor acknowledged nor the \
+         record of what that fence revoked"
+    );
+    link.register_receiver(false);
+
+    let refused = link
+        .deliver_held("start-under-4")
+        .expect_err("a restarted incarnation authorises nothing its predecessor was told");
+    assert_eq!(refused.code(), Code::FailedPrecondition);
+    assert!(!AMBIGUOUS.contains(&refused.code()));
+    assert_eq!(
+        refused.message(),
+        "this worker generation has acknowledged no lifecycle fence, so no handshake authorises \
+         a request under fence 4"
+    );
+    assert!(link.idle(), "and nothing began executing");
+    assert_eq!(
+        link.acknowledged(),
+        0,
+        "a refused start acknowledges nothing"
+    );
+
+    // The discriminator: the live controller's own handshake, and then its own start, applies.
+    // So what the restart cost is the predecessor's authority, not this worker's usefulness.
+    link.handshake_receiver(REFUSAL_FENCE);
+    assert_eq!(
+        link.deliver(fenced_start("live-attempt", REFUSAL_FENCE))
+            .unwrap(),
+        settlement(REFUSAL_FENCE, StartExecutionOutcome::Applied),
+    );
+}
+
 /// A new generation at the predecessor's endpoint refuses the predecessor's delayed start.
 ///
 /// M11.D39g's endpoint-reuse row. Identity is the (worker id, generation) pair: the address is
@@ -315,6 +393,9 @@ async fn a_reused_endpoint_refuses_its_predecessors_delayed_start() {
 
     link.endpoint_reused_by(GENERATION + 1);
     link.register_receiver(false);
+    // The successor is a generation of its own, so the controller handshakes *it* before it may
+    // address it — and that handshake is what the predecessor's delayed start does not have.
+    link.handshake_receiver(ISSUED_UNDER);
 
     let refused = link
         .deliver_held("start-to-generation-3")

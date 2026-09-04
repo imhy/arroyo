@@ -407,6 +407,40 @@ fn mint_start_execution_id() -> String {
     )
 }
 
+/// The targets of one fan-out and the identifier each of them will be sent, as one value.
+///
+/// One value because they are one fact. M11.D39d's obligation has to name every target *and* the
+/// identifier that target was issued, and it has to be durable before the first request is
+/// polled — so a target paired with no identifier is a target a later controller could not
+/// revoke anything at. Minting them together, once, is what makes "every target has one" a
+/// property of this value rather than of the order in which two collections happened to be built
+/// (PR #167 round 2).
+pub(crate) struct IssuedFanOut {
+    targets: StartTargets,
+    minted: HashMap<WorkerId, String>,
+}
+
+impl IssuedFanOut {
+    /// Mints one identifier per target and records each in `attempts`, before any request that
+    /// could carry one exists.
+    pub(crate) fn mint(targets: StartTargets, attempts: &AttemptLedger) -> Self {
+        let minted: HashMap<WorkerId, String> = targets
+            .worker_ids()
+            .into_iter()
+            .map(|worker| (worker, mint_start_execution_id()))
+            .collect();
+        for (worker, attempt_id) in &minted {
+            attempts.issued(*worker, attempt_id);
+        }
+        Self { targets, minted }
+    }
+
+    /// Every worker this fan-out will address, for the obligation that names them.
+    pub(crate) fn addressed(&self) -> Vec<WorkerId> {
+        self.minted.keys().copied().collect()
+    }
+}
+
 /// Reads a `StartExecution` response as "this generation applied the request".
 ///
 /// Through [`observed_settlement`] rather than off the response's fields, for the reason that
@@ -468,9 +502,10 @@ async fn start_execution_on_workers(
     pipeline_id: PipelineId,
     plan: ExecutionPlan,
     machine_ids: HashMap<WorkerId, MachineId>,
-    targets: StartTargets,
+    issued: IssuedFanOut,
     attempts: Arc<AttemptLedger>,
 ) -> (Admission, anyhow::Result<HashMap<WorkerId, WorkerClient>>) {
+    let IssuedFanOut { targets, minted } = issued;
     // Read once, from the targets themselves. A worker's channel and the directive its request
     // carries arrive here as one value (M11.D39e), so the retry table below and the fence a
     // request was issued under cannot be read from different modes.
@@ -500,13 +535,19 @@ async fn start_execution_on_workers(
                             let leader_addr = leader_addr.clone();
                             let checkpoint_manifest_ref = plan.checkpoint_manifest_ref.clone();
                             let state_backend = plan.state_backend;
-                            let start_execution_id = mint_start_execution_id();
-                            // Recorded here, where the identifier is minted and before the first
-                            // request carrying it is sent, rather than when a request returns. An
-                            // inventory that under-reports could let a phase release its authority
-                            // while a request it had forgotten was still live; one that
-                            // over-reports only holds the obligation longer than it had to.
-                            attempts.issued(id, &start_execution_id);
+                            // Minted and recorded by the caller, before this fan-out was built
+                            // and before the obligation naming it was written — which is the
+                            // ordering that makes a durable record of it possible at all
+                            // (PR #167 round 2, `persist_issued_obligation`). An identifier
+                            // minted here could not appear in a row written before the request
+                            // carrying it existed. A target with none is unreachable: `minted`
+                            // is built from `StartTargets::worker_ids`, the same set this
+                            // iterates, and an empty identifier would be refused by the worker
+                            // rather than silently applied.
+                            let start_execution_id = minted
+                                .get(&id)
+                                .cloned()
+                                .expect("every target is minted an identifier before any is sent");
                             let attempts = Arc::clone(&attempts);
                             let (restore_epoch, start_epoch, min_epoch, checkpoint_interval_micros) = (
                                 plan.restore_epoch,
@@ -1672,6 +1713,11 @@ impl State for Scheduling {
                 10,
             ));
         };
+        // Minted and recorded before the fan-out, as the phase graph does it. This body persists
+        // no obligation — the landed mechanism has no durable record and no settlement owner —
+        // but the identifiers are produced in the one place either route produces them, so the
+        // two cannot drift about what a fan-out is handed.
+        let issued = IssuedFanOut::mint(targets, &attempts);
         let admission = ctx.admit_irreversible_scheduling().await;
         let (admission, started) = start_execution_on_workers(
             admission,
@@ -1679,7 +1725,7 @@ impl State for Scheduling {
             ctx.pipeline_info.pipeline_id.clone(),
             plan,
             machine_ids,
-            targets,
+            issued,
             attempts,
         )
         .await;

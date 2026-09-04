@@ -13,8 +13,9 @@
 //! this must not disturb lives.
 
 use super::tests::{
-    AMBIGUOUS, GENERATION, WORKER, acknowledged, announced, applied, apply_registration_response,
-    call, fence_only, fenced_start, generation, register, registered, strict, unfenced,
+    AMBIGUOUS, GENERATION, WORKER, acknowledge, acknowledged, announced, applied,
+    apply_registration_response, call, fence_only, fenced_start, generation, handshaken, register,
+    registered, strict, unfenced,
 };
 use crate::{EngineState, WorkerExecutionPhase, WorkerServer};
 use arroyo_rpc::ControlMessage;
@@ -427,8 +428,10 @@ async fn a_fenced_commit_neither_advances_the_fence_nor_activates_strict_mode() 
     );
 
     // The floor did not rise: a start under a fence *below* the one the commit carried is still
-    // admitted, which is only true because the commit acknowledged nothing.
-    let (_idle_shutdown, idle_server) = registered(false);
+    // admitted, which is only true because the commit acknowledged nothing. The handshake is at
+    // 5 rather than at 9 for exactly that reason — a commit at 9 leaves this generation
+    // acknowledging 5, so a start at 5 is the one its controller may still send.
+    let (_idle_shutdown, idle_server) = handshaken(5);
     assert_eq!(
         call(&idle_server, fenced_start("attempt_1", 5))
             .expect("admitted")
@@ -596,6 +599,12 @@ async fn a_commit_and_a_start_agree_about_which_directives_this_generation_answe
         ("another worker id", 5, WORKER + 1, GENERATION, false),
     ] {
         let (shutdown, start_server) = registered(false);
+        // The start path additionally requires the handshake that authorises a start at all, so
+        // it is performed here and the rows below vary only the addressing — which is the
+        // question these pairs are about. It is addressed to *this* generation whatever the row
+        // addresses its directive to, so a misaddressed row is still refused for being
+        // misaddressed.
+        acknowledge(&start_server, fence);
         let start = call(
             &start_server,
             super::tests::addressed_start("attempt_1", fence, to_worker, to_generation),
@@ -643,10 +652,20 @@ fn the_authority_a_start_confers_is_the_address_it_was_admitted_under() {
     use std::num::NonZeroU64;
 
     let nz = |v: u64| NonZeroU64::new(v).unwrap();
-    let conferred = |req| {
+    let conferred = |req: arroyo_rpc::grpc::rpc::StartExecutionReq| {
         let mut lifecycle = WorkerLifecycle::idle(WORKER, GENERATION);
         let announced = lifecycle.announce();
         lifecycle.registered(announced, false);
+        // The handshake at the start's own fence: what a controller holds before it may address
+        // one at all — `guard_tests::a_start_is_admitted_only_under_a_fence_this_generation_acknowledged`.
+        if req.lifecycle_fence != 0 {
+            assert!(matches!(
+                lifecycle
+                    .admit_start(&fence_only(req.lifecycle_fence))
+                    .expect("the handshake is acknowledged"),
+                StartAdmission::Settled(_)
+            ));
+        }
         match lifecycle.admit_start(&req).expect("admitted") {
             StartAdmission::Apply(applied) => {
                 let mut seen = None;

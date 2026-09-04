@@ -340,12 +340,16 @@ impl Scheduler for KubernetesScheduler {
     /// only, and a target it cannot reach keeps its job in `Fencing` — M11.D39g's declared
     /// choice, arrived at here for a reason worth removing. Giving the pods their worker id, or
     /// listing by it, makes this `Authoritative` and nothing else has to change.
-    fn generation_termination_reporting(&self) -> super::GenerationTerminationReporting {
-        super::GenerationTerminationReporting::Untracked {
+    async fn observe_generation(
+        &self,
+        _job_id: &str,
+        _generation: u64,
+    ) -> anyhow::Result<super::GenerationObservation> {
+        Ok(super::GenerationObservation::Untracked {
             scheduler: "kubernetes",
             why: "its pod listing does not carry the worker id the controller assigned, so it \
                   cannot say that a particular worker generation has terminated",
-        }
+        })
     }
 
     async fn workers_for_job(

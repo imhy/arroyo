@@ -26,9 +26,11 @@ use self::leader_rescaling::LeaderRescaling;
 use self::leader_restarting::LeaderRestarting;
 use self::leader_running::LeaderRunning;
 use self::leader_stopping::LeaderStopping;
+use self::lifecycle::fence::AuthorityOutcome;
+use self::lifecycle::recovery::{Discharge, discharge_recorded_obligation};
 use self::lifecycle::{
     ConsumptionPoint, IntentWakeup, JobLifecycle, JobWait, LifecycleActor, LifecycleIntent,
-    ObservedIntent, UnfencedAuthority,
+    ObservedIntent, UnfencedAuthority, stand_down,
 };
 use self::recovering::Recovering;
 use self::rescaling::Rescaling;
@@ -2350,6 +2352,84 @@ impl StateMachine {
         lifecycle::publish_status(status, &self.db).await
     }
 
+    /// Wins this job's durable lifecycle authority before administering it, on the one recovered
+    /// path that does not pass through `Scheduling`'s preamble (M11.D39d, PR #167 round 2).
+    ///
+    /// Two steps, in the order the preamble runs them and for the same two reasons.
+    ///
+    /// **Adoption** is what makes holding the job exclusive. It is a conditional write on the
+    /// (fence, epoch) the row carries that installs a *different* pair, so of two cold
+    /// controllers that read the same row exactly one applies; a status publication, which
+    /// presents the pair unchanged, would match for both.
+    ///
+    /// **Discharging the recovered obligation** is the other half of the same rule: a job whose
+    /// row still names worker generations an earlier attempt addressed has targets that can still
+    /// apply what was addressed to them, and M11.D39d makes every later lifecycle effect
+    /// reachable only after each has acknowledged a superseding fence or been observed
+    /// terminated. This path reconnects to a live leader and can publish stops and rescales, so
+    /// it waits on that evidence exactly as the scheduling path does.
+    ///
+    /// Answers whether this controller may administer the job. `false` starts no state task and
+    /// writes nothing further: the poll that produced this call runs again, and either this
+    /// controller wins the next pass or the controller that holds the job carries on.
+    async fn adopt_before_administering(&self, status: &mut JobStatus) -> bool {
+        let job_id = (*status.id).clone();
+        match status.adopt_lifecycle_authority(&self.db).await {
+            Ok(AuthorityOutcome::Applied(())) => {}
+            Ok(AuthorityOutcome::Stale(stale)) => {
+                stand_down(stale);
+                return false;
+            }
+            Err(e) => {
+                error!(
+                    job_id = %job_id,
+                    error = %e,
+                    "could not adopt this job's durable lifecycle authority, so this controller \
+                     does not begin administering it"
+                );
+                return false;
+            }
+        }
+
+        match discharge_recorded_obligation(
+            status,
+            &self.db,
+            &self.scheduler,
+            self.lifecycle.mode(),
+        )
+        .await
+        {
+            Discharge::Inactive | Discharge::NothingRecorded | Discharge::Settled => true,
+            Discharge::StillPending {
+                pending,
+                outstanding_attempts,
+            } => {
+                error!(
+                    job_id = %job_id,
+                    pending_targets = pending,
+                    outstanding_attempts,
+                    "an earlier attempt's worker generations have not acknowledged this \
+                     controller's fence, so it does not begin administering this job; the \
+                     obligation stays durable and the next poll repeats the pass"
+                );
+                false
+            }
+            Discharge::Superseded(stale) => {
+                stand_down(stale);
+                false
+            }
+            Discharge::Unusable(failure) => {
+                error!(
+                    job_id = %job_id,
+                    error = %failure,
+                    "this job's recovered fencing obligation could not be discharged, so this \
+                     controller does not begin administering it"
+                );
+                false
+            }
+        }
+    }
+
     async fn start(&mut self, mut status: JobStatus, shutdown_guard: ShutdownGuard) {
         if !self.done() {
             // we're already running, don't do anything
@@ -2359,14 +2439,21 @@ impl StateMachine {
         let leader_mode = matches!(config().job_controller, JobControllerMode::Worker);
 
         // TODO: This seems pretty error-prone and easy to miss adding when we add states
+        let mut cold_leader_running = false;
         let initial_state: Option<Box<dyn State>> = match status.state.as_str() {
             "Created" => Some(Box::new(Created {})),
             "Stopped" => Some(Box::new(Stopped {})),
             "Finished" => Some(Box::new(Finished {})),
             "Failed" => Some(Box::new(Failed {})),
-            "Running" if leader_mode => Some(Box::new(LeaderRunning {
-                started: Instant::now(),
-            })),
+            "Running" if leader_mode => {
+                // The one recovered state that begins administering a job without passing
+                // through `Scheduling`'s preamble, and therefore the one that has to adopt for
+                // itself — see the adoption below.
+                cold_leader_running = true;
+                Some(Box::new(LeaderRunning {
+                    started: Instant::now(),
+                }))
+            }
             "Compiling" | "Scheduling" | "Running" | "Recovering" | "Rescaling" | "Restarting" => {
                 Some(Box::new(Compiling {}))
             }
@@ -2395,6 +2482,21 @@ impl StateMachine {
 
         if let Some(initial_state) = initial_state {
             status.state = initial_state.name().to_string();
+            // M11.D39d, PR #167 round 2. Every other route into a job's lifecycle effects runs
+            // `Scheduling`'s preamble, whose first step is cold adoption; a job recovered
+            // straight into `LeaderRunning` runs none of it and would otherwise administer the
+            // job on the authority it merely *read*.
+            //
+            // Reading is not winning. `publish_status` is conditional on the (fence, epoch) the
+            // row carries, so two cold controllers that read the same row present the same pair
+            // and **both** writes match: both would reconnect to the leader, both would publish,
+            // and nothing would separate them until some later writer happened to move the
+            // authority. Adoption is the operation that is exclusive — it raises the fence and
+            // installs a fresh epoch under that same predicate, so exactly one of them applies —
+            // and it is performed below, before this controller reconnects, publishes, or
+            // discharges anything — and only once this job is actually going to be
+            // administered, because adoption raises the job's fence and a job whose program
+            // will not load is one no controller is about to run.
             let (tx, rx) = channel(1024);
             let started;
             {
@@ -2431,6 +2533,19 @@ impl StateMachine {
                 // that does not — and the execution selector must only be recorded for one
                 // that does.
                 let program = Self::get_program(&db, &status.id, pipeline_id).await;
+
+                // The adoption, at the last moment before this controller writes anything
+                // about the job and the first at which it is going to administer it: the
+                // program is loaded, so the publication below is followed by a state task.
+                // A poll that could not load the program publishes the recovered state and
+                // starts nothing, which administers nothing and needs no authority — and
+                // adopting for it would burn one fence per poll of a job that cannot run.
+                if cold_leader_running
+                    && matches!(program, Ok(Some(_)))
+                    && !self.adopt_before_administering(&mut status).await
+                {
+                    return;
+                }
 
                 if matches!(program, Ok(Some(_))) {
                     // Recorded at the one moment the execution actually begins: the
@@ -3279,16 +3394,20 @@ mod tests {
                 .collect())
         }
 
-        fn generation_termination_reporting(
+        async fn observe_generation(
             &self,
-        ) -> crate::schedulers::GenerationTerminationReporting {
+            job_id: &str,
+            generation: u64,
+        ) -> anyhow::Result<crate::schedulers::GenerationObservation> {
             match self.tracks_generations {
-                true => crate::schedulers::GenerationTerminationReporting::Authoritative,
-                false => crate::schedulers::GenerationTerminationReporting::Untracked {
+                true => Ok(crate::schedulers::GenerationObservation::Live(
+                    self.workers_for_job(job_id, Some(generation)).await?,
+                )),
+                false => Ok(crate::schedulers::GenerationObservation::Untracked {
                     scheduler: "recording",
                     why: "this fixture was asked to answer the way a scheduler that keeps no \
                           worker registry answers",
-                },
+                }),
             }
         }
     }
@@ -8192,6 +8311,105 @@ mod tests {
     /// obligation rather than about a retry budget elapsing.
     const UNREACHABLE: &str = "http://127.0.0.1:1";
 
+    /// **PR #167 round 2.** A state task killed mid-fan-out leaves its obligation in the row.
+    ///
+    /// The crash the in-process inventory cannot survive, and the reason M11.D39d's obligation is
+    /// written *before* the first request is polled rather than when the attempt ends. Every
+    /// other controller-crash row in this suite ends the attempt — `InterruptedFanOut::crashed_at`
+    /// reaches `Interrupted::persist_obligation`, which is code below the fan-out's `await`. A
+    /// task that is *dropped* runs none of it: no reconciliation, no hand-over to the settlement
+    /// owner, no status write. Neither does a `SIGKILL`ed process. So the only thing that can
+    /// carry what this attempt issued to the controller that adopts the job next is a row already
+    /// written when the requests went out.
+    ///
+    /// The kill here is real. The scheduling future is dropped while a `StartExecution` it issued
+    /// is unsettled — the worker answers `Unavailable` forever, so the fan-out is inside its
+    /// reconcile budget and nothing after it has run — and every assertion below reads the
+    /// **row**, which is all a replacement controller would have.
+    ///
+    /// The identifier is compared against what arrived at the worker rather than against one the
+    /// test composed: an obligation naming an identifier no request carried would name nothing a
+    /// later controller could revoke.
+    #[tokio::test]
+    async fn a_state_task_killed_mid_fan_out_leaves_its_obligation_in_the_row() {
+        let never = NeverSettles::new();
+        let mut run = SchedulingRun::with_workers(
+            "killed-mid-fan-out",
+            vec![StartsExecution::NeverSettling(Arc::clone(&never))],
+        )
+        .await;
+        let mailbox = intent_mailbox();
+        run.harness.install_actor(&mailbox);
+        run.harness
+            .queue()
+            .send(worker_connect_from(WorkerId(7), &run.address(0)))
+            .await
+            .unwrap();
+
+        let calls = Arc::clone(&run.calls);
+        // Cloned before the borrow, because the only thing that survives the kill is what was
+        // written outside this task: the row, and the address the request was sent to.
+        let db = run.db.clone();
+        let address = run.address(0);
+        let scheduling = run.schedule_through_the_phase_graph();
+        let issued = async {
+            loop {
+                if calls
+                    .protocol()
+                    .iter()
+                    .any(|directive| matches!(directive, Directive::Start(_)))
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        tokio::pin!(issued);
+        {
+            tokio::pin!(scheduling);
+            tokio::select! {
+                _ = &mut scheduling => panic!(
+                    "this row kills the task while a request is unsettled; a fan-out that \
+                     finished first is not the case under test"
+                ),
+                _ = &mut issued => {}
+            }
+            // The kill: leaving this scope drops the scheduling future itself, so nothing below
+            // the fan-out's `await` runs, in this task or anywhere else.
+        }
+
+        let recorded = stored_state_context(&db);
+        let fencing = recorded.get("fencing").unwrap_or_else(|| {
+            panic!("the row must carry the obligation this attempt issued; it carries {recorded}")
+        });
+        let targets = fencing["targets"]
+            .as_array()
+            .expect("the record names its targets");
+        assert_eq!(targets.len(), 1, "one worker was addressed, so one is owed");
+        assert_eq!(
+            targets[0]["worker_id"].as_u64(),
+            Some(7),
+            "and it is the worker this attempt actually addressed"
+        );
+        assert_eq!(
+            targets[0]["generation"].as_u64(),
+            Some(2),
+            "under the generation the preamble raised the job to"
+        );
+        assert_eq!(
+            targets[0]["attempt_id"].as_str().map(str::to_string),
+            never.attempt_id(),
+            "carrying the identifier that arrived at the worker, which is what a later \
+             controller revokes"
+        );
+        assert_eq!(
+            targets[0]["rpc_address"].as_str(),
+            Some(address.as_str()),
+            "and the address it is reachable at, so a controller that did not start it can \
+             still advance its fence there"
+        );
+    }
+
     /// **D96 row 20.** A partition holds one job in `Fencing` while another schedules normally.
     ///
     /// The two jobs run **concurrently**, against their own rows, their own workers and their own
@@ -9113,11 +9331,18 @@ mod tests {
         );
         assert_eq!(
             state_writes(&fenced.db),
-            [("Scheduling".to_string(), 2), ("Scheduling".to_string(), 2)],
+            [
+                ("Scheduling".to_string(), 2),
+                ("Scheduling".to_string(), 2),
+                ("Scheduling".to_string(), 2),
+                ("Scheduling".to_string(), 2)
+            ],
             "and the phase graph persists the same generation, in the same preamble, and then \
-             writes the row a second time to install that generation's authoritative metadata \
-             root (M11.D39d) — an effect the landed body has no equivalent of. Both writes name \
-             the same state and the same generation, which is the parity this row is about"
+             writes the row three more times: the authoritative metadata root for that \
+             generation, the fan-out's obligation before any `StartExecution` is polled, and \
+             the clearing of that obligation once every request has settled (M11.D39d) — \
+             effects the landed body has no equivalent of. Every write names the same state and \
+             the same generation, which is the parity this row is about"
         );
         assert_eq!(
             authority_writes(&legacy.db),

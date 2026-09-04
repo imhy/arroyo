@@ -319,6 +319,13 @@ impl WorkerLifecycle {
     pub(crate) fn admit_commit(&self, req: CommitReq) -> Result<AdmittedCommit, Status> {
         match commit_directive(&req).map_err(|e| Status::invalid_argument(e.to_string()))? {
             CommitDirective::Unfenced => self.fence.unfenced_is_still_admissible()?,
+            // Deliberately *not* `acknowledged_this_fence`, which the start path requires. A
+            // commit is issued by whatever controller is administering the job now, and a
+            // controller that adopts an already-running job holds a fence above the one its
+            // workers acknowledged without ever re-handshaking them — that is a takeover, not a
+            // forgery, and refusing it would make a running job uncommittable by its own owner.
+            // A start is different: one is only ever issued out of an `AcknowledgedTarget`, so
+            // requiring the acknowledgement costs a live controller nothing.
             CommitDirective::Fenced(address) => self.fence.addressed_to_this_generation(address)?,
         }
         Ok(AdmittedCommit {
@@ -373,7 +380,24 @@ impl WorkerLifecycle {
                             revoking: true,
                         });
                     }
-                    LifecycleOperation::Start => {}
+                    LifecycleOperation::Start => {
+                        // M11.D39d's active replacement handshake, required here rather than
+                        // assumed. A controller cannot build a fenced start without an
+                        // `AcknowledgedTarget`, so every start it sends is under a fence this
+                        // generation has *already* acknowledged; asking for that is what makes a
+                        // start unforgeable by a state this generation no longer holds.
+                        //
+                        // It is what a restart costs, and the reason this is not merely
+                        // symmetry. A restarted process is the same worker id and generation with
+                        // none of the fence state its predecessor held (`WorkerFault::Restart`),
+                        // so under a `>=` rule a start delayed from before a refusal — revoked
+                        // and fenced past by the controller that published that refusal — would
+                        // be admitted by the successor, which holds no record of either. Under
+                        // this rule the successor has acknowledged nothing, so it authorises
+                        // nothing, and the only fence it can be brought to is the live
+                        // controller's own (PR #167 round 2).
+                        self.fence.acknowledged_this_fence(address)?;
+                    }
                 }
                 (Some(address), revoked_execution_ids)
             }
@@ -555,6 +579,42 @@ impl FenceState {
             )));
         }
         Ok(())
+    }
+
+    /// Whether this generation has already acknowledged the exact fence `address` names.
+    ///
+    /// The worker end of M11.D39d's active handshake. `addressed_to_this_generation` asks the
+    /// monotonicity question — is this fence one I have moved past? — and that is the right
+    /// question for the handshake itself, which is how a generation *learns* a fence. It is the
+    /// wrong question for a directive that applies a program or publishes a commit: those are
+    /// only ever issued under a fence the issuer has already heard this generation acknowledge,
+    /// so accepting one under any other fence accepts a directive no live controller could have
+    /// sent (PR #167 round 2).
+    ///
+    /// # Errors
+    ///
+    /// `FailedPrecondition`, definitive like every other refusal here, and worded for the two
+    /// cases an operator has to tell apart: a generation that has acknowledged nothing at all —
+    /// a fresh process, which is what a restart produces — and one holding a different fence.
+    #[allow(clippy::result_large_err)]
+    fn acknowledged_this_fence(&self, address: FenceAddress) -> Result<(), Status> {
+        if address.fence() == self.acknowledged {
+            return Ok(());
+        }
+        Err(Status::failed_precondition(if self.acknowledged == 0 {
+            format!(
+                "this worker generation has acknowledged no lifecycle fence, so no handshake \
+                 authorises a request under fence {}",
+                address.fence(),
+            )
+        } else {
+            format!(
+                "lifecycle fence {} is not fence {}, the one this worker generation acknowledged, \
+                 so no handshake of that authority authorises this request",
+                address.fence(),
+                self.acknowledged,
+            )
+        }))
     }
 
     /// Raises the highest acknowledged fence and turns strict mode on.

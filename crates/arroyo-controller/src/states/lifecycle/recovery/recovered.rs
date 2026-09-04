@@ -24,7 +24,7 @@ use tracing::info;
 
 use super::super::fence::metrics;
 use super::super::handshake::FenceAcknowledgement;
-use crate::schedulers::{GenerationTerminationReporting, Scheduler};
+use crate::schedulers::{GenerationObservation, Scheduler};
 
 /// A worker generation observed to have terminated (M11.D39e(v)).
 ///
@@ -101,22 +101,24 @@ pub(crate) async fn observe_terminations(
     generation: u64,
     targets: &[WorkerId],
 ) -> Result<Vec<ObservedTermination>, TerminationUnobservable> {
-    match scheduler.generation_termination_reporting() {
-        GenerationTerminationReporting::Authoritative => {}
-        GenerationTerminationReporting::Untracked { scheduler, why } => {
-            return Err(TerminationUnobservable::NotTracked { scheduler, why });
-        }
-    }
-    let live: BTreeSet<u64> = scheduler
-        .workers_for_job(job_id, Some(generation))
+    // One question, so the authority and the listing cannot come from different states of the
+    // world: a scheduler answers `Live` only for a generation it can vouch for, and the listing
+    // it vouches for arrives inside that answer (PR #167 round 2).
+    let observation = scheduler
+        .observe_generation(job_id, generation)
         .await
         .map_err(|e| TerminationUnobservable::ListingFailed {
             job_id: job_id.to_string(),
             report: format!("{e:?}"),
-        })?
-        .into_iter()
-        .map(|worker| worker.0)
-        .collect();
+        })?;
+    let live: BTreeSet<u64> = match observation {
+        GenerationObservation::Live(workers) => {
+            workers.into_iter().map(|worker| worker.0).collect()
+        }
+        GenerationObservation::Untracked { scheduler, why } => {
+            return Err(TerminationUnobservable::NotTracked { scheduler, why });
+        }
+    };
     Ok(targets
         .iter()
         .filter(|worker| !live.contains(&worker.0))

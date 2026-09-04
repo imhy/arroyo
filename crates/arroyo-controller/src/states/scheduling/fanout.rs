@@ -590,6 +590,21 @@ impl PhaseContext<'_, '_> {
             generation,
             fence,
         ));
+
+        // Every identifier this fan-out may use, minted and recorded *before* any request that
+        // could carry one exists. Minting inside the request — where it used to happen — made
+        // the identifier unrecordable until the request was already built, and therefore
+        // unrecordable in a row written before the first one was polled. See
+        // `PhaseContext::persist_issued_obligation` for why that ordering is the whole point.
+        let issued_fan_out = super::IssuedFanOut::mint(targets, &attempts);
+        let addressed = issued_fan_out.addressed();
+        if let Err(reason) = self
+            .persist_issued_obligation(&admission, &attempts.snapshot(), &addressed)
+            .await
+        {
+            return (admission, attempts.snapshot(), Err(reason));
+        }
+
         let job_id = self.job().config.id.clone();
         let pipeline_id = self.job().pipeline_info.pipeline_id.clone();
         let (admission, started) = super::start_execution_on_workers(
@@ -598,7 +613,7 @@ impl PhaseContext<'_, '_> {
             pipeline_id,
             plan,
             machine_ids,
-            targets,
+            issued_fan_out,
             Arc::clone(&attempts),
         )
         .await;
@@ -611,6 +626,12 @@ impl PhaseContext<'_, '_> {
             }
             Err(e) => Err(self.retryable("failed to initialize workers", e, 10)),
         };
+        // The record is an image of what is outstanding, so it is cleared when the inventory says
+        // nothing is — and only then. An attempt that ends owing something leaves it standing for
+        // `Interrupted::persist_obligation` to update with what it actually owed.
+        if outcome.is_ok() && issued.outstanding_count() == 0 {
+            self.clear_settled_obligation(&admission).await;
+        }
         (admission, issued, outcome)
     }
 }

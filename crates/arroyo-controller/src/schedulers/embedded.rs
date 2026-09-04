@@ -136,10 +136,20 @@ impl Scheduler for EmbeddedScheduler {
         Ok(())
     }
 
-    /// Authoritative: the embedded scheduler holds the worker tasks it started, keyed by
-    /// [`WorkerId`], and drops one when its task ends.
-    fn generation_termination_reporting(&self) -> super::GenerationTerminationReporting {
-        super::GenerationTerminationReporting::Authoritative
+    /// First-hand for every generation, and the only scheduler for which that is true without a
+    /// launch gate.
+    ///
+    /// Its workers are tasks *in this process*, keyed by [`WorkerId`] and dropped when the task
+    /// ends. There is no controller-restart case to guard against, because a restart takes the
+    /// workers with it: a generation this value never started cannot have a surviving worker.
+    async fn observe_generation(
+        &self,
+        job_id: &str,
+        generation: u64,
+    ) -> anyhow::Result<super::GenerationObservation> {
+        Ok(super::GenerationObservation::Live(
+            self.workers_for_job(job_id, Some(generation)).await?,
+        ))
     }
 
     async fn workers_for_job(
