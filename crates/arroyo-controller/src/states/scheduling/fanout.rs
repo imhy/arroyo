@@ -631,9 +631,18 @@ impl PhaseContext<'_, '_> {
         // a controller about to publish a refusal has to fence, and a healthy generation leaves
         // no other trace of it (PR #167 round 5). An attempt that ends owing something leaves the
         // record standing for `Interrupted::persist_obligation` to update with what it owed.
-        if outcome.is_ok() && issued.outstanding_count() == 0 {
-            self.settle_recorded_obligation(&admission).await;
-        }
+        // The refusal of that write is this attempt's own evidence that it has lost the job, and
+        // it arrives *before* the handover builds a job controller and before any restored
+        // checkpoint commit is published. So it replaces the fan-out's outcome rather than being
+        // logged beside it: a controller that carried a healthy `Ok` past this point would start
+        // tasks and publish commits under an authority it has already been told it does not hold
+        // (PR #167 round 6, finding 3).
+        let outcome = match outcome {
+            Ok(()) if issued.outstanding_count() == 0 => {
+                self.settle_recorded_obligation(&admission).await
+            }
+            outcome => outcome,
+        };
         (admission, issued, outcome)
     }
 }

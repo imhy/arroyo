@@ -46,6 +46,14 @@ impl ProtocolPaths {
     }
 
     /// Path to the controller-written current generation fence.
+    /// The **legacy** single mutable current-generation object.
+    ///
+    /// Nothing writes or reads it since PR #167 round 7 replaced it with one immutable marker
+    /// per generation — see [`Self::current_generation_marker`] for why. It is kept named here
+    /// so the path cannot be quietly reused for something else, and so the cleanup guard goes on
+    /// refusing to delete it in a deployment that still has one. A build predating the markers
+    /// finds no object at the new location and fails closed, which is the direction M11.D75's
+    /// worker-first rollout requires.
     pub fn current_generation(&self) -> CheckpointRef {
         self.path("current-generation.json")
     }
@@ -53,6 +61,24 @@ impl ProtocolPaths {
     /// Path to a generation manifest.
     pub fn generation_manifest(&self, generation: Generation) -> CheckpointRef {
         self.path(format!("generations/{generation}/generation-manifest.json"))
+    }
+
+    /// Path to the marker that makes one generation the job's current one.
+    ///
+    /// One object per generation, written once with put-if-absent, rather than one mutable
+    /// object rewritten by each generation in turn (PR #167 round 7, finding 2). Two controllers
+    /// can be racing to make *different* generations current, and a mutable pointer has no
+    /// portable way to serialize that: `object_store`'s conditional update is unimplemented for
+    /// the local filesystem, which a `file://` checkpoint URL uses. An immutable marker needs
+    /// only put-if-absent, which every backend implements, and readers take the **highest**
+    /// generation that has one.
+    ///
+    /// That is sound because a marker is written only after its controller has won the job's
+    /// authoritative metadata-root update (M11.D39d): a controller that lost writes no marker at
+    /// all, so it can never be the maximum, and a controller that won wrote a root the row
+    /// agrees with.
+    pub fn current_generation_marker(&self, generation: Generation) -> CheckpointRef {
+        self.path(format!("generations/{generation}/current-generation.json"))
     }
 
     /// Prefix containing all artifacts for one checkpoint.
@@ -170,10 +196,11 @@ mod tests {
     use crate::validated::{CheckpointHistory, CollectingJob};
     use crate::workflow::{
         CheckpointPublication, ClaimEpochRecordRequest, CommitAuthorization, CommitPermit,
-        CommittedMarkerOutcome, CurrentGenerationPolicy, GenerationInitialization,
-        GenerationRecovery, GenerationResolution, InitializeGenerationRequest,
-        PublishCheckpointRequest, claim_epoch_record, complete_commit, initialize_generation,
-        mark_committed, prepare_commit, publish_checkpoint, resolve_generation_manifest,
+        CommittedMarkerOutcome, CurrentGenerationPolicy, CurrentGenerationPublication,
+        GenerationInitialization, GenerationRecovery, GenerationResolution,
+        InitializeGenerationRequest, PublishCheckpointRequest, claim_epoch_record, complete_commit,
+        initialize_generation, mark_committed, prepare_commit, publish_checkpoint,
+        resolve_generation_manifest,
     };
     use arroyo_rpc::grpc::rpc::{
         CheckpointManifest, ExpiringKeyedTimeTableCheckpointMetadata,
@@ -309,6 +336,15 @@ mod tests {
         manifest
     }
 
+    /// The record whichever marker makes current, which is what every reader now consults.
+    async fn current_marker<S: ProtocolStore + ?Sized>(store: &S) -> CurrentGeneration {
+        let paths = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J"));
+        crate::workflow::read_current_generation(store, &paths)
+            .await
+            .expect("the markers are readable")
+            .expect("a generation has been made current")
+    }
+
     async fn write_current_generation(
         store: &MemoryProtocolStore,
         paths: &ProtocolPaths,
@@ -321,9 +357,13 @@ mod tests {
             from_micros(0),
         );
 
-        put_json(store, &paths.current_generation(), &current_generation)
-            .await
-            .unwrap();
+        put_json(
+            store,
+            &paths.current_generation_marker(generation),
+            &current_generation,
+        )
+        .await
+        .unwrap();
     }
 
     async fn write_canonical_checkpoint(
@@ -418,7 +458,14 @@ mod tests {
                 "the generation manifest",
             ),
             (paths.epoch_record(Epoch(2)), "an epoch record"),
-            (paths.current_generation(), "the current-generation fence"),
+            (
+                paths.current_generation(),
+                "the legacy current-generation fence",
+            ),
+            (
+                paths.current_generation_marker(Generation(1)),
+                "a generation's current-generation marker",
+            ),
         ] {
             refused(control, what);
         }
@@ -1942,10 +1989,7 @@ mod tests {
             deferred_by_control.is_none(),
             "the publishing policy writes the pointer and hands nothing back"
         );
-        let written: CurrentGeneration = read_json(&published, &paths.current_generation())
-            .await
-            .unwrap()
-            .expect("the publishing policy writes the canonical pointer");
+        let written: CurrentGeneration = current_marker(&published).await;
         assert_eq!(written.generation, Generation(1));
 
         // The row: the deferring policy.
@@ -1973,21 +2017,21 @@ mod tests {
 
         // But nothing names this generation as current.
         assert_eq!(
-            read_json::<_, CurrentGeneration>(&store, &paths.current_generation())
+            crate::workflow::current_generation(&store, &paths)
                 .await
                 .unwrap(),
             None,
-            "a controller that has not won its fence duel must leave no canonical pointer behind"
+            "a controller that has not won its fence duel must leave no generation current"
         );
 
         // And the pointer it deferred is the one publishing would have written.
         let deferred = current_generation.expect("the deferring policy hands the pointer back");
         assert_eq!(deferred.generation(), Generation(1));
-        deferred.publish(&store).await.expect("published");
-        let after: CurrentGeneration = read_json(&store, &paths.current_generation())
-            .await
-            .unwrap()
-            .expect("publishing the deferred pointer makes this generation current");
+        assert_eq!(
+            deferred.publish(&store).await.expect("published"),
+            CurrentGenerationPublication::Published
+        );
+        let after: CurrentGeneration = current_marker(&store).await;
         assert_eq!(
             CurrentGeneration {
                 updated_at_micros: written.updated_at_micros,
@@ -1996,6 +2040,87 @@ mod tests {
             written,
             "the deferred object differs from the published one only in when it was minted"
         );
+    }
+
+    /// **PR #167 round 7, finding 2.** A deferred publication is a compare-and-set: a controller
+    /// that was superseded between its root CAS and its canonical write cannot revert the
+    /// generation the winner made current.
+    ///
+    /// The reviewer's interleaving, at the level the overwrite actually happens: A defers
+    /// generation 1, B defers generation 2, B publishes, then A resumes and publishes. Before
+    /// round 7 the last write won and the canonical generation became **1** — and every
+    /// checkpoint B's live generation published from that moment was refused as stale, because
+    /// `publish_checkpoint` follows this pointer.
+    ///
+    /// Three claims. A is told it was superseded rather than silently succeeding; the job's
+    /// current generation is still B's; and B's own re-publication of the generation that is
+    /// already current is accepted, so the rule is "never move it backwards" and not "never
+    /// write it twice".
+    ///
+    /// A's marker for generation 1 may exist afterwards and that is harmless — an additive write
+    /// reverts nothing, and readers take the highest marker, which is B's.
+    #[tokio::test]
+    async fn a_superseded_deferred_publication_cannot_revert_a_newer_current_generation() {
+        let store = MemoryProtocolStore::default();
+        let request = |generation: u64| InitializeGenerationRequest {
+            pipeline_id: PipelineId::new("P"),
+            job_id: JobId::new("J"),
+            generation: Generation(generation),
+            updated_at: from_micros(123),
+            state_backend: StateBackendSelector::Parquet,
+            program_operators: HashSet::new(),
+        };
+        let deferred = |initialization| match initialization {
+            GenerationInitialization::Initialized {
+                current_generation: Some(deferred),
+                ..
+            } => deferred,
+            other => panic!("expected a deferred initialization, got {other:?}"),
+        };
+
+        // A resolves generation 1 and defers; B then adopts and resolves generation 2.
+        let a = deferred(
+            initialize_generation(&store, request(1), CurrentGenerationPolicy::Defer)
+                .await
+                .unwrap(),
+        );
+        let b = deferred(
+            initialize_generation(&store, request(2), CurrentGenerationPolicy::Defer)
+                .await
+                .unwrap(),
+        );
+
+        // B wins its root CAS and publishes.
+        assert_eq!(
+            b.publish(&store).await.expect("B publishes"),
+            CurrentGenerationPublication::Published
+        );
+
+        // A resumes. It won its *own* root update earlier, so nothing it holds says it has lost
+        // the job — the store is the only thing that can tell it.
+        assert_eq!(
+            a.publish(&store)
+                .await
+                .expect("A's publication is answered"),
+            CurrentGenerationPublication::Superseded {
+                current_generation: Generation(2)
+            },
+            "a controller superseded between its root update and its canonical write is told so"
+        );
+        let current: CurrentGeneration = current_marker(&store).await;
+        assert_eq!(
+            current.generation,
+            Generation(2),
+            "and the winner's generation is still the job's current one"
+        );
+
+        // Re-publishing the generation that is already current is idempotent, not a refusal.
+        assert_eq!(
+            b.publish(&store).await.expect("B re-publishes"),
+            CurrentGenerationPublication::Published
+        );
+        let current: CurrentGeneration = current_marker(&store).await;
+        assert_eq!(current.generation, Generation(2));
     }
 
     /// A deferring initialization is under the same monotonicity rule as a publishing one, and is
@@ -2032,10 +2157,7 @@ mod tests {
             "got {err:?}"
         );
 
-        let current: CurrentGeneration = read_json(&store, &paths.current_generation())
-            .await
-            .unwrap()
-            .expect("the current generation is untouched");
+        let current: CurrentGeneration = current_marker(&store).await;
         assert_eq!(current.generation, Generation(4));
         assert_eq!(
             read_json::<_, GenerationManifest>(&store, &paths.generation_manifest(Generation(3)))
@@ -2105,10 +2227,7 @@ mod tests {
             "no protocol state may be published for a rejected recovery checkpoint"
         );
         // and specifically, neither of the two objects publication consists of
-        let current: CurrentGeneration = read_json(&store, &paths.current_generation())
-            .await
-            .unwrap()
-            .expect("the previous current generation should still be there");
+        let current: CurrentGeneration = current_marker(&store).await;
         assert_eq!(current.generation, Generation(1));
         assert!(
             read_json::<_, GenerationManifest>(&store, &paths.generation_manifest(Generation(2)))
@@ -2177,11 +2296,7 @@ mod tests {
             "the validated manifest should be handed back rather than left to be re-read"
         );
 
-        let current: CurrentGeneration = read_json(&store, &paths.current_generation())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(current.generation, Generation(2));
+        assert_eq!(current_marker(&store).await.generation, Generation(2));
         assert!(
             read_json::<_, GenerationManifest>(&store, &paths.generation_manifest(Generation(2)))
                 .await
@@ -2295,10 +2410,7 @@ mod tests {
                     store.written_objects()
                 ));
             }
-            let current: CurrentGeneration = read_json(&store, &paths.current_generation())
-                .await
-                .unwrap()
-                .expect("the previous current generation should still be there");
+            let current: CurrentGeneration = current_marker(&store).await;
             if current.generation != Generation(1) {
                 problems.push(format!("{name}: the current generation was advanced"));
             }
@@ -2349,10 +2461,7 @@ mod tests {
                 store.written_objects()
             ));
         }
-        let current: CurrentGeneration = read_json(store, &paths.current_generation())
-            .await
-            .unwrap()
-            .expect("the previous current generation should still be there");
+        let current: CurrentGeneration = current_marker(store).await;
         if current.generation != Generation(1) {
             problems.push(format!("{name}: the current generation was advanced"));
         }
@@ -2962,6 +3071,10 @@ mod tests {
             bytes: Vec<u8>,
         ) -> Result<CreateResult<Vec<u8>>, StoreError> {
             self.inner.create_bytes(path, bytes).await
+        }
+
+        async fn list_child_directories(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
+            self.inner.list_child_directories(prefix).await
         }
 
         async fn delete_object(&self, path: &CheckpointRef) -> Result<(), StoreError> {
@@ -4598,7 +4711,7 @@ mod tests {
         );
         assert_eq!(
             store.written_objects(),
-            vec![paths.current_generation().to_string()],
+            vec![paths.current_generation_marker(Generation(1)).to_string()],
             "only the fixture's own current-generation write should have happened"
         );
     }

@@ -370,6 +370,24 @@
           "name": "a_record_written_before_the_incarnation_field_addresses_no_process",
           "kind": "test",
           "path": "crates/arroyo-controller/src/states/lifecycle/recovery_tests.rs"
+        },
+        {
+          "crate": "arroyo-controller",
+          "name": "a_superseding_controller_asks_a_settled_generation_again_and_an_adopting_one_does_not",
+          "kind": "test",
+          "path": "crates/arroyo-controller/src/states/lifecycle/recovery_tests.rs"
+        },
+        {
+          "crate": "arroyo-controller",
+          "name": "re_opening_a_record_expires_acknowledgements_and_keeps_terminations",
+          "kind": "test",
+          "path": "crates/arroyo-controller/src/states/lifecycle/recovery_tests.rs"
+        },
+        {
+          "crate": "arroyo-controller",
+          "name": "a_settlement_write_the_row_refuses_stops_before_the_restored_commits",
+          "kind": "test",
+          "path": "crates/arroyo-controller/src/states/mod.rs"
         }
       ]
     },
@@ -549,6 +567,12 @@
           "name": "stale_controller_candidate_never_becomes_authoritative_root",
           "kind": "test",
           "path": "crates/arroyo-controller/src/states/lifecycle/fence_tests.rs"
+        },
+        {
+          "crate": "arroyo-state-protocol",
+          "name": "a_superseded_deferred_publication_cannot_revert_a_newer_current_generation",
+          "kind": "test",
+          "path": "crates/arroyo-state-protocol/src/lib.rs"
         }
       ]
     },

@@ -398,18 +398,32 @@ impl Fencing {
         }
     }
 
-    /// The same record with every target owed an acknowledgement again (M11.D39d, PR #167
-    /// round 5).
+    /// The same record with every target that is still *running* owed an acknowledgement again
+    /// (M11.D39d, PR #167 round 5).
     ///
     /// A record survives the generation it names, so what it says once a fan-out has settled is
     /// *which worker generations can act and where they are reached* — true for as long as they
-    /// run. That is what lets a controller about to publish a refusal fence them first, but only
-    /// if it asks them again, under the fence it has just adopted, rather than reading the
+    /// run. That is what lets a controller superseding those generations fence them first, but
+    /// only if it asks them again, under the fence it has just adopted, rather than reading the
     /// settled states an earlier and lower fence left behind.
     ///
-    /// Identifiers are dropped with the states. What is being asked for here is an
-    /// acknowledgement of a *fence*; a revocation naming an identifier an earlier pass already
-    /// settled would be asking a live generation to disown work it is legitimately doing.
+    /// [`FenceTargetState::Terminated`] is **kept**, and that is the whole of the difference
+    /// between the two settled states (PR #167 round 6, finding 1). `Acknowledged` is a
+    /// statement about a fence — it says this generation took *that* one, and says nothing about
+    /// a higher one — so it expires the moment a higher fence exists. `Terminated` is a
+    /// statement about the world: the generation is gone, and no later fence makes it come back.
+    /// Reopening it would throw away authoritative termination evidence and ask a controller to
+    /// re-observe a teardown its scheduler may no longer be able to see at all — which is a job
+    /// wedged in `Fencing` for want of a fact it already had.
+    ///
+    /// A target that is *already* pending is untouched, identifier and all. It owes exactly what
+    /// it owed, and the identifier it was issued is the thing a discharge has to revoke;
+    /// dropping it here would quietly forgive an outstanding start.
+    ///
+    /// An identifier is dropped only where its state is: an `Acknowledged` target's identifier
+    /// was settled by the pass that acknowledged it, and what is being asked for now is an
+    /// acknowledgement of a *fence*. Naming that identifier again would be asking a live
+    /// generation to disown work it is legitimately doing.
     #[must_use]
     pub fn reopened(&self) -> Self {
         Self {
@@ -417,10 +431,13 @@ impl Fencing {
             targets: self
                 .targets
                 .iter()
-                .map(|target| FenceTarget {
-                    attempt_id: None,
-                    state: FenceTargetState::Pending,
-                    ..target.clone()
+                .map(|target| match target.state {
+                    FenceTargetState::Pending | FenceTargetState::Terminated => target.clone(),
+                    FenceTargetState::Acknowledged => FenceTarget {
+                        attempt_id: None,
+                        state: FenceTargetState::Pending,
+                        ..target.clone()
+                    },
                 })
                 .collect(),
             candidate_root: self.candidate_root.clone(),

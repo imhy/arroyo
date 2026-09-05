@@ -47,7 +47,7 @@ use super::fence::metrics::{self, AlertTransition, FencingError};
 use super::fence_tests::{JOB, adopt, cold_status, migrated_job_named};
 use super::handshake::FenceAcknowledgement;
 use super::recovery::{
-    Discharge, ObservedTermination, RecoveredObligation, RecoveryFailure,
+    Discharge, DischargeReason, ObservedTermination, RecoveredObligation, RecoveryFailure,
     discharge_recorded_obligation, observe_terminations,
 };
 use crate::schedulers::{GenerationObservation, Scheduler, SchedulerError, StartPipelineReq};
@@ -518,6 +518,147 @@ async fn a_fencing_obligation_is_written_under_authority_and_read_back_whole() {
 /// replacement generation". Both halves are asserted: the value, against a real row and a real
 /// worker, and the position, against the driver's own source, because a behavioural test of a
 /// successful attempt cannot show the order of steps it took.
+/// **PR #167 round 7, finding 1.** A controller that is about to *supersede* the generations a
+/// record names asks them again; one that is *adopting* them does not.
+///
+/// Round 5 made a settled fan-out leave its targets `Acknowledged` rather than clearing the
+/// record, because what it still says — which generations can act and where they answer — stays
+/// true while they run. Round 6 stopped ordinary recovery deleting that. What neither did is
+/// decide what a *reader* of those acknowledgements may conclude, and the answer is not the same
+/// for both readers: `Acknowledged` says that generation took some **earlier** fence, so a
+/// replacement preamble that treats it as settlement admits a new generation while the old one
+/// still admits its old owner's directives, having sent no fence at all.
+///
+/// Both readings are asserted against the same record, because either one alone is consistent
+/// with a build that has no idea which it is doing:
+///
+/// * superseding — every live target is re-opened and the advance goes out under the fence this
+///   controller has just adopted, and the discharge does **not** report the job settled;
+/// * adopting — nothing is asked, which is the documented cold worker-leader exception (PR #167
+///   round 3): it admits no generation, so demanding a fresh acknowledgement would let a
+///   partition wedge a job that is running perfectly well.
+#[tokio::test]
+async fn a_superseding_controller_asks_a_settled_generation_again_and_an_adopting_one_does_not() {
+    for (reason, expected_directives) in [
+        (
+            DischargeReason::SupersedingTheGenerationsItNames,
+            "the replacement advances its own fence at the generation it is superseding",
+        ),
+        (
+            DischargeReason::AdoptingTheGenerationItNames,
+            "the adopter asks the generation it is keeping nothing",
+        ),
+    ] {
+        let superseding = reason == DischargeReason::SupersedingTheGenerationsItNames;
+        let (job_id, db, connection) = job(if superseding {
+            "row17-superseding"
+        } else {
+            "row17-adopting"
+        });
+        let (address, directives) = serve(Answers::Acknowledging).await;
+
+        // Exactly what a healthy, settled fan-out leaves behind (PR #167 round 5): the targets
+        // are acknowledged, and no identifier is outstanding.
+        let settled = obligation(Some(address)).settled_and_still_running();
+        assert!(
+            settled
+                .targets()
+                .iter()
+                .all(|t| t.state == FenceTargetState::Acknowledged),
+            "the fixture is the record a healthy fan-out leaves, not a pending one"
+        );
+        seed_obligation(&job_id, &connection, Some(&settled));
+
+        let mut controller = cold_status(&db).await;
+        adopt(&mut controller, &db).await;
+        let adopted = controller.authority().fence().get();
+
+        let scheduler = TestScheduler::shared(Lists::Live(vec![(GENERATION, WORKER)]));
+        let discharge = discharge_recorded_obligation(
+            &mut controller,
+            &db,
+            &scheduler,
+            LifecycleMode::FencedV2,
+            reason,
+        )
+        .await;
+
+        let sent = directives.seen.lock().unwrap().clone();
+        if superseding {
+            assert_eq!(
+                sent,
+                vec![(adopted, GENERATION, Some(INCARNATION))],
+                "{expected_directives}"
+            );
+            assert!(
+                matches!(discharge, Discharge::Settled),
+                "and it settles only because that generation answered the *new* fence: {discharge:?}"
+            );
+        } else {
+            assert_eq!(sent, Vec::new(), "{expected_directives}");
+            assert!(
+                matches!(discharge, Discharge::Settled),
+                "and it settles on the record as it stands: {discharge:?}"
+            );
+        }
+    }
+}
+
+/// A re-opening keeps authoritative termination evidence, and expires only acknowledgements.
+///
+/// The two settled states are not the same kind of fact (PR #167 round 7, finding 1).
+/// `Acknowledged` is about a *fence* and expires the moment a higher one exists. `Terminated` is
+/// about the world: the generation is gone, and no later fence brings it back. Re-opening a
+/// terminated target would throw away evidence this controller already holds and ask it to
+/// observe a teardown its scheduler may no longer be able to see — a job wedged in `Fencing` for
+/// want of a fact it had.
+#[test]
+fn re_opening_a_record_expires_acknowledgements_and_keeps_terminations() {
+    let record = Fencing::record(
+        vec![
+            FenceTarget {
+                worker_id: 1,
+                state: FenceTargetState::Acknowledged,
+                ..pending_target(Some("http://10.0.0.1:9191".to_string()))
+            },
+            FenceTarget {
+                worker_id: 2,
+                state: FenceTargetState::Terminated,
+                ..pending_target(Some("http://10.0.0.2:9191".to_string()))
+            },
+            FenceTarget {
+                worker_id: 3,
+                state: FenceTargetState::Pending,
+                ..pending_target(Some("http://10.0.0.3:9191".to_string()))
+            },
+        ],
+        None,
+        Some(an_hour_ago()),
+    )
+    .expect("the fixture record is writable");
+
+    let reopened = record.reopened();
+    assert_eq!(
+        reopened
+            .targets()
+            .iter()
+            .map(|t| (t.worker_id, t.state, t.attempt_id.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            // Acknowledged: expired, and its identifier with it — that identifier was settled by
+            // the pass that acknowledged it, and what is asked for now is a *fence*.
+            (1, FenceTargetState::Pending, None),
+            // Terminated: kept whole. The generation is gone and no later fence brings it back.
+            (2, FenceTargetState::Terminated, Some(ATTEMPT.to_string())),
+            // Already pending: untouched, identifier included. It owes exactly what it owed, and
+            // dropping the identifier here would quietly forgive an outstanding start.
+            (3, FenceTargetState::Pending, Some(ATTEMPT.to_string())),
+        ],
+        "an acknowledgement of an older fence expires; an observed termination does not; and a \
+         target that already owed something still owes it"
+    );
+}
+
 /// **PR #167 round 6, finding 3.** A record written before the incarnation field addresses no
 /// process, and its target stays pending.
 ///
@@ -548,9 +689,14 @@ async fn a_record_written_before_the_incarnation_field_addresses_no_process() {
     let adopted = replacement.authority().fence().get();
 
     let scheduler = TestScheduler::shared(Lists::Live(vec![(GENERATION, WORKER)]));
-    let _ =
-        discharge_recorded_obligation(&mut replacement, &db, &scheduler, LifecycleMode::FencedV2)
-            .await;
+    let _ = discharge_recorded_obligation(
+        &mut replacement,
+        &db,
+        &scheduler,
+        LifecycleMode::FencedV2,
+        DischargeReason::SupersedingTheGenerationsItNames,
+    )
+    .await;
 
     assert_eq!(
         *directives.seen.lock().unwrap(),
@@ -580,9 +726,14 @@ async fn replacement_cannot_publish_before_worker_fence_settlement() {
     );
 
     let scheduler = TestScheduler::shared(Lists::Live(vec![(GENERATION, WORKER)]));
-    let discharge =
-        discharge_recorded_obligation(&mut replacement, &db, &scheduler, LifecycleMode::FencedV2)
-            .await;
+    let discharge = discharge_recorded_obligation(
+        &mut replacement,
+        &db,
+        &scheduler,
+        LifecycleMode::FencedV2,
+        DischargeReason::SupersedingTheGenerationsItNames,
+    )
+    .await;
     assert!(
         matches!(
             discharge,
@@ -690,9 +841,14 @@ async fn an_acknowledgement_settles_a_recovered_target_only_if_it_supersedes_wha
              exactly the one that supersedes nothing it inherited"
         );
         let scheduler = TestScheduler::shared(Lists::Live(vec![(GENERATION, WORKER)]));
-        let discharge =
-            discharge_recorded_obligation(&mut status, &db, &scheduler, LifecycleMode::FencedV2)
-                .await;
+        let discharge = discharge_recorded_obligation(
+            &mut status,
+            &db,
+            &scheduler,
+            LifecycleMode::FencedV2,
+            DischargeReason::SupersedingTheGenerationsItNames,
+        )
+        .await;
 
         match expected {
             FenceTargetState::Acknowledged => {
@@ -760,9 +916,14 @@ async fn a_generation_settles_only_when_a_tracking_scheduler_says_it_is_gone() {
         adopt(&mut status, &db).await;
 
         let scheduler = TestScheduler::shared(lists);
-        let discharge =
-            discharge_recorded_obligation(&mut status, &db, &scheduler, LifecycleMode::FencedV2)
-                .await;
+        let discharge = discharge_recorded_obligation(
+            &mut status,
+            &db,
+            &scheduler,
+            LifecycleMode::FencedV2,
+            DischargeReason::SupersedingTheGenerationsItNames,
+        )
+        .await;
         assert_eq!(
             matches!(discharge, Discharge::Settled),
             settles,
@@ -842,9 +1003,14 @@ async fn repeated_recovery_passes_reconcile_idempotently() {
         // same one going round a loop, and re-adoption is part of what it repeats.
         let mut status = cold_status(&db).await;
         adopt(&mut status, &db).await;
-        let discharge =
-            discharge_recorded_obligation(&mut status, &db, &scheduler, LifecycleMode::FencedV2)
-                .await;
+        let discharge = discharge_recorded_obligation(
+            &mut status,
+            &db,
+            &scheduler,
+            LifecycleMode::FencedV2,
+            DischargeReason::SupersedingTheGenerationsItNames,
+        )
+        .await;
         assert!(
             matches!(
                 discharge,
@@ -894,8 +1060,14 @@ async fn a_recovery_that_loses_its_re_adoption_publishes_nothing() {
     // The loser tries to discharge anyway. Everything it would have settled, it settles: the
     // scheduler reports the generation gone. The write is what refuses it.
     let scheduler = TestScheduler::shared(Lists::Live(vec![]));
-    let discharge =
-        discharge_recorded_obligation(&mut first, &db, &scheduler, LifecycleMode::FencedV2).await;
+    let discharge = discharge_recorded_obligation(
+        &mut first,
+        &db,
+        &scheduler,
+        LifecycleMode::FencedV2,
+        DischargeReason::SupersedingTheGenerationsItNames,
+    )
+    .await;
     assert!(
         matches!(discharge, Discharge::Superseded(_)),
         "losing the row is reported as what it is, and not as a failure of the job"
@@ -927,9 +1099,14 @@ async fn a_permanent_partition_leaves_the_obligation_pending_and_publishes_it() 
     for pass in 0..2 {
         let mut status = cold_status(&db).await;
         adopt(&mut status, &db).await;
-        let discharge =
-            discharge_recorded_obligation(&mut status, &db, &scheduler, LifecycleMode::FencedV2)
-                .await;
+        let discharge = discharge_recorded_obligation(
+            &mut status,
+            &db,
+            &scheduler,
+            LifecycleMode::FencedV2,
+            DischargeReason::SupersedingTheGenerationsItNames,
+        )
+        .await;
         assert!(
             matches!(discharge, Discharge::StillPending { pending: 1, .. }),
             "pass {pass}: an unobservable target is not settled by the retry budget running out"
@@ -1054,8 +1231,14 @@ async fn a_recorded_address_that_is_not_an_address_leaves_its_target_pending() {
 
     // The scheduler still lists the generation, so the other route to settlement is closed too.
     let live = TestScheduler::shared(Lists::Live(vec![(GENERATION, WORKER)]));
-    let discharge =
-        discharge_recorded_obligation(&mut status, &db, &live, LifecycleMode::FencedV2).await;
+    let discharge = discharge_recorded_obligation(
+        &mut status,
+        &db,
+        &live,
+        LifecycleMode::FencedV2,
+        DischargeReason::SupersedingTheGenerationsItNames,
+    )
+    .await;
     assert!(
         matches!(
             discharge,
@@ -1097,8 +1280,14 @@ async fn a_recovery_pass_without_an_adopted_fence_is_unusable_and_writes_nothing
     assert_eq!(status.authority().fence().get(), 0);
 
     let live = TestScheduler::shared(Lists::Live(vec![(GENERATION, WORKER)]));
-    let discharge =
-        discharge_recorded_obligation(&mut status, &db, &live, LifecycleMode::FencedV2).await;
+    let discharge = discharge_recorded_obligation(
+        &mut status,
+        &db,
+        &live,
+        LifecycleMode::FencedV2,
+        DischargeReason::SupersedingTheGenerationsItNames,
+    )
+    .await;
     let Discharge::Unusable(failure) = discharge else {
         panic!("a pass with no fence to advance cannot report anything about the obligation");
     };
@@ -1147,8 +1336,14 @@ async fn a_row_that_will_not_take_the_updated_record_is_unusable_and_settles_not
         .execute_batch("DROP TABLE job_statuses;")
         .expect("the fixture must be editable");
 
-    let discharge =
-        discharge_recorded_obligation(&mut status, &db, &gone, LifecycleMode::FencedV2).await;
+    let discharge = discharge_recorded_obligation(
+        &mut status,
+        &db,
+        &gone,
+        LifecycleMode::FencedV2,
+        DischargeReason::SupersedingTheGenerationsItNames,
+    )
+    .await;
     let Discharge::Unusable(failure) = discharge else {
         panic!("a record that could not be written must not be reported as settled");
     };
@@ -1349,8 +1544,14 @@ async fn a_discharge_publishes_its_settlements_its_errors_and_its_alert() {
     let mut status = cold_status(&db).await;
     adopt(&mut status, &db).await;
     let live = TestScheduler::shared(Lists::Live(vec![(GENERATION, WORKER)]));
-    let _pending =
-        discharge_recorded_obligation(&mut status, &db, &live, LifecycleMode::FencedV2).await;
+    let _pending = discharge_recorded_obligation(
+        &mut status,
+        &db,
+        &live,
+        LifecycleMode::FencedV2,
+        DischargeReason::SupersedingTheGenerationsItNames,
+    )
+    .await;
     let (pending_targets, outstanding, age, alert) = metrics::published(&unsettled_id);
     assert_eq!(
         (pending_targets, outstanding, alert),
@@ -1372,7 +1573,14 @@ async fn a_discharge_publishes_its_settlements_its_errors_and_its_alert() {
     let mut status = cold_status(&db).await;
     adopt(&mut status, &db).await;
     assert!(matches!(
-        discharge_recorded_obligation(&mut status, &db, &gone, LifecycleMode::FencedV2).await,
+        discharge_recorded_obligation(
+            &mut status,
+            &db,
+            &gone,
+            LifecycleMode::FencedV2,
+            DischargeReason::SupersedingTheGenerationsItNames,
+        )
+        .await,
         Discharge::Settled
     ));
     assert_eq!(
@@ -1397,8 +1605,14 @@ async fn a_discharge_publishes_its_settlements_its_errors_and_its_alert() {
     let mut status = cold_status(&db).await;
     adopt(&mut status, &db).await;
     let untracked = TestScheduler::shared(Lists::Untracked);
-    let _pending =
-        discharge_recorded_obligation(&mut status, &db, &untracked, LifecycleMode::FencedV2).await;
+    let _pending = discharge_recorded_obligation(
+        &mut status,
+        &db,
+        &untracked,
+        LifecycleMode::FencedV2,
+        DischargeReason::SupersedingTheGenerationsItNames,
+    )
+    .await;
     assert_eq!(
         metrics::errors(&untracked_id, FencingError::TerminationUnobservable),
         1,
@@ -1456,7 +1670,14 @@ async fn the_legacy_mechanism_neither_writes_nor_recovers_a_durable_fencing_obli
     let gone = TestScheduler::shared(Lists::Live(vec![]));
     assert!(
         matches!(
-            discharge_recorded_obligation(&mut status, &db, &gone, LifecycleMode::LegacyT08).await,
+            discharge_recorded_obligation(
+                &mut status,
+                &db,
+                &gone,
+                LifecycleMode::LegacyT08,
+                DischargeReason::SupersedingTheGenerationsItNames,
+            )
+            .await,
             Discharge::Inactive
         ),
         "the legacy mechanism does not discharge an obligation, even one that would settle"
@@ -1616,6 +1837,7 @@ async fn a_recovery_pass_dropped_part_way_leaves_the_record_readable_and_recover
             &db,
             &scheduler,
             LifecycleMode::FencedV2,
+            DischargeReason::SupersedingTheGenerationsItNames,
         ));
         tokio::select! {
             _ = &mut pass => panic!("the paused worker never answers, so the pass cannot finish"),
@@ -1641,7 +1863,14 @@ async fn a_recovery_pass_dropped_part_way_leaves_the_record_readable_and_recover
     let live = TestScheduler::shared(Lists::Live(vec![(GENERATION, WORKER)]));
     assert!(
         matches!(
-            discharge_recorded_obligation(&mut status, &db, &live, LifecycleMode::FencedV2).await,
+            discharge_recorded_obligation(
+                &mut status,
+                &db,
+                &live,
+                LifecycleMode::FencedV2,
+                DischargeReason::SupersedingTheGenerationsItNames,
+            )
+            .await,
             Discharge::Settled
         ),
         "the next pass reads the record the cancelled one left and discharges it"

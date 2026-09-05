@@ -28,7 +28,7 @@ use crate::resolve::{ParentCheckpointStatus, ResolveDecision, ResolveFailure, re
 use crate::state::{CheckpointState, derive_checkpoint_state};
 use crate::store::{ProtocolStore, StoreError, read_json, read_protobuf};
 use crate::types::{
-    CheckpointRef, CurrentGeneration, Epoch, EpochRecord, Generation, GenerationManifest,
+    CheckpointRef, Epoch, EpochRecord, Generation, GenerationManifest,
     checkpoint_parent_checkpoint_ref,
 };
 use arroyo_rpc::grpc::rpc::CheckpointManifest;
@@ -270,10 +270,9 @@ where
     };
 
     let paths = ProtocolPaths::new(manifest.pipeline_id.clone(), manifest.job_id.clone());
-    let is_current_generation =
-        read_json::<_, CurrentGeneration>(store, &paths.current_generation())
-            .await?
-            .is_some_and(|current_generation| current_generation.generation == runner_generation);
+    let is_current_generation = crate::workflow::current_generation(store, &paths)
+        .await?
+        .is_some_and(|current| current == runner_generation);
 
     let mut candidate_ref = candidate_ref;
 

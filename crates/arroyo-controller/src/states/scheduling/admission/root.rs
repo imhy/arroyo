@@ -20,6 +20,8 @@ use arroyo_state::{StorageProviderFor, get_storage_provider};
 use super::PhaseContext;
 use crate::AuthorityOutcome;
 use crate::states::lifecycle::{GenerationRoot, RecoveryReference, RootCandidate, RootContext};
+use arroyo_state_protocol::workflow::CurrentGenerationPublication;
+
 use crate::states::{Admission, StateError, fatal};
 
 impl PhaseContext<'_, '_> {
@@ -143,7 +145,27 @@ impl PhaseContext<'_, '_> {
                     )
                     .await
                 {
-                    Ok(()) => Ok(()),
+                    Ok(CurrentGenerationPublication::Published) => Ok(()),
+                    // The store refused because a **newer** generation is already current. This
+                    // controller won the row update and was superseded between that and this
+                    // write, which is exactly the interleaving the conditional publication
+                    // exists to answer (PR #167 round 6, finding 2). It has lost the job, so it
+                    // stands down rather than reverting a live generation's pointer.
+                    Ok(CurrentGenerationPublication::Superseded { current_generation }) => {
+                        let authority = self.ctx.status.authority();
+                        tracing::warn!(
+                            job_id = %self.ctx.config.id,
+                            current_generation = current_generation.0,
+                            "another controller made a newer generation current between this \
+                             controller's metadata-root update and its canonical publication"
+                        );
+                        Err(self.stand_down_from(crate::StaleAuthority {
+                            job_id: (**authority.job_id()).clone(),
+                            operation: "publish its canonical current-generation pointer",
+                            presented_fence: authority.fence(),
+                            presented_epoch: authority.epoch().to_string(),
+                        }))
+                    }
                     // Retryable, and the root stays installed: this controller holds the job,
                     // and a later attempt of its own re-registers the generation and writes the
                     // pointer. Nothing has been started against a generation that is not yet

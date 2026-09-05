@@ -866,6 +866,24 @@ impl StorageProvider {
         }?
     }
 
+    /// The immediate child directories of `prefix`, as a store-side delimiter listing.
+    ///
+    /// A delimiter listing returns the common prefixes under `prefix` without enumerating what
+    /// is inside them, which is what makes "which generations exist" cheap on a job whose
+    /// generations hold thousands of checkpoint objects.
+    pub async fn list_directories(
+        &self,
+        prefix: impl Into<Path>,
+    ) -> Result<Vec<Path>, StorageError> {
+        let prefix: Path = prefix.into();
+        let qualified = self.qualify_path(&prefix).into_owned();
+        let listing = self
+            .object_store
+            .list_with_delimiter(Some(&qualified))
+            .await?;
+        Ok(listing.common_prefixes)
+    }
+
     pub fn qualify_path<'a>(&self, path: &'a Path) -> Cow<'a, Path> {
         match self.config.key() {
             Some(prefix) => Cow::Owned(prefix.parts().chain(path.parts()).collect()),

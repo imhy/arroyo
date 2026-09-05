@@ -94,6 +94,7 @@ use crate::states::scheduling::fanout::Accounting;
 /// difference between them is what the caller reports.
 #[must_use = "a recovered obligation may still be unsettled, in which case this attempt may not \
               admit a replacement generation"]
+#[derive(Debug)]
 pub(crate) enum Discharge {
     /// This job's lifecycle mechanism does not recover a durable obligation.
     ///
@@ -157,6 +158,36 @@ pub(crate) enum RecoveryFailure {
 /// Discharges whatever fencing obligation this job's row carries, under this controller's
 /// freshly adopted authority.
 ///
+/// Why a controller is discharging a recovered obligation.
+///
+/// The record survives the generation it names (PR #167 round 5), which makes a *settled* target
+/// mean two different things depending on who is reading it. `Acknowledged` says that generation
+/// took some **earlier** fence; whether that settles anything depends entirely on what the
+/// reader is about to do, and there is no way to answer it from the record alone. So the caller
+/// says which it is, and the two answers are different code paths rather than a flag one of them
+/// might forget to set (PR #167 round 6, finding 1).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DischargeReason {
+    /// This controller is about to **supersede** the generations the record names — by admitting
+    /// a replacement generation, or by publishing a refusal.
+    ///
+    /// Every target that is still running is re-opened and asked again under the fence this
+    /// controller has just adopted. An acknowledgement of a lower fence acknowledges nothing
+    /// about this one: those workers still admit their old owner's directives, and D39d requires
+    /// them fenced *before* a replacement generation is admitted or a refusal is published.
+    /// Observed terminations survive the re-opening — see [`Fencing::reopened`].
+    SupersedingTheGenerationsItNames,
+    /// This controller is **adopting** the execution the record names and will keep it running.
+    ///
+    /// The documented exception (PR #167 round 3): the cold `Running` → `LeaderRunning` recovery
+    /// admits no generation and issues no start, and in worker-leader mode holds no worker set to
+    /// address — it reconnects to the leader the row names, and what makes it exclusive is the
+    /// adoption CAS. Re-opening here would demand a fresh acknowledgement from workers this
+    /// controller is not superseding, and a partition would then wedge a job that is running
+    /// perfectly well. Those workers learn this controller's fence at its first fenced directive.
+    AdoptingTheGenerationItNames,
+}
+
 /// The whole of M11.T26f's recovery, in the order M11.D39d requires it:
 ///
 /// 1. read the durable record — the caller has already re-adopted, conditionally, so this
@@ -172,11 +203,15 @@ pub(crate) enum RecoveryFailure {
 /// attempt that called it may go on to do those things, which is M11.D39d's *"`Refused` (or a
 /// new scheduling generation) becomes reachable only after every target generation has acked
 /// the fence/revokes or has been observed terminated."*
+///
+/// `reason` decides whether the record's *settled* targets are asked again; see
+/// [`DischargeReason`], which is the whole of PR #167 round 6's finding 1.
 pub(crate) async fn discharge_recorded_obligation(
     status: &mut JobStatus,
     db: &DatabaseSource,
     scheduler: &Arc<dyn Scheduler>,
     mode: LifecycleMode,
+    reason: DischargeReason,
 ) -> Discharge {
     if !mode.recovers_a_durable_fencing_obligation() {
         return Discharge::Inactive;
@@ -184,6 +219,18 @@ pub(crate) async fn discharge_recorded_obligation(
     let job_id = (**status.authority().job_id()).clone();
     let Some(record) = status.recorded_fencing().cloned() else {
         return Discharge::NothingRecorded;
+    };
+    // The one place the settled states of a recovered record are re-opened, and the reason
+    // decides it (PR #167 round 6, finding 1). Doing it here rather than at each caller is what
+    // stops a third discharge path being added that reads a *previous* fence's acknowledgements
+    // as though they said something about this controller's.
+    let record = match reason {
+        DischargeReason::SupersedingTheGenerationsItNames => {
+            let reopened = record.reopened();
+            status.record_fencing_obligation(Some(reopened.clone()));
+            reopened
+        }
+        DischargeReason::AdoptingTheGenerationItNames => record,
     };
     let adopted_fence = status.authority().fence().get();
     let mut obligation = RecoveredObligation::of(&record, adopted_fence);

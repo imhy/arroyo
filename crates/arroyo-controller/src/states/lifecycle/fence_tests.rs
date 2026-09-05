@@ -900,7 +900,7 @@ fn the_production_status_write_is_conditional_since_the_activation_change() {
     // the publications is what keeps the equality from being satisfied by a file that answers
     // neither.
     const PUBLISHING: [(&str, &str, usize, usize); 5] = [
-        ("states/mod.rs", include_str!("../mod.rs"), 2, 6),
+        ("states/mod.rs", include_str!("../mod.rs"), 2, 2),
         (
             "states/scheduling.rs",
             include_str!("../scheduling.rs"),
@@ -916,13 +916,14 @@ fn the_production_status_write_is_conditional_since_the_activation_change() {
         ),
         (
             // Three publications since PR #167 round 2 — the raised generation, the fan-out's
-            // obligation written before any request it names is polled, and the clearing of
-            // that obligation once every request has settled — answered by two stand-down
-            // sites, because two of them funnel through `stand_down_from`.
+            // obligation written before any request it names is polled, and the reduction of
+            // that obligation once every request has settled — and since PR #167 round 7 all
+            // three answer through `stand_down_from`, the form that reports rather than only
+            // logs.
             "states/scheduling/admission.rs",
             include_str!("../scheduling/admission.rs"),
             3,
-            2,
+            3,
         ),
     ];
     let funnel = include_str!("publication.rs");
@@ -1006,9 +1007,9 @@ fn the_production_status_write_is_conditional_since_the_activation_change() {
     }
 
     // 3. Every state that learns it has been superseded acts on it, in the one way there is:
-    //    one arm per publication, and one stand-down per arm. Counting both against the number
-    //    of publications rather than against each other is what stops the equality from being
-    //    satisfied by a file that has neither.
+    //    one arm per publication, and every arm answered. Both numbers are stated against the
+    //    file rather than against each other, so the equality cannot be satisfied by a file that
+    //    has neither.
     for (name, source, publications, stand_downs) in PUBLISHING {
         let source = production_half(source);
         assert_eq!(
@@ -1016,9 +1017,24 @@ fn the_production_status_write_is_conditional_since_the_activation_change() {
             publications,
             "{name}: every one of its status publications answers the superseded outcome"
         );
+        // Per *arm*, not per file. A count is satisfied by a file with the right number of
+        // stand-downs somewhere in it, which is how PR #167 round 7's finding 3 survived round
+        // 6: `settle_recorded_obligation` matched the superseded outcome, called `stand_down`,
+        // and then returned `()` so the caller carried a healthy fan-out onward. What has to be
+        // true is that *each* arm answers, so each arm is looked at.
+        //
+        // Either spelling answers. `stand_down_from` is the stronger one — it stands down, keeps
+        // the stale authority for the caller, and returns a reason the code below it cannot
+        // discard — and it is what every arm that has a caller to report to uses.
+        let answered = source
+            .match_indices("StatusPublication::Superseded(")
+            .filter(|(at, _)| {
+                let arm = &source[*at..source.len().min(at + 240)];
+                arm.contains("stand_down")
+            })
+            .count();
         assert_eq!(
-            source.matches("stand_down(").count(),
-            stand_downs,
+            answered, stand_downs,
             "{name}: and answers every superseded outcome it can reach by standing down, not \
              by logging it and continuing"
         );

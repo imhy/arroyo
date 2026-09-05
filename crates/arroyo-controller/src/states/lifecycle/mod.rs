@@ -114,7 +114,7 @@ pub(crate) use intent::{IntentMailbox, IntentWakeup, LifecycleIntent};
 pub(crate) use mode::LifecycleMode;
 pub(crate) use protocol::{FenceProtocol, TransportSettlement, UnfencedAuthority};
 pub(crate) use publication::{StatusPublication, publish_status, stand_down};
-pub(crate) use recovery::{Discharge, discharge_recorded_obligation};
+pub(crate) use recovery::{Discharge, DischargeReason, discharge_recorded_obligation};
 pub(crate) use root::{GenerationRoot, RecoveryReference, RootCandidate, RootContext};
 pub(crate) use settlement::JobSettlementOwner;
 pub(crate) use waiting::{JobWait, Waited};

@@ -84,6 +84,13 @@ pub trait ProtocolStore: Send + Sync {
         bytes: Vec<u8>,
     ) -> Result<CreateResult<Vec<u8>>, StoreError>;
 
+    /// The immediate child directory names under `prefix`.
+    ///
+    /// A delimiter listing: it answers "which generations exist" without enumerating the objects
+    /// inside them, which is what keeps it cheap on a job whose generations hold thousands of
+    /// checkpoint objects. Implementors return the child name only, not the full path.
+    async fn list_child_directories(&self, prefix: &str) -> Result<Vec<String>, StoreError>;
+
     /// Deletes raw object bytes, succeeding if the object is already absent.
     async fn delete_object(&self, path: &CheckpointRef) -> Result<(), StoreError>;
 
@@ -211,7 +218,7 @@ where
     }
 }
 
-fn encode_json<T>(path: &CheckpointRef, value: &T) -> Result<Vec<u8>, StoreError>
+pub(crate) fn encode_json<T>(path: &CheckpointRef, value: &T) -> Result<Vec<u8>, StoreError>
 where
     T: Serialize,
 {
@@ -253,6 +260,15 @@ impl ProtocolStore for StorageProvider {
             }
             Err(error) => Err(StoreError::Storage(error)),
         }
+    }
+
+    async fn list_child_directories(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
+        Ok(self
+            .list_directories(prefix)
+            .await?
+            .into_iter()
+            .filter_map(|path| path.parts().last().map(|part| part.as_ref().to_string()))
+            .collect())
     }
 
     async fn delete_object(&self, path: &CheckpointRef) -> Result<(), StoreError> {
@@ -338,6 +354,24 @@ pub(crate) mod tests {
                 .push(path.as_str().to_string());
             objects.insert(path.as_str().to_string(), bytes);
             Ok(CreateResult::Created)
+        }
+
+        async fn list_child_directories(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
+            let prefix = if prefix.ends_with('/') {
+                prefix.to_string()
+            } else {
+                format!("{prefix}/")
+            };
+            let objects = self.objects.lock().unwrap();
+            let mut children: Vec<String> = objects
+                .keys()
+                .filter_map(|key| key.strip_prefix(&prefix))
+                // A *directory* listing: only keys with something below the child name.
+                .filter_map(|rest| rest.split_once('/').map(|(child, _)| child.to_string()))
+                .collect();
+            children.sort();
+            children.dedup();
+            Ok(children)
         }
 
         async fn delete_object(&self, path: &CheckpointRef) -> Result<(), StoreError> {

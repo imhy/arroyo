@@ -359,14 +359,30 @@ impl<'a, 'ctx> PhaseContext<'a, 'ctx> {
     /// A write that fails is logged rather than reported: the attempt is starting a job, and a
     /// record that still names outstanding identifiers costs a later pass one redundant fence
     /// advance per target and settles nothing wrongly.
-    pub(super) async fn settle_recorded_obligation(&mut self, a: &Admission) {
+    ///
+    /// # Errors
+    ///
+    /// A **refused** write is a different thing entirely, and is reported (PR #167 round 6,
+    /// finding 3). Reaching a conditional write that matches no row is this controller's own,
+    /// definitive evidence that it no longer holds the job — the same evidence adoption and the
+    /// metadata root stand down on. Logging it and returning success let a superseded attempt
+    /// carry a healthy fan-out outcome into task startup and publish restored checkpoint
+    /// commits, which are visible outside the cluster and cannot be withdrawn. A failed database
+    /// write and a lost authority are not the same control flow.
+    ///
+    /// The durable record is left exactly as the row holds it: the write that would have reduced
+    /// it was refused, so what the replacement reads is the full obligation this attempt owed.
+    pub(super) async fn settle_recorded_obligation(
+        &mut self,
+        a: &Admission,
+    ) -> Result<(), StateError> {
         let Some(settled) = self
             .ctx
             .status
             .recorded_fencing()
             .map(arroyo_rpc::fencing::Fencing::settled_and_still_running)
         else {
-            return;
+            return Ok(());
         };
         self.ctx.status.record_fencing_obligation(Some(settled));
         match a
@@ -376,14 +392,17 @@ impl<'a, 'ctx> PhaseContext<'a, 'ctx> {
             )
             .await
         {
-            Ok(StatusPublication::Published) => {}
-            Ok(StatusPublication::Superseded(stale)) => stand_down(stale),
-            Err(e) => warn!(
-                error = %e,
-                "this attempt's settled fan-out obligation could not be written back to the \
-                 job's row; a later pass will advance its fence at targets that have nothing \
-                 outstanding, which costs a round trip and settles nothing wrongly"
-            ),
+            Ok(StatusPublication::Published) => Ok(()),
+            Ok(StatusPublication::Superseded(stale)) => Err(self.stand_down_from(stale)),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "this attempt's settled fan-out obligation could not be written back to the \
+                     job's row; a later pass will advance its fence at targets that have nothing \
+                     outstanding, which costs a round trip and settles nothing wrongly"
+                );
+                Ok(())
+            }
         }
     }
 

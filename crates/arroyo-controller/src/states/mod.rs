@@ -27,7 +27,7 @@ use self::leader_restarting::LeaderRestarting;
 use self::leader_running::LeaderRunning;
 use self::leader_stopping::LeaderStopping;
 use self::lifecycle::fence::AuthorityOutcome;
-use self::lifecycle::recovery::{Discharge, discharge_recorded_obligation};
+use self::lifecycle::recovery::{Discharge, DischargeReason, discharge_recorded_obligation};
 use self::lifecycle::{
     ConsumptionPoint, IntentWakeup, JobLifecycle, JobWait, LifecycleActor, LifecycleIntent,
     ObservedIntent, UnfencedAuthority, stand_down,
@@ -1305,16 +1305,15 @@ impl JobContext<'_> {
         // a single worker having been asked anything. Asking them again, under the fence this
         // controller now holds, is exactly M11.D39d's "refusal actively advances the fence at
         // every worker generation addressable by the old scheduling generation".
-        if let Some(reopened) = self
-            .status
-            .recorded_fencing()
-            .map(arroyo_rpc::fencing::Fencing::reopened)
-        {
-            self.status.record_fencing_obligation(Some(reopened));
-        }
         let mode = self.lifecycle_mode();
-        let discharged =
-            discharge_recorded_obligation(self.status, &self.db, &self.scheduler, mode).await;
+        let discharged = discharge_recorded_obligation(
+            self.status,
+            &self.db,
+            &self.scheduler,
+            mode,
+            DischargeReason::SupersedingTheGenerationsItNames,
+        )
+        .await;
         match discharged {
             // Nothing owed, or everything settled. The fence this pass adopted supersedes every
             // identifier an earlier attempt issued, so the inventory it reclaimed is discharged
@@ -2753,6 +2752,10 @@ impl StateMachine {
             &self.db,
             &self.scheduler,
             self.lifecycle.mode(),
+            // The exception, stated rather than implied (PR #167 rounds 3 and 6): this
+            // controller is adopting the execution the record names and keeps it running, so it
+            // supersedes nobody and asks nobody for a fresh acknowledgement.
+            DischargeReason::AdoptingTheGenerationItNames,
         )
         .await
         {
@@ -10951,6 +10954,84 @@ mod tests {
             1,
             "the control: the preamble did run, so this row really is about the wait after it \
              and not about a job that never got that far"
+        );
+    }
+
+    /// **PR #167 round 7, finding 3.** A settlement write the job's row refuses stops the attempt
+    /// before its restored commits, rather than being logged beside a healthy fan-out.
+    ///
+    /// The fan-out's last act is to reduce the durable obligation it wrote before its first
+    /// request. That write is conditional on this controller's fence and epoch, so a refusal is
+    /// this controller's own definitive evidence that it no longer holds the job — the same
+    /// evidence adoption and the metadata root already stand down on. Before round 7 it was a
+    /// log line: the attempt kept its `Ok`, ran task startup, built a job controller and
+    /// published the restored checkpoint's commits, which are visible outside the cluster and
+    /// cannot be withdrawn.
+    ///
+    /// The rival adopts from inside the worker's own `StartExecution` handler, so it lands
+    /// strictly after the metadata root — which this attempt therefore still won — and strictly
+    /// before the settlement write. That is what isolates this row from the duel
+    /// `a_controller_superseded_after_publishing_leaves_an_unrooted_candidate` covers: here the
+    /// controller wins everything up to the fan-out and is superseded inside it.
+    ///
+    /// The fixture's restored checkpoint died in its committing phase, so an attempt that
+    /// reaches the third region publishes — which is exactly what
+    /// `the_fenced_lifecycle_schedules_a_job_through_the_phase_graph` asserts on the ordinary
+    /// path, and what must not happen here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_settlement_write_the_row_refuses_stops_before_the_restored_commits() {
+        let mut run = SchedulingRun::new("stale-settlement").await;
+        let mailbox = intent_mailbox();
+        run.harness.install_actor(&mailbox);
+        let barriers = run.barriers.clone();
+        let db = run.db.clone();
+        let queue = run.harness.queue();
+
+        let rival = tokio::spawn(async move {
+            // Raised inside the worker's own `StartExecution` handler: after this attempt won
+            // its metadata root, and before its fan-out settles.
+            barriers.execution_started.notified().await;
+            let DatabaseSource::Sqlite(connection) = &db else {
+                unreachable!("the fixture is always sqlite")
+            };
+            connection
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE job_statuses
+                        SET lifecycle_fence = lifecycle_fence + 1, controller_epoch = 'rival'
+                      WHERE id = 'job_abc'",
+                    [],
+                )
+                .unwrap();
+            // The tasks do start, so the attempt is not merely timing out in its second wait.
+            queue.send(task_started()).await.unwrap();
+        });
+
+        run.harness
+            .queue()
+            .send(worker_connect_from(WorkerId(7), &run.address(0)))
+            .await
+            .unwrap();
+        let outcome = tokio::time::timeout(DECIDED, run.schedule_through_the_phase_graph())
+            .await
+            .expect("the refused settlement has to end the attempt");
+        rival.await.unwrap();
+
+        assert!(
+            matches!(outcome, Ok(Transition::Stop)),
+            "a controller whose settlement write matched no row has been told it lost the job,              and stands down rather than carrying a healthy fan-out onward: {:?}",
+            advanced_to(&outcome)
+        );
+        assert_eq!(
+            run.calls.committed(),
+            Vec::<u64>::new(),
+            "so the restored checkpoint's commits — visible outside the cluster, and              unwithdrawable — were not published under an authority this controller had lost"
+        );
+        assert_eq!(
+            run.calls.started(),
+            ["parquet".to_string()],
+            "the control: the fan-out did run and did succeed, so this row is about what happens              *after* it and not about an attempt that never got there"
         );
     }
 

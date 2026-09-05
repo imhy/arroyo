@@ -44,7 +44,7 @@ use tracing::warn;
 
 use super::PhaseContext;
 use crate::states::lifecycle::recovery::observe_terminations;
-use crate::states::lifecycle::{Discharge, discharge_recorded_obligation};
+use crate::states::lifecycle::{Discharge, DischargeReason, discharge_recorded_obligation};
 use crate::states::{Admission, StateError};
 
 impl PhaseContext<'_, '_> {
@@ -72,7 +72,19 @@ impl PhaseContext<'_, '_> {
         let discharge = a
             .effect(
                 "discharge the job's recovered durable fencing obligation",
-                discharge_recorded_obligation(self.ctx.status, &db, &scheduler, mode),
+                discharge_recorded_obligation(
+                    self.ctx.status,
+                    &db,
+                    &scheduler,
+                    mode,
+                    // A preamble exists to admit a **replacement** generation, so every target
+                    // the record still names is asked again under the fence this attempt has
+                    // just adopted. Reading the acknowledgements an *earlier* and lower fence
+                    // left behind would let the preamble persist a new generation and tear the
+                    // old cluster down while its workers still admit their old owner's
+                    // directives (PR #167 round 6, finding 1).
+                    DischargeReason::SupersedingTheGenerationsItNames,
+                ),
             )
             .await;
         match discharge {

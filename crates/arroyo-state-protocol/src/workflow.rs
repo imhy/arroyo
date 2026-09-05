@@ -4,8 +4,8 @@ use crate::ProtocolPaths;
 use crate::resolve::{EpochClaimOutcome, ParentCheckpointStatus, ResolveFailure};
 use crate::state::{CheckpointState, derive_checkpoint_state};
 use crate::store::{
-    CreateResult, ProtocolStore, StoreError, create_json_if_not_exist, create_protobuf, put_json,
-    read_json, read_protobuf,
+    CreateResult, ProtocolStore, StoreError, create_json_if_not_exist, create_protobuf,
+    encode_json, put_json, read_json, read_protobuf,
 };
 use crate::types::{
     CheckpointRef, CommittedMarker, CurrentGeneration, Epoch, EpochRecord, Generation,
@@ -135,28 +135,124 @@ pub enum CurrentGenerationPolicy {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeferredCurrentGeneration(CurrentGeneration);
 
+/// What publishing a deferred pointer did.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[must_use]
+pub enum CurrentGenerationPublication {
+    /// This generation is now the job's current one.
+    Published,
+    /// A **newer** generation is already current, so this controller has lost the job and wrote
+    /// nothing.
+    Superseded {
+        /// The generation that is current.
+        current_generation: Generation,
+    },
+}
+
 impl DeferredCurrentGeneration {
     /// The generation this pointer makes current.
     pub fn generation(&self) -> Generation {
         self.0.generation
     }
 
-    /// Writes it, making this generation the job's current one.
+    /// Makes this generation the job's current one, or reports that a newer one already is.
+    ///
+    /// One **immutable marker per generation**, written with put-if-absent, and readers take the
+    /// highest that exists (PR #167 round 7, finding 2). Winning the metadata-root row update and
+    /// making the generation current are two operations, and a controller can be superseded
+    /// between them: A wins its root update and pauses, B adopts the job, installs its own root
+    /// and makes generation 2 current, and A then resumes. Against a single mutable pointer A's
+    /// write reverts the job to generation 1, and every checkpoint B's live generation publishes
+    /// is refused as stale from that moment on.
+    ///
+    /// A conditional overwrite would serialize that, and is not portable: `object_store`'s
+    /// `PutMode::Update` is unimplemented for the local filesystem, which a `file://` checkpoint
+    /// URL uses. Put-if-absent is implemented by every backend, and an *additive* write cannot
+    /// revert anything — A's marker for generation 1 leaves B's marker for generation 2 exactly
+    /// where it is, and the reader takes the higher one.
+    ///
+    /// What makes "highest wins" the right rule rather than a race in disguise is the ordering
+    /// round 6 established: a marker is written only after its controller has won the root CAS,
+    /// so a controller that lost writes none and can never be the maximum.
+    ///
+    /// Re-publishing a generation whose marker already exists is [`Published`] and writes
+    /// nothing: a generation belongs to exactly one adoption, so an existing marker at this
+    /// generation is this controller's own earlier write.
+    ///
+    /// [`Published`]: CurrentGenerationPublication::Published
     ///
     /// # Errors
     ///
-    /// [`StoreError`] when the object could not be written. Nothing else is written here, and
-    /// nothing here is conditional: the condition is the caller's authority, which it has
-    /// already established.
-    pub async fn publish<S>(&self, store: &S) -> Result<(), StoreError>
+    /// [`StoreError`] when the store could not be listed, read or written.
+    pub async fn publish<S>(&self, store: &S) -> Result<CurrentGenerationPublication, StoreError>
     where
         S: ProtocolStore + ?Sized,
     {
-        put_current_generation(store, &self.0).await
+        let paths = ProtocolPaths::new(self.0.pipeline_id.clone(), self.0.job_id.clone());
+        if let Some(current) = current_generation(store, &paths).await?
+            && current > self.0.generation
+        {
+            return Ok(CurrentGenerationPublication::Superseded {
+                current_generation: current,
+            });
+        }
+
+        let path = paths.current_generation_marker(self.0.generation);
+        match store
+            .create_bytes(&path, encode_json(&path, &self.0)?)
+            .await?
+        {
+            CreateResult::Created | CreateResult::AlreadyExists(_) => {
+                Ok(CurrentGenerationPublication::Published)
+            }
+        }
     }
 }
 
-/// Result of [`initialize_generation`].
+/// The generation a job's markers say is current, or `None` if none has been made current.
+///
+/// The highest generation that has a marker. A delimiter listing answers which generations
+/// exist without enumerating their contents, and the markers are then probed from the highest
+/// down — so the common case is one listing and one existence check.
+pub async fn current_generation<S>(
+    store: &S,
+    paths: &ProtocolPaths,
+) -> Result<Option<Generation>, StoreError>
+where
+    S: ProtocolStore + ?Sized,
+{
+    Ok(read_current_generation(store, paths)
+        .await?
+        .map(|current| current.generation))
+}
+
+/// The same, as the whole record the marker holds.
+pub async fn read_current_generation<S>(
+    store: &S,
+    paths: &ProtocolPaths,
+) -> Result<Option<CurrentGeneration>, StoreError>
+where
+    S: ProtocolStore + ?Sized,
+{
+    let mut generations: Vec<u64> = store
+        .list_child_directories(paths.generations_prefix().trim_end_matches('/'))
+        .await?
+        .iter()
+        .filter_map(|name| name.parse::<u64>().ok())
+        .collect();
+    generations.sort_unstable_by(|a, b| b.cmp(a));
+
+    for generation in generations {
+        let generation = Generation(generation);
+        let path = paths.current_generation_marker(generation);
+        if let Some(current) = read_json::<_, CurrentGeneration>(store, &path).await? {
+            return Ok(Some(current));
+        }
+    }
+    Ok(None)
+}
+
+/// Result of [`initialize_generation`]./// Result of [`initialize_generation`].
 ///
 /// Not `Eq`: it carries a [`CheckpointManifest`], whose generated `PartialEq` is all
 /// prost provides.
@@ -359,8 +455,7 @@ where
 
     // TODO: this read is not strictly necessary for a policy that writes the pointer, but is
     //  here to prevent potential corruption by a confused controller
-    let current_generation =
-        read_json::<_, CurrentGeneration>(store, &paths.current_generation()).await?;
+    let current_generation = read_current_generation(store, &paths).await?;
 
     match policy {
         // Both policies that make this generation current owe the same monotonicity rule, and it
@@ -600,31 +695,12 @@ async fn publish_current_generation<S>(
 where
     S: ProtocolStore + ?Sized,
 {
-    put_current_generation(
-        store,
-        &publication.get().current_generation(SystemTime::now()),
-    )
-    .await
-}
-
-/// The one write of `current-generation.json`.
-///
-/// Both routes to the object go through it — the immediate one above and
-/// [`DeferredCurrentGeneration::publish`] — so the bytes a deferred publication writes are the
-/// bytes an immediate one would have, and the path is derived from the record rather than named
-/// twice.
-async fn put_current_generation<S>(
-    store: &S,
-    current_generation: &CurrentGeneration,
-) -> Result<(), StoreError>
-where
-    S: ProtocolStore + ?Sized,
-{
-    let paths = ProtocolPaths::new(
-        current_generation.pipeline_id.clone(),
-        current_generation.job_id.clone(),
-    );
-    put_json(store, &paths.current_generation(), current_generation).await
+    // The same marker the deferred route writes, through the same code: an immediate
+    // publication and a deferred one differ in *when* they happen and not in what they write.
+    DeferredCurrentGeneration(publication.get().current_generation(SystemTime::now()))
+        .publish(store)
+        .await
+        .map(|_| ())
 }
 
 /// Writes the generation manifest and returns what was written.
@@ -788,12 +864,9 @@ where
     // of the same job, generation and epoch, so no legitimate publication is refused.
     identify_checkpoint_manifest(&paths, request.checkpoint_ref, request.checkpoint)?;
 
-    let is_current_generation =
-        read_json::<_, CurrentGeneration>(store, &paths.current_generation())
-            .await?
-            .is_some_and(|current_generation| {
-                current_generation.generation == request.generation_manifest.generation
-            });
+    let is_current_generation = current_generation(store, &paths)
+        .await?
+        .is_some_and(|current| current == request.generation_manifest.generation);
 
     if !is_current_generation {
         return Ok(CheckpointPublication::StaleGeneration);
