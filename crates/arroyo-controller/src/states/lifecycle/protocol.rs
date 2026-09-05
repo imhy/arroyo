@@ -34,7 +34,9 @@
 
 use std::num::NonZeroU64;
 
-use arroyo_rpc::fence_wire::{CommitAuthority, FenceAddress, LifecycleTarget, StartDirective};
+use arroyo_rpc::fence_wire::{
+    CommitAuthority, FenceAddress, LifecycleTarget, StartDirective, WorkerIncarnation,
+};
 use arroyo_rpc::grpc::rpc::LifecycleOperation;
 use arroyo_types::WorkerId;
 use thiserror::Error;
@@ -182,15 +184,26 @@ impl FenceProtocol {
 }
 
 impl FencedGeneration {
-    /// The fence, addressed to `worker` in this generation.
+    /// The fence, addressed to `worker`'s `incarnation` in this generation.
     ///
     /// Total, and that is the point: the two things that could make an address meaningless were
     /// settled when this value was built, so a send site has no failure to handle and no reason
-    /// to reach for the three scalars underneath.
-    pub(crate) fn address(self, worker: WorkerId) -> FenceAddress {
+    /// to reach for the four scalars underneath.
+    ///
+    /// The incarnation is per call because it is per *worker*, and this value is per generation:
+    /// each worker of a generation is its own process and reported its own nonce at
+    /// registration. An `Option` because both of its sources may name none — a worker predating
+    /// `RegisterWorkerReq::worker_incarnation`, and a durable fencing record written before the
+    /// field — and a generation that has one refuses an address that names none, which is the
+    /// fail-closed reading (M11.D39d, PR #167 round 6).
+    pub(crate) fn address(
+        self,
+        worker: WorkerId,
+        incarnation: Option<WorkerIncarnation>,
+    ) -> FenceAddress {
         FenceAddress::under(
             self.fence,
-            LifecycleTarget::in_generation(worker.0, self.generation),
+            LifecycleTarget::in_generation(worker.0, self.generation, incarnation),
         )
     }
 
@@ -199,9 +212,13 @@ impl FencedGeneration {
     /// It revokes nothing. Advancing the fence is what supersedes older identifiers; naming them
     /// as well is M11.T26e's reconciliation, and the worker refuses a `FENCE_ONLY` that names
     /// any.
-    pub(crate) fn fence_only(self, worker: WorkerId) -> StartDirective<'static> {
+    pub(crate) fn fence_only(
+        self,
+        worker: WorkerId,
+        incarnation: Option<WorkerIncarnation>,
+    ) -> StartDirective<'static> {
         StartDirective::Fenced {
-            address: self.address(worker),
+            address: self.address(worker, incarnation),
             operation: LifecycleOperation::FenceOnly,
             revoked_execution_ids: &[],
         }

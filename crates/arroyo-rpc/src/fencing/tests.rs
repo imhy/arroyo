@@ -12,6 +12,7 @@ fn target(worker_id: u64) -> FenceTarget {
         generation: 7,
         attempt_id: Some("a".repeat(MAX_ATTEMPT_ID_CHARS)),
         rpc_address: Some("http://worker:9191".to_string()),
+        incarnation: NonZeroU64::new(worker_id + 1),
         state: FenceTargetState::Pending,
     }
 }
@@ -210,6 +211,7 @@ fn a_record_round_trips_without_gaining_fields() {
             generation: 11,
             attempt_id: None,
             rpc_address: None,
+            incarnation: None,
             state: FenceTargetState::Acknowledged,
         }],
         None,
@@ -267,6 +269,7 @@ fn the_address_and_origin_bounds_are_exact_at_their_boundaries() {
             generation: 2,
             attempt_id: None,
             rpc_address: Some("h".repeat(chars)),
+            incarnation: None,
             state: FenceTargetState::Pending,
         };
         let written = Fencing::record(vec![target.clone()], None, None);

@@ -58,10 +58,11 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use arroyo_rpc::fence_wire::{
-    FenceAddress, MalformedFenceFields, ObservedSettlement, StartDirective, observed_settlement,
+    FenceAddress, MalformedFenceFields, ObservedSettlement, StartDirective, WorkerIncarnation,
+    observed_settlement,
 };
 use arroyo_rpc::grpc::rpc::{StartExecutionOutcome, StartExecutionReq};
-use arroyo_rpc::identity::WorkerClient;
+use arroyo_rpc::identity::{WorkerChannel, WorkerClient};
 use arroyo_types::WorkerId;
 use futures::stream::{FuturesUnordered, StreamExt};
 use thiserror::Error;
@@ -221,10 +222,17 @@ impl StartTargets {
     /// a decision the type checker forces rather than one a caller has to remember.
     pub(crate) fn without_a_handshake(
         protocol: FenceProtocol,
-        connects: HashMap<WorkerId, WorkerClient>,
+        connects: HashMap<WorkerId, WorkerChannel>,
     ) -> Option<Self> {
         match protocol {
-            FenceProtocol::Legacy => Some(Self(Addressed::Unfenced(connects))),
+            // The incarnations are dropped here and only here: a legacy directive addresses no
+            // generation and therefore no process, so there is nothing for one to name.
+            FenceProtocol::Legacy => Some(Self(Addressed::Unfenced(
+                connects
+                    .into_iter()
+                    .map(|(id, channel)| (id, channel.into_client()))
+                    .collect(),
+            ))),
             FenceProtocol::Fenced(_) => None,
         }
     }
@@ -356,15 +364,16 @@ pub(crate) struct HandshakeRefusal(Vec<NotAcknowledged>);
 /// one does: see the module documentation on why this is all or nothing.
 pub(crate) async fn advance_fence(
     generation: FencedGeneration,
-    connects: HashMap<WorkerId, WorkerClient>,
+    connects: HashMap<WorkerId, WorkerChannel>,
 ) -> Result<StartTargets, HandshakeRefusal> {
     let protocol = FenceProtocol::Fenced(generation);
-    let mut handshakes: FuturesUnordered<_> = connects
-        .into_iter()
-        .map(
-            |(id, client)| async move { (id, advance_one(protocol, generation, id, client).await) },
-        )
-        .collect();
+    let mut handshakes: FuturesUnordered<_> =
+        connects
+            .into_iter()
+            .map(|(id, channel)| async move {
+                (id, advance_one(protocol, generation, id, channel).await)
+            })
+            .collect();
 
     let mut acknowledged = HashMap::new();
     let mut refused = Vec::new();
@@ -403,10 +412,16 @@ async fn advance_one(
     protocol: FenceProtocol,
     generation: FencedGeneration,
     id: WorkerId,
-    mut client: WorkerClient,
+    channel: WorkerChannel,
 ) -> Result<(WorkerClient, AcknowledgedTarget), NotAcknowledged> {
+    // Read once, before the request is built, and carried into the acknowledgement below: the
+    // address this handshake advanced and the address the resulting `START` is issued under must
+    // name the same process, and reading the channel's incarnation twice is what would let them
+    // differ.
+    let incarnation = channel.incarnation();
+    let mut client = channel.into_client();
     let mut request = StartExecutionReq::default();
-    generation.fence_only(id).stamp(&mut request);
+    generation.fence_only(id, incarnation).stamp(&mut request);
 
     let mut unsettled = 0usize;
     loop {
@@ -415,6 +430,7 @@ async fn advance_one(
                 return acknowledgement(
                     generation,
                     id,
+                    incarnation,
                     observed_settlement(&response.into_inner()),
                 )
                 .map(|target| (client, target));
@@ -449,6 +465,7 @@ async fn advance_one(
 fn acknowledgement(
     generation: FencedGeneration,
     id: WorkerId,
+    incarnation: Option<WorkerIncarnation>,
     settlement: Result<ObservedSettlement, MalformedFenceFields>,
 ) -> Result<AcknowledgedTarget, NotAcknowledged> {
     let refuse = |report: String| NotAcknowledged::NotAnAcknowledgement {
@@ -471,7 +488,7 @@ fn acknowledgement(
     // generation had not taken this fence at all.
     match settlement.observed_fence() {
         Some(observed) if observed >= generation.fence() => Ok(AcknowledgedTarget {
-            address: generation.address(id),
+            address: generation.address(id, incarnation),
             observed_fence: observed,
         }),
         observed => Err(refuse(format!("observed fence {observed:?}"))),
@@ -495,15 +512,16 @@ fn acknowledgement(
 /// this module that could express one.
 pub(crate) async fn advance_fence_each(
     generation: FencedGeneration,
-    connects: HashMap<WorkerId, WorkerClient>,
+    connects: HashMap<WorkerId, WorkerChannel>,
 ) -> FenceAdvance {
     let protocol = FenceProtocol::Fenced(generation);
-    let mut handshakes: FuturesUnordered<_> = connects
-        .into_iter()
-        .map(
-            |(id, client)| async move { (id, advance_one(protocol, generation, id, client).await) },
-        )
-        .collect();
+    let mut handshakes: FuturesUnordered<_> =
+        connects
+            .into_iter()
+            .map(|(id, channel)| async move {
+                (id, advance_one(protocol, generation, id, channel).await)
+            })
+            .collect();
 
     let mut advance = FenceAdvance::default();
     while let Some((id, outcome)) = handshakes.next().await {

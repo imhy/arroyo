@@ -90,6 +90,72 @@ pub enum GenerationRecovery {
     },
 }
 
+/// What an initialization does about the job's canonical `current-generation.json`.
+///
+/// The object is not bookkeeping: `publish_checkpoint` refuses a checkpoint whose generation is
+/// not the current one, and `resolve_generation_manifest` reads a candidate differently
+/// depending on whether its generation is current. Writing it is therefore a *protocol* effect,
+/// which is why who writes it and when is a decision this type makes explicit rather than a
+/// boolean at the call site (M11.D39c/M11.D39d, PR #167 round 6, finding 5).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CurrentGenerationPolicy {
+    /// Write it here, once the generation's history is resolved and its epoch claimed.
+    ///
+    /// The unfenced route: the caller has no authority to establish, so there is nothing for the
+    /// write to wait behind. It refuses to move the pointer backwards.
+    Publish,
+    /// Write nothing, and refuse unless this generation is already the current one.
+    ///
+    /// What a worker leader re-initializing its own generation asks for: the pointer already
+    /// names this generation, and a worker has no business moving it.
+    RequireCurrent,
+    /// Write nothing, and hand the pointer back for the caller to publish itself.
+    ///
+    /// The fenced route (M11.D39d). A controller that has not yet won the metadata-root CAS may
+    /// have lost the job to a replacement, and the canonical pointer is an authoritative
+    /// reader/writer input rather than an unrooted candidate: publishing it before the duel is
+    /// decided leaves a loser's generation named as current with nothing to undo it. Under this
+    /// policy the pointer is prepared here — from the same validated publication that would have
+    /// written it, so the object cannot differ — and returned as
+    /// [`DeferredCurrentGeneration`] for the caller to publish once its authority is
+    /// established.
+    ///
+    /// The monotonicity rule is [`Self::Publish`]'s, checked here as well: a caller whose
+    /// generation is behind the current one is refused before anything is claimed, not after.
+    Defer,
+}
+
+/// The canonical `current-generation.json` an initialization prepared and did not write.
+///
+/// Its field is private and it is built only by [`initialize_generation`], so a caller cannot
+/// name a generation current that no initialization resolved. Publishing it is the last step of
+/// making a generation authoritative, and under [`CurrentGenerationPolicy::Defer`] it is the
+/// caller's to take once its own fence duel is won.
+#[must_use = "a deferred current-generation pointer is published once the caller's authority is               established; dropping it leaves the job's previous generation current"]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeferredCurrentGeneration(CurrentGeneration);
+
+impl DeferredCurrentGeneration {
+    /// The generation this pointer makes current.
+    pub fn generation(&self) -> Generation {
+        self.0.generation
+    }
+
+    /// Writes it, making this generation the job's current one.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] when the object could not be written. Nothing else is written here, and
+    /// nothing here is conditional: the condition is the caller's authority, which it has
+    /// already established.
+    pub async fn publish<S>(&self, store: &S) -> Result<(), StoreError>
+    where
+        S: ProtocolStore + ?Sized,
+    {
+        put_current_generation(store, &self.0).await
+    }
+}
+
 /// Result of [`initialize_generation`].
 ///
 /// Not `Eq`: it carries a [`CheckpointManifest`], whose generated `PartialEq` is all
@@ -108,6 +174,12 @@ pub enum GenerationInitialization {
         /// for the same bytes and would let the caller act on a different object than the
         /// one that was validated.
         recovery_checkpoint: Option<CheckpointManifest>,
+        /// The canonical current-generation pointer this initialization did not write.
+        ///
+        /// `Some` under [`CurrentGenerationPolicy::Defer`] and `None` under the other two, which
+        /// either wrote it or were forbidden to. A caller that asked for the deferral and drops
+        /// this leaves the previous generation current — see [`DeferredCurrentGeneration`].
+        current_generation: Option<DeferredCurrentGeneration>,
     },
     StaleGeneration {
         current_generation: Generation,
@@ -278,32 +350,41 @@ pub enum CommitAuthorization {
 pub async fn initialize_generation<S>(
     store: &S,
     request: InitializeGenerationRequest,
-    update_current_generation: bool,
+    policy: CurrentGenerationPolicy,
 ) -> Result<GenerationInitialization, StoreError>
 where
     S: ProtocolStore + ?Sized,
 {
     let paths = ProtocolPaths::new(request.pipeline_id.clone(), request.job_id.clone());
 
-    // TODO: this read is not strictly necessary if update_current_generation is true, but is here
-    //  to prevent potential corruption by a confused controller
+    // TODO: this read is not strictly necessary for a policy that writes the pointer, but is
+    //  here to prevent potential corruption by a confused controller
     let current_generation =
         read_json::<_, CurrentGeneration>(store, &paths.current_generation()).await?;
 
-    if update_current_generation {
-        if let Some(current) = &current_generation
-            && current.generation > request.generation
-        {
-            return Err(StoreError::Protocol(
-                ProtocolError::NonMonotonicGenerationUpdate,
-            ));
+    match policy {
+        // Both policies that make this generation current owe the same monotonicity rule, and it
+        // is checked here for both — `Defer` moves *when* the pointer is written and not what may
+        // be written, so a controller behind the current generation is refused before it claims
+        // an epoch rather than after.
+        CurrentGenerationPolicy::Publish | CurrentGenerationPolicy::Defer => {
+            if let Some(current) = &current_generation
+                && current.generation > request.generation
+            {
+                return Err(StoreError::Protocol(
+                    ProtocolError::NonMonotonicGenerationUpdate,
+                ));
+            }
         }
-    } else if let Some(cur) = &current_generation
-        && cur.generation != request.generation
-    {
-        return Ok(GenerationInitialization::StaleGeneration {
-            current_generation: cur.generation,
-        });
+        CurrentGenerationPolicy::RequireCurrent => {
+            if let Some(cur) = &current_generation
+                && cur.generation != request.generation
+            {
+                return Ok(GenerationInitialization::StaleGeneration {
+                    current_generation: cur.generation,
+                });
+            }
+        }
     }
 
     // Whole-object check, before every persistent effect. `find_recovery_checkpoint` and
@@ -345,7 +426,11 @@ where
         resolved => resolved,
     };
 
-    if update_current_generation {
+    // Written here only for the policy that owns the write. Under `Defer` the object is minted
+    // from this same validated publication below and handed back, so the pointer the caller
+    // publishes is the pointer this initialization resolved rather than one rebuilt from a
+    // second read (M11.D39d, PR #167 round 6, finding 5).
+    if policy == CurrentGenerationPolicy::Publish {
         publish_current_generation(store, &publication).await?;
     }
 
@@ -372,10 +457,15 @@ where
 
     let generation_manifest = publish_generation_manifest(store, &publication).await?;
 
+    let current_generation = (policy == CurrentGenerationPolicy::Defer).then(|| {
+        DeferredCurrentGeneration(publication.get().current_generation(SystemTime::now()))
+    });
+
     Ok(GenerationInitialization::Initialized {
         generation_manifest,
         recovery,
         recovery_checkpoint: publication.into_inner().into_recovery_checkpoint(),
+        current_generation,
     })
 }
 
@@ -510,12 +600,31 @@ async fn publish_current_generation<S>(
 where
     S: ProtocolStore + ?Sized,
 {
-    put_json(
+    put_current_generation(
         store,
-        &publication.get().paths().current_generation(),
         &publication.get().current_generation(SystemTime::now()),
     )
     .await
+}
+
+/// The one write of `current-generation.json`.
+///
+/// Both routes to the object go through it — the immediate one above and
+/// [`DeferredCurrentGeneration::publish`] — so the bytes a deferred publication writes are the
+/// bytes an immediate one would have, and the path is derived from the record rather than named
+/// twice.
+async fn put_current_generation<S>(
+    store: &S,
+    current_generation: &CurrentGeneration,
+) -> Result<(), StoreError>
+where
+    S: ProtocolStore + ?Sized,
+{
+    let paths = ProtocolPaths::new(
+        current_generation.pipeline_id.clone(),
+        current_generation.job_id.clone(),
+    );
+    put_json(store, &paths.current_generation(), current_generation).await
 }
 
 /// Writes the generation manifest and returns what was written.

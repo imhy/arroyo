@@ -8,7 +8,7 @@ use crate::job_controller::{
 use crate::network_manager::NetworkManager;
 use anyhow::{Context, Result, anyhow};
 
-use arroyo_rpc::fence_wire::CommitAuthority;
+use arroyo_rpc::fence_wire::{CommitAuthority, WorkerIncarnation};
 use arroyo_rpc::grpc::rpc::controller_grpc_client::ControllerGrpcClient;
 use arroyo_rpc::grpc::rpc::worker_grpc_server::{WorkerGrpc, WorkerGrpcServer};
 use arroyo_rpc::grpc::rpc::{
@@ -250,6 +250,14 @@ pub struct WorkerState {
     job_status: Arc<Mutex<JobStatus>>,
     checkpoint_history: Arc<Mutex<CheckpointHistory>>,
     metrics: Arc<OnceLock<JobMetrics>>,
+    /// This worker *process*'s incarnation, minted once at construction and reported on this
+    /// generation's `RegisterWorkerReq`.
+    ///
+    /// Held here as well as inside the lifecycle guard because the two uses are one value read
+    /// twice: the guard checks every fenced directive against it, and the registration tells the
+    /// controller what to address them to. A second mint would give the controller an
+    /// incarnation the guard would refuse (M11.D39d, PR #167 round 6).
+    incarnation: WorkerIncarnation,
     /// The selector this worker was started with, recorded once so the leader can report
     /// it to a controller that asks.
     ///
@@ -773,6 +781,11 @@ impl WorkerServer {
             PipelineId(pipeline_id.into()),
             JobId(job_id.into()),
             run_id,
+            // One mint per worker *process*, and this is the only production call: a restart
+            // runs `from_config` again and therefore mints a value its predecessor did not have,
+            // which is what makes a directive addressed to the predecessor refusable (M11.D39d,
+            // PR #167 round 6).
+            WorkerIncarnation::mint(),
             shutdown_guard,
         ))
     }
@@ -783,11 +796,19 @@ impl WorkerServer {
         pipeline_id: PipelineId,
         job_id: JobId,
         run_id: u64,
+        incarnation: WorkerIncarnation,
         shutdown_guard: ShutdownGuard,
     ) -> Self {
         Self {
             state: WorkerState {
-                lifecycle: Arc::new(Mutex::new(WorkerLifecycle::idle(worker_id.0, run_id))),
+                // One mint per process, and this is it: a restart produces a new value, which is
+                // exactly what makes a directive addressed to the predecessor refusable.
+                incarnation,
+                lifecycle: Arc::new(Mutex::new(WorkerLifecycle::idle(
+                    worker_id.0,
+                    run_id,
+                    incarnation,
+                ))),
                 network: Arc::new(Mutex::new(None)),
                 job_controller_tx: Arc::new(OnceLock::new()),
                 worker_context: WorkerContext {
@@ -846,6 +867,7 @@ impl WorkerServer {
 
         let context = self.state.worker_context.clone();
         let lifecycle = self.state.lifecycle.clone();
+        let incarnation = self.state.incarnation;
 
         let hostname = local_address(config.worker.bind_address);
         let rpc_address = format!("http://{}:{}", hostname, local_addr.port());
@@ -939,6 +961,11 @@ impl WorkerServer {
                 // authoritative phase with `failed_precondition`. A worker that does not
                 // set this is not sent a `StartExecution` at all.
                 reconciles_start_execution: true,
+                // What every fenced directive to this generation must name (M11.D39d, PR #167
+                // round 6). The controller learns it here and nowhere else: registration is the
+                // only message that tells a controller this generation exists, so a process that
+                // did not report its incarnation cannot be addressed under one.
+                worker_incarnation: incarnation.get(),
             },
         )
         .await?;
@@ -1670,6 +1697,17 @@ mod tests {
     use crate::job_controller::JobControllerStatus;
     use arroyo_rpc::checkpoints::{CheckpointMetadataStore, CreateCheckpointReq};
     use arroyo_rpc::fence_wire::observed_settlement;
+
+    /// The process every worker fixture in this module runs as.
+    ///
+    /// Fixed rather than minted so a directive can name it in closed form; in production it is
+    /// `WorkerIncarnation::mint()`, once per process.
+    const FIXTURE_INCARNATION: u64 = 5;
+
+    fn fixture_incarnation() -> WorkerIncarnation {
+        WorkerIncarnation::named(FIXTURE_INCARNATION).expect("a fixture names a live process")
+    }
+
     use arroyo_rpc::grpc::rpc::{LifecycleOperation, StartExecutionOutcome};
     use arroyo_rpc::state_backend::validate_leader_selector;
     use arroyo_server_common::shutdown::{Shutdown, SignalBehavior};
@@ -1732,6 +1770,7 @@ mod tests {
             PipelineId(Arc::new("pipeline_1".to_string())),
             JobId(Arc::new("job_1".to_string())),
             1,
+            fixture_incarnation(),
             shutdown.guard("worker"),
         );
         // No registration line: M11.T26d gates the fenced protocol, not the fence-less route
@@ -1805,6 +1844,7 @@ mod tests {
             PipelineId(Arc::new("pipeline_1".to_string())),
             JobId(Arc::new("job_1".to_string())),
             1,
+            fixture_incarnation(),
             shutdown.guard("worker"),
         );
         {
@@ -1842,6 +1882,7 @@ mod tests {
         let addressed = StartExecutionReq {
             target_worker_id: 1,
             target_worker_generation: 1,
+            target_worker_incarnation: FIXTURE_INCARNATION,
             ..misaddressed
         };
         let acknowledged = WorkerGrpc::start_execution(&server, Request::new(addressed))
@@ -1865,6 +1906,7 @@ mod tests {
             lifecycle_fence: 4,
             target_worker_id: 1,
             target_worker_generation: 1,
+            target_worker_incarnation: FIXTURE_INCARNATION,
             lifecycle_operation: LifecycleOperation::Start as i32,
             ..Default::default()
         };
@@ -1892,6 +1934,7 @@ mod tests {
             lifecycle_fence: 4,
             target_worker_id: 1,
             target_worker_generation: 1,
+            target_worker_incarnation: FIXTURE_INCARNATION,
             lifecycle_operation: LifecycleOperation::Start as i32,
             ..Default::default()
         };
@@ -1909,6 +1952,7 @@ mod tests {
             lifecycle_fence: 3,
             target_worker_id: 1,
             target_worker_generation: 1,
+            target_worker_incarnation: FIXTURE_INCARNATION,
             lifecycle_operation: LifecycleOperation::Start as i32,
             ..Default::default()
         };
@@ -1932,6 +1976,7 @@ mod tests {
             PipelineId(Arc::new("pipeline_1".to_string())),
             JobId(Arc::new("job_1".to_string())),
             1,
+            fixture_incarnation(),
             legacy_shutdown.guard("worker"),
         );
         let accepted = WorkerGrpc::start_execution(

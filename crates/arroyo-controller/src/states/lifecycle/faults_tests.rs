@@ -11,7 +11,7 @@
 //! The per-fault rows of M11.D39g's declared model are in [`super::fault_model_tests`].
 
 use arroyo_rpc::config::{JobControllerMode, config};
-use arroyo_rpc::fence_wire::{CommitDirective, LifecycleTarget};
+use arroyo_rpc::fence_wire::{CommitDirective, LifecycleTarget, WorkerIncarnation};
 use arroyo_types::WorkerId;
 
 use super::actor::{ConsumptionPoint, LifecycleActor, LifecycleDecision};
@@ -292,13 +292,15 @@ async fn fence_protocol_covers_both_controller_modes() {
 
     // The controller-mode route: the job's own protocol is what stamps the commit, because
     // `prepare_handover` builds a `JobController` holding it.
-    let by_the_controller = protocol.commit_authority().directive(WORKER);
+    // The process the registration named, which both routes must address.
+    let incarnation = WorkerIncarnation::named(21);
+    let by_the_controller = protocol.commit_authority().directive(WORKER, incarnation);
     // The worker-leader route: no `JobController` exists in the controller process, and the
     // leader commits under the authority the fenced start it applied conferred on it.
     let by_the_leader = generation
-        .address(WorkerId(WORKER))
+        .address(WorkerId(WORKER), incarnation)
         .commit_authority()
-        .directive(WORKER);
+        .directive(WORKER, incarnation);
 
     let CommitDirective::Fenced(controller_address) = by_the_controller else {
         panic!("a fenced controller's commit directive carries a fence");
@@ -310,7 +312,7 @@ async fn fence_protocol_covers_both_controller_modes() {
         (controller_address.fence(), controller_address.target()),
         (
             FENCE,
-            LifecycleTarget::addressed(WORKER, GENERATION).unwrap()
+            LifecycleTarget::addressed(WORKER, GENERATION, 21).unwrap()
         ),
         "the controller-mode route commits under the fence its own row produced, addressed to \
          the generation this attempt raised the job to"

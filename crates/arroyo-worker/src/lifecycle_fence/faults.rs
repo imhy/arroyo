@@ -34,8 +34,11 @@
 //! same table back.
 
 use crate::lifecycle_fence::guard::WorkerLifecycle;
-use crate::lifecycle_fence::tests::{GENERATION, WORKER, call, read, register};
+use crate::lifecycle_fence::tests::{
+    GENERATION, INCARNATION, SUCCESSOR_INCARNATION, WORKER, call, read, register,
+};
 use crate::{WorkerExecutionPhase, WorkerServer};
+use arroyo_rpc::fence_wire::WorkerIncarnation;
 use arroyo_rpc::grpc::rpc::{StartExecutionReq, StartExecutionResp};
 use arroyo_server_common::shutdown::{Shutdown, SignalBehavior};
 use arroyo_types::{JobId, MachineId, PipelineId, WorkerId};
@@ -121,6 +124,8 @@ pub(super) struct Link {
     /// This generation's identity, so a successor can be built against the same worker id.
     worker_id: u64,
     generation: u64,
+    /// The process currently at the receiving end, which every directive addressed to it names.
+    incarnation: u64,
     /// Directives sent and not yet delivered, oldest first.
     in_flight: Vec<InFlight>,
     /// Directives that were sent and never arrived, in send order — read back by
@@ -149,11 +154,11 @@ impl Link {
     /// than its answer, because a controller may address a generation from the moment it holds
     /// one — see `WorkerLifecycle::announce`.
     pub(super) fn to_unregistered_generation() -> Self {
-        Self::to_generation(WORKER, GENERATION)
+        Self::to_generation(WORKER, GENERATION, INCARNATION)
     }
 
     /// A link to an arbitrary worker generation that has not announced itself.
-    fn to_generation(worker_id: u64, generation: u64) -> Self {
+    fn to_generation(worker_id: u64, generation: u64, incarnation: u64) -> Self {
         let shutdown = Shutdown::new("m11-d39g-fault-link", SignalBehavior::None);
         let server = WorkerServer::new(
             MachineId(Arc::new("machine_1".to_string())),
@@ -161,6 +166,7 @@ impl Link {
             PipelineId(Arc::new("pipeline_1".to_string())),
             JobId(Arc::new("job_1".to_string())),
             generation,
+            WorkerIncarnation::named(incarnation).expect("a fixture names a live process"),
             shutdown.guard("worker"),
         );
         Self {
@@ -168,6 +174,7 @@ impl Link {
             server,
             worker_id,
             generation,
+            incarnation,
             in_flight: Vec::new(),
             lost: Vec::new(),
         }
@@ -276,8 +283,14 @@ impl Link {
     /// does not let a controller treat a *reachable* endpoint as evidence about what its
     /// predecessor applied. Anything still in flight stays in flight — a restart does not
     /// deliver or cancel messages already on the wire.
+    ///
+    /// The successor mints [`SUCCESSOR_INCARNATION`], because it is a different process. A
+    /// restart that kept its predecessor's nonce would model a fault the protocol does not have,
+    /// and would leave every directive addressed to the predecessor admissible by a generation
+    /// that has reconstructed the state those directives are checked against (PR #167 round 6,
+    /// finding 3).
     pub(super) fn restart_generation(&mut self) {
-        self.replace_receiver(self.worker_id, self.generation);
+        self.replace_receiver(self.worker_id, self.generation, SUCCESSOR_INCARNATION);
     }
 
     /// **Injects [`WorkerFault::EndpointReuse`].** A *new* generation answers at this endpoint.
@@ -286,13 +299,13 @@ impl Link {
     /// the field the guard compares. Directives already in flight are addressed to the
     /// predecessor and must be refused rather than answered on its behalf.
     pub(super) fn endpoint_reused_by(&mut self, generation: u64) {
-        self.replace_receiver(self.worker_id, generation);
+        self.replace_receiver(self.worker_id, generation, SUCCESSOR_INCARNATION);
     }
 
     /// Puts a fresh generation, which has announced itself to nobody, at this link's receiving
     /// end.
-    fn replace_receiver(&mut self, worker_id: u64, generation: u64) {
-        let replacement = Self::to_generation(worker_id, generation);
+    fn replace_receiver(&mut self, worker_id: u64, generation: u64, incarnation: u64) {
+        let replacement = Self::to_generation(worker_id, generation, incarnation);
         // The predecessor's shutdown is dropped with the value it belongs to; the in-flight
         // queue and the loss log belong to the *link* and survive, which is what makes a
         // delayed directive outlive the generation it was addressed to.
@@ -300,6 +313,12 @@ impl Link {
         self.server = replacement.server;
         self.worker_id = worker_id;
         self.generation = generation;
+        self.incarnation = incarnation;
+    }
+
+    /// The process currently at this link's receiving end.
+    pub(super) fn incarnation(&self) -> u64 {
+        self.incarnation
     }
 
     /// Completes this generation's registration.
@@ -314,7 +333,12 @@ impl Link {
     /// performs this first — including the ones whose whole point is that the start is *late*,
     /// because being late is not the same as never having been authorised.
     pub(super) fn handshake_receiver(&mut self, fence: u64) {
-        let directive = super::tests::addressed_fence_only(fence, self.worker_id, self.generation);
+        let directive = super::tests::addressed_fence_only_to(
+            fence,
+            self.worker_id,
+            self.generation,
+            self.incarnation,
+        );
         self.deliver(directive)
             .expect("the handshake this generation needs before a start can be addressed to it");
     }

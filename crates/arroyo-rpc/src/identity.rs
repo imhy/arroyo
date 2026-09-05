@@ -7,6 +7,7 @@
 //! 64-bit random values in production, so they are effectively globally
 //! unique across jobs, runs, and clusters.
 
+use crate::fence_wire::WorkerIncarnation;
 use crate::grpc::rpc::worker_grpc_client::WorkerGrpcClient;
 use arroyo_types::WorkerId;
 use tonic::metadata::{Ascii, MetadataValue};
@@ -25,6 +26,54 @@ pub type WorkerClient = WorkerGrpcClient<InterceptedService<Channel, InjectWorke
 /// Construct a worker client that injects `target` as `x-target-worker-id`.
 pub fn worker_client(channel: Channel, target: WorkerId) -> WorkerClient {
     WorkerGrpcClient::with_interceptor(channel, InjectWorkerId::new(target))
+}
+
+/// An open channel to one worker generation, and the process incarnation answering on it.
+///
+/// The two travel together because a fenced directive addresses a process, not an endpoint: the
+/// incarnation is read from that worker's own `RegisterWorkerReq` (or from the durable fencing
+/// record, for a controller discharging an obligation it did not issue), and a sender holding a
+/// channel without it could only address the directive to no incarnation — which the generation
+/// refuses. Keeping them in one value is what stops a fan-out pairing one worker's channel with
+/// another's incarnation.
+///
+/// The incarnation is optional because both of its sources can legitimately fail to name one: a
+/// worker predating `RegisterWorkerReq::worker_incarnation` reports zero, and a fencing record
+/// written before the field carries none.
+#[derive(Clone)]
+pub struct WorkerChannel {
+    client: WorkerClient,
+    incarnation: Option<WorkerIncarnation>,
+}
+
+impl WorkerChannel {
+    /// The channel to a worker whose incarnation this sender knows.
+    pub fn to(client: WorkerClient, incarnation: Option<WorkerIncarnation>) -> Self {
+        Self {
+            client,
+            incarnation,
+        }
+    }
+
+    /// The process at the other end, or `None` when this sender does not know which.
+    pub fn incarnation(&self) -> Option<WorkerIncarnation> {
+        self.incarnation
+    }
+
+    /// The channel, for a caller that has finished addressing the directive.
+    pub fn into_client(self) -> WorkerClient {
+        self.client
+    }
+}
+
+impl std::fmt::Debug for WorkerChannel {
+    /// The incarnation and deliberately not the channel: a `WorkerClient` has no useful
+    /// rendering.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkerChannel")
+            .field("incarnation", &self.incarnation.map(WorkerIncarnation::get))
+            .finish_non_exhaustive()
+    }
 }
 
 /// Client interceptor: injects target worker_id into request metadata.

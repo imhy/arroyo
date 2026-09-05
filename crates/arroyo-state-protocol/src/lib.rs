@@ -170,10 +170,10 @@ mod tests {
     use crate::validated::{CheckpointHistory, CollectingJob};
     use crate::workflow::{
         CheckpointPublication, ClaimEpochRecordRequest, CommitAuthorization, CommitPermit,
-        CommittedMarkerOutcome, GenerationInitialization, GenerationRecovery, GenerationResolution,
-        InitializeGenerationRequest, PublishCheckpointRequest, claim_epoch_record, complete_commit,
-        initialize_generation, mark_committed, prepare_commit, publish_checkpoint,
-        resolve_generation_manifest,
+        CommittedMarkerOutcome, CurrentGenerationPolicy, GenerationInitialization,
+        GenerationRecovery, GenerationResolution, InitializeGenerationRequest,
+        PublishCheckpointRequest, claim_epoch_record, complete_commit, initialize_generation,
+        mark_committed, prepare_commit, publish_checkpoint, resolve_generation_manifest,
     };
     use arroyo_rpc::grpc::rpc::{
         CheckpointManifest, ExpiringKeyedTimeTableCheckpointMetadata,
@@ -1869,7 +1869,7 @@ mod tests {
                 state_backend: StateBackendSelector::Parquet,
                 program_operators: HashSet::new(),
             },
-            false,
+            CurrentGenerationPolicy::RequireCurrent,
         )
         .await
         .unwrap();
@@ -1887,6 +1887,7 @@ mod tests {
                 generation_manifest: expected_manifest.clone(),
                 recovery: GenerationRecovery::NoCheckpoint,
                 recovery_checkpoint: None,
+                current_generation: None,
             }
         );
 
@@ -1896,6 +1897,153 @@ mod tests {
                 .unwrap()
                 .expect("new generation manifest should be written");
         assert_eq!(written_manifest, expected_manifest);
+    }
+
+    /// **PR #167 round 6, finding 5.** A deferred initialization publishes no canonical
+    /// current-generation object, and the pointer it hands back writes exactly the one the
+    /// publishing policy would have written.
+    ///
+    /// The canonical pointer is an authoritative protocol input, not an unrooted candidate:
+    /// `publish_checkpoint` refuses a checkpoint whose generation is not the current one and
+    /// `resolve_generation_manifest` reads a candidate differently depending on whether its
+    /// generation is current. A controller that has not yet won its fence duel must therefore
+    /// not have written it — losing the duel undoes the metadata root and nothing else.
+    ///
+    /// Three claims, and the third is what stops the first two from being an accident: the
+    /// deferral writes the generation manifest and claims the epoch exactly as publishing does,
+    /// it writes no pointer, and the pointer it defers is byte-identical to the published one
+    /// apart from the instant it records.
+    #[tokio::test]
+    async fn a_deferred_initialization_writes_no_canonical_generation_until_it_is_published() {
+        let request = || InitializeGenerationRequest {
+            pipeline_id: PipelineId::new("P"),
+            job_id: JobId::new("J"),
+            generation: Generation(1),
+            updated_at: from_micros(123),
+            state_backend: StateBackendSelector::Parquet,
+            program_operators: HashSet::new(),
+        };
+        let paths = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J"));
+
+        // The control: the publishing policy, which writes the pointer itself and defers none.
+        let published = MemoryProtocolStore::default();
+        let control =
+            initialize_generation(&published, request(), CurrentGenerationPolicy::Publish)
+                .await
+                .unwrap();
+        let GenerationInitialization::Initialized {
+            current_generation: deferred_by_control,
+            ..
+        } = &control
+        else {
+            panic!("expected the generation to be initialized, got {control:?}");
+        };
+        assert!(
+            deferred_by_control.is_none(),
+            "the publishing policy writes the pointer and hands nothing back"
+        );
+        let written: CurrentGeneration = read_json(&published, &paths.current_generation())
+            .await
+            .unwrap()
+            .expect("the publishing policy writes the canonical pointer");
+        assert_eq!(written.generation, Generation(1));
+
+        // The row: the deferring policy.
+        let store = MemoryProtocolStore::default();
+        let initialization =
+            initialize_generation(&store, request(), CurrentGenerationPolicy::Defer)
+                .await
+                .unwrap();
+        let GenerationInitialization::Initialized {
+            generation_manifest,
+            current_generation,
+            ..
+        } = initialization
+        else {
+            panic!("expected the generation to be initialized");
+        };
+
+        // Everything else the initialization does, it did.
+        let manifest: GenerationManifest =
+            read_json(&store, &paths.generation_manifest(Generation(1)))
+                .await
+                .unwrap()
+                .expect("a deferred initialization still writes its generation manifest");
+        assert_eq!(manifest, generation_manifest);
+
+        // But nothing names this generation as current.
+        assert_eq!(
+            read_json::<_, CurrentGeneration>(&store, &paths.current_generation())
+                .await
+                .unwrap(),
+            None,
+            "a controller that has not won its fence duel must leave no canonical pointer behind"
+        );
+
+        // And the pointer it deferred is the one publishing would have written.
+        let deferred = current_generation.expect("the deferring policy hands the pointer back");
+        assert_eq!(deferred.generation(), Generation(1));
+        deferred.publish(&store).await.expect("published");
+        let after: CurrentGeneration = read_json(&store, &paths.current_generation())
+            .await
+            .unwrap()
+            .expect("publishing the deferred pointer makes this generation current");
+        assert_eq!(
+            CurrentGeneration {
+                updated_at_micros: written.updated_at_micros,
+                ..after
+            },
+            written,
+            "the deferred object differs from the published one only in when it was minted"
+        );
+    }
+
+    /// A deferring initialization is under the same monotonicity rule as a publishing one, and is
+    /// refused before it claims anything.
+    ///
+    /// The rule cannot move with the write: an epoch claimed by a controller whose generation is
+    /// behind the current one is claimed by a controller that has already lost, and the claim is
+    /// irreversible whether or not the pointer is ever written.
+    #[tokio::test]
+    async fn a_deferred_initialization_is_refused_below_the_current_generation() {
+        let store = MemoryProtocolStore::default();
+        let paths = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J"));
+        write_current_generation(&store, &paths, Generation(4)).await;
+
+        let err = initialize_generation(
+            &store,
+            InitializeGenerationRequest {
+                pipeline_id: PipelineId::new("P"),
+                job_id: JobId::new("J"),
+                generation: Generation(3),
+                updated_at: from_micros(123),
+                state_backend: StateBackendSelector::Parquet,
+                program_operators: HashSet::new(),
+            },
+            CurrentGenerationPolicy::Defer,
+        )
+        .await
+        .expect_err("a generation behind the current one may not initialize");
+        assert!(
+            matches!(
+                err,
+                StoreError::Protocol(ProtocolError::NonMonotonicGenerationUpdate)
+            ),
+            "got {err:?}"
+        );
+
+        let current: CurrentGeneration = read_json(&store, &paths.current_generation())
+            .await
+            .unwrap()
+            .expect("the current generation is untouched");
+        assert_eq!(current.generation, Generation(4));
+        assert_eq!(
+            read_json::<_, GenerationManifest>(&store, &paths.generation_manifest(Generation(3)))
+                .await
+                .unwrap(),
+            None,
+            "and nothing was written for the generation that was refused"
+        );
     }
 
     /// Publishing a generation is what commits a job to a recovery checkpoint, so a
@@ -1938,7 +2086,7 @@ mod tests {
                 state_backend: StateBackendSelector::Parquet,
                 program_operators: HashSet::from(["op".to_string()]),
             },
-            true,
+            CurrentGenerationPolicy::Publish,
         )
         .await
         .expect_err("a recovery checkpoint from another backend must not be published");
@@ -2004,7 +2152,7 @@ mod tests {
                 state_backend: StateBackendSelector::Parquet,
                 program_operators: HashSet::from(["op".to_string()]),
             },
-            true,
+            CurrentGenerationPolicy::Publish,
         )
         .await
         .expect("a legacy recovery checkpoint must still be restorable");
@@ -2124,7 +2272,7 @@ mod tests {
                     state_backend: StateBackendSelector::Parquet,
                     program_operators: program.iter().map(|s| s.to_string()).collect(),
                 },
-                true,
+                CurrentGenerationPolicy::Publish,
             )
             .await;
 
@@ -2266,7 +2414,7 @@ mod tests {
                     state_backend: StateBackendSelector::Parquet,
                     program_operators: HashSet::from(["op".to_string()]),
                 },
-                true,
+                CurrentGenerationPolicy::Publish,
             )
             .await;
 
@@ -2329,7 +2477,7 @@ mod tests {
                     state_backend: StateBackendSelector::Parquet,
                     program_operators: HashSet::from(["op".to_string()]),
                 },
-                true,
+                CurrentGenerationPolicy::Publish,
             )
             .await;
 
@@ -2381,7 +2529,7 @@ mod tests {
     /// already the one being initialized.
     ///
     /// This is what the two round-7 rows could not stage: they call
-    /// `initialize_generation(.., true)` against already-canonical state, so the epoch is
+    /// `initialize_generation(.., CurrentGenerationPolicy::Publish)` against already-canonical state, so the epoch is
     /// claimed before the call and no claim happens during it.
     async fn stage_unclaimed_recovery_candidate(
         store: &MemoryProtocolStore,
@@ -2521,8 +2669,12 @@ mod tests {
             let checkpoint_ref = paths.checkpoint_manifest(Generation(1), Epoch(1));
             stage_unclaimed_recovery_candidate(&store, &paths, &checkpoint_ref, candidate).await;
 
-            let outcome =
-                initialize_generation(&store, leader_initialization(program), false).await;
+            let outcome = initialize_generation(
+                &store,
+                leader_initialization(program),
+                CurrentGenerationPolicy::RequireCurrent,
+            )
+            .await;
 
             match (refusal, outcome) {
                 (_, Ok(initialized)) => problems.push(format!(
@@ -2560,7 +2712,13 @@ mod tests {
                 .await
                 .unwrap();
 
-            match initialize_generation(&store, leader_initialization(program), false).await {
+            match initialize_generation(
+                &store,
+                leader_initialization(program),
+                CurrentGenerationPolicy::RequireCurrent,
+            )
+            .await
+            {
                 Ok(GenerationInitialization::Initialized { recovery, .. })
                     if recovery
                         == (GenerationRecovery::Ready {
@@ -2622,9 +2780,13 @@ mod tests {
         );
         stage_unclaimed_recovery_candidate(&store, &paths, &candidate_ref, &candidate).await;
 
-        let err = initialize_generation(&store, leader_initialization(&["op"]), false)
-            .await
-            .expect_err("a refused candidate must not become a search for an older one");
+        let err = initialize_generation(
+            &store,
+            leader_initialization(&["op"]),
+            CurrentGenerationPolicy::RequireCurrent,
+        )
+        .await
+        .expect_err("a refused candidate must not become a search for an older one");
 
         assert!(
             matches!(
@@ -2679,15 +2841,19 @@ mod tests {
             );
             stage_unclaimed_recovery_candidate(&store, &paths, &checkpoint_ref, &checkpoint).await;
 
-            let initialization =
-                initialize_generation(&store, leader_initialization(&["op"]), false)
-                    .await
-                    .expect("a candidate this job can restore must initialize");
+            let initialization = initialize_generation(
+                &store,
+                leader_initialization(&["op"]),
+                CurrentGenerationPolicy::RequireCurrent,
+            )
+            .await
+            .expect("a candidate this job can restore must initialize");
 
             let GenerationInitialization::Initialized {
                 generation_manifest,
                 recovery,
                 recovery_checkpoint,
+                ..
             } = initialization
             else {
                 problems.push(format!("{name}: expected an initialized generation"));
@@ -2847,8 +3013,12 @@ mod tests {
             let store =
                 HidesFromTheFirstRead::hiding(memory.clone(), &paths.epoch_record(Epoch(1)));
 
-            let outcome =
-                initialize_generation(&store, leader_initialization(&["op"]), false).await;
+            let outcome = initialize_generation(
+                &store,
+                leader_initialization(&["op"]),
+                CurrentGenerationPolicy::RequireCurrent,
+            )
+            .await;
 
             if !expect_published {
                 assert!(
@@ -2882,6 +3052,7 @@ mod tests {
                 generation_manifest,
                 recovery,
                 recovery_checkpoint,
+                ..
             } = outcome.expect("the canonical checkpoint is restorable")
             else {
                 panic!("{name}: expected an initialized generation");
@@ -3002,7 +3173,7 @@ mod tests {
                 state_backend: StateBackendSelector::Parquet,
                 program_operators: HashSet::new(),
             },
-            false,
+            CurrentGenerationPolicy::RequireCurrent,
         )
         .await
         .unwrap();
@@ -3022,6 +3193,7 @@ mod tests {
                     checkpoint_ref: checkpoint_ref.clone()
                 },
                 recovery_checkpoint: Some(checkpoint.clone()),
+                current_generation: None,
             }
         );
 
@@ -3062,7 +3234,7 @@ mod tests {
                 state_backend: StateBackendSelector::Parquet,
                 program_operators: HashSet::new(),
             },
-            false,
+            CurrentGenerationPolicy::RequireCurrent,
         )
         .await
         .unwrap();
@@ -3082,6 +3254,7 @@ mod tests {
                     commit_permit: commit_permit(checkpoint_ref, &checkpoint),
                 },
                 recovery_checkpoint: Some(checkpoint.clone()),
+                current_generation: None,
             }
         );
     }
@@ -3113,7 +3286,7 @@ mod tests {
                 state_backend: StateBackendSelector::Parquet,
                 program_operators: HashSet::new(),
             },
-            false,
+            CurrentGenerationPolicy::RequireCurrent,
         )
         .await
         .unwrap();
@@ -3162,7 +3335,7 @@ mod tests {
                 state_backend: StateBackendSelector::Parquet,
                 program_operators: HashSet::new(),
             },
-            false,
+            CurrentGenerationPolicy::RequireCurrent,
         )
         .await
         .unwrap();
@@ -3220,7 +3393,7 @@ mod tests {
                 state_backend: StateBackendSelector::Parquet,
                 program_operators: HashSet::new(),
             },
-            false,
+            CurrentGenerationPolicy::RequireCurrent,
         )
         .await
         .unwrap();
@@ -3239,6 +3412,7 @@ mod tests {
                     checkpoint_ref: winner_ref.clone()
                 },
                 recovery_checkpoint: Some(winner_checkpoint.clone()),
+                current_generation: None,
             }
         );
         let written_manifest: GenerationManifest =
@@ -3288,7 +3462,7 @@ mod tests {
                 state_backend: StateBackendSelector::Parquet,
                 program_operators: HashSet::new(),
             },
-            false,
+            CurrentGenerationPolicy::RequireCurrent,
         )
         .await
         .unwrap();
@@ -3308,6 +3482,7 @@ mod tests {
                     commit_permit: commit_permit(winner_ref, &winner_checkpoint),
                 },
                 recovery_checkpoint: Some(winner_checkpoint.clone()),
+                current_generation: None,
             }
         );
     }
@@ -3328,7 +3503,7 @@ mod tests {
                 state_backend: StateBackendSelector::Parquet,
                 program_operators: HashSet::new(),
             },
-            false,
+            CurrentGenerationPolicy::RequireCurrent,
         )
         .await
         .unwrap();

@@ -27,7 +27,7 @@ fence-read RPC.
 | Build | What it does |
 |---|---|
 | **Fence-capable** | Understands every field in §4 of `docs/lifecycle-fence-protocol.md`. Its worker enforces strict mode when a registration response asks for it; its controller adopts, fences, and publishes conditionally. |
-| **Fence-less (legacy)** | Any build older than the one carrying this document. Its `RegisterWorkerResp.requires_lifecycle_fence` is absent (decodes `false`), its starts carry `lifecycle_fence = 0` and `target_worker_generation = 0`, and it neither adopts nor publishes conditionally. |
+| **Fence-less (legacy)** | Any build older than the one carrying this document. Its `RegisterWorkerResp.requires_lifecycle_fence` is absent (decodes `false`), its starts carry `lifecycle_fence = 0`, `target_worker_generation = 0` and `target_worker_incarnation = 0`, and it neither adopts nor publishes conditionally. |
 
 Every new field is a defaulted field on a message that already existed. There is no new RPC
 service, no new message type and no fence-read RPC, so a fence-capable peer and a fence-less
@@ -80,6 +80,9 @@ A generation in strict mode fails closed on:
 - a start carrying no fence (`lifecycle_fence = 0` or `target_worker_generation = 0`);
 - a start that reaches it before it has issued its own registration request;
 - a start addressed to another worker id or another generation (endpoint reuse);
+- a start addressed to another *process* of its own worker id and generation, or to none — a
+  restart reuses the id and the generation, so the per-process incarnation the worker reported at
+  registration is what tells a successor apart from its predecessor;
 - a start under a fence below the highest it has acknowledged;
 - a revocation naming an identifier it has already applied.
 

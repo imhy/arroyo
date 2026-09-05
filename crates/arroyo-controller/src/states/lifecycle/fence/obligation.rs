@@ -30,12 +30,27 @@
 
 use std::collections::HashMap;
 
+use arroyo_rpc::fence_wire::WorkerIncarnation;
 use arroyo_rpc::fencing::{FenceTarget, Fencing, FencingRecordError};
 use arroyo_types::WorkerId;
 use thiserror::Error;
 
 use crate::states::scheduling::fanout::IssuedAttempts;
 use crate::states::scheduling::fencing::FenceTargets;
+
+/// Where one registered worker generation was reached, and which process answered there.
+///
+/// One value rather than two maps because the two are read together and are only correct
+/// together: a discharge that paired one worker's address with another's incarnation would
+/// address a live process under a directive meant for a different one, and the receiving
+/// generation would refuse a fence it should have taken (M11.D39d, PR #167 round 6).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RecordedEndpoint {
+    /// The address the attempt reached this generation at.
+    pub(crate) rpc_address: String,
+    /// The process that answered its registration, or `None` if it named none.
+    pub(crate) incarnation: Option<WorkerIncarnation>,
+}
 
 /// Why a live obligation could not be described durably.
 ///
@@ -93,7 +108,7 @@ pub(crate) fn describe(
     generation: u64,
     targets: &FenceTargets,
     issued: &IssuedAttempts,
-    addresses: &HashMap<WorkerId, String>,
+    endpoints: &HashMap<WorkerId, RecordedEndpoint>,
     candidate_root: Option<&str>,
     since_millis: Option<u64>,
 ) -> Result<Option<Fencing>, ObligationRefusal> {
@@ -123,7 +138,16 @@ pub(crate) fn describe(
             attempt_id: issued
                 .record(worker)
                 .map(|record| record.attempt_id.clone()),
-            rpc_address: addresses.get(&worker).cloned(),
+            rpc_address: endpoints
+                .get(&worker)
+                .map(|endpoint| endpoint.rpc_address.clone()),
+            // The process this target is owed by, so that a controller which did not start it
+            // can still address a fence to it. Read from the same entry as the address, so a
+            // record can never carry one worker's endpoint with another's incarnation.
+            incarnation: endpoints
+                .get(&worker)
+                .and_then(|endpoint| endpoint.incarnation)
+                .map(|incarnation| incarnation.into()),
             state,
         })
         .collect();

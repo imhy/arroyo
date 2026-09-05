@@ -31,11 +31,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::states::lifecycle::fence::obligation::RecordedEndpoint;
 use anyhow::anyhow;
 use arroyo_datastream::logical::LogicalProgram;
 use arroyo_rpc::config::{JobControllerMode, config};
-use arroyo_rpc::identity::WorkerClient;
+use arroyo_rpc::identity::{WorkerChannel, WorkerClient};
 use arroyo_rpc::state_backend::StateBackendError;
+use arroyo_state_protocol::workflow::{CurrentGenerationPolicy, DeferredCurrentGeneration};
 use arroyo_types::WorkerId;
 use arroyo_worker::job_controller::committing_state::CommittingState;
 use tokio::sync::Mutex;
@@ -90,13 +92,26 @@ pub(crate) struct PhaseContext<'a, 'ctx> {
     /// The outbound channel setup started for each of them, awaited before the fan-out.
     handles: Vec<JoinHandle<()>>,
     /// The clients those tasks produce, shared with them until they are done.
-    worker_connects: Arc<Mutex<HashMap<WorkerId, WorkerClient>>>,
+    worker_connects: Arc<Mutex<HashMap<WorkerId, WorkerChannel>>>,
     /// The clients the fan-out actually reached, once it has.
-    started_connects: HashMap<WorkerId, WorkerClient>,
+    started_connects: HashMap<WorkerId, WorkerChannel>,
     /// `(task_id, subtask_idx)` of every task reported started.
     started_tasks: HashSet<(u32, u32)>,
     /// The checkpoint this generation restores from, if any.
     checkpoint_info: Option<CheckpointInfo>,
+    /// The canonical `current-generation.json` this generation's registration prepared and did
+    /// not write (M11.D39c/M11.D39d, PR #167 round 6, finding 5).
+    ///
+    /// It is deferred because it is an *authoritative* protocol object, not an unrooted
+    /// candidate: `publish_checkpoint` refuses a checkpoint whose generation is not the current
+    /// one, and `resolve_generation_manifest` reads a candidate differently depending on whether
+    /// its generation is current. A controller that wrote it before winning the metadata-root
+    /// duel would leave a losing generation named as current with nothing to undo it, because
+    /// losing the root CAS undoes only the root. [`Self::publish_metadata_root`] publishes it
+    /// once that CAS has applied, and never otherwise.
+    ///
+    /// `None` on the non-leader path, which registers no generation and has no pointer to write.
+    deferred_current_generation: Option<DeferredCurrentGeneration>,
     /// The commit replay that checkpoint implies, if any.
     ///
     /// Moved into the job controller at the handover, which is why
@@ -187,6 +202,7 @@ impl<'a, 'ctx> PhaseContext<'a, 'ctx> {
             started_connects: HashMap::new(),
             started_tasks: HashSet::new(),
             checkpoint_info: None,
+            deferred_current_generation: None,
             committing_state: None,
             restored_commits_pending: false,
             job_controller: None,
@@ -284,7 +300,7 @@ impl<'a, 'ctx> PhaseContext<'a, 'ctx> {
         targets: &[WorkerId],
     ) -> Result<(), StateError> {
         let generation = self.addressed_generation();
-        let addresses = self.target_addresses();
+        let endpoints = self.target_endpoints();
         // No candidate: the metadata root is published by the preamble's last step, so by the
         // time a fan-out exists this attempt has left none unrooted. An interruption below
         // republishes through `Fencing`, which reads the candidate it actually holds.
@@ -292,7 +308,7 @@ impl<'a, 'ctx> PhaseContext<'a, 'ctx> {
             generation,
             &FenceTargets::for_workers(targets.iter().copied()),
             issued,
-            &addresses,
+            &endpoints,
             None,
             crate::states::lifecycle::fence::metrics::now_millis(),
         );
@@ -466,12 +482,20 @@ impl<'a, 'ctx> PhaseContext<'a, 'ctx> {
             let prepared = a
                 .effect(
                     "register the generation and prepare its recovery checkpoint",
-                    super::get_and_register_checkpoint_info_leader(self.ctx),
+                    // `Defer`, and this is the whole of finding 5's fix at this end: the
+                    // canonical current-generation pointer is not written here, where this
+                    // controller may still lose the job, but by `publish_metadata_root` once the
+                    // root CAS has said it did not.
+                    super::get_and_register_checkpoint_info_leader(
+                        self.ctx,
+                        CurrentGenerationPolicy::Defer,
+                    ),
                 )
                 .await;
             match prepared {
-                Ok(info) => {
-                    self.checkpoint_info = info;
+                Ok(registered) => {
+                    self.checkpoint_info = registered.checkpoint_info;
+                    self.deferred_current_generation = registered.current_generation;
                     self.committing_state = None;
                 }
                 Err(e) if e.downcast_ref::<StateBackendError>().is_some() => {
@@ -604,15 +628,26 @@ impl<'ctx> PhaseContext<'_, 'ctx> {
             .unwrap_or(0)
     }
 
-    /// The address each registered worker of this attempt was reached at.
+    /// Where each registered worker of this attempt was reached, and which process answered.
     ///
     /// Carried onto the durable fencing record so that a controller which did not start these
     /// workers can still advance its fence at them — see
-    /// [`FenceTarget::rpc_address`](arroyo_rpc::fencing::FenceTarget::rpc_address).
-    pub(super) fn target_addresses(&self) -> HashMap<WorkerId, String> {
+    /// [`FenceTarget::rpc_address`](arroyo_rpc::fencing::FenceTarget::rpc_address) and
+    /// [`FenceTarget::incarnation`](arroyo_rpc::fencing::FenceTarget::incarnation). One value
+    /// rather than two maps: a discharge that paired one worker's address with another's
+    /// incarnation would address a live process under a directive meant for a different one.
+    pub(super) fn target_endpoints(&self) -> HashMap<WorkerId, RecordedEndpoint> {
         self.workers
             .iter()
-            .map(|(id, status)| (*id, status.rpc_address.clone()))
+            .map(|(id, status)| {
+                (
+                    *id,
+                    RecordedEndpoint {
+                        rpc_address: status.rpc_address.clone(),
+                        incarnation: status.incarnation,
+                    },
+                )
+            })
             .collect()
     }
 
@@ -699,8 +734,8 @@ impl<'ctx> PhaseContext<'_, 'ctx> {
         self.checkpoint_info.as_ref()
     }
 
-    /// The clients the channel-setup tasks produced, taken once they have all been awaited.
-    pub(crate) fn take_worker_connects(&mut self) -> HashMap<WorkerId, WorkerClient> {
+    /// The channels the setup tasks produced, taken once they have all been awaited.
+    pub(crate) fn take_worker_connects(&mut self) -> HashMap<WorkerId, WorkerChannel> {
         let shared = std::mem::replace(
             &mut self.worker_connects,
             Arc::new(Mutex::new(HashMap::new())),
@@ -710,14 +745,23 @@ impl<'ctx> PhaseContext<'_, 'ctx> {
             .into_inner()
     }
 
-    /// Records which workers the fan-out reached.
+    /// Records which workers the fan-out reached, each re-paired with the process that
+    /// registered it.
+    ///
+    /// The incarnation is read back out of [`workers`](Self::workers) rather than carried through
+    /// the fan-out, because that map is the one thing that learned it — from the registration —
+    /// and re-reading it here is what keeps the commits this execution later issues addressed to
+    /// the same processes its `StartExecution` was (M11.D39d, PR #167 round 6).
     pub(crate) fn record_started_connects(&mut self, connects: HashMap<WorkerId, WorkerClient>) {
-        for id in connects.keys() {
-            if let Some(worker) = self.workers.get_mut(id) {
+        let mut started = HashMap::with_capacity(connects.len());
+        for (id, client) in connects {
+            let incarnation = self.workers.get(&id).and_then(|worker| worker.incarnation);
+            if let Some(worker) = self.workers.get_mut(&id) {
                 worker.state = WorkerState::Initializing;
             }
+            started.insert(id, WorkerChannel::to(client, incarnation));
         }
-        self.started_connects = connects;
+        self.started_connects = started;
     }
 }
 
@@ -763,6 +807,7 @@ impl PhaseContext<'_, '_> {
                 slots: 1,
                 state: WorkerState::Connected,
                 reconciles_start_execution: true,
+                incarnation: Some(arroyo_rpc::fence_wire::WorkerIncarnation::mint()),
             },
         );
     }

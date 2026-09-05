@@ -15,6 +15,50 @@ use std::collections::{BTreeMap, BTreeSet};
 /// The schema these tests are about, read at compile time from the crate's own `proto/`.
 const RPC_PROTO: &str = include_str!("../../proto/rpc.proto");
 
+/// The operator-facing description of the same schema, read at compile time from the repository
+/// it documents.
+///
+/// It is read here rather than reviewed because the claim it makes is total — *"every field
+/// below is a defaulted field"*, with a zero-value reading for each — and a total claim about a
+/// changing schema is one that goes stale silently. PR #167 added four fields in one round; the
+/// only thing that keeps the table honest is a test that fails when the two disagree.
+const PROTOCOL_DOC: &str = include_str!("../../../../docs/lifecycle-fence-protocol.md");
+
+/// Every field the lifecycle-fence protocol added, by message, with its number.
+///
+/// One inventory, read by the number-reuse test below and by the documentation test beside it,
+/// so "which fields are new" cannot be answered differently by the two.
+const ADDED_FIELDS: [(&str, &[(&str, u32)]); 7] = [
+    ("RegisterWorkerReq", &[("worker_incarnation", 10)]),
+    ("RegisterWorkerResp", &[("requires_lifecycle_fence", 1)]),
+    (
+        "StartExecutionReq",
+        &[
+            ("lifecycle_fence", 13),
+            ("target_worker_id", 14),
+            ("target_worker_generation", 15),
+            ("lifecycle_operation", 16),
+            ("revoked_execution_ids", 17),
+            ("target_worker_incarnation", 18),
+        ],
+    ),
+    (
+        "StartExecutionResp",
+        &[("observed_lifecycle_fence", 1), ("outcome", 2)],
+    ),
+    (
+        "CommitReq",
+        &[
+            ("lifecycle_fence", 3),
+            ("target_worker_id", 4),
+            ("target_worker_generation", 5),
+            ("target_worker_incarnation", 6),
+        ],
+    ),
+    ("CommitResp", &[]),
+    ("TaskAssignment", &[("worker_incarnation", 7)]),
+];
+
 /// One `message` block's field numbers, by field name, and the numbers it reserves.
 struct MessageTags {
     fields: BTreeMap<String, u32>,
@@ -180,6 +224,7 @@ fn register_worker_req_reserves_the_numbers_it_abandoned() {
             ("resources", 6),
             ("slots", 8),
             ("reconciles_start_execution", 9),
+            ("worker_incarnation", 10),
         ],
     );
 }
@@ -195,7 +240,7 @@ fn register_worker_resp_allocates_the_strict_mode_flag_at_one() {
     );
 }
 
-/// The start request's fence fields take 13-17, above every number it has ever used.
+/// The start request's fence fields take 13-18, above every number it has ever used.
 ///
 /// 1-12 are all live. Two of them changed type in the past — `restore_epoch` from `uint32` to
 /// `uint64` at 2, `start_epoch`/`min_epoch` likewise at 6 and 7 — which is wire-compatible
@@ -222,6 +267,7 @@ fn start_execution_req_allocates_the_fence_fields_above_every_number_it_has_used
             ("target_worker_generation", 15),
             ("lifecycle_operation", 16),
             ("revoked_execution_ids", 17),
+            ("target_worker_incarnation", 18),
         ],
     );
 }
@@ -235,7 +281,7 @@ fn start_execution_resp_allocates_the_settlement_fields_at_one_and_two() {
     );
 }
 
-/// The commit request's fence fields take 3-5, above both numbers it has ever used.
+/// The commit request's fence fields take 3-6, above both numbers it has ever used.
 #[test]
 fn commit_req_allocates_the_fence_fields_above_every_number_it_has_used() {
     expect(
@@ -246,6 +292,28 @@ fn commit_req_allocates_the_fence_fields_above_every_number_it_has_used() {
             ("lifecycle_fence", 3),
             ("target_worker_id", 4),
             ("target_worker_generation", 5),
+            ("target_worker_incarnation", 6),
+        ],
+    );
+}
+
+/// `TaskAssignment` allocates the worker incarnation at 7, above every number it has used, and
+/// keeps 3 out of circulation.
+///
+/// 3 held `string worker_addr` before the split into `worker_addr`/`worker_rpc`; it was dropped
+/// without being reserved, so a message from a build old enough to set it encodes a
+/// length-delimited value there. 7 is above all of 1, 2, 4, 5, 6.
+#[test]
+fn task_assignment_allocates_the_incarnation_above_every_number_it_has_used() {
+    expect(
+        "TaskAssignment",
+        &[
+            ("task_id", 1),
+            ("subtask_idx", 2),
+            ("worker_id", 4),
+            ("worker_addr", 5),
+            ("worker_rpc", 6),
+            ("worker_incarnation", 7),
         ],
     );
 }
@@ -264,11 +332,11 @@ fn commit_resp_stays_empty() {
 ///
 /// The historical sets come from reading `crates/arroyo-rpc/proto/rpc.proto` at every commit
 /// that has ever touched it: `RegisterWorkerReq` has used 1-9, `StartExecutionReq` 1-12,
-/// `CommitReq` 1-2, and `RegisterWorkerResp`/`StartExecutionResp`/`CommitResp` have never had a
-/// field at all.
+/// `CommitReq` 1-2, `TaskAssignment` 1-6, and
+/// `RegisterWorkerResp`/`StartExecutionResp`/`CommitResp` have never had a field at all.
 #[test]
 fn no_fence_field_reuses_a_number_any_build_has_encoded() {
-    let ever_used: [(&str, &[u32]); 6] = [
+    let ever_used: [(&str, &[u32]); 7] = [
         ("RegisterWorkerReq", &[1, 2, 3, 4, 5, 6, 7, 8, 9]),
         ("RegisterWorkerResp", &[]),
         (
@@ -278,47 +346,26 @@ fn no_fence_field_reuses_a_number_any_build_has_encoded() {
         ("StartExecutionResp", &[]),
         ("CommitReq", &[1, 2]),
         ("CommitResp", &[]),
+        ("TaskAssignment", &[1, 2, 3, 4, 5, 6]),
     ];
-    let added: [(&str, &[&str]); 6] = [
-        ("RegisterWorkerReq", &[]),
-        ("RegisterWorkerResp", &["requires_lifecycle_fence"]),
-        (
-            "StartExecutionReq",
-            &[
-                "lifecycle_fence",
-                "target_worker_id",
-                "target_worker_generation",
-                "lifecycle_operation",
-                "revoked_execution_ids",
-            ],
-        ),
-        (
-            "StartExecutionResp",
-            &["observed_lifecycle_fence", "outcome"],
-        ),
-        (
-            "CommitReq",
-            &[
-                "lifecycle_fence",
-                "target_worker_id",
-                "target_worker_generation",
-            ],
-        ),
-        ("CommitResp", &[]),
-    ];
-
     let messages = parse_messages();
-    for ((message, historical), (same_message, new_fields)) in ever_used.iter().zip(added.iter()) {
+    for ((message, historical), (same_message, new_fields)) in
+        ever_used.iter().zip(ADDED_FIELDS.iter())
+    {
         assert_eq!(message, same_message, "the two tables must stay aligned");
         let tags = messages
             .get(*message)
             .unwrap_or_else(|| panic!("rpc.proto has no message {message}"));
         let historical: BTreeSet<u32> = historical.iter().copied().collect();
-        for field in *new_fields {
+        for (field, declared) in *new_fields {
             let number = tags
                 .fields
                 .get(*field)
                 .unwrap_or_else(|| panic!("{message} has no field {field}"));
+            assert_eq!(
+                number, declared,
+                "{message}.{field} is declared at {number} and this inventory says {declared}"
+            );
             assert!(
                 !historical.contains(number),
                 "{message}.{field} takes number {number}, which a previous build encoded a \
@@ -326,6 +373,57 @@ fn no_fence_field_reuses_a_number_any_build_has_encoded() {
             );
         }
     }
+}
+
+/// Every field the fence protocol adds has a documented zero value, and the operator
+/// documentation names no field the protocol does not add.
+///
+/// The protocol document's §2 makes a *total* claim — every new field, with the reading a peer
+/// that predates it produces — and a total claim about a schema that keeps changing goes stale
+/// without a word of warning: a round that adds a field and forgets the row leaves a table that
+/// still says "every field below". Both directions are checked, because a stale row describing a
+/// field that no longer exists misleads exactly as much as a missing one.
+///
+/// The pairing is asserted on the *number* as well as the name, since the number is the part
+/// that is load-bearing on the wire and the part a reader would otherwise have to take on trust.
+#[test]
+fn every_fence_field_has_a_documented_zero_value() {
+    // `| `Message` | Tag | `field` | ... |` — the three leading cells of §2's table. The message
+    // name is matched against the inventory rather than merely parsed, so the two enum tables
+    // further down the document — whose first cell is a value name and whose third is prose —
+    // are not read as field rows.
+    let messages: BTreeSet<&str> = ADDED_FIELDS.iter().map(|(message, _)| *message).collect();
+    let documented: BTreeSet<(String, String, u32)> = PROTOCOL_DOC
+        .lines()
+        .filter_map(|line| {
+            let cells: Vec<&str> = line.trim().split('|').map(str::trim).collect();
+            // A leading and a trailing empty cell from the delimiters, then Message/Tag/Field.
+            let (message, tag, field) = (
+                cells.get(1)?.trim_matches('`'),
+                cells.get(2)?,
+                cells.get(3)?.trim_matches('`'),
+            );
+            if !messages.contains(message) {
+                return None;
+            }
+            let tag: u32 = tag.parse().ok()?;
+            Some((message.to_string(), field.to_string(), tag))
+        })
+        .collect();
+
+    let declared: BTreeSet<(String, String, u32)> = ADDED_FIELDS
+        .iter()
+        .flat_map(|(message, fields)| {
+            fields
+                .iter()
+                .map(move |(field, tag)| ((*message).to_string(), (*field).to_string(), *tag))
+        })
+        .collect();
+
+    assert_eq!(
+        declared, documented,
+        "docs/lifecycle-fence-protocol.md §2 must document exactly the fields the protocol adds,          at the numbers it adds them"
+    );
 }
 
 /// The fence protocol adds no RPC and no message type.

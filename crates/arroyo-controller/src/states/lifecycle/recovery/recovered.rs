@@ -17,6 +17,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use arroyo_rpc::fence_wire::WorkerIncarnation;
 use arroyo_rpc::fencing::{FenceTarget, FenceTargetState, Fencing, FencingRecordError};
 use arroyo_types::WorkerId;
 use thiserror::Error;
@@ -139,6 +140,13 @@ pub(crate) async fn observe_terminations(
 pub(super) struct PendingTarget {
     pub(super) worker: WorkerId,
     pub(super) rpc_address: Option<String>,
+    /// The process the obligation is owed by, as the record names it.
+    ///
+    /// Carried beside the address because an advance has to be addressed to a *process*: a
+    /// worker id and a generation name a slot, and the successor of a restart holds none of its
+    /// predecessor's fence state (M11.D39d, PR #167 round 6). `None` is a record written before
+    /// the field, whose targets can be observed terminated but not fenced.
+    pub(super) incarnation: Option<WorkerIncarnation>,
 }
 
 /// A job's fencing obligation, as read back from its row and advanced by one recovery pass.
@@ -216,6 +224,7 @@ impl RecoveredObligation {
                 .push(PendingTarget {
                     worker: WorkerId(target.worker_id),
                     rpc_address: target.rpc_address.clone(),
+                    incarnation: target.incarnation.map(WorkerIncarnation::from),
                 });
         }
         by_generation
@@ -284,13 +293,28 @@ impl RecoveredObligation {
         true
     }
 
-    /// The record this obligation would be republished as, or `None` if it owes nothing.
+    /// The record this obligation would be republished as, or `None` if it names nothing.
     ///
-    /// `None` once every target has settled, **including** when a candidate is still unrooted:
-    /// a candidate is not an obligation to a worker, it is an object the grace collector
-    /// reclaims from the job's own `generations/` prefix, and keeping the record alive for it
-    /// would keep the job in `Fencing` forever for something no acknowledgement can settle. The
-    /// caller logs the key on the way out so it is not lost from the record silently.
+    /// # Why a settled record is kept and not deleted
+    ///
+    /// A record says two things, and they stop being true at different moments (PR #167
+    /// rounds 5 and 6). The **identifiers** stop being owed the instant every target settles.
+    /// The **targets** — which worker generations can act, and where they answer — stay true for
+    /// as long as those workers run, and that is what a controller about to publish a refusal, or
+    /// to admit a replacement generation, has to fence.
+    ///
+    /// So settling advances the states and keeps the record. Deleting it here was how round 5's
+    /// retained live-generation inventory was lost: a recovery pass — the cold `LeaderRunning`
+    /// adoption and the scheduling preamble both run this one — converted an all-acknowledged
+    /// record to `None` and persisted the deletion, leaving nothing for a later refusal to fence
+    /// *at*. Keeping it holds the job in `Fencing` for nothing, because a job is held by
+    /// **pending** targets and this record has none.
+    ///
+    /// `None` is now only "this obligation names no target at all", which is a record with
+    /// nothing in it whatever its candidate says: a candidate is not an obligation to a worker,
+    /// it is an object the grace collector reclaims from the job's own `generations/` prefix, and
+    /// no acknowledgement can settle one. The caller logs the key on the way out so it is not
+    /// lost from the record silently.
     ///
     /// # Errors
     ///
@@ -299,15 +323,24 @@ impl RecoveredObligation {
     /// `Result` rather than an `expect` because "it cannot" is an argument about today's
     /// operations rather than a property of the type.
     pub(super) fn into_record(self) -> Result<Option<Fencing>, FencingRecordError> {
-        if self
-            .targets
-            .iter()
-            .all(|target| target.state != FenceTargetState::Pending)
-        {
+        if self.targets.is_empty() {
             return Ok(None);
         }
+        // Settled targets keep the record; only the identifiers they were issued go, because an
+        // identifier a later pass could revoke is one this pass has already had answered.
+        let targets = self
+            .targets
+            .into_iter()
+            .map(|target| match target.state {
+                FenceTargetState::Pending => target,
+                _ => FenceTarget {
+                    attempt_id: None,
+                    ..target
+                },
+            })
+            .collect();
         Ok(Some(Fencing::record(
-            self.targets,
+            targets,
             self.candidate_root,
             self.since_millis,
         )?))

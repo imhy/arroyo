@@ -1838,10 +1838,33 @@ async fn execute_state<'a>(
     let observed = match observed {
         Ok(intent) => Ok(intent),
         Err(refusal) => match ctx.settle_before_publishing_refusal().await {
-            BeforePublishing::Settled => Err(fatal_refused_config(
-                "the job's persisted configuration was refused",
-                refusal.into(),
-            )),
+            // Re-read before it is acted on, and this is PR #167 round 6's second finding: the
+            // settlement above talks to workers and to the row, and a stop an operator asked for
+            // or a configuration they repaired can arrive during that I/O. The refusal this
+            // holds describes the row as it was *before* all of it. Publishing it without asking
+            // again fails a job for a configuration that no longer exists.
+            BeforePublishing::Settled => {
+                match ctx.observe_boundary_intent(ConsumptionPoint::BeforeIrreversiblePhase) {
+                    // Nothing newer: the refusal is still the truth about this job, and now it may
+                    // be published.
+                    Ok(ObservedIntent::Continue) => Err(fatal_refused_config(
+                        "the job's persisted configuration was refused",
+                        refusal.into(),
+                    )),
+                    // Newer truth, published into the job's configuration by the read itself. It is
+                    // handed on exactly as an adoption or a stop read here has always been — the
+                    // arms below do that — and the superseded refusal is neither published nor kept.
+                    // A stop in particular wins over a refusal, which is `stop_wins_over_refusal`
+                    // read at this end of the mechanism.
+                    Ok(newer) => Ok(newer),
+                    // A *newer* refusal, decided from a row read after the settlement. That is the
+                    // one that gets published, not the one this pass started with.
+                    Err(newer) => Err(fatal_refused_config(
+                        "the job's persisted configuration was refused",
+                        newer.into(),
+                    )),
+                }
+            }
             // The job owes. It stays exactly where it is — nothing is published, so neither
             // `Failing` nor `Failed` reaches the row — and the refusal stands on the writer so
             // the next pass is offered it again rather than running the configuration this
@@ -1947,7 +1970,26 @@ async fn execute_state<'a>(
             // reads the mailbox fresh — so the reason is neither lost nor pinned to a
             // configuration the poll has since replaced.
             match ctx.settle_before_publishing_refusal().await {
-                BeforePublishing::Settled => {}
+                BeforePublishing::Settled => {
+                    // Re-read for the reason the boundary re-reads (PR #167 round 6): the
+                    // settlement talks to workers and to the row, and what the writer has
+                    // decided since is newer truth than the reason this attempt is ending with.
+                    // A stop in particular must not lose to a failure that was already decided.
+                    if !matches!(
+                        ctx.observe_boundary_intent(ConsumptionPoint::BeforeIrreversiblePhase),
+                        Ok(ObservedIntent::Continue)
+                    ) {
+                        error!(
+                            message = "the job's writer decided something newer while this \
+                                       failure was settling, so the failure is not published",
+                            job_id = %ctx.config.id,
+                            pipeline_id = *ctx.pipeline_info.pipeline_id,
+                            state = state_name,
+                            error_message = message,
+                        );
+                        return (None, ctx);
+                    }
+                }
                 BeforePublishing::StillOwed => {
                     error!(
                         message = "a fatal reason is not published while this job still owes a \
@@ -6019,6 +6061,12 @@ mod tests {
         healed: std::sync::atomic::AtomicBool,
         total: std::sync::atomic::AtomicBool,
         expected_id: Mutex<Option<String>>,
+        /// Held while a test needs a directive to be *in flight*.
+        ///
+        /// A row about something arriving "during" an RPC cannot be written as a sleep and a
+        /// hope: the handler takes this receiver and awaits it, so the request is provably
+        /// unanswered until the test says so.
+        gate: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     }
 
     impl HealingPartition {
@@ -6027,7 +6075,15 @@ mod tests {
                 healed: std::sync::atomic::AtomicBool::new(false),
                 total: std::sync::atomic::AtomicBool::new(false),
                 expected_id: Mutex::new(None),
+                gate: Mutex::new(None),
             })
+        }
+
+        /// Holds the next directive this worker receives until the returned sender is used.
+        fn hold_next_directive(&self) -> tokio::sync::oneshot::Sender<()> {
+            let (release, held) = tokio::sync::oneshot::channel();
+            *self.gate.lock().unwrap() = Some(held);
+            release
         }
 
         /// The partition deepens: this worker now answers nothing, the handshake included.
@@ -6382,12 +6438,18 @@ mod tests {
             // A total partition answers nothing — the fence handshake included — which is what
             // stops an attempt discharging the obligation it inherited. Answered above the
             // `FENCE_ONLY` arm below for exactly that reason.
-            if let StartsExecution::HealingPartition(partition) = &self.starts_execution
-                && partition.is_total()
-            {
-                return Err(tonic::Status::unavailable(
-                    "this worker answers nothing while the partition is total",
-                ));
+            if let StartsExecution::HealingPartition(partition) = &self.starts_execution {
+                if partition.is_total() {
+                    return Err(tonic::Status::unavailable(
+                        "this worker answers nothing while the partition is total",
+                    ));
+                }
+                // Held, if a test asked for this directive to be in flight while it does
+                // something else. Taken once: the next directive answers normally.
+                let held = partition.gate.lock().unwrap().take();
+                if let Some(held) = held {
+                    let _ = held.await;
+                }
             }
 
             // A fence-capable worker generation, as M11.T26d's guard is: a `FENCE_ONLY`
@@ -6616,6 +6678,16 @@ mod tests {
         format!("http://{addr}")
     }
 
+    /// The process every fixture worker in this module reports at registration.
+    ///
+    /// Fixed rather than minted so a directive's address is closed form; in production a worker
+    /// mints one per process and reports it on `RegisterWorkerReq` (M11.D39d, PR #167 round 6).
+    const FIXTURE_INCARNATION: u64 = 21;
+
+    fn fixture_incarnation() -> Option<arroyo_rpc::fence_wire::WorkerIncarnation> {
+        arroyo_rpc::fence_wire::WorkerIncarnation::named(FIXTURE_INCARNATION)
+    }
+
     /// The `WorkerConnect` a fake worker would send, at the generation the preamble has just
     /// advanced to, carrying one slot.
     ///
@@ -6649,6 +6721,7 @@ mod tests {
             data_address: "127.0.0.1:1".to_string(),
             slots: 1,
             reconciles_start_execution,
+            incarnation: fixture_incarnation(),
         }
     }
 
@@ -6670,6 +6743,7 @@ mod tests {
             data_address,
             slots,
             reconciles_start_execution,
+            incarnation,
             ..
         } = worker_connect_from(worker_id, rpc_address)
         else {
@@ -6683,6 +6757,7 @@ mod tests {
             data_address,
             slots,
             reconciles_start_execution,
+            incarnation,
         }
     }
 
@@ -8696,6 +8771,7 @@ mod tests {
                 generation,
                 attempt_id: Some("0123456789abcdef0123456789abcdef".to_string()),
                 rpc_address: Some(address.to_string()),
+                incarnation: std::num::NonZeroU64::new(21),
                 state: arroyo_rpc::fencing::FenceTargetState::Pending,
             }],
             None,
@@ -8713,6 +8789,84 @@ mod tests {
     /// generation the scheduler still reports as running. It fails fast, so the row is about the
     /// obligation rather than about a retry budget elapsing.
     const UNREACHABLE: &str = "http://127.0.0.1:1";
+
+    /// **PR #167 round 6.** A repair that arrives *during* settlement supersedes the refusal.
+    ///
+    /// Round 5 made the writer's *reads* ordered — the mailbox is consulted before a deferred
+    /// refusal — but the refusal a pass is holding crosses an `await` that talks to workers and
+    /// to the row, and it crosses it as a bare error. A stop an operator asked for, or a
+    /// configuration they repaired, arriving during that I/O was simply not looked at: the
+    /// settlement completed and the old error became a failure.
+    ///
+    /// So the writer is read again before the refusal is acted on. This row submits the repair at
+    /// the one moment that makes it a race rather than a sequence — after the settlement's first
+    /// directive has actually reached the worker — and asserts the job is not failed for the
+    /// configuration that repair replaced.
+    #[tokio::test]
+    async fn a_repair_arriving_during_settlement_supersedes_the_refusal() {
+        let partition = HealingPartition::partitioned();
+        partition.heal();
+        let mut run = SchedulingRun::with_workers(
+            "repair-during-settlement",
+            vec![StartsExecution::HealingPartition(Arc::clone(&partition))],
+        )
+        .await;
+        let _owner = run.harness.install_fenced_lifecycle();
+        let mailbox = intent_mailbox();
+        run.harness.install_actor(&mailbox);
+        run.harness
+            .queue()
+            .send(worker_connect_from(WorkerId(7), &run.address(0)))
+            .await
+            .unwrap();
+        run.harness.queue().send(task_started()).await.unwrap();
+        assert_eq!(
+            advanced_to(&run.schedule_through_the_phase_graph().await),
+            Some("Running"),
+            "the control: a healthy generation, with a record naming it"
+        );
+
+        // The refusal, and then — while the settlement is advancing its fence at that
+        // generation — the repair.
+        mailbox.submit(LifecycleIntent::Refused(selector_changed()));
+        run.harness.install_actor(&mailbox);
+        let repaired = mailbox.clone();
+        // The settlement's first directive is held unanswered until the repair is in the
+        // mailbox, so "during" is a fact about the ordering rather than about a sleep.
+        let release = partition.hold_next_directive();
+        let repair = async move {
+            // A stop, which is the sharpest form of newer truth: it wins over a refusal
+            // (`stop_wins_over_refusal`), and where the job goes is unambiguous — a job that
+            // stops has plainly not been failed for the configuration this pass was holding.
+            let mut stopping = running_config(StateBackendSelector::Parquet);
+            stopping.stop_mode = StopMode::checkpoint;
+            repaired.submit(LifecycleIntent::classify(
+                StateBackendSelector::Parquet,
+                polled(StateBackendSelector::Parquet, stopping, None),
+            ));
+            let _ = release.send(());
+        };
+
+        let ctx = run.harness.ctx(
+            running_config(StateBackendSelector::Parquet),
+            StateBackendSelector::Parquet,
+        );
+        let ((next, _ctx), ()) = tokio::join!(execute_state(Box::new(Scheduling {}), ctx), repair);
+
+        let landed = next.map(|state| state.name());
+        assert!(
+            landed.is_some_and(|state| state.contains("Stopping")),
+            "the job stops rather than failing: the stop the poll read while the refusal was \
+             settling is newer truth about the same job, and it wins. Landed in {landed:?}"
+        );
+        assert!(
+            !state_writes(&run.db)
+                .iter()
+                .any(|(state, _)| state == "Failing" || state == "Failed"),
+            "and the row has never named either: {:?}",
+            state_writes(&run.db)
+        );
+    }
 
     /// **PR #167 round 5.** A refusal fences a *healthy running* generation before it is
     /// published.
@@ -10216,6 +10370,25 @@ mod tests {
     /// what a *store* holds after a run: a candidate is an object M11.D39d writes before
     /// anything points at it, so nothing in the controller can be asked whether it is there.
     fn candidate_objects(checkpoints: &CheckpointDir) -> Vec<String> {
+        let mut keys = all_objects(checkpoints);
+        keys.retain(|key| key.contains("/candidates/"));
+        keys
+    }
+
+    /// Every canonical `current-generation.json` under a job's checkpoint directory.
+    ///
+    /// The sibling of [`candidate_objects`] for the object M11.D39c makes *authoritative*: a
+    /// candidate is one nothing points at until a root names it, and this one is read by
+    /// `publish_checkpoint` and by the recovery search the moment it exists. Read from the store
+    /// for the same reason — nothing in the controller can be asked whether it is there.
+    fn current_generation_objects(checkpoints: &CheckpointDir) -> Vec<String> {
+        let mut keys = all_objects(checkpoints);
+        keys.retain(|key| key.ends_with("current-generation.json"));
+        keys
+    }
+
+    /// Every object under a job's checkpoint directory, sorted.
+    fn all_objects(checkpoints: &CheckpointDir) -> Vec<String> {
         fn walk(root: &std::path::Path, at: &std::path::Path, into: &mut Vec<String>) {
             for entry in std::fs::read_dir(at).into_iter().flatten().flatten() {
                 let path = entry.path();
@@ -10234,7 +10407,6 @@ mod tests {
         let root = std::path::Path::new(&checkpoints.0);
         let mut keys = Vec::new();
         walk(root, root, &mut keys);
-        keys.retain(|key| key.contains("/candidates/"));
         keys.sort();
         keys
     }
@@ -10424,6 +10596,21 @@ mod tests {
             "but the row names no root: the candidate is unrooted, which is what leaves it for \
              the grace collector"
         );
+        // **PR #167 round 6, finding 5.** And nothing was made *canonical*. An unrooted candidate
+        // is an object nobody points at, which is why the row above is the whole of what a lost
+        // duel costs; `current-generation.json` is not that — it is read by `publish_checkpoint`
+        // and by the recovery search from the moment it exists, and losing the root CAS would
+        // not undo it. It is written by `publish_metadata_root` only after that CAS applies, so a
+        // controller that stood down here wrote none.
+        //
+        // Meaningful in the worker-leader topology, where the preamble registers the generation;
+        // in controller mode no scheduling attempt writes this object at all, and the row is a
+        // pin that this stays true.
+        assert_eq!(
+            current_generation_objects(&run._checkpoints),
+            Vec::<String>::new(),
+            "a superseded controller must not leave its generation named as the job's current one"
+        );
         assert!(
             arroyo_rpc::fencing::Fencing::record(vec![], Some(candidates[0].clone()), None).is_ok(),
             "and the reference fits the durable fencing record's own bound, so the obligation \
@@ -10509,6 +10696,33 @@ mod tests {
             root.epoch(),
             fenced.harness.status.authority().epoch(),
             "and to the epoch this attempt's own adoption installed"
+        );
+
+        // **PR #167 round 6, finding 5**, from the winning side. A canonical
+        // `current-generation.json` exists only where a generation was registered — the
+        // worker-leader preamble — and where one does, the attempt that wrote it is the attempt
+        // that installed the root above. The pairing is the claim: the pointer is written by
+        // `publish_metadata_root` after its CAS applies, so a run that has a root has a pointer
+        // and a run that has neither wrote neither.
+        let canonical = current_generation_objects(&fenced._checkpoints);
+        assert!(
+            canonical.len() <= 1,
+            "one attempt makes at most one generation current: {canonical:?}"
+        );
+        assert_eq!(
+            canonical.is_empty(),
+            !matches!(
+                super::config().job_controller,
+                super::JobControllerMode::Worker
+            ),
+            "the canonical pointer is written exactly where a generation is registered, which is \
+             the worker-leader preamble: {canonical:?}"
+        );
+        assert_eq!(
+            current_generation_objects(&legacy._checkpoints),
+            canonical,
+            "and the landed body writes the same object it always did: activating the fence \
+             moved when the pointer is written, not whether it is"
         );
     }
 
@@ -12723,7 +12937,12 @@ mod tests {
             Arc::new(program),
             1,
             1,
-            HashMap::from([(WorkerId(7), worker_client(channel, WorkerId(7)))]),
+            HashMap::from([(
+                WorkerId(7),
+                // The pre-flag-day fixture: an unfenced authority addresses no generation and
+                // therefore no process.
+                arroyo_rpc::identity::WorkerChannel::to(worker_client(channel, WorkerId(7)), None),
+            )]),
             None,
             None,
             // The pre-flag-day protocol, which is what `LifecycleMode::SELECTED` produces and

@@ -128,10 +128,34 @@ impl PhaseContext<'_, '_> {
             }
             Err(refusal) => {
                 return Err(match self.ctx.settle_before_publishing_refusal().await {
-                    BeforePublishing::Settled => fatal_refused_config(
-                        "the job's persisted configuration was refused",
-                        refusal.into(),
-                    ),
+                    // Re-read before it is acted on, for the reason `execute_state`'s boundary
+                    // does the same: the settlement above talks to workers and to the row, and a
+                    // stop or a repaired configuration arriving during that I/O is newer truth
+                    // than the refusal this holds (PR #167 round 6).
+                    BeforePublishing::Settled => match self
+                        .ctx
+                        .observe_boundary_intent(ConsumptionPoint::BeforeIrreversiblePhase)
+                    {
+                        Ok(ObservedIntent::Continue) => fatal_refused_config(
+                            "the job's persisted configuration was refused",
+                            refusal.into(),
+                        ),
+                        // Newer truth: this attempt does not fail the job for a configuration the
+                        // poll has since replaced. It ends retryably, and the next pass's
+                        // boundary acts on what the writer decided.
+                        Ok(_) => self.retryable(
+                            "the job's configuration was replaced while its refusal was settling",
+                            anyhow!(
+                                "the writer decided something newer than the refusal this \
+                                 attempt was about to publish"
+                            ),
+                            10,
+                        ),
+                        Err(newer) => fatal_refused_config(
+                            "the job's persisted configuration was refused",
+                            newer.into(),
+                        ),
+                    },
                     // Left standing, so the next pass is offered it again rather than running a
                     // configuration this controller has already refused; and reported as
                     // retryable, so nothing publishes `Failing` for a job whose targets have

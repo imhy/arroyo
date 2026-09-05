@@ -28,7 +28,7 @@ use arroyo_rpc::grpc::rpc::{
     LoadCompactedDataReq, LoadCompactedDataRes, MetricsReq, MetricsResp, StartExecutionOutcome,
     StartExecutionReq, StartExecutionResp, StopExecutionReq, StopExecutionResp,
 };
-use arroyo_rpc::identity::{WorkerClient, worker_client};
+use arroyo_rpc::identity::{WorkerChannel, WorkerClient, worker_client};
 use arroyo_rpc::state_backend::StateBackendSelector;
 use arroyo_types::{MachineId, PipelineId, WorkerId};
 
@@ -312,8 +312,18 @@ async fn fan_out(
     // The landed rows are about the pre-flag-day fan-out, so they address their workers the way
     // `LifecycleMode::LegacyT08` does: no fence, no addressed generation. The fenced shape has
     // its own rows in `lifecycle::handshake_tests`.
-    let targets = StartTargets::without_a_handshake(FenceProtocol::Legacy, connects)
-        .expect("the legacy protocol needs no handshake");
+    let targets = StartTargets::without_a_handshake(
+        FenceProtocol::Legacy,
+        connects
+            .into_iter()
+            .map(|(id, client)| {
+                // The legacy protocol addresses no generation and therefore no process; the
+                // channel carries none, and `without_a_handshake` drops it.
+                (id, WorkerChannel::to(client, None))
+            })
+            .collect(),
+    )
+    .expect("the legacy protocol needs no handshake");
     // Minted and recorded before the fan-out, exactly as both production routes do it since
     // PR #167 round 2: an identifier the fan-out minted for itself could not appear in a record
     // written before its request existed.

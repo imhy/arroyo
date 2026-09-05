@@ -10,8 +10,8 @@ use tonic::Code;
 
 use super::faults::{Link, WorkerFault};
 use super::tests::{
-    AMBIGUOUS, GENERATION, WORKER, addressed_start, fence_only, fenced_start, revoke, settlement,
-    unfenced,
+    AMBIGUOUS, GENERATION, INCARNATION, SUCCESSOR_INCARNATION, WORKER, addressed_fence_only_to,
+    addressed_start_to, fence_only, fenced_start, revoke, settlement, unfenced,
 };
 use arroyo_rpc::grpc::rpc::StartExecutionOutcome;
 
@@ -357,11 +357,12 @@ async fn a_restart_does_not_resurrect_the_start_a_refusal_superseded() {
         .expect_err("a restarted incarnation authorises nothing its predecessor was told");
     assert_eq!(refused.code(), Code::FailedPrecondition);
     assert!(!AMBIGUOUS.contains(&refused.code()));
-    assert_eq!(
-        refused.message(),
-        "this worker generation has acknowledged no lifecycle fence, so no handshake authorises \
-         a request under fence 4"
-    );
+    // The identity comparison, which since PR #167 round 6 includes the process: the held start
+    // names the predecessor's incarnation, and this is its successor. That is one step *earlier*
+    // than the acknowledged-fence rule this row used to end at, and deliberately so — the fence
+    // rule is a comparison against state a restart reconstructs, and the incarnation is the part
+    // it cannot (finding 3).
+    assert_eq!(refused.message(), identity_refused_after_restart());
     assert!(link.idle(), "and nothing began executing");
     assert_eq!(
         link.acknowledged(),
@@ -373,9 +374,105 @@ async fn a_restart_does_not_resurrect_the_start_a_refusal_superseded() {
     // So what the restart cost is the predecessor's authority, not this worker's usefulness.
     link.handshake_receiver(REFUSAL_FENCE);
     assert_eq!(
-        link.deliver(fenced_start("live-attempt", REFUSAL_FENCE))
-            .unwrap(),
+        link.deliver(addressed_start_to(
+            "live-attempt",
+            REFUSAL_FENCE,
+            WORKER,
+            GENERATION,
+            link.incarnation()
+        ))
+        .unwrap(),
         settlement(REFUSAL_FENCE, StartExecutionOutcome::Applied),
+    );
+}
+
+/// The refusal a successor process gives a directive addressed to its predecessor.
+///
+/// One place, because two rows below assert it and a copy of the message in each would let them
+/// drift apart from the guard and from each other.
+fn identity_refused_after_restart() -> String {
+    format!(
+        "request is addressed to worker {WORKER} generation {GENERATION} incarnation \
+         {INCARNATION}, and this is worker {WORKER} generation {GENERATION} incarnation \
+         {SUCCESSOR_INCARNATION}"
+    )
+}
+
+/// **PR #167 round 6, finding 3.** A replayed handshake cannot rebuild the acknowledgement a
+/// restart destroyed, so the start it would have authorised stays refused.
+///
+/// The reviewer's composition, and the one round 2's exact-fence rule does not reach. It uses
+/// two faults the model already declares, together: arbitrary in-transit delay with duplication
+/// ([`WorkerFault::Delay`], [`WorkerFault::Duplication`]) and same-generation restart
+/// ([`WorkerFault::Restart`]). The superseded controller's `FENCE_ONLY` at fence 4 and its start
+/// under fence 4 are *both* held; the live controller then revokes and fences to 7; the process
+/// restarts and announces itself; and the two held directives arrive in the order they were
+/// sent. Under round 2's rule the replayed handshake reconstructs exactly the state the start is
+/// checked against — a generation whose highest acknowledged fence is 4 — and the start is
+/// `Applied` reporting observed fence 4.
+///
+/// What refuses both of them now is that they name a process that no longer exists. The
+/// discriminator at the end is the same pair of directives re-addressed to the live process,
+/// which the successor takes normally: so it is the incarnation that rejects them and not the
+/// delay, the duplication, or the fence.
+#[tokio::test]
+async fn a_replayed_handshake_cannot_resurrect_a_revoked_start_across_a_restart() {
+    let mut link = Link::handshaken_at(ISSUED_UNDER);
+    // Both directives of the superseded controller's exchange, in flight: the handshake that
+    // authorised the start, and the start itself.
+    link.hold(
+        "fence-only-4",
+        addressed_fence_only_to(ISSUED_UNDER, WORKER, GENERATION, INCARNATION),
+    );
+    link.hold("start-under-4", fenced_start(ATTEMPT, ISSUED_UNDER));
+
+    // The live controller revokes the identifier and advances this generation past it.
+    assert_eq!(
+        link.deliver(revoke(REFUSAL_FENCE, &[ATTEMPT])).unwrap(),
+        settlement(REFUSAL_FENCE, StartExecutionOutcome::Revoked),
+    );
+
+    // The process restarts and announces itself, so the fenced protocol is open to it and the
+    // registration refusal cannot be what answers below.
+    link.restart_generation();
+    link.register_receiver(false);
+    assert_eq!(link.acknowledged(), 0);
+
+    let replayed = link
+        .deliver_held("fence-only-4")
+        .expect_err("a replayed handshake addresses a process that no longer exists");
+    assert_eq!(replayed.code(), Code::FailedPrecondition);
+    assert!(!AMBIGUOUS.contains(&replayed.code()));
+    assert_eq!(replayed.message(), identity_refused_after_restart());
+    assert_eq!(
+        link.acknowledged(),
+        0,
+        "and it advanced nothing: the acknowledgement the start needs cannot be rebuilt"
+    );
+
+    let resurrected = link
+        .deliver_held("start-under-4")
+        .expect_err("and the start it would have authorised is refused with it");
+    assert_eq!(resurrected.code(), Code::FailedPrecondition);
+    assert!(!AMBIGUOUS.contains(&resurrected.code()));
+    assert_eq!(resurrected.message(), identity_refused_after_restart());
+    assert!(link.idle(), "nothing began executing");
+    assert_eq!(link.tracked(), 0);
+
+    // The discriminator: the same two directives, addressed to the process that is actually
+    // there, are taken normally.
+    link.handshake_receiver(ISSUED_UNDER);
+    assert_eq!(link.acknowledged(), ISSUED_UNDER);
+    assert_eq!(
+        link.deliver(addressed_start_to(
+            ATTEMPT,
+            ISSUED_UNDER,
+            WORKER,
+            GENERATION,
+            link.incarnation()
+        ))
+        .unwrap(),
+        settlement(ISSUED_UNDER, StartExecutionOutcome::Applied),
     );
 }
 
@@ -404,8 +501,9 @@ async fn a_reused_endpoint_refuses_its_predecessors_delayed_start() {
     assert_eq!(
         refused.message(),
         format!(
-            "request is addressed to worker {WORKER} generation {GENERATION}, and this is \
-             worker {WORKER} generation {}",
+            "request is addressed to worker {WORKER} generation {GENERATION} incarnation \
+             {INCARNATION}, and this is worker {WORKER} generation {} incarnation \
+             {SUCCESSOR_INCARNATION}",
             GENERATION + 1
         ),
     );
@@ -414,11 +512,12 @@ async fn a_reused_endpoint_refuses_its_predecessors_delayed_start() {
 
     // The successor answers for its own generation, under the same fence, normally.
     assert_eq!(
-        link.deliver(addressed_start(
+        link.deliver(addressed_start_to(
             ATTEMPT,
             ISSUED_UNDER,
             WORKER,
-            GENERATION + 1
+            GENERATION + 1,
+            link.incarnation()
         ))
         .unwrap(),
         settlement(ISSUED_UNDER, StartExecutionOutcome::Applied),

@@ -125,6 +125,7 @@ fn a_directive_addressed_to_another_generation_arrives_intact() {
         lifecycle_fence: 7,
         target_worker_id: 42,
         target_worker_generation: 3,
+        target_worker_incarnation: 11,
         ..Default::default()
     };
     let decoded = round_trip(&request);
@@ -136,21 +137,91 @@ fn a_directive_addressed_to_another_generation_arrives_intact() {
     assert_eq!(address.target().worker_id(), 42);
     assert_ne!(address.target().generation(), 4);
     assert_eq!(
-        LifecycleTarget::addressed(42, 3),
+        LifecycleTarget::addressed(42, 3, 11),
         Some(address.target()),
         "the target that arrived is the one the sender named, byte for byte"
+    );
+}
+
+/// A directive addressed to a *predecessor process* of the same worker generation arrives with
+/// the incarnation the sender named, so the receiver compares two intact values.
+///
+/// The wire half of PR #167 round 6, finding 3: the id and the generation agree — a restart
+/// reuses both — and only the incarnation says the request was minted for a process that is
+/// gone. Normalizing it away here would leave the guard nothing to refuse on.
+#[test]
+fn a_directive_addressed_to_a_predecessor_incarnation_arrives_intact() {
+    let request = StartExecutionReq {
+        lifecycle_fence: 7,
+        target_worker_id: 42,
+        target_worker_generation: 3,
+        target_worker_incarnation: 11,
+        ..Default::default()
+    };
+    let decoded = round_trip(&request);
+    let StartDirective::Fenced { address, .. } = start_directive(&decoded).unwrap() else {
+        panic!("a fenced request must not classify as unfenced");
+    };
+
+    let successor = LifecycleTarget::addressed(42, 3, 12).expect("generation 3 is addressable");
+    assert_eq!(address.target().worker_id(), successor.worker_id());
+    assert_eq!(address.target().generation(), successor.generation());
+    assert_ne!(
+        address.target(),
+        successor,
+        "the same worker and generation at a different incarnation is a different target"
+    );
+    assert_eq!(
+        address.target().incarnation().map(WorkerIncarnation::get),
+        Some(11)
+    );
+}
+
+/// An incarnation carried without a fence describes nothing this build can act on, and is
+/// refused rather than read as an address.
+#[test]
+fn an_incarnation_without_a_fence_is_refused() {
+    let request = StartExecutionReq {
+        target_worker_incarnation: 11,
+        ..Default::default()
+    };
+    assert_eq!(
+        start_directive(&round_trip(&request)).unwrap_err(),
+        MalformedFenceFields::IncarnationWithoutFence {
+            worker_id: 0,
+            incarnation: 11,
+        }
+    );
+
+    let commit = CommitReq {
+        epoch: 4,
+        target_worker_incarnation: 11,
+        ..Default::default()
+    };
+    assert_eq!(
+        commit_directive(&round_trip(&commit)).unwrap_err(),
+        MalformedFenceFields::IncarnationWithoutFence {
+            worker_id: 0,
+            incarnation: 11,
+        }
     );
 }
 
 /// Generation zero addresses nothing, whatever the worker id says; worker id zero is a worker.
 #[test]
 fn only_the_generation_decides_whether_a_target_is_addressed() {
-    assert_eq!(LifecycleTarget::addressed(42, 0), None);
-    assert_eq!(LifecycleTarget::addressed(0, 0), None);
+    assert_eq!(LifecycleTarget::addressed(42, 0, 11), None);
+    assert_eq!(LifecycleTarget::addressed(0, 0, 0), None);
 
-    let addressed = LifecycleTarget::addressed(0, 3).expect("generation 3 addresses a generation");
+    let addressed =
+        LifecycleTarget::addressed(0, 3, 0).expect("generation 3 addresses a generation");
     assert_eq!(addressed.worker_id(), 0);
     assert_eq!(addressed.generation(), 3);
+    assert_eq!(
+        addressed.incarnation(),
+        None,
+        "incarnation zero names no process, which is a shape an address may have"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------

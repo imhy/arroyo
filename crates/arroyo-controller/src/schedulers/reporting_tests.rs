@@ -211,6 +211,59 @@ async fn a_recreated_controller_reads_nothing_into_its_empty_registry() {
     }
 }
 
+/// **PR #167 round 6.** A stop *request* is not an observed termination.
+///
+/// `observe_generation` reads an absent registry entry as authoritative evidence that a worker
+/// generation has terminated, and the fencing path releases obligations on that evidence. The
+/// entry therefore has to leave only on an exit that was actually observed. It used to leave on
+/// the *request*: `stop_workers` removed it before sending the shutdown, and the task that owns
+/// the child removed it again on receiving one — under
+/// `process_scheduler.shutdown_with_controller = false` without killing anything at all. A worker
+/// asked to stop, still running, was reported gone.
+///
+/// The fixture reproduces that shape without a child process, because the claim is about the
+/// registry and not about `Command`: an entry whose shutdown receiver nobody has polled and whose
+/// `finished_rx` has not completed is exactly a worker that has been asked and has not exited.
+#[tokio::test]
+async fn a_stop_request_is_not_an_observed_termination() {
+    let process = ProcessScheduler::new();
+    process
+        .start_workers(start_nothing(JOB, GENERATION))
+        .await
+        .expect("starting zero workers is not an error");
+
+    // A worker of that generation, in the state the spawn path leaves one in: a shutdown channel
+    // nobody is reading and an exit nobody has signalled.
+    let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel();
+    let (_finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+    process.workers.lock().await.insert(
+        WorkerId(42),
+        super::ProcessWorker {
+            pipeline_id: PipelineId(Arc::new("pipeline_1".to_string())),
+            job_id: JobId(Arc::new(JOB.to_string())),
+            generation: GENERATION,
+            shutdown_tx: Some(shutdown_tx),
+            finished_rx,
+        },
+    );
+
+    process
+        .stop_workers(JOB, Some(GENERATION), false)
+        .await
+        .expect("asking a worker to stop is not an error");
+
+    assert_eq!(
+        process
+            .observe_generation(JOB, GENERATION)
+            .await
+            .expect("the evidence listing answers"),
+        GenerationObservation::Live(vec![WorkerId(42)]),
+        "a worker that has been asked to stop and has not exited is still able to act, and the \
+         evidence listing must say so — releasing a fencing obligation on this absence is what \
+         lets a delayed request be applied by a worker nobody killed"
+    );
+}
+
 /// A node worker the controller could not reach stays in the evidence listing.
 ///
 /// `NodeScheduler::stop_worker` sets `running = false` when it *fails* to reach a worker's node —

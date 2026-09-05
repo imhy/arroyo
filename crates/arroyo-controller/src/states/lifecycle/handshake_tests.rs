@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use arroyo_rpc::fence_wire::{StartDirective, start_directive};
+use arroyo_rpc::fence_wire::{StartDirective, WorkerIncarnation, start_directive};
 use arroyo_rpc::grpc::rpc::worker_grpc_server::{WorkerGrpc, WorkerGrpcServer};
 use arroyo_rpc::grpc::rpc::{
     CheckpointReq, CheckpointResp, CommitReq, CommitResp, GetWorkerPhaseReq, GetWorkerPhaseResp,
@@ -16,7 +16,7 @@ use arroyo_rpc::grpc::rpc::{
     StartExecutionOutcome, StartExecutionReq, StartExecutionResp, StopExecutionReq,
     StopExecutionResp,
 };
-use arroyo_rpc::identity::{WorkerClient, worker_client};
+use arroyo_rpc::identity::{WorkerChannel, worker_client};
 use arroyo_server_common::shutdown::{Shutdown, SignalBehavior};
 use arroyo_types::{JobId, MachineId, PipelineId, WorkerId};
 use arroyo_worker::WorkerServer;
@@ -29,6 +29,18 @@ use super::protocol::{FenceProtocol, FencedGeneration};
 /// The fence and generation these rows address, unless they say otherwise.
 const FENCE: u64 = 4;
 const GENERATION: u64 = 2;
+
+/// The process every worker fixture here reports at registration, which this controller then
+/// addresses every fenced directive to (M11.D39d, PR #167 round 6).
+///
+/// Fixed rather than minted so a directive's address can be asserted in closed form; in
+/// production the worker mints it once per process and reports it on `RegisterWorkerReq`.
+const INCARNATION: u64 = 21;
+
+/// [`INCARNATION`] as an address carries it.
+fn incarnation() -> Option<WorkerIncarnation> {
+    WorkerIncarnation::named(INCARNATION)
+}
 
 fn fenced(fence: u64, generation: u64) -> FencedGeneration {
     match FenceProtocol::for_job(
@@ -167,7 +179,7 @@ impl WorkerGrpc for FenceWorker {
 }
 
 /// Serves a [`FenceWorker`] on a loopback port and returns a client for it.
-async fn worker(id: WorkerId, answers: Answers) -> (Arc<Received>, WorkerClient) {
+async fn worker(id: WorkerId, answers: Answers) -> (Arc<Received>, WorkerChannel) {
     let received = Arc::new(Received::default());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = format!("http://{}", listener.local_addr().unwrap());
@@ -185,19 +197,23 @@ async fn worker(id: WorkerId, answers: Answers) -> (Arc<Received>, WorkerClient)
         .connect()
         .await
         .unwrap();
-    (received, worker_client(channel, id))
+    (
+        received,
+        WorkerChannel::to(worker_client(channel, id), incarnation()),
+    )
 }
 
 /// Serves a **real** [`WorkerServer`] on a loopback port: the production `WorkerGrpc` guard, on
 /// the receiving end of the production handshake, in the state a worker generation is in before
 /// it has announced itself to any controller.
-async fn real_worker(id: WorkerId, generation: u64, shutdown: &Shutdown) -> WorkerClient {
+async fn real_worker(id: WorkerId, generation: u64, shutdown: &Shutdown) -> WorkerChannel {
     let server = WorkerServer::new(
         MachineId(Arc::new("machine_1".to_string())),
         id,
         PipelineId(Arc::new("pipeline_1".to_string())),
         JobId(Arc::new("job_1".to_string())),
         generation,
+        WorkerIncarnation::named(INCARNATION).expect("a fixture names a live process"),
         shutdown.guard("worker"),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -213,7 +229,7 @@ async fn real_worker(id: WorkerId, generation: u64, shutdown: &Shutdown) -> Work
         .connect()
         .await
         .unwrap();
-    worker_client(channel, id)
+    WorkerChannel::to(worker_client(channel, id), incarnation())
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -295,6 +311,11 @@ async fn the_handshake_advances_and_is_acknowledged_by_every_addressed_generatio
         assert_eq!(req.lifecycle_fence, FENCE);
         assert_eq!(req.target_worker_id, id);
         assert_eq!(req.target_worker_generation, GENERATION);
+        assert_eq!(
+            req.target_worker_incarnation, INCARNATION,
+            "and to the process that registered, so a successor of a restart refuses it \
+             (M11.D39d, PR #167 round 6)"
+        );
         assert!(
             req.program.is_none() && req.start_execution_id.is_empty(),
             "a fence-only directive starts nothing and carries no attempt identifier"
@@ -302,7 +323,7 @@ async fn the_handshake_advances_and_is_acknowledged_by_every_addressed_generatio
     }
 
     // And the starts the handshake authorises carry the same fence, addressed the same way.
-    let mut addressed: Vec<(u64, u64, u64, i32)> = targets
+    let mut addressed: Vec<(u64, u64, u64, u64, i32)> = targets
         .into_starts()
         .into_iter()
         .map(|(id, _, directive)| {
@@ -312,6 +333,7 @@ async fn the_handshake_advances_and_is_acknowledged_by_every_addressed_generatio
                 id.0,
                 req.lifecycle_fence,
                 req.target_worker_generation,
+                req.target_worker_incarnation,
                 req.lifecycle_operation,
             )
         })
@@ -320,9 +342,70 @@ async fn the_handshake_advances_and_is_acknowledged_by_every_addressed_generatio
     assert_eq!(
         addressed,
         vec![
-            (1, FENCE, GENERATION, LifecycleOperation::Start as i32),
-            (2, FENCE, GENERATION, LifecycleOperation::Start as i32),
-        ]
+            (
+                1,
+                FENCE,
+                GENERATION,
+                INCARNATION,
+                LifecycleOperation::Start as i32
+            ),
+            (
+                2,
+                FENCE,
+                GENERATION,
+                INCARNATION,
+                LifecycleOperation::Start as i32
+            ),
+        ],
+        "the start carries the address the handshake acknowledged, process included: a start \
+         addressed to a process the handshake did not reach is a start no live generation \
+         answers"
+    );
+}
+
+/// **PR #167 round 6, finding 3.** The address is read from the channel's own registration, so a
+/// generation whose process has been replaced refuses this controller's handshake.
+///
+/// The controller half of the incarnation rule, against the production worker guard. Two runs
+/// against the same real generation — same worker id, same generation number, same endpoint —
+/// differing only in which process the controller believes is answering. The one that names the
+/// process that is there acknowledges; the one that names its predecessor is refused
+/// definitively, which is what a directive minted before a restart is.
+///
+/// It is the *controller* end that this pins: nothing in `advance_fence` re-derives the
+/// incarnation, so the address a directive carries is the one the channel was built with — and a
+/// channel is built from a `WorkerConnect` that came from that process's own registration.
+#[tokio::test]
+async fn a_handshake_addressed_to_a_replaced_process_is_refused() {
+    let shutdown = Shutdown::new("m11-t26-incarnation-handshake", SignalBehavior::None);
+    let live = real_worker(WorkerId(1), GENERATION, &shutdown).await;
+    // Announced, so the refusal below cannot be the registration gate.
+    let announced = WorkerChannel::to(live.clone().into_client(), live.incarnation());
+
+    // The control: the process that is actually there acknowledges.
+    advance_fence(
+        fenced(FENCE, GENERATION),
+        HashMap::from([(WorkerId(1), announced.clone())]),
+    )
+    .await
+    .expect_err("this generation has announced itself to nobody yet");
+
+    // A controller that believes a *predecessor* process is answering addresses it, and the
+    // generation that is there refuses.
+    let predecessor = WorkerChannel::to(
+        announced.into_client(),
+        WorkerIncarnation::named(INCARNATION + 1),
+    );
+    let refusal = advance_fence(
+        fenced(FENCE, GENERATION),
+        HashMap::from([(WorkerId(1), predecessor)]),
+    )
+    .await
+    .expect_err("a live process does not answer for another process's handshake")
+    .to_string();
+    assert!(
+        refusal.contains("FailedPrecondition"),
+        "the refusal is definitive, so nothing re-offers the directive: {refusal}"
     );
 }
 

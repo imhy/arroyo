@@ -7,6 +7,7 @@
 use crate::lifecycle_fence::attempt_ids::AttemptDisposition;
 use crate::lifecycle_fence::guard::{Announced, WorkerLifecycle};
 use crate::{WorkerExecutionPhase, WorkerServer};
+use arroyo_rpc::fence_wire::WorkerIncarnation;
 use arroyo_rpc::grpc::rpc::worker_grpc_server::WorkerGrpc;
 use arroyo_rpc::grpc::rpc::{
     LifecycleOperation, StartExecutionOutcome, StartExecutionReq, StartExecutionResp,
@@ -22,6 +23,20 @@ pub(super) const WORKER: u64 = 7;
 /// This worker generation's own generation, chosen above 1 so a predecessor can be addressed.
 pub(super) const GENERATION: u64 = 3;
 
+/// The process every fixture generation in these tests runs as.
+///
+/// Fixed rather than minted so a directive can be addressed to it from a free function. In
+/// production it is `WorkerIncarnation::mint()`, once per process; what the constant models is
+/// one process, and [`SUCCESSOR_INCARNATION`] is what a restart of it mints.
+pub(super) const INCARNATION: u64 = 5;
+
+/// The process a restarted generation runs as.
+///
+/// A restart is a new process, so it mints a value its predecessor did not have — which is the
+/// whole of what makes a directive addressed to the predecessor refusable (M11.D39d, PR #167
+/// round 6, finding 3).
+pub(super) const SUCCESSOR_INCARNATION: u64 = 6;
+
 /// The four gRPC codes M11.D39e(iv) makes ambiguous: the controller retries these with the same
 /// identifier. Nothing this worker answers may be one of them.
 pub(super) const AMBIGUOUS: [Code; 4] = [
@@ -31,8 +46,17 @@ pub(super) const AMBIGUOUS: [Code; 4] = [
     Code::Unavailable,
 ];
 
-/// A worker generation that has not registered.
+/// A worker generation that has not registered, running as [`INCARNATION`].
 pub(super) fn generation(worker_id: u64, generation: u64) -> (Shutdown, WorkerServer) {
+    incarnated_generation(worker_id, generation, INCARNATION)
+}
+
+/// The same, running as a named process.
+pub(super) fn incarnated_generation(
+    worker_id: u64,
+    generation: u64,
+    incarnation: u64,
+) -> (Shutdown, WorkerServer) {
     let shutdown = Shutdown::new("lifecycle-fence-test", SignalBehavior::None);
     let server = WorkerServer::new(
         MachineId(Arc::new("machine_1".to_string())),
@@ -40,6 +64,7 @@ pub(super) fn generation(worker_id: u64, generation: u64) -> (Shutdown, WorkerSe
         PipelineId(Arc::new("pipeline_1".to_string())),
         JobId(Arc::new("job_1".to_string())),
         generation,
+        WorkerIncarnation::named(incarnation).expect("a fixture names a live process"),
         shutdown.guard("worker"),
     );
     (shutdown, server)
@@ -180,18 +205,31 @@ pub(super) fn fenced_start(id: &str, fence: u64) -> StartExecutionReq {
     addressed_start(id, fence, WORKER, GENERATION)
 }
 
-/// A start under `fence`, addressed to worker `to_worker` generation `to_generation`.
+/// A start under `fence`, addressed to worker `to_worker` generation `to_generation` running as
+/// [`INCARNATION`].
 pub(super) fn addressed_start(
     id: &str,
     fence: u64,
     to_worker: u64,
     to_generation: u64,
 ) -> StartExecutionReq {
+    addressed_start_to(id, fence, to_worker, to_generation, INCARNATION)
+}
+
+/// The same, naming the process the start is for.
+pub(super) fn addressed_start_to(
+    id: &str,
+    fence: u64,
+    to_worker: u64,
+    to_generation: u64,
+    to_incarnation: u64,
+) -> StartExecutionReq {
     StartExecutionReq {
         start_execution_id: id.to_string(),
         lifecycle_fence: fence,
         target_worker_id: to_worker,
         target_worker_generation: to_generation,
+        target_worker_incarnation: to_incarnation,
         lifecycle_operation: LifecycleOperation::Start as i32,
         ..Default::default()
     }
@@ -203,16 +241,27 @@ pub(super) fn fence_only(fence: u64) -> StartExecutionReq {
 }
 
 /// A fence-only directive under `fence`, addressed to worker `to_worker` generation
-/// `to_generation`.
+/// `to_generation` running as [`INCARNATION`].
 pub(super) fn addressed_fence_only(
     fence: u64,
     to_worker: u64,
     to_generation: u64,
 ) -> StartExecutionReq {
+    addressed_fence_only_to(fence, to_worker, to_generation, INCARNATION)
+}
+
+/// The same, naming the process the advance is for.
+pub(super) fn addressed_fence_only_to(
+    fence: u64,
+    to_worker: u64,
+    to_generation: u64,
+    to_incarnation: u64,
+) -> StartExecutionReq {
     StartExecutionReq {
         lifecycle_fence: fence,
         target_worker_id: to_worker,
         target_worker_generation: to_generation,
+        target_worker_incarnation: to_incarnation,
         lifecycle_operation: LifecycleOperation::FenceOnly as i32,
         ..Default::default()
     }
@@ -231,6 +280,7 @@ pub(super) fn revoke_owned(fence: u64, ids: &[String]) -> StartExecutionReq {
         lifecycle_fence: fence,
         target_worker_id: WORKER,
         target_worker_generation: GENERATION,
+        target_worker_incarnation: INCARNATION,
         lifecycle_operation: LifecycleOperation::Revoke as i32,
         revoked_execution_ids: ids.to_vec(),
         ..Default::default()

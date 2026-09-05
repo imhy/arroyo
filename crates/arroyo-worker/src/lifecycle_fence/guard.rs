@@ -47,7 +47,7 @@ use crate::WorkerExecutionPhase;
 use crate::lifecycle_fence::attempt_ids::{AttemptDisposition, AttemptIdRefusal, AttemptIds};
 use arroyo_rpc::fence_wire::{
     CommitAuthority, CommitDirective, FenceAddress, LifecycleTarget, StartDirective,
-    commit_directive, start_directive,
+    WorkerIncarnation, commit_directive, start_directive,
 };
 use arroyo_rpc::grpc::rpc::{
     CommitReq, LifecycleOperation, OperatorCommitData, StartExecutionOutcome, StartExecutionReq,
@@ -56,6 +56,16 @@ use arroyo_rpc::grpc::rpc::{
 use std::collections::HashMap;
 use std::time::SystemTime;
 use tonic::Status;
+
+/// How an incarnation reads in a refusal: its value, or `none` when the side in question names
+/// no process.
+///
+/// Both sides of the identity comparison can legitimately name none — an address from a sender
+/// predating the field, and a generation built without one — and an operator reading the refusal
+/// has to be able to tell "a different process" from "no process named" without decoding zero.
+fn describe_incarnation(incarnation: Option<WorkerIncarnation>) -> String {
+    incarnation.map_or_else(|| "none".to_string(), |i| i.get().to_string())
+}
 
 /// Proof that a start was admitted by [`WorkerLifecycle::admit_start`].
 ///
@@ -148,11 +158,19 @@ pub(crate) struct WorkerLifecycle {
 /// the same lock as the phase.
 #[derive(Debug)]
 struct FenceState {
-    /// This generation's own identity, or `None` when it addresses no generation.
+    /// This generation's own identity — worker, generation and *this process* — or `None` when
+    /// it addresses no generation.
     ///
     /// `LifecycleTarget::addressed` answers `None` for generation zero, which no live worker
     /// generation runs under. A worker that reports one is a worker no fence can be addressed
     /// to, so it refuses every fenced directive rather than matching one by accident.
+    ///
+    /// The incarnation is the third part and the one a restart cannot reconstruct. Everything
+    /// else here is rebuilt by a successor process at the same worker id and generation — that
+    /// is `WorkerFault::Restart` — so every check below is a check against reconstructed state
+    /// and a directive delayed from before the restart passes it. The incarnation does not
+    /// survive the process that minted it, so a directive addressed to the predecessor names a
+    /// process this one is not (PR #167 round 6, finding 3).
     identity: Option<LifecycleTarget>,
     /// Whether this generation has announced itself to a controller (M11.D39e(i)).
     ///
@@ -220,11 +238,15 @@ pub(crate) struct Announced(());
 
 impl WorkerLifecycle {
     /// An idle generation that has not announced itself and has acknowledged no fence.
-    pub(crate) fn idle(worker_id: u64, generation: u64) -> Self {
+    ///
+    /// `incarnation` is this *process*'s, minted once by whoever builds the worker and reported
+    /// on its `RegisterWorkerReq`. It is taken rather than minted here so that the value the
+    /// controller is told and the value directives are checked against are one value.
+    pub(crate) fn idle(worker_id: u64, generation: u64, incarnation: WorkerIncarnation) -> Self {
         Self {
             execution: WorkerExecutionPhase::Idle,
             fence: FenceState {
-                identity: LifecycleTarget::addressed(worker_id, generation),
+                identity: LifecycleTarget::addressed(worker_id, generation, incarnation.get()),
                 announced: false,
                 strict: false,
                 acknowledged: 0,
@@ -561,14 +583,27 @@ impl FenceState {
         })?;
         // Endpoint reuse is distinguished by generation, not by address or worker id: a
         // restarted worker answering at its predecessor's address is a different generation and
-        // must not answer for its predecessor's requests (M11.D39d).
+        // must not answer for its predecessor's requests (M11.D39d). Generation reuse is
+        // distinguished by incarnation, for the same reason one step down: a restart under the
+        // same generation is a different *process*, and everything else this guard holds is
+        // state that process reconstructed (PR #167 round 6, finding 3).
+        //
+        // Whole-value equality, so an address that names no incarnation is refused by a
+        // generation that has one. That fails closed and costs nothing deployable: the only
+        // sender that cannot name an incarnation is one predating
+        // `StartExecutionReq::target_worker_incarnation`, and M11.D75's worker-first ordering
+        // means no such sender ever addresses a fence — a controller old enough to omit the
+        // field is old enough to send no fence at all, which is the unfenced route above.
         if address.target() != identity {
             return Err(Status::failed_precondition(format!(
-                "request is addressed to worker {} generation {}, and this is worker {} generation {}",
+                "request is addressed to worker {} generation {} incarnation {}, and this is \
+                 worker {} generation {} incarnation {}",
                 address.target().worker_id(),
                 address.target().generation(),
+                describe_incarnation(address.target().incarnation()),
                 identity.worker_id(),
                 identity.generation(),
+                describe_incarnation(identity.incarnation()),
             )));
         }
         if address.fence() < self.acknowledged {

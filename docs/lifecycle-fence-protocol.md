@@ -58,22 +58,26 @@ in `docs/lifecycle-fence-rollout.md` §4 rests on.
 
 | Message | Tag | Field | Type | Zero value means |
 |---|---:|---|---|---|
+| `RegisterWorkerReq` | 10 | `worker_incarnation` | `uint64` | This worker names no process. A worker id and a generation identify the *slot* a worker runs in and a restart reuses both, so the incarnation is the part of a worker's identity a restart cannot reconstruct; a controller that reads `0` addresses its directives to no incarnation, which is the pre-flag-day shape. |
 | `RegisterWorkerResp` | 1 | `requires_lifecycle_fence` | `bool` | This registration does **not** activate strict mode — the pre-flag-day window. It is also the only honest answer a controller that sends no fence could give. |
 | `StartExecutionReq` | 13 | `lifecycle_fence` | `uint64` | This request carries no fence. Safe as a sentinel because `0` is never an *adopted* fence (§1). |
 | `StartExecutionReq` | 14 | `target_worker_id` | `uint64` | — paired with 15; not a sentinel on its own, because `worker.id` is configuration and `0` is representable there. |
 | `StartExecutionReq` | 15 | `target_worker_generation` | `uint64` | **The sentinel for the pair**: this request addresses no generation. `job_statuses.run_id` starts at 0 and the scheduling preamble increments it before launching that generation's workers, so no live generation is 0. |
 | `StartExecutionReq` | 16 | `lifecycle_operation` | `LifecycleOperation` | `START` — the only thing `StartExecution` has ever meant. |
 | `StartExecutionReq` | 17 | `revoked_execution_ids` | `repeated string` | Revoke nothing. |
+| `StartExecutionReq` | 18 | `target_worker_incarnation` | `uint64` | This request addresses no *process* of the addressed generation. Not a sentinel of its own — it is only ever read alongside 13, and an incarnation carried without a fence is refused as malformed. A generation that reports an incarnation refuses a fenced address that does not name exactly its own. |
 | `StartExecutionResp` | 1 | `observed_lifecycle_fence` | `uint64` | This generation has acknowledged no fence. |
 | `StartExecutionResp` | 2 | `outcome` | `StartExecutionOutcome` | `APPLIED` — which is what an `Ok` `StartExecutionResp` has always meant. |
 | `CommitReq` | 3 | `lifecycle_fence` | `uint64` | as on `StartExecutionReq`. |
 | `CommitReq` | 4 | `target_worker_id` | `uint64` | as on `StartExecutionReq`. |
 | `CommitReq` | 5 | `target_worker_generation` | `uint64` | as on `StartExecutionReq`. |
+| `CommitReq` | 6 | `target_worker_incarnation` | `uint64` | as on `StartExecutionReq`. |
+| `TaskAssignment` | 7 | `worker_incarnation` | `uint64` | This assignment names no process. Carried because a worker leader issues its generation's commits and has no registration exchange of its own to learn its peers' incarnations from; a leader that reads `0` addresses its commits to no incarnation, and a generation that has one refuses them. |
 
 `CommitResp` gains nothing: M11.P54a's list ends at "commit fence", and D39e(v) settles issued
 *start* attempts.
 
-`RegisterWorkerReq` gains no field but now carries **`reserved 3, 7;`**. Both tags once held
+`RegisterWorkerReq` also carries **`reserved 3, 7;`**. Both tags once held
 `string` fields (`job_id`, `job_hash`) that were removed without being reserved, so reusing
 either would have been wire-indistinguishable from a message an old build sent. `protoc` now
 refuses the reuse.

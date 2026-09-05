@@ -41,6 +41,8 @@
 //! surface. Both are optional and skipped when absent, so a record written without them decodes
 //! and re-serializes unchanged.
 
+use std::num::NonZeroU64;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -260,6 +262,24 @@ pub struct FenceTarget {
     /// unsettled until it is observed terminated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rpc_address: Option<String>,
+    /// The worker *process* that was answering for this generation, if the attempt that recorded
+    /// the obligation knew which.
+    ///
+    /// A worker id and a generation name the slot; a restart reuses both and holds none of the
+    /// fence state its predecessor held, so a fenced directive names the incarnation too and a
+    /// successor refuses one addressed to its predecessor
+    /// ([`WorkerIncarnation`](crate::fence_wire::WorkerIncarnation), PR #167 round 6). A
+    /// controller discharging this obligation therefore has to be able to address the process
+    /// the obligation is owed by, which is why the value is durable rather than re-read: the
+    /// controller that recorded it may be gone, and there is no other message that would tell
+    /// its successor.
+    ///
+    /// `None` is a record written before this field existed. Such a target can still be
+    /// *observed* terminated, but an advance addressed to it names no incarnation and a
+    /// generation that reports one refuses it — so the target stays pending, which is M11.D39g's
+    /// declared outcome for a target this controller cannot fence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incarnation: Option<NonZeroU64>,
     /// What the target has done about the fence.
     pub state: FenceTargetState,
 }

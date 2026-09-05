@@ -34,7 +34,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use arroyo_rpc::grpc::api;
-use arroyo_rpc::identity::WorkerClient;
+use arroyo_rpc::identity::WorkerChannel;
 use arroyo_types::{MachineId, WorkerId};
 use tracing::warn;
 
@@ -500,7 +500,7 @@ impl PhaseContext<'_, '_> {
     async fn address_every_worker(
         &mut self,
         admission: &Admission,
-        connects: HashMap<WorkerId, WorkerClient>,
+        connects: HashMap<WorkerId, WorkerChannel>,
     ) -> Result<StartTargets, StateError> {
         let protocol = self.fence_protocol()?;
         let FenceProtocol::Fenced(generation) = protocol else {

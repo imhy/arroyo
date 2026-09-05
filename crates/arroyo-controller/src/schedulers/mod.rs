@@ -141,7 +141,12 @@ pub struct ProcessWorker {
     pipeline_id: PipelineId,
     job_id: JobId,
     generation: u64,
-    shutdown_tx: oneshot::Sender<()>,
+    /// Taken when this worker is asked to stop, and `None` afterwards.
+    ///
+    /// An `Option` because asking a worker to stop no longer removes it from the registry
+    /// (PR #167 round 6): a stop *request* is not an exit, and the entry is what says this
+    /// worker can still act. So the sender is taken out of an entry that stays.
+    shutdown_tx: Option<oneshot::Sender<()>>,
     finished_rx: oneshot::Receiver<()>,
 }
 
@@ -246,7 +251,7 @@ impl Scheduler for ProcessScheduler {
                         pipeline_id: start_pipeline_req.pipeline_id.clone(),
                         job_id: start_pipeline_req.job_id.clone(),
                         generation: start_pipeline_req.generation,
-                        shutdown_tx: tx,
+                        shutdown_tx: Some(tx),
                         finished_rx,
                     },
                 );
@@ -341,9 +346,25 @@ impl Scheduler for ProcessScheduler {
                                 );
                             }
                         }
+                        // Waited for whether or not this deployment kills its workers, because
+                        // the registry entry below is read as evidence that this worker can no
+                        // longer act (PR #167 round 6). A kill that succeeded has already
+                        // reaped it and this returns at once; a kill that failed, or one this
+                        // deployment opted out of, leaves a child that is still running — and a
+                        // worker that is still running must stay listed however long it takes.
+                        let status = child.wait().await;
+                        info!(
+                            job_id = %job_id,
+                            pipeline_id = %pipeline_id,
+                            worker_id,
+                            "child exited with status {:?} after being asked to stop",
+                            status
+                        );
                     }
                 }
 
+                // Only ever after an observed exit: this removal is what
+                // `observe_generation` reports as an authoritative termination.
                 if let Some(workers) = workers.upgrade() {
                     let mut state = workers.lock().await;
                     state.remove(&WorkerId(worker_id));
@@ -402,6 +423,18 @@ impl Scheduler for ProcessScheduler {
         ))
     }
 
+    /// Asks every worker of this job generation to stop, and keeps them in the registry.
+    ///
+    /// **The request is not the exit** (PR #167 round 6). This used to remove each entry before
+    /// sending the shutdown, and the spawned task removed it again on receiving one whether or
+    /// not it killed anything — under `process_scheduler.shutdown_with_controller = false` it
+    /// kills nothing at all. The registry therefore reported a worker gone the instant a stop was
+    /// *asked for*, and [`Self::observe_generation`] handed that absence to the fencing path as
+    /// authoritative termination, releasing an obligation while the worker could still act.
+    ///
+    /// An entry now leaves only where an exit is observed: the task that owns the child removes
+    /// it after `wait` returns. A worker that ignores its shutdown, or one this deployment has
+    /// opted out of killing, stays listed — which is the honest answer and the fail-closed one.
     async fn stop_workers(
         &self,
         job_id: &str,
@@ -409,15 +442,17 @@ impl Scheduler for ProcessScheduler {
         _force: bool,
     ) -> anyhow::Result<()> {
         for worker_id in self.workers_for_job(job_id, run_id).await? {
-            let worker = {
+            let shutdown = {
                 let mut state = self.workers.lock().await;
-                let Some(worker) = state.remove(&worker_id) else {
-                    return Ok(());
-                };
-                worker
+                state
+                    .get_mut(&worker_id)
+                    .and_then(|worker| worker.shutdown_tx.take())
             };
-
-            let _ = worker.shutdown_tx.send(());
+            // A worker with no sender left has already been asked; asking twice is not an error,
+            // and neither is one that finished between the listing and here.
+            if let Some(shutdown) = shutdown {
+                let _ = shutdown.send(());
+            }
         }
 
         Ok(())
@@ -436,12 +471,18 @@ impl Scheduler for ProcessScheduler {
             workers = worker_count,
         );
 
-        let waiters = workers.into_iter().map(|(worker_id, worker)| async move {
-            let job_id = worker.job_id.clone();
-            let pipeline_id = worker.pipeline_id.clone();
-            let _ = worker.shutdown_tx.send(());
-            (worker_id, job_id, pipeline_id, worker.finished_rx.await)
-        });
+        let waiters = workers
+            .into_iter()
+            .map(|(worker_id, mut worker)| async move {
+                let job_id = worker.job_id.clone();
+                let pipeline_id = worker.pipeline_id.clone();
+                // `None` for a worker a `stop_workers` has already asked; its task is already on its
+                // way out, and this still waits for the exit below.
+                if let Some(shutdown) = worker.shutdown_tx.take() {
+                    let _ = shutdown.send(());
+                }
+                (worker_id, job_id, pipeline_id, worker.finished_rx.await)
+            });
 
         match tokio::time::timeout(PROCESS_WORKER_SHUTDOWN_TIMEOUT, join_all(waiters)).await {
             Ok(results) => {

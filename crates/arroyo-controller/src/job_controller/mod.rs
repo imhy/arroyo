@@ -8,7 +8,7 @@ use crate::types::public::StopMode as SqlStopMode;
 use anyhow::bail;
 use arroyo_rpc::checkpoints::CheckpointMetadataStore;
 use arroyo_rpc::grpc::rpc::{StopExecutionReq, StopMode};
-use arroyo_rpc::identity::WorkerClient;
+use arroyo_rpc::identity::WorkerChannel;
 use arroyo_state::validated::CheckpointIdentity;
 use arroyo_state::{BackingStore, StateBackend, StorageProviderFor};
 use arroyo_types::{JobId, PipelineId, WorkerId};
@@ -116,7 +116,7 @@ impl JobController {
         program: Arc<LogicalProgram>,
         epoch: u64,
         min_epoch: u64,
-        worker_connects: HashMap<WorkerId, WorkerClient>,
+        worker_connects: HashMap<WorkerId, WorkerChannel>,
         commit_state: Option<CommittingState>,
         job_metrics: Option<JobMetrics>,
         fence_protocol: FenceProtocol,
@@ -140,12 +140,17 @@ impl JobController {
                     ),
                 workers: worker_connects
                     .into_iter()
-                    .map(|(id, connect)| {
+                    .map(|(id, channel)| {
+                        // The incarnation travels with the channel, so the commits this model
+                        // issues address the same processes the attempt's `StartExecution` did
+                        // (M11.D39d, PR #167 round 6).
+                        let incarnation = channel.incarnation();
                         (
                             id,
                             WorkerStatus {
                                 id,
-                                connect,
+                                connect: channel.into_client(),
+                                incarnation,
                                 last_heartbeat: Instant::now(),
                                 state: WorkerState::Running,
                             },

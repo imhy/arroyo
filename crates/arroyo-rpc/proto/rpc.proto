@@ -46,6 +46,22 @@ message RegisterWorkerReq {
   // reports. The controller does not issue StartExecution to such a worker at all: see
   // `Scheduling::next` in arroyo-controller, which fails the scheduling attempt instead.
   bool reconciles_start_execution = 9;
+  // A nonce this worker *process* minted at startup, distinguishing it from any predecessor
+  // that ran under the same worker id and generation.
+  //
+  // A worker id and a generation identify the *slot* a worker runs in, and a restart reuses
+  // both: `WorkerFault::Restart` puts a fresh process at the same id and generation with none
+  // of the fence state its predecessor held. That is enough for a directive delayed from
+  // before the restart to be re-admitted by the successor, because the successor has
+  // reconstructed the volatile state the directive is checked against. The incarnation is the
+  // part that cannot be reconstructed: the controller learns it here and addresses every
+  // fenced directive to it, so a directive minted for the predecessor names a process that no
+  // longer exists and is refused (PR #167 round 6).
+  //
+  // Zero is the proto3 default and is therefore what a worker predating this field reports. A
+  // controller that reads zero addresses its directives to no incarnation, which is the
+  // pre-flag-day shape; see `target_worker_incarnation` on StartExecutionReq.
+  uint64 worker_incarnation = 10;
 }
 
 message RegisterWorkerResp {
@@ -519,6 +535,15 @@ message TaskAssignment {
   uint64 worker_id = 4;
   string worker_addr = 5;
   string worker_rpc = 6;
+  // The incarnation of the worker process this subtask is assigned to, as it reported at
+  // registration.
+  //
+  // Carried because in worker-leader mode the leader — not the controller — issues this
+  // generation's commits, and it has no registration exchange of its own to learn the other
+  // workers' incarnations from. Without it a leader could only address its commits to no
+  // incarnation, and every worker of the generation would refuse them. Zero is what a
+  // controller predating the field sends, and it addresses no incarnation.
+  uint64 worker_incarnation = 7;
 }
 
 // What a StartExecutionReq asks of the worker generation it is addressed to.
@@ -590,6 +615,20 @@ message StartExecutionReq {
   // field decodes as. The named set is acknowledged as a whole or not at all: the response
   // carries no per-identifier result, so no partial revocation can be expressed on this wire.
   repeated string revoked_execution_ids = 17;
+  // The worker *process* this request is addressed to, alongside `target_worker_id` and
+  // `target_worker_generation`.
+  //
+  // The id and the generation name a slot, and a restart reuses both; this names the process
+  // filling it, from `RegisterWorkerReq.worker_incarnation`. A generation that reports an
+  // incarnation refuses a fenced directive that does not name exactly that one, which is what
+  // stops a directive delayed from before a restart being admitted by the successor that
+  // reconstructed the state it is checked against (PR #167 round 6).
+  //
+  // Zero means "this request addresses no incarnation", which is what a request from a
+  // controller predating this field decodes as, and what a controller addressing a worker that
+  // reported none sends. It is not a fence sentinel of its own: it is only ever read alongside
+  // `lifecycle_fence`, and an incarnation carried without a fence is refused as malformed.
+  uint64 target_worker_incarnation = 18;
 }
 
 // What a successful StartExecution response settles.
@@ -650,6 +689,9 @@ message CommitReq {
   uint64 lifecycle_fence = 3;
   uint64 target_worker_id = 4;
   uint64 target_worker_generation = 5;
+  // The worker process this commit is addressed to; it means exactly what the identically
+  // named field on StartExecutionReq means, including its zero value.
+  uint64 target_worker_incarnation = 6;
 }
 
 message CommitResp {

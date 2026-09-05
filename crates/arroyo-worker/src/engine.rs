@@ -188,6 +188,9 @@ impl Program {
                     worker_id: 0,
                     worker_addr: "".into(),
                     worker_rpc: "".into(),
+                    // A single-process engine addresses nobody over the wire, so there is no
+                    // process for an assignment to name.
+                    worker_incarnation: 0,
                 })
             })
             .collect();
@@ -510,6 +513,7 @@ impl Engine {
                         worker_id: worker_id.0,
                         worker_addr: "locahost:0".to_string(),
                         worker_rpc: "http://localhost:0".to_string(),
+                        worker_incarnation: 0,
                     },
                 )
             })

@@ -70,7 +70,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arroyo_rpc::fencing::{Fencing, FencingRecordError};
-use arroyo_rpc::identity::{WorkerClient, worker_client};
+use arroyo_rpc::identity::{WorkerChannel, WorkerClient, worker_client};
 use arroyo_rpc::{config::config, grpc_channel_builder};
 use arroyo_types::WorkerId;
 use cornucopia_async::DatabaseSource;
@@ -324,7 +324,14 @@ async fn advance_and_observe(
                 continue;
             };
             if let Some(client) = connect(address, target.worker).await {
-                connects.insert(target.worker, client);
+                // The process the obligation is owed by, from the record rather than from
+                // anything this pass observes: the controller that registered this generation
+                // is gone, so the durable incarnation is the only thing that can address the
+                // advance to the process that actually owes it (M11.D39d, PR #167 round 6). A
+                // record written before the field names none, and a generation that has one
+                // refuses an advance that names none — so such a target stays pending, which is
+                // M11.D39g's declared outcome for one this controller cannot fence.
+                connects.insert(target.worker, WorkerChannel::to(client, target.incarnation));
             }
         }
         let advance = advance_fence_each(fenced, connects).await;

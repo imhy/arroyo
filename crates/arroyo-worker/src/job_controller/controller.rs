@@ -9,7 +9,7 @@ use crate::job_controller::{
 };
 use anyhow::{anyhow, bail};
 use arroyo_datastream::logical::LogicalProgram;
-use arroyo_rpc::fence_wire::CommitAuthority;
+use arroyo_rpc::fence_wire::{CommitAuthority, WorkerIncarnation};
 use arroyo_rpc::grpc::rpc;
 use arroyo_rpc::grpc::rpc::{
     CheckpointManifest, GetWorkerPhaseReq, JobControllerInitReq, JobFailure, JobStatus,
@@ -27,8 +27,8 @@ use arroyo_state_protocol::ProtocolPaths;
 use arroyo_state_protocol::gc::cleanup_leader_checkpoints;
 use arroyo_state_protocol::types::{CheckpointRef, Epoch, Generation};
 use arroyo_state_protocol::workflow::{
-    CommitPermit, CommittedMarkerOutcome, GenerationInitialization, GenerationRecovery,
-    InitializeGenerationRequest, complete_commit, initialize_generation,
+    CommitPermit, CommittedMarkerOutcome, CurrentGenerationPolicy, GenerationInitialization,
+    GenerationRecovery, InitializeGenerationRequest, complete_commit, initialize_generation,
 };
 use arroyo_types::WorkerId;
 use futures::future::try_join_all;
@@ -106,25 +106,35 @@ impl WorkerJobController {
         let mut workers = HashMap::new();
 
         for t in tasks {
-            workers
-                .entry(WorkerId(t.worker_id))
-                .or_insert_with(|| t.worker_rpc.clone());
+            // The address and the incarnation together: both come from the same assignment, so a
+            // leader cannot pair one worker's endpoint with another's process (M11.D39d, PR #167
+            // round 6). A leader has no registration exchange of its own, so the assignment is
+            // the only thing that can tell it which process each worker is.
+            workers.entry(WorkerId(t.worker_id)).or_insert_with(|| {
+                (
+                    t.worker_rpc.clone(),
+                    WorkerIncarnation::named(t.worker_incarnation),
+                )
+            });
         }
 
-        let futures = workers.into_iter().map(|(id, addr)| async move {
-            let connect = connect_to_worker(id, addr).await?;
-            anyhow::Ok((id, connect))
-        });
+        let futures = workers
+            .into_iter()
+            .map(|(id, (addr, incarnation))| async move {
+                let connect = connect_to_worker(id, addr).await?;
+                anyhow::Ok((id, connect, incarnation))
+            });
 
         let mut workers = HashMap::new();
 
-        for (id, connect) in try_join_all(futures).await? {
+        for (id, connect, incarnation) in try_join_all(futures).await? {
             worker_connects.insert(id, connect.clone());
             workers.insert(
                 id,
                 WorkerStatus {
                     id,
                     connect,
+                    incarnation,
                     last_heartbeat: Instant::now(),
                     state: WorkerState::Running,
                 },
@@ -175,7 +185,10 @@ impl WorkerJobController {
                 // been published.
                 program_operators: program.tasks_per_operator().into_keys().collect(),
             },
-            false,
+            // A leader re-initializes the generation the controller already made current; it
+            // has no authority to move the pointer and none to defer, so it requires rather
+            // than writes.
+            CurrentGenerationPolicy::RequireCurrent,
         )
         .await?
         {
@@ -359,9 +372,11 @@ impl WorkerJobController {
             // unfenced and every request is the one this path sent before the fields existed.
             let authority = self.model.commit_authority;
             let futures = self.model.workers.iter_mut().map(|(id, status)| {
+                // Each worker's own process, from the entry that holds its channel.
+                let incarnation = status.incarnation;
                 status
                     .connect
-                    .commit(addressed_commit(authority, *id, &commit_body))
+                    .commit(addressed_commit(authority, *id, incarnation, &commit_body))
             });
 
             try_join_all(futures).await?;

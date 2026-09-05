@@ -558,7 +558,7 @@ impl<'a, 'ctx> Fencing<'a, 'ctx> {
             self.ctx.addressed_generation(),
             &self.targets,
             &self.outstanding,
-            &self.ctx.target_addresses(),
+            &self.ctx.target_endpoints(),
             self.unrooted_candidate(),
             since_millis,
         )

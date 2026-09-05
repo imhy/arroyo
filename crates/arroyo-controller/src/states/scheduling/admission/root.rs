@@ -23,15 +23,28 @@ use crate::states::lifecycle::{GenerationRoot, RecoveryReference, RootCandidate,
 use crate::states::{Admission, StateError, fatal};
 
 impl PhaseContext<'_, '_> {
-    /// Publishes this generation's metadata as an immutable, fence-scoped candidate object and
-    /// then installs it as the job's authoritative root, conditionally (M11.D39c/M11.D39d).
+    /// Publishes this generation's metadata as an immutable, fence-scoped candidate object,
+    /// installs it as the job's authoritative root, conditionally, and only then makes this
+    /// generation canonically current (M11.D39c/M11.D39d).
     ///
-    /// Two steps, in this order, and the order is the guarantee:
+    /// Three steps, in this order, and the order is the guarantee:
     ///
     /// 1. the object is written under a name that embeds the whole identity — job, pipeline,
     ///    generation, fence, epoch — so nothing else can write it and nothing is overwritten;
     /// 2. the reference is installed by the conditional row update, which either matches this
-    ///    controller's authority or matches nothing.
+    ///    controller's authority or matches nothing;
+    /// 3. the canonical `current-generation.json` that
+    ///    [`prepare_recovery_checkpoint`](super::PhaseContext::prepare_recovery_checkpoint)
+    ///    deferred is written, if there is one.
+    ///
+    /// The third step is here rather than inside the registration because it is *authoritative*
+    /// protocol state and not an unrooted candidate: `publish_checkpoint` refuses a checkpoint
+    /// whose generation is not the current one and `resolve_generation_manifest` reads a
+    /// candidate differently depending on whether its generation is current, so a controller
+    /// that wrote it before step 2 would leave a generation it has just lost named as the
+    /// job's current one — and losing the CAS undoes only the root (PR #167 round 6, finding
+    /// 5). Everything the loser wrote before that point is a candidate the grace collector
+    /// takes; this is the one object that would not have been.
     ///
     /// A controller that loses the duel between the two has published an object nobody points
     /// at. That is the intended outcome, not a failure to clean up: an **unrooted candidate**
@@ -117,7 +130,31 @@ impl PhaseContext<'_, '_> {
             )
             .await;
         match installed {
-            Ok(Ok(AuthorityOutcome::Applied(()))) => Ok(()),
+            Ok(Ok(AuthorityOutcome::Applied(()))) => {
+                // Won. Only now is this generation the job's current one, and only now may the
+                // pointer that says so be written.
+                let Some(deferred) = self.deferred_current_generation.take() else {
+                    return Ok(());
+                };
+                match a
+                    .effect(
+                        "publish the generation's canonical current-generation pointer",
+                        deferred.publish(storage.as_ref()),
+                    )
+                    .await
+                {
+                    Ok(()) => Ok(()),
+                    // Retryable, and the root stays installed: this controller holds the job,
+                    // and a later attempt of its own re-registers the generation and writes the
+                    // pointer. Nothing has been started against a generation that is not yet
+                    // current — the fan-out is past the end of this region.
+                    Err(e) => Err(self.retryable(
+                        "failed to publish the generation's canonical current-generation pointer",
+                        anyhow!("{}", e),
+                        20,
+                    )),
+                }
+            }
             // The duel, lost between publishing and rooting. The candidate stays exactly where
             // it was written, unrooted, and is recorded so the fencing obligation names it.
             Ok(Ok(AuthorityOutcome::Stale(stale))) => {

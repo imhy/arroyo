@@ -7,12 +7,14 @@
 //! [`super::tests`].
 
 use super::tests::{
-    AMBIGUOUS, GENERATION, WORKER, acknowledge, acknowledged, addressed_start, announced, applied,
-    apply_registration_response, call, disposition, fence_only, fenced_start, generation,
-    handshaken, has_announced, idle, initializing, register, registered, revoke, revoke_owned,
-    settlement, strict, tracked, unfenced,
+    AMBIGUOUS, GENERATION, INCARNATION, WORKER, acknowledge, acknowledged, addressed_fence_only_to,
+    addressed_start, announced, applied, apply_registration_response, call, disposition,
+    fence_only, fenced_start, generation, handshaken, has_announced, idle, incarnated_generation,
+    initializing, register, registered, revoke, revoke_owned, settlement, strict, tracked,
+    unfenced,
 };
 use crate::lifecycle_fence::attempt_ids::{AttemptDisposition, MAX_TRACKED_ATTEMPT_IDS};
+use arroyo_rpc::fence_wire::WorkerIncarnation;
 use arroyo_rpc::fencing::{MAX_ATTEMPT_ID_CHARS, MAX_FENCE_TARGETS};
 use arroyo_rpc::grpc::rpc::{StartExecutionOutcome, StartExecutionResp};
 use tonic::Code;
@@ -22,6 +24,48 @@ fn bulk_ids(count: usize) -> Vec<String> {
     (0..count)
         .map(|i| format!("{i:0width$x}", width = MAX_ATTEMPT_ID_CHARS))
         .collect()
+}
+
+/// **PR #167 round 6, finding 3.** One incarnation per worker process: the value the guard
+/// checks a directive against is the value the registration reports, and a restart mints another.
+///
+/// Two claims, and the second is what makes the first worth anything. The value the controller is
+/// told and the value directives are checked against are one field of one struct, so a build
+/// cannot report one nonce and admit against another — a directive addressed to what the
+/// controller was told would then be refused by the process that told it. And
+/// [`WorkerIncarnation::mint`] produces a fresh value per call, which is what a restart does: the
+/// successor process runs `WorkerServer::from_config` again, so it holds a value its predecessor
+/// did not.
+#[tokio::test]
+async fn a_worker_reports_the_incarnation_its_guard_admits_against() {
+    let (_shutdown, server) = incarnated_generation(WORKER, GENERATION, INCARNATION);
+    register(&server, true);
+
+    // The one field both halves read: the registration reports it, the guard is built from it.
+    assert_eq!(server.state.incarnation.get(), INCARNATION);
+    assert_eq!(
+        call(
+            &server,
+            addressed_fence_only_to(4, WORKER, GENERATION, server.state.incarnation.get())
+        )
+        .expect("a directive addressed to the reported process is admitted"),
+        settlement(4, StartExecutionOutcome::FenceAcknowledged),
+    );
+
+    // And a mint is per process, not per build: 64 random bits, so two calls agreeing would be
+    // a defect rather than a coincidence.
+    let minted: std::collections::HashSet<u64> =
+        (0..16).map(|_| WorkerIncarnation::mint().get()).collect();
+    assert_eq!(
+        minted.len(),
+        16,
+        "each process mints its own incarnation; a shared one would make every restart \
+         indistinguishable from its predecessor"
+    );
+    assert!(
+        !minted.contains(&0),
+        "zero is the wire's 'names no process' and is never minted"
+    );
 }
 
 /// Strict mode has two on-switches, no off-switch, and is scoped to this generation.

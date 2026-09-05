@@ -139,6 +139,21 @@ pub enum MalformedFenceFields {
         /// Its length in characters.
         found: usize,
     },
+    /// A worker process was named by a message carrying no fence to address it under.
+    ///
+    /// An incarnation is one third of an address, not a field of its own: it says *which
+    /// process* of the addressed generation a directive is for, and a message that names one
+    /// while addressing no generation under no fence describes an operation this build cannot
+    /// name.
+    #[error(
+        "target worker {worker_id} incarnation {incarnation} is named without a lifecycle fence"
+    )]
+    IncarnationWithoutFence {
+        /// The target worker id the message carried.
+        worker_id: u64,
+        /// The incarnation it named.
+        incarnation: u64,
+    },
     /// A start-execution outcome this build does not know, and therefore cannot act on.
     #[error("start execution outcome {outcome} is not one this build knows")]
     UnknownOutcome {
@@ -153,29 +168,101 @@ pub enum MalformedFenceFields {
     },
 }
 
-/// The worker generation a fenced directive is addressed to.
+/// One worker *process*, as distinct from the slot it runs in.
 ///
-/// The pair is the identity, not either half: an endpoint can be reused, so a restarted worker
-/// at the same address and the same id is a different generation and must not answer for its
-/// predecessor's requests (M11.D39d). It mirrors the durable
-/// [`FenceTarget`](crate::fencing::FenceTarget), which pairs the same two values for the same
-/// reason.
+/// A worker id and a generation name a slot, and a restart reuses both: `WorkerFault::Restart`
+/// puts a fresh process at the same id and generation holding none of the fence state its
+/// predecessor held. Every check the guard makes against that state is therefore a check against
+/// state the successor has *reconstructed*, and a directive delayed from before the restart
+/// passes it (PR #167 round 6, finding 3). An incarnation is the part of a worker's identity a
+/// restart cannot reconstruct, so a directive minted for the predecessor names a process that no
+/// longer exists.
+///
+/// It is minted by the process it identifies — nothing else knows when a process began — and is
+/// reported once, on `RegisterWorkerReq`, which is the only message that tells a controller a
+/// generation exists.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct WorkerIncarnation(NonZeroU64);
+
+impl WorkerIncarnation {
+    /// The incarnation `value` names, or `None` when it names none.
+    ///
+    /// Zero is the wire's "names no incarnation": it is the proto3 default and therefore what a
+    /// peer predating the field reports, and no minted incarnation is zero.
+    pub fn named(value: u64) -> Option<Self> {
+        NonZeroU64::new(value).map(Self)
+    }
+
+    /// A fresh incarnation for the calling process.
+    ///
+    /// Random rather than a counter or a clock reading, because the value has to be distinct
+    /// from what a *predecessor* process at the same worker id and generation minted, and a
+    /// successor shares neither that process's memory nor, after a machine restart, necessarily
+    /// a monotonic clock with it. There is no durable state to keep a counter in: a worker owns
+    /// none, which is the whole reason this exists.
+    pub fn mint() -> Self {
+        loop {
+            if let Some(incarnation) = Self::named(rand::random::<u64>()) {
+                return incarnation;
+            }
+        }
+    }
+
+    /// Its wire value, which is never zero.
+    pub fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+/// The durable record carries an incarnation as the `NonZeroU64` it is; these two conversions
+/// are the only route between that and the addressing type, so a record cannot be read as an
+/// incarnation the wire could not carry, nor written as one it could not name.
+impl From<WorkerIncarnation> for NonZeroU64 {
+    fn from(incarnation: WorkerIncarnation) -> Self {
+        incarnation.0
+    }
+}
+
+impl From<NonZeroU64> for WorkerIncarnation {
+    fn from(value: NonZeroU64) -> Self {
+        Self(value)
+    }
+}
+
+/// The worker generation a fenced directive is addressed to, and the process answering for it.
+///
+/// The triple is the identity, not any part of it: an endpoint can be reused, so a restarted
+/// worker at the same address and the same id is a different generation and must not answer for
+/// its predecessor's requests (M11.D39d); and a *generation* can be reused too, by a process
+/// that restarted under it, which is what [`WorkerIncarnation`] distinguishes. It mirrors the
+/// durable [`FenceTarget`](crate::fencing::FenceTarget), which carries the same three values for
+/// the same reason.
+///
+/// The incarnation is optional because zero is a shape the wire can carry — a peer predating the
+/// field, or a controller addressing a worker that reported none — and a reader must be able to
+/// tell that apart from a named one rather than defaulting it. What a *receiver* does about an
+/// address that names none is policy, and belongs to the worker's guard.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LifecycleTarget {
     worker_id: u64,
     generation: NonZeroU64,
+    incarnation: Option<WorkerIncarnation>,
 }
 
 impl LifecycleTarget {
     /// The generation `worker_id`/`generation` addresses, or `None` if they address none.
     ///
-    /// The generation decides, and the worker id cannot. `job_statuses.run_id` starts at 0 and
-    /// `states::scheduling`'s preamble increments it before that generation's workers are
-    /// launched, so every generation a live worker runs under is at least 1 and zero addresses
-    /// nothing. A worker id has no such floor: it is `worker.id` from configuration when that
-    /// is set, and zero is a value an operator can write there.
-    pub fn addressed(worker_id: u64, generation: u64) -> Option<Self> {
-        NonZeroU64::new(generation).map(|generation| Self::in_generation(worker_id, generation))
+    /// The generation decides, and neither the worker id nor the incarnation can.
+    /// `job_statuses.run_id` starts at 0 and `states::scheduling`'s preamble increments it
+    /// before that generation's workers are launched, so every generation a live worker runs
+    /// under is at least 1 and zero addresses nothing. A worker id has no such floor: it is
+    /// `worker.id` from configuration when that is set, and zero is a value an operator can
+    /// write there. An incarnation of zero is the wire's "names none", which is a shape an
+    /// address may legitimately have.
+    pub fn addressed(worker_id: u64, generation: u64, incarnation: u64) -> Option<Self> {
+        NonZeroU64::new(generation).map(|generation| {
+            Self::in_generation(worker_id, generation, WorkerIncarnation::named(incarnation))
+        })
     }
 
     /// The generation `worker_id`/`generation` addresses, for a caller that already holds a
@@ -186,16 +273,26 @@ impl LifecycleTarget {
     /// [`Self::addressed`] checks, and a fallible constructor there would have to be answered
     /// with an `expect` at every send site. Both constructors agree by construction — this is
     /// the only one that builds the value.
-    pub fn in_generation(worker_id: u64, generation: NonZeroU64) -> Self {
+    pub fn in_generation(
+        worker_id: u64,
+        generation: NonZeroU64,
+        incarnation: Option<WorkerIncarnation>,
+    ) -> Self {
         Self {
             worker_id,
             generation,
+            incarnation,
         }
     }
 
     /// The worker this directive is addressed to.
     pub fn worker_id(&self) -> u64 {
         self.worker_id
+    }
+
+    /// The worker process this directive is addressed to, or `None` when it names none.
+    pub fn incarnation(&self) -> Option<WorkerIncarnation> {
+        self.incarnation
     }
 
     /// The worker generation this directive is addressed to, which is never zero.
@@ -295,17 +392,28 @@ impl CommitAuthority {
         Self(Some(FencedCommits { fence, generation }))
     }
 
-    /// The directive a commit to `worker_id` carries under this authority.
+    /// The directive a commit to `worker_id`'s `incarnation` carries under this authority.
     ///
     /// Total: the two things that could make an address meaningless were settled when this
     /// value was built, so a send site has no failure to handle and no reason to reach for the
-    /// three scalars underneath.
-    pub fn directive(self, worker_id: u64) -> CommitDirective {
+    /// four scalars underneath.
+    ///
+    /// The incarnation is per call rather than held here for the same reason the worker id is:
+    /// an authority addresses a *generation*, and which process of which worker of that
+    /// generation a particular commit is for is decided at the fan-out that sends it.
+    pub fn directive(
+        self,
+        worker_id: u64,
+        incarnation: Option<WorkerIncarnation>,
+    ) -> CommitDirective {
         match self.0 {
             None => CommitDirective::Unfenced,
-            Some(FencedCommits { fence, generation }) => CommitDirective::Fenced(
-                FenceAddress::under(fence, LifecycleTarget::in_generation(worker_id, generation)),
-            ),
+            Some(FencedCommits { fence, generation }) => {
+                CommitDirective::Fenced(FenceAddress::under(
+                    fence,
+                    LifecycleTarget::in_generation(worker_id, generation, incarnation),
+                ))
+            }
         }
     }
 }
@@ -355,10 +463,12 @@ impl StartDirective<'_> {
                 revoked_execution_ids,
             } => (Some(*address), *operation, *revoked_execution_ids),
         };
-        let (fence, target_worker_id, target_worker_generation) = flat(address);
+        let (fence, target_worker_id, target_worker_generation, target_worker_incarnation) =
+            flat(address);
         req.lifecycle_fence = fence;
         req.target_worker_id = target_worker_id;
         req.target_worker_generation = target_worker_generation;
+        req.target_worker_incarnation = target_worker_incarnation;
         req.lifecycle_operation = operation as i32;
         req.revoked_execution_ids = revoked.to_vec();
     }
@@ -378,13 +488,15 @@ impl CommitDirective {
     ///
     /// All three, on both arms, for the reason [`StartDirective::stamp`] gives.
     pub fn stamp(&self, req: &mut CommitReq) {
-        let (fence, target_worker_id, target_worker_generation) = flat(match self {
-            CommitDirective::Unfenced => None,
-            CommitDirective::Fenced(address) => Some(*address),
-        });
+        let (fence, target_worker_id, target_worker_generation, target_worker_incarnation) =
+            flat(match self {
+                CommitDirective::Unfenced => None,
+                CommitDirective::Fenced(address) => Some(*address),
+            });
         req.lifecycle_fence = fence;
         req.target_worker_id = target_worker_id;
         req.target_worker_generation = target_worker_generation;
+        req.target_worker_incarnation = target_worker_incarnation;
     }
 }
 
@@ -436,6 +548,7 @@ pub fn start_directive(
         req.lifecycle_fence,
         req.target_worker_id,
         req.target_worker_generation,
+        req.target_worker_incarnation,
     )?
     else {
         // No fence was carried, so every other lifecycle field must be at its default too:
@@ -475,6 +588,7 @@ pub fn commit_directive(req: &CommitReq) -> Result<CommitDirective, MalformedFen
             req.lifecycle_fence,
             req.target_worker_id,
             req.target_worker_generation,
+            req.target_worker_incarnation,
         )? {
             Some(address) => CommitDirective::Fenced(address),
             None => CommitDirective::Unfenced,
@@ -513,31 +627,50 @@ pub fn observed_settlement(
     }
 }
 
-/// The three wire scalars an address is carried as, or the three zeros that carry none.
+/// The four wire scalars an address is carried as, or the four zeros that carry none.
 ///
 /// The exact inverse of [`fence_address`], and beside it so that the two cannot drift: a shape
 /// this produces is a shape that one accepts, which is what makes a stamped request decode back
 /// into the directive it was stamped with.
-fn flat(address: Option<FenceAddress>) -> (u64, u64, u64) {
+fn flat(address: Option<FenceAddress>) -> (u64, u64, u64, u64) {
     match address {
-        None => (0, 0, 0),
+        None => (0, 0, 0, 0),
         Some(address) => (
             address.fence(),
             address.target().worker_id(),
             address.target().generation(),
+            address
+                .target()
+                .incarnation()
+                .map_or(0, WorkerIncarnation::get),
         ),
     }
 }
 
-/// Pairs a fence with the generation it addresses, or refuses the halves that do not pair.
+/// Pairs a fence with the generation and process it addresses, or refuses the parts that do not
+/// pair.
 fn fence_address(
     fence: u64,
     target_worker_id: u64,
     target_worker_generation: u64,
+    target_worker_incarnation: u64,
 ) -> Result<Option<FenceAddress>, MalformedFenceFields> {
+    // Checked before the pair below, because it is the one part that is never sufficient on its
+    // own: an incarnation says which process of an addressed generation a directive is for, so a
+    // message naming one while addressing nothing names a process for no purpose.
+    if fence == 0 && target_worker_incarnation != 0 {
+        return Err(MalformedFenceFields::IncarnationWithoutFence {
+            worker_id: target_worker_id,
+            incarnation: target_worker_incarnation,
+        });
+    }
     match (
         NonZeroU64::new(fence),
-        LifecycleTarget::addressed(target_worker_id, target_worker_generation),
+        LifecycleTarget::addressed(
+            target_worker_id,
+            target_worker_generation,
+            target_worker_incarnation,
+        ),
     ) {
         (None, None) if target_worker_id == 0 => Ok(None),
         (None, None) => Err(MalformedFenceFields::TargetWithoutFence {

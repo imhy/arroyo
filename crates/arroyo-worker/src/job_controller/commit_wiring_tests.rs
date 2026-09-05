@@ -14,7 +14,8 @@ use crate::{EngineState, WorkerExecutionPhase, WorkerServer};
 use arroyo_datastream::logical::LogicalProgram;
 use arroyo_rpc::ControlMessage;
 use arroyo_rpc::fence_wire::{
-    CommitAuthority, FenceAddress, LifecycleTarget, StartDirective, observed_settlement,
+    CommitAuthority, FenceAddress, LifecycleTarget, StartDirective, WorkerIncarnation,
+    observed_settlement,
 };
 use arroyo_rpc::grpc::rpc::worker_grpc_server::WorkerGrpcServer;
 use arroyo_rpc::grpc::rpc::{
@@ -40,6 +41,17 @@ const GENERATION: u64 = 3;
 const FENCE: u64 = 5;
 const OPERATOR: &str = "op_1";
 
+/// The process every live worker in this file runs as.
+///
+/// Fixed rather than minted so the fan-out's address can be asserted in closed form; in
+/// production it is `WorkerIncarnation::mint()`, once per process.
+const INCARNATION: u64 = 21;
+
+/// [`INCARNATION`] as the address type carries it.
+fn incarnation() -> Option<WorkerIncarnation> {
+    WorkerIncarnation::named(INCARNATION)
+}
+
 /// A real worker serving on loopback, with one operator control channel this test can read.
 struct LiveWorker {
     _shutdown: Shutdown,
@@ -57,6 +69,7 @@ async fn live_worker(worker_id: u64, generation: u64) -> LiveWorker {
         PipelineId(Arc::new("pipeline_1".to_string())),
         JobId(Arc::new("job_1".to_string())),
         generation,
+        WorkerIncarnation::named(INCARNATION).expect("a fixture names a live process"),
         shutdown.guard("worker"),
     );
     {
@@ -119,6 +132,7 @@ fn leader_model(
             WorkerStatus {
                 id: worker,
                 connect: client,
+                incarnation: incarnation(),
                 last_heartbeat: Instant::now(),
                 state: WorkerState::Running,
             },
@@ -270,7 +284,7 @@ async fn a_leader_under_a_superseded_fence_cannot_commit() {
     StartDirective::Fenced {
         address: FenceAddress::under(
             nz(FENCE + 1),
-            LifecycleTarget::in_generation(11, nz(GENERATION)),
+            LifecycleTarget::in_generation(11, nz(GENERATION), incarnation()),
         ),
         operation: LifecycleOperation::FenceOnly,
         revoked_execution_ids: &[],
@@ -313,13 +327,19 @@ async fn an_unfenced_leader_sends_and_a_worker_applies_the_commit_from_before_th
     use prost::Message;
 
     let body = body(4);
-    let sent = addressed_commit(CommitAuthority::unfenced(), WorkerId(11), &body);
+    let sent = addressed_commit(
+        CommitAuthority::unfenced(),
+        WorkerId(11),
+        incarnation(),
+        &body,
+    );
     let legacy = CommitReq {
         epoch: 4,
         committing_data: sent.committing_data.clone(),
         lifecycle_fence: 0,
         target_worker_id: 0,
         target_worker_generation: 0,
+        target_worker_incarnation: 0,
     };
     assert_eq!(sent, legacy);
     assert_eq!(sent.encode_to_vec(), legacy.encode_to_vec());
@@ -348,6 +368,7 @@ async fn every_worker_of_the_generation_is_addressed_to_itself() {
         WorkerStatus {
             id: WorkerId(12),
             connect: second.client.clone(),
+            incarnation: incarnation(),
             last_heartbeat: Instant::now(),
             state: WorkerState::Running,
         },
@@ -358,12 +379,30 @@ async fn every_worker_of_the_generation_is_addressed_to_itself() {
     assert_eq!(published(&mut second.control), expected(4));
 
     // And the requests differ in exactly the worker id, under one fence and one generation.
-    let to_first = addressed_commit(authority, WorkerId(11), &body(4));
-    let to_second = addressed_commit(authority, WorkerId(12), &body(4));
+    let to_first = addressed_commit(authority, WorkerId(11), incarnation(), &body(4));
+    let to_second = addressed_commit(authority, WorkerId(12), incarnation(), &body(4));
     assert_eq!(to_first.lifecycle_fence, FENCE);
     assert_eq!(to_second.lifecycle_fence, FENCE);
     assert_eq!(to_first.target_worker_generation, GENERATION);
     assert_eq!(to_second.target_worker_generation, GENERATION);
     assert_eq!(to_first.target_worker_id, 11);
     assert_eq!(to_second.target_worker_id, 12);
+    assert_eq!(to_first.target_worker_incarnation, INCARNATION);
+    assert_eq!(to_second.target_worker_incarnation, INCARNATION);
+
+    // And a commit addressed to a process that is not the one answering is refused by it, which
+    // is the commit end of PR #167 round 6's finding 3: a restart reuses the worker id and the
+    // generation, so those two cannot tell a live process from its predecessor.
+    let to_a_predecessor = addressed_commit(
+        authority,
+        WorkerId(11),
+        WorkerIncarnation::named(INCARNATION + 1),
+        &body(4),
+    );
+    let refused = first
+        .client
+        .commit(tonic::Request::new(to_a_predecessor))
+        .await
+        .expect_err("a live process does not answer for its predecessor's commit");
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
 }

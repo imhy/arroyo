@@ -1,8 +1,8 @@
-use arroyo_rpc::fence_wire::observed_settlement;
+use arroyo_rpc::fence_wire::{WorkerIncarnation, observed_settlement};
 use arroyo_rpc::grpc::rpc::{
     JobState, StartExecutionOutcome, StartExecutionReq, StartExecutionResp, TaskAssignment,
 };
-use arroyo_rpc::identity::{WorkerClient, worker_client};
+use arroyo_rpc::identity::{WorkerChannel, WorkerClient, worker_client};
 use arroyo_types::{CLUSTER_ID_ENV, JobId, MachineId, PipelineId, WorkerId};
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::time::SystemTime;
@@ -54,8 +54,8 @@ use arroyo_state::{
 };
 use arroyo_state_protocol::types::Generation;
 use arroyo_state_protocol::workflow::{
-    GenerationInitialization, GenerationRecovery, InitializeGenerationRequest,
-    initialize_generation,
+    CurrentGenerationPolicy, DeferredCurrentGeneration, GenerationInitialization,
+    GenerationRecovery, InitializeGenerationRequest, initialize_generation,
 };
 use arroyo_worker::job_controller::committing_state::{CheckpointIdOrRef, CommittingState};
 use arroyo_worker::job_controller::job_metrics::JobMetrics;
@@ -95,6 +95,9 @@ struct WorkerStatus {
     /// Whether this worker advertised the `StartExecution` reconciliation contract at
     /// registration. See [`JobMessage::WorkerConnect`] and [`START_EXECUTION_RECONCILE_ATTEMPTS`].
     reconciles_start_execution: bool,
+    /// The worker process that answered this generation's registration, which every fenced
+    /// directive to it is addressed to. See [`JobMessage::WorkerConnect`].
+    incarnation: Option<WorkerIncarnation>,
 }
 
 #[derive(Debug, Clone)]
@@ -167,6 +170,13 @@ fn compute_assignments(
                 worker_id: workers[worker_idx].id.0,
                 worker_addr: workers[worker_idx].data_address.clone(),
                 worker_rpc: workers[worker_idx].rpc_address.clone(),
+                // Carried so that a worker-leader execution can address its own commits: the
+                // leader has no registration exchange to learn the other workers' incarnations
+                // from, and a commit addressed to none is refused by every generation that has
+                // one (M11.D39d, PR #167 round 6).
+                worker_incarnation: workers[worker_idx]
+                    .incarnation
+                    .map_or(0, WorkerIncarnation::get),
             });
             current_count += 1;
 
@@ -183,7 +193,7 @@ fn compute_assignments(
 async fn handle_worker_connect<'a>(
     msg: JobMessage,
     workers: &mut HashMap<WorkerId, WorkerStatus>,
-    worker_connects: Arc<Mutex<HashMap<WorkerId, WorkerClient>>>,
+    worker_connects: Arc<Mutex<HashMap<WorkerId, WorkerChannel>>>,
     handles: &mut Vec<JoinHandle<()>>,
     ctx: &mut JobContext<'a>,
 ) -> Result<(), StateError> {
@@ -196,6 +206,7 @@ async fn handle_worker_connect<'a>(
             data_address,
             slots,
             reconciles_start_execution,
+            incarnation,
             ..
         } => {
             let job_id = ctx.config.id.clone();
@@ -222,6 +233,7 @@ async fn handle_worker_connect<'a>(
                     slots,
                     state: WorkerState::Connected,
                     reconciles_start_execution,
+                    incarnation,
                 },
             );
 
@@ -254,7 +266,13 @@ async fn handle_worker_connect<'a>(
                         Ok(channel) => {
                             {
                                 let mut connects = connects.lock().await;
-                                connects.insert(worker_id, worker_client(channel, worker_id));
+                                connects.insert(
+                                    worker_id,
+                                    WorkerChannel::to(
+                                        worker_client(channel, worker_id),
+                                        incarnation,
+                                    ),
+                                );
                             }
                             return;
                         }
@@ -1112,9 +1130,24 @@ async fn prepare_restored_checkpoint(
     Ok(committing_state)
 }
 
+/// What registering a leader generation resolved.
+///
+/// The pointer travels with the checkpoint because they come from one call: under
+/// [`CurrentGenerationPolicy::Defer`] the initialization resolves the generation's history and
+/// prepares its canonical pointer without writing it, and returning them separately would let a
+/// caller act on the checkpoint while forgetting the write that makes the generation current
+/// (M11.D39c/M11.D39d, PR #167 round 6, finding 5).
+struct RegisteredGeneration {
+    /// The checkpoint this generation restores from, if any.
+    checkpoint_info: Option<CheckpointInfo>,
+    /// The canonical pointer the initialization deferred, if it deferred one.
+    current_generation: Option<DeferredCurrentGeneration>,
+}
+
 async fn get_and_register_checkpoint_info_leader<'a>(
     ctx: &'a JobContext<'a>,
-) -> anyhow::Result<Option<CheckpointInfo>> {
+    policy: CurrentGenerationPolicy,
+) -> anyhow::Result<RegisteredGeneration> {
     // in the future, this should likely move to the leader, but that will require rethinking how
     // worker initialization works
     let storage_role = StorageProviderFor::Controller {
@@ -1156,22 +1189,31 @@ async fn get_and_register_checkpoint_info_leader<'a>(
             // not just the chain heads.
             program_operators: ctx.program.tasks_per_operator().into_keys().collect(),
         },
-        true,
+        policy,
     )
     .await?;
 
+    let current_generation;
     let recovery_checkpoint = match new_gen {
         GenerationInitialization::Initialized {
             recovery: GenerationRecovery::NoCheckpoint,
+            current_generation: deferred,
             ..
-        } => None,
+        } => {
+            current_generation = deferred;
+            None
+        }
         GenerationInitialization::Initialized {
             recovery:
                 GenerationRecovery::Ready { checkpoint_ref }
                 | GenerationRecovery::ReplayCommit { checkpoint_ref, .. },
             recovery_checkpoint,
+            current_generation: deferred,
             ..
-        } => Some((checkpoint_ref, recovery_checkpoint)),
+        } => {
+            current_generation = deferred;
+            Some((checkpoint_ref, recovery_checkpoint))
+        }
         GenerationInitialization::StaleGeneration { .. } => {
             unreachable!(
                 "cannot end up with stale generation given that we updated the generation\
@@ -1193,7 +1235,7 @@ async fn get_and_register_checkpoint_info_leader<'a>(
         }
     };
 
-    Ok(if let Some((r, manifest)) = recovery_checkpoint {
+    let checkpoint_info = if let Some((r, manifest)) = recovery_checkpoint {
         // Already read and already validated inside `initialize_generation`, above; using
         // it rather than re-reading is also what guarantees the checkpoint this generation
         // was published against is the one that passed validation.
@@ -1208,6 +1250,11 @@ async fn get_and_register_checkpoint_info_leader<'a>(
         })
     } else {
         None
+    };
+
+    Ok(RegisteredGeneration {
+        checkpoint_info,
+        current_generation,
     })
 }
 
@@ -1431,11 +1478,20 @@ impl State for Scheduling {
             match admission
                 .effect(
                     "register the generation and prepare its recovery checkpoint",
-                    get_and_register_checkpoint_info_leader(ctx),
+                    // `Publish`, and this is the pre-flag-day peer: it wins no fence duel and
+                    // installs no metadata root, so there is nothing for the canonical pointer to
+                    // wait behind and nobody to hand it to.
+                    get_and_register_checkpoint_info_leader(ctx, CurrentGenerationPolicy::Publish),
                 )
                 .await
             {
-                Ok(ci) => (self, ci, None),
+                Ok(registered) => {
+                    debug_assert!(
+                        registered.current_generation.is_none(),
+                        "`Publish` writes the pointer itself and defers nothing"
+                    );
+                    (self, registered.checkpoint_info, None)
+                }
                 // A rejected selector is not a transient failure: every attempt resolves
                 // the same recovery manifest, so retrying only delays the report.
                 Err(e) if e.downcast_ref::<StateBackendError>().is_some() => {
@@ -1731,16 +1787,22 @@ impl State for Scheduling {
         .await;
         drop(admission);
 
-        let worker_connects = match started {
+        let started_connects = match started {
             Ok(connects) => connects,
             Err(e) => {
                 return Err(ctx.retryable(self, "failed to initialize workers", e, 10));
             }
         };
-        for id in worker_connects.keys() {
-            if let Some(worker) = workers.get_mut(id) {
+        // Each channel re-paired with the process that registered on it, from the one map that
+        // learned which — so the commits this execution issues address the same processes its
+        // `StartExecution` did (M11.D39d, PR #167 round 6).
+        let mut worker_connects = HashMap::with_capacity(started_connects.len());
+        for (id, client) in started_connects {
+            let incarnation = workers.get(&id).and_then(|worker| worker.incarnation);
+            if let Some(worker) = workers.get_mut(&id) {
                 worker.state = WorkerState::Initializing;
             }
+            worker_connects.insert(id, WorkerChannel::to(client, incarnation));
         }
 
         // Now wait until all tasks are running

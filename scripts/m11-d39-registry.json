@@ -21,14 +21,14 @@
       "env": {
         "ARROYO__JOB_CONTROLLER": "controller"
       },
-      "why": "JobControllerMode::Controller \u2014 the job controller runs in the controller process."
+      "why": "JobControllerMode::Controller — the job controller runs in the controller process."
     },
     {
       "id": "worker-leader",
       "env": {
         "ARROYO__JOB_CONTROLLER": "worker"
       },
-      "why": "JobControllerMode::Worker \u2014 the job controller runs on a worker leader."
+      "why": "JobControllerMode::Worker — the job controller runs on a worker leader."
     }
   ],
   "rows": [
@@ -191,7 +191,7 @@
           "path": "crates/arroyo-controller/src/states/mod.rs"
         }
       ],
-      "distinct_path": "The fixture now gives the running job the state_context.leader a leader-mode row carries, so run_to_completion rebuilds a real LeaderManager against a real leader before the job's first state \u2014 the same reconnect production makes. The row then asserts the stop's last two status writes as one closed-form pair per topology: controller mode funnels every stop mode through Stopping before Stopped, because that is where this controller tears the workers down; worker-leader mode reaches Stopped straight from CheckpointStopping for a checkpoint stop, because the leader does the teardown and LeaderCheckpointStopping only waits for it to report JobStopped. The worker-leader cell therefore proves the job stopped through the leader, not merely that the row ran again."
+      "distinct_path": "The fixture now gives the running job the state_context.leader a leader-mode row carries, so run_to_completion rebuilds a real LeaderManager against a real leader before the job's first state — the same reconnect production makes. The row then asserts the stop's last two status writes as one closed-form pair per topology: controller mode funnels every stop mode through Stopping before Stopped, because that is where this controller tears the workers down; worker-leader mode reaches Stopped straight from CheckpointStopping for a checkpoint stop, because the leader does the teardown and LeaderCheckpointStopping only waits for it to report JobStopped. The worker-leader cell therefore proves the job stopped through the leader, not merely that the row ran again."
     },
     {
       "id": 11,
@@ -224,7 +224,7 @@
           "path": "crates/arroyo-controller/src/states/scheduling/compile_fail.rs"
         }
       ],
-      "note": "Not an ordinary behavioural test: the body invokes rustc over a positive fixture, two intended-diagnostic negative fixtures and two weakened-API mutations, asserting the exact error codes. It is topology-independent by construction \u2014 rustc reads no runtime configuration \u2014 and it is slow, so the runner budgets for it explicitly."
+      "note": "Not an ordinary behavioural test: the body invokes rustc over a positive fixture, two intended-diagnostic negative fixtures and two weakened-API mutations, asserting the exact error codes. It is topology-independent by construction — rustc reads no runtime configuration — and it is slow, so the runner budgets for it explicitly."
     },
     {
       "id": 13,
@@ -364,6 +364,12 @@
           "name": "a_node_worker_the_controller_could_not_reach_is_not_reported_terminated",
           "kind": "test",
           "path": "crates/arroyo-controller/src/schedulers/reporting_tests.rs"
+        },
+        {
+          "crate": "arroyo-controller",
+          "name": "a_record_written_before_the_incarnation_field_addresses_no_process",
+          "kind": "test",
+          "path": "crates/arroyo-controller/src/states/lifecycle/recovery_tests.rs"
         }
       ]
     },
@@ -384,6 +390,12 @@
         {
           "crate": "arroyo-worker",
           "name": "a_restart_does_not_resurrect_the_start_a_refusal_superseded",
+          "kind": "test",
+          "path": "crates/arroyo-worker/src/lifecycle_fence/faults_tests.rs"
+        },
+        {
+          "crate": "arroyo-worker",
+          "name": "a_replayed_handshake_cannot_resurrect_a_revoked_start_across_a_restart",
           "kind": "test",
           "path": "crates/arroyo-worker/src/lifecycle_fence/faults_tests.rs"
         }
@@ -464,6 +476,30 @@
           "name": "worker_generation_mismatch_rejects_delayed_start",
           "kind": "test",
           "path": "crates/arroyo-worker/src/lifecycle_fence/tests.rs"
+        },
+        {
+          "crate": "arroyo-rpc",
+          "name": "a_directive_addressed_to_a_predecessor_incarnation_arrives_intact",
+          "kind": "test",
+          "path": "crates/arroyo-rpc/src/fence_wire/agreement_tests.rs"
+        },
+        {
+          "crate": "arroyo-controller",
+          "name": "a_handshake_addressed_to_a_replaced_process_is_refused",
+          "kind": "test",
+          "path": "crates/arroyo-controller/src/states/lifecycle/handshake_tests.rs"
+        },
+        {
+          "crate": "arroyo-worker",
+          "name": "a_commit_addressed_to_another_generation_is_refused",
+          "kind": "test",
+          "path": "crates/arroyo-worker/src/lifecycle_fence/commit_tests.rs"
+        },
+        {
+          "crate": "arroyo-worker",
+          "name": "a_worker_reports_the_incarnation_its_guard_admits_against",
+          "kind": "test",
+          "path": "crates/arroyo-worker/src/lifecycle_fence/guard_tests.rs"
         }
       ]
     },
@@ -498,7 +534,7 @@
           "path": "crates/arroyo-controller/src/states/lifecycle/faults_tests.rs"
         }
       ],
-      "distinct_path": "Reads config().job_controller and asserts it resolves to the topology ARROYO__JOB_CONTROLLER declares, so a broken figment mapping cannot make the two cells the same process. Then branches on that value: in controller mode it asserts the commit fence comes from the JobController's own FenceProtocol; in worker-leader mode it asserts prepare_handover returns before building one, so the fence can only come from the CommitAuthority the leader's own fenced start conferred \u2014 and asserts both routes produce the same fence and target. The match over JobControllerMode is exhaustive."
+      "distinct_path": "Reads config().job_controller and asserts it resolves to the topology ARROYO__JOB_CONTROLLER declares, so a broken figment mapping cannot make the two cells the same process. Then branches on that value: in controller mode it asserts the commit fence comes from the JobController's own FenceProtocol; in worker-leader mode it asserts prepare_handover returns before building one, so the fence can only come from the CommitAuthority the leader's own fenced start conferred — and asserts both routes produce the same fence and target. The match over JobControllerMode is exhaustive."
     },
     {
       "id": 25,
@@ -537,7 +573,7 @@
           "path": "crates/arroyo-controller/src/states/mod.rs"
         }
       ],
-      "note": "Multi-test cell; it passes as a group. M11.T26m declared the controller control `a_busy_worker_phase_is_retried_under_the_same_start_admission` a PRE-ACTIVATION CONTROL ONLY, and M11.T26h's activation change removed it: it asserted that the fan-out retries the same identifier under the same admission after an `Aborted`, which is the reading M11.D39e(iii) replaces. `transport_settlement` no longer takes a mode and answers `Definitive` for `Aborted`, so the control could only have passed by keeping the mechanism it was a control for. Its half of the requirement \u2014 the controller's reading of a busy worker's answer \u2014 is carried by `busy_aborted_settles_no_apply_without_ambiguous_reconcile`, which asserts the stronger fact: exactly one START reaches the worker, the identifier is accounted for by an authoritative response, and the attempt ends as a retryable scheduling error so that only a LATER scheduling attempt may try again. The landed worker-side no-apply proof is unchanged."
+      "note": "Multi-test cell; it passes as a group. M11.T26m declared the controller control `a_busy_worker_phase_is_retried_under_the_same_start_admission` a PRE-ACTIVATION CONTROL ONLY, and M11.T26h's activation change removed it: it asserted that the fan-out retries the same identifier under the same admission after an `Aborted`, which is the reading M11.D39e(iii) replaces. `transport_settlement` no longer takes a mode and answers `Definitive` for `Aborted`, so the control could only have passed by keeping the mechanism it was a control for. Its half of the requirement — the controller's reading of a busy worker's answer — is carried by `busy_aborted_settles_no_apply_without_ambiguous_reconcile`, which asserts the stronger fact: exactly one START reaches the worker, the identifier is accounted for by an authoritative response, and the attempt ends as a retryable scheduling error so that only a LATER scheduling attempt may try again. The landed worker-side no-apply proof is unchanged."
     },
     {
       "id": 27,
@@ -583,7 +619,7 @@
           "path": "crates/arroyo-controller/src/states/mod.rs"
         }
       ],
-      "note": "M11.T26m declared the control `a_permanently_unsettled_start_execution_ends_the_fan_out_and_releases_the_admission` a PRE-ACTIVATION CONTROL ONLY, and M11.T26h's activation change removed it. It asserted that budget exhaustion RELEASES the job's lifecycle authority \u2014 observed through `RefusalGate::admit_publication`, which the same change removed \u2014 and after activation budget exhaustion must enter durable `Fencing` instead, holding the authority until the obligation is discharged. The requirement 'a permanently unsettled start ends the fan-out safely' is carried whole by `permanently_unsettled_start_enters_durable_fencing`, which asserts the bounded terminal path AND the durable obligation the release used to skip; `budget_exhaustion_transfers_into_token_free_fencing_without_publishing_or_rescheduling` covers the same transfer at the phase seam."
+      "note": "M11.T26m declared the control `a_permanently_unsettled_start_execution_ends_the_fan_out_and_releases_the_admission` a PRE-ACTIVATION CONTROL ONLY, and M11.T26h's activation change removed it. It asserted that budget exhaustion RELEASES the job's lifecycle authority — observed through `RefusalGate::admit_publication`, which the same change removed — and after activation budget exhaustion must enter durable `Fencing` instead, holding the authority until the obligation is discharged. The requirement 'a permanently unsettled start ends the fan-out safely' is carried whole by `permanently_unsettled_start_enters_durable_fencing`, which asserts the bounded terminal path AND the durable obligation the release used to skip; `budget_exhaustion_transfers_into_token_free_fencing_without_publishing_or_rescheduling` covers the same transfer at the phase seam."
     },
     {
       "id": 29,

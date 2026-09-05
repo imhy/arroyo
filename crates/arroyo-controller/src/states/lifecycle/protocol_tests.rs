@@ -1,6 +1,6 @@
 //! What a job's directives carry, and what a status about one settles (M11.T26c).
 
-use arroyo_rpc::fence_wire::{CommitDirective, StartDirective, start_directive};
+use arroyo_rpc::fence_wire::{CommitDirective, StartDirective, WorkerIncarnation, start_directive};
 use arroyo_rpc::grpc::rpc::{CommitReq, LifecycleOperation, StartExecutionReq};
 use arroyo_types::WorkerId;
 use tonic::Code;
@@ -99,7 +99,7 @@ fn requiring_a_fence_and_sending_one_are_the_same_decision() {
         );
         assert_eq!(
             matches!(
-                protocol.commit_authority().directive(7),
+                protocol.commit_authority().directive(7, incarnation()),
                 arroyo_rpc::fence_wire::CommitDirective::Fenced(_)
             ),
             mode.requires_lifecycle_fence(),
@@ -135,7 +135,7 @@ fn the_legacy_protocol_stamps_the_request_a_controller_predating_the_fields_send
     };
     FenceProtocol::Legacy
         .commit_authority()
-        .directive(WorkerId(7).0)
+        .directive(WorkerId(7).0, incarnation())
         .stamp(&mut commit);
     assert_eq!(
         commit,
@@ -145,33 +145,48 @@ fn the_legacy_protocol_stamps_the_request_a_controller_predating_the_fields_send
         }
     );
     assert_eq!(
-        FenceProtocol::Legacy.commit_authority().directive(7),
+        FenceProtocol::Legacy
+            .commit_authority()
+            .directive(7, incarnation()),
         CommitDirective::Unfenced
     );
 }
 
-/// A fenced directive carries this job's own fence, addressed to the worker it is sent to.
+/// A fenced directive carries this job's own fence, addressed to the worker process it is sent
+/// to.
 ///
-/// Each of the three dimensions is varied on its own, against closed-form expected values, so
+/// Each of the four dimensions is varied on its own, against closed-form expected values, so
 /// that a directive built from a fence and a target that came from different decisions would
 /// show up as a different address rather than as a plausible one.
 #[test]
 fn a_fenced_directive_carries_this_jobs_fence_addressed_to_the_worker_it_is_sent_to() {
-    for (fence, generation, worker) in [(1u64, 1u64, 0u64), (4, 2, 7), (u64::MAX, 9, u64::MAX)] {
+    for (fence, generation, worker, named) in [
+        (1u64, 1u64, 0u64, 0u64),
+        (4, 2, 7, 21),
+        (u64::MAX, 9, u64::MAX, u64::MAX),
+    ] {
+        let named = WorkerIncarnation::named(named);
         let addressed = fenced(fence, generation);
         assert_eq!(addressed.fence(), fence);
         assert_eq!(addressed.generation(), generation);
 
-        let address = addressed.address(WorkerId(worker));
+        let address = addressed.address(WorkerId(worker), named);
         assert_eq!(address.fence(), fence);
         assert_eq!(address.target().worker_id(), worker);
         assert_eq!(address.target().generation(), generation);
+        assert_eq!(address.target().incarnation(), named);
 
         let mut req = StartExecutionReq::default();
-        addressed.fence_only(WorkerId(worker)).stamp(&mut req);
+        addressed
+            .fence_only(WorkerId(worker), named)
+            .stamp(&mut req);
         assert_eq!(req.lifecycle_fence, fence);
         assert_eq!(req.target_worker_id, worker);
         assert_eq!(req.target_worker_generation, generation);
+        assert_eq!(
+            req.target_worker_incarnation,
+            named.map_or(0, WorkerIncarnation::get)
+        );
         assert_eq!(
             req.lifecycle_operation,
             LifecycleOperation::FenceOnly as i32
@@ -192,23 +207,39 @@ fn a_fenced_directive_carries_this_jobs_fence_addressed_to_the_worker_it_is_sent
         let mut commit = CommitReq::default();
         FenceProtocol::Fenced(addressed)
             .commit_authority()
-            .directive(worker)
+            .directive(worker, named)
             .stamp(&mut commit);
         assert_eq!(commit.lifecycle_fence, fence);
         assert_eq!(commit.target_worker_id, worker);
         assert_eq!(commit.target_worker_generation, generation);
+        assert_eq!(
+            commit.target_worker_incarnation,
+            named.map_or(0, WorkerIncarnation::get),
+            "a commit addresses the same process the start did"
+        );
     }
 }
 
-/// Two workers of one generation are addressed under the same fence and different ids.
+/// Two workers of one generation are addressed under the same fence, at different ids and their
+/// own processes.
 #[test]
 fn every_worker_of_one_generation_is_addressed_under_the_same_fence() {
     let addressed = fenced(4, 2);
-    let one = addressed.address(WorkerId(1));
-    let two = addressed.address(WorkerId(2));
+    let one = addressed.address(WorkerId(1), WorkerIncarnation::named(21));
+    let two = addressed.address(WorkerId(2), WorkerIncarnation::named(22));
     assert_eq!(one.fence(), two.fence());
     assert_eq!(one.target().generation(), two.target().generation());
     assert_ne!(one.target().worker_id(), two.target().worker_id());
+    assert_ne!(
+        one.target().incarnation(),
+        two.target().incarnation(),
+        "each worker of a generation is its own process and is addressed as one"
+    );
+}
+
+/// The incarnation every fixture directive in this file addresses.
+fn incarnation() -> Option<WorkerIncarnation> {
+    WorkerIncarnation::named(21)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -376,8 +407,8 @@ fn a_commit_and_a_start_address_the_same_generation_under_the_same_fence() {
         assert_eq!(
             FenceProtocol::Fenced(addressed)
                 .commit_authority()
-                .directive(worker),
-            CommitDirective::Fenced(addressed.address(WorkerId(worker)))
+                .directive(worker, incarnation()),
+            CommitDirective::Fenced(addressed.address(WorkerId(worker), incarnation()))
         );
     }
     assert_eq!(

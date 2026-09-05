@@ -11,7 +11,7 @@ use arroyo_rpc::checkpoints::{
     UpdateCheckpointReq,
 };
 use arroyo_rpc::config::config;
-use arroyo_rpc::fence_wire::CommitAuthority;
+use arroyo_rpc::fence_wire::{CommitAuthority, WorkerIncarnation};
 use arroyo_rpc::grpc::rpc::{
     CheckpointManifest, CheckpointReq, CommitReq, JobFinishedReq, LabelPair, LoadCompactedDataReq,
     MetricsReq, OperatorCheckpointMetadata, OperatorCommitData, TaskCheckpointEventType,
@@ -152,6 +152,7 @@ pub struct CommitBody {
 pub fn addressed_commit(
     authority: CommitAuthority,
     worker: WorkerId,
+    incarnation: Option<WorkerIncarnation>,
     body: &CommitBody,
 ) -> CommitReq {
     let mut req = CommitReq {
@@ -160,7 +161,7 @@ pub fn addressed_commit(
         // Written by the directive below, on every arm; see `fence_wire::stamp`.
         ..Default::default()
     };
-    authority.directive(worker.0).stamp(&mut req);
+    authority.directive(worker.0, incarnation).stamp(&mut req);
     req
 }
 
@@ -174,9 +175,18 @@ impl RunningJobModel {
     pub async fn commit_to_workers(&mut self, body: &CommitBody) -> anyhow::Result<()> {
         let authority = self.commit_authority;
         for (id, worker) in self.workers.iter_mut() {
+            // The process this commit is addressed to, from the entry that holds the channel it
+            // is sent on, so a commit cannot be addressed to one worker's incarnation and
+            // delivered to another's (M11.D39d, PR #167 round 6).
+            let incarnation = worker.incarnation;
             worker
                 .connect
-                .commit(Request::new(addressed_commit(authority, *id, body)))
+                .commit(Request::new(addressed_commit(
+                    authority,
+                    *id,
+                    incarnation,
+                    body,
+                )))
                 .await?;
         }
         Ok(())
@@ -1013,6 +1023,14 @@ pub enum WorkerState {
 pub struct WorkerStatus {
     pub id: WorkerId,
     pub connect: WorkerClient,
+    /// The worker process at the other end of [`Self::connect`], which every commit to it is
+    /// addressed to.
+    ///
+    /// In controller mode it comes from that worker's registration; in worker-leader mode from
+    /// `TaskAssignment::worker_incarnation`, because a leader has no registration exchange of
+    /// its own. `None` is a worker that named none, and a generation that has one refuses a
+    /// commit addressed to none (M11.D39d, PR #167 round 6).
+    pub incarnation: Option<WorkerIncarnation>,
     pub last_heartbeat: Instant,
     pub state: WorkerState,
 }

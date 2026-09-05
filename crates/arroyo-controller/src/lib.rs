@@ -6,6 +6,7 @@
 
 use anyhow::Result;
 use arroyo_rpc::config::config;
+use arroyo_rpc::fence_wire::WorkerIncarnation;
 use arroyo_rpc::fencing::Fencing;
 use arroyo_rpc::grpc::rpc;
 use arroyo_rpc::grpc::rpc::controller_grpc_server::{ControllerGrpc, ControllerGrpcServer};
@@ -695,6 +696,16 @@ pub enum JobMessage {
         /// default and so is what a worker predating the field reports; see
         /// `states::scheduling::Scheduling::next`, which refuses to fan out to one.
         reconciles_start_execution: bool,
+        /// The worker *process* that answered this registration, from
+        /// `RegisterWorkerReq::worker_incarnation`.
+        ///
+        /// Every fenced directive this controller sends the generation is addressed to it, and a
+        /// generation refuses one addressed to a predecessor process — which is what stops a
+        /// directive delayed from before a restart being admitted by the successor that
+        /// reconstructed the state it is checked against (M11.D39d, PR #167 round 6). `None` is
+        /// what a worker predating the field reports; a directive addressed to no incarnation is
+        /// refused by any generation that has one, so such a worker cannot be fenced.
+        incarnation: Option<WorkerIncarnation>,
     },
     WorkerInitializationComplete {
         worker_id: WorkerId,
@@ -756,6 +767,7 @@ impl ControllerGrpc for ControllerServer {
                 data_address: req.data_address,
                 slots: req.slots as usize,
                 reconciles_start_execution: req.reconciles_start_execution,
+                incarnation: WorkerIncarnation::named(req.worker_incarnation),
             },
         )
         .await?;

@@ -1,4 +1,5 @@
 use crate::schedulers::{Scheduler, SchedulerError, StartPipelineReq};
+use arroyo_rpc::fence_wire::WorkerIncarnation;
 use arroyo_rpc::grpc::rpc::{HeartbeatNodeReq, RegisterNodeReq, WorkerFinishedReq};
 use arroyo_server_common::shutdown::{Shutdown, SignalBehavior};
 use arroyo_types::{JobId, MachineId, WorkerId};
@@ -61,6 +62,10 @@ impl Scheduler for EmbeddedScheduler {
                 req.pipeline_id.clone(),
                 req.job_id.clone(),
                 req.generation,
+                // One mint per embedded worker process, as `WorkerServer::from_config` does for
+                // a spawned one: this is a distinct process from any predecessor at the same
+                // worker id and generation (M11.D39d, PR #167 round 6).
+                WorkerIncarnation::mint(),
                 guard,
             );
             let worker_job_id = log_job_id.clone();

@@ -35,7 +35,9 @@
 
 use std::num::NonZeroU64;
 
-use arroyo_rpc::fence_wire::{FenceAddress, LifecycleTarget, StartDirective, start_directive};
+use arroyo_rpc::fence_wire::{
+    FenceAddress, LifecycleTarget, StartDirective, WorkerIncarnation, start_directive,
+};
 use arroyo_rpc::grpc::rpc::{
     LifecycleOperation, StartExecutionOutcome, StartExecutionReq, StartExecutionResp,
 };
@@ -43,8 +45,8 @@ use prost::Message;
 use tonic::{Code, Status};
 
 use super::tests::{
-    AMBIGUOUS, GENERATION, WORKER, acknowledged, applied, call, generation, has_announced, idle,
-    register, strict,
+    AMBIGUOUS, GENERATION, INCARNATION, WORKER, acknowledged, applied, call, generation,
+    has_announced, idle, register, strict,
 };
 
 /// Which side of M11.D75's flag day a binary was cut on.
@@ -116,6 +118,7 @@ impl Build {
                     LifecycleTarget::in_generation(
                         WORKER,
                         NonZeroU64::new(GENERATION).expect("no live generation is zero"),
+                        WorkerIncarnation::named(INCARNATION),
                     ),
                 ),
                 operation,

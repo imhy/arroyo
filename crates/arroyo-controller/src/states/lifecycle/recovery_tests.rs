@@ -24,6 +24,21 @@ use arroyo_rpc::grpc::rpc::{
 };
 use arroyo_rpc::{StateContext, fence_wire};
 use arroyo_types::WorkerId;
+
+/// Whether a record on the row owes nothing: every target settled, and no identifier left that
+/// anything could still be answerable for.
+///
+/// Since PR #167 round 6 a discharged record is **kept**, not deleted: what it still names is the
+/// worker generation that can act and the address it answers at, which is what a later refusal or
+/// replacement has to fence. So "discharged" is read off its contents rather than off its absence.
+fn owes_nothing(record: &Option<arroyo_rpc::fencing::Fencing>) -> bool {
+    record.as_ref().is_some_and(|record| {
+        record.targets().iter().all(|target| {
+            target.state != arroyo_rpc::fencing::FenceTargetState::Pending
+                && target.attempt_id.is_none()
+        })
+    })
+}
 use cornucopia_async::DatabaseSource;
 use cornucopia_async::rusqlite::Connection;
 
@@ -51,6 +66,13 @@ const ATTEMPT: &str = "0123456789abcdef0123456789abcdef";
 // Fixtures
 // ---------------------------------------------------------------------------------------------
 
+/// The process the recorded target was answering as.
+///
+/// Durable, because the controller that registered it is gone: a fenced advance names the
+/// process it is for, and the record is the only thing that can tell its successor which
+/// (M11.D39d, PR #167 round 6).
+const INCARNATION: u64 = 21;
+
 /// One recorded target, pending, reachable at `address` if it is reachable at all.
 fn pending_target(address: Option<String>) -> FenceTarget {
     FenceTarget {
@@ -58,6 +80,7 @@ fn pending_target(address: Option<String>) -> FenceTarget {
         generation: GENERATION,
         attempt_id: Some(ATTEMPT.to_string()),
         rpc_address: address,
+        incarnation: std::num::NonZeroU64::new(INCARNATION),
         state: FenceTargetState::Pending,
     }
 }
@@ -254,7 +277,13 @@ struct Paused {
 #[derive(Default)]
 struct Directives {
     /// Every `(fence, generation)` this worker was addressed under, in arrival order.
-    seen: Mutex<Vec<(u64, u64)>>,
+    /// Every directive this worker was sent, as `(fence, generation, incarnation)`.
+    ///
+    /// The incarnation is recorded because it is the half of the address a *durable* record has
+    /// to carry: the controller that registered these workers is gone, so if the record does not
+    /// name the process, the advance names none and a generation that has one refuses it
+    /// (M11.D39d, PR #167 round 6).
+    seen: Mutex<Vec<(u64, u64, Option<u64>)>>,
 }
 
 struct FenceWorker {
@@ -274,11 +303,14 @@ impl WorkerGrpc for FenceWorker {
         let fence_wire::StartDirective::Fenced { address, .. } = directive else {
             panic!("a recovery pass sends only fenced directives");
         };
-        self.directives
-            .seen
-            .lock()
-            .unwrap()
-            .push((address.fence(), address.target().generation()));
+        self.directives.seen.lock().unwrap().push((
+            address.fence(),
+            address.target().generation(),
+            address
+                .target()
+                .incarnation()
+                .map(arroyo_rpc::fence_wire::WorkerIncarnation::get),
+        ));
         match &self.answers {
             Answers::Acknowledging => Ok(tonic::Response::new(StartExecutionResp {
                 observed_lifecycle_fence: address.fence(),
@@ -420,6 +452,7 @@ async fn a_fencing_obligation_is_written_under_authority_and_read_back_whole() {
                 t.generation,
                 t.attempt_id.clone(),
                 t.rpc_address.clone(),
+                t.incarnation.map(std::num::NonZeroU64::get),
                 t.state
             ))
             .collect::<Vec<_>>(),
@@ -428,10 +461,13 @@ async fn a_fencing_obligation_is_written_under_authority_and_read_back_whole() {
             GENERATION,
             Some(ATTEMPT.to_string()),
             Some("http://10.0.0.1:9191".to_string()),
+            Some(INCARNATION),
             FenceTargetState::Pending
         )],
-        "with the target, the identifier it was issued and the address it was reached at — the \
-         three things a replacement controller needs to fence it"
+        "with the target, the identifier it was issued, the address it was reached at and the \
+         process that was answering there — the four things a replacement controller needs to \
+         fence it (PR #167 round 6, finding 3: without the process, an advance names one that \
+         may already be gone and a successor refuses it)"
     );
     assert_eq!(read_back.candidate_root(), record.candidate_root());
     assert_eq!(
@@ -482,6 +518,49 @@ async fn a_fencing_obligation_is_written_under_authority_and_read_back_whole() {
 /// replacement generation". Both halves are asserted: the value, against a real row and a real
 /// worker, and the position, against the driver's own source, because a behavioural test of a
 /// successful attempt cannot show the order of steps it took.
+/// **PR #167 round 6, finding 3.** A record written before the incarnation field addresses no
+/// process, and its target stays pending.
+///
+/// The compatibility statement, made rather than argued. An advance is addressed to a *process*
+/// since round 6, and the only thing that can tell a replacement controller which process a
+/// target was is the record — the controller that registered it is gone. A record that names none
+/// therefore produces an advance that names none, which a generation that has one refuses; the
+/// target is left pending, which is M11.D39g's declared outcome for one this controller cannot
+/// fence. The positive control is `replacement_cannot_publish_before_worker_fence_settlement`
+/// above, whose record names a process and whose advance carries it.
+#[tokio::test]
+async fn a_record_written_before_the_incarnation_field_addresses_no_process() {
+    let (job_id, db, connection) = job("row17-preincarnation");
+    let (address, directives) = serve(Answers::Acknowledging).await;
+    let seeded = Fencing::record(
+        vec![FenceTarget {
+            incarnation: None,
+            ..pending_target(Some(address))
+        }],
+        None,
+        Some(an_hour_ago()),
+    )
+    .expect("a record predating the field is writable");
+    seed_obligation(&job_id, &connection, Some(&seeded));
+
+    let mut replacement = cold_status(&db).await;
+    adopt(&mut replacement, &db).await;
+    let adopted = replacement.authority().fence().get();
+
+    let scheduler = TestScheduler::shared(Lists::Live(vec![(GENERATION, WORKER)]));
+    let _ =
+        discharge_recorded_obligation(&mut replacement, &db, &scheduler, LifecycleMode::FencedV2)
+            .await;
+
+    assert_eq!(
+        *directives.seen.lock().unwrap(),
+        vec![(adopted, GENERATION, None)],
+        "the advance carries what the record carried and invents nothing: a controller that \
+         guessed a process here would address a live worker under a directive minted for no \
+         one"
+    );
+}
+
 #[tokio::test]
 async fn replacement_cannot_publish_before_worker_fence_settlement() {
     let (job_id, db, connection) = job("row17");
@@ -517,9 +596,10 @@ async fn replacement_cannot_publish_before_worker_fence_settlement() {
     );
     assert_eq!(
         *directives.seen.lock().unwrap(),
-        vec![(adopted, GENERATION)],
-        "the replacement did advance its own fence at the recorded generation — this is not a \
-         controller that failed to try"
+        vec![(adopted, GENERATION, Some(INCARNATION))],
+        "the replacement did advance its own fence at the recorded generation, addressed to the \
+         process the record names — this is not a controller that failed to try, and not one \
+         addressing a process that may already be gone (PR #167 round 6, finding 3)"
     );
     let still = recorded(&job_id, &connection).expect("the obligation stands");
     assert_eq!(
@@ -620,10 +700,10 @@ async fn an_acknowledgement_settles_a_recovered_target_only_if_it_supersedes_wha
                     matches!(discharge, Discharge::Settled),
                     "{what}: the only target settles, so the obligation is discharged"
                 );
-                assert_eq!(
-                    recorded(&job_id, &connection),
-                    None,
-                    "{what}: and the record is cleared from the row"
+                assert!(
+                    owes_nothing(&recorded(&job_id, &connection)),
+                    "{what}: and the record on the row owes nothing — it still names the \
+                     generation, which is what a later refusal fences"
                 );
             }
             _ => {
@@ -689,9 +769,10 @@ async fn a_generation_settles_only_when_a_tracking_scheduler_says_it_is_gone() {
             "{what}: settling must be exactly '{settles}'"
         );
         assert_eq!(
-            recorded(&job_id, &connection).is_none(),
+            owes_nothing(&recorded(&job_id, &connection)),
             settles,
-            "{what}: and the row must agree with it"
+            "{what}: and the row must agree with it — a discharged record owes nothing and is \
+             kept, rather than being deleted"
         );
     }
 }
@@ -1151,9 +1232,13 @@ fn a_recovered_target_only_ever_leaves_pending() {
         vec![(WORKER.0, GENERATION, FenceTargetState::Terminated)]
     );
     assert!(
-        recovered.record().is_none(),
-        "a record with nothing pending is no obligation at all, so it is cleared rather than \
-         rewritten"
+        recovered.record().is_some_and(|record| record
+            .targets()
+            .iter()
+            .all(|target| target.state == FenceTargetState::Terminated
+                && target.attempt_id.is_none())),
+        "a record with nothing pending owes nothing, and is rewritten rather than cleared: what \
+         it still names is the generation, which is what a later refusal or replacement fences"
     );
 }
 
@@ -1561,10 +1646,10 @@ async fn a_recovery_pass_dropped_part_way_leaves_the_record_readable_and_recover
         ),
         "the next pass reads the record the cancelled one left and discharges it"
     );
-    assert_eq!(
-        recorded(&job_id, &connection),
-        None,
-        "and clears it from the row, which is what makes the job schedulable again"
+    assert!(
+        owes_nothing(&recorded(&job_id, &connection)),
+        "and leaves it on the row owing nothing, which is what makes the job schedulable again \
+         while keeping the generation a later refusal has to fence"
     );
 }
 

@@ -6,7 +6,7 @@
 //! which is what pins the field numbers at the layer that actually carries them.
 
 use super::*;
-use crate::grpc::rpc::RegisterWorkerResp;
+use crate::grpc::rpc::{RegisterWorkerReq, RegisterWorkerResp, TaskAssignment};
 use prost::Message;
 
 /// A request shaped exactly as a controller predating M11.T26c would send it: it carries an
@@ -24,6 +24,7 @@ fn fenced_start_request() -> StartExecutionReq {
         lifecycle_fence: 7,
         target_worker_id: 42,
         target_worker_generation: 3,
+        target_worker_incarnation: 5,
         lifecycle_operation: LifecycleOperation::Revoke as i32,
         revoked_execution_ids: vec!["ab".to_string()],
         ..Default::default()
@@ -76,6 +77,7 @@ fn a_start_request_predating_the_fence_protocol_is_unfenced() {
     assert_eq!(old_request.lifecycle_fence, 0);
     assert_eq!(old_request.target_worker_id, 0);
     assert_eq!(old_request.target_worker_generation, 0);
+    assert_eq!(old_request.target_worker_incarnation, 0);
     assert_eq!(old_request.lifecycle_operation, 0);
     assert!(old_request.revoked_execution_ids.is_empty());
 
@@ -130,6 +132,7 @@ fn a_commit_request_predating_the_fence_protocol_is_unfenced() {
     assert_eq!(decoded.lifecycle_fence, 0);
     assert_eq!(decoded.target_worker_id, 0);
     assert_eq!(decoded.target_worker_generation, 0);
+    assert_eq!(decoded.target_worker_incarnation, 0);
     assert_eq!(
         commit_directive(&decoded).unwrap(),
         CommitDirective::Unfenced
@@ -153,6 +156,7 @@ fn every_start_request_fence_field_survives_the_wire() {
             0x78, 0x03, // 15 varint = 3          (target_worker_generation)
             0x80, 0x01, 0x02, // 16 varint = 2    (lifecycle_operation = REVOKE)
             0x8A, 0x01, 0x02, b'a', b'b', // 17 len 2 = "ab" (revoked_execution_ids)
+            0x90, 0x01, 0x05, // 18 varint = 5    (target_worker_incarnation)
         ]
     );
 
@@ -160,6 +164,7 @@ fn every_start_request_fence_field_survives_the_wire() {
     assert_eq!(decoded.lifecycle_fence, 7);
     assert_eq!(decoded.target_worker_id, 42);
     assert_eq!(decoded.target_worker_generation, 3);
+    assert_eq!(decoded.target_worker_incarnation, 5);
     assert_eq!(
         decoded.lifecycle_operation,
         LifecycleOperation::Revoke as i32
@@ -177,6 +182,10 @@ fn every_start_request_fence_field_survives_the_wire() {
     assert_eq!(address.fence(), 7);
     assert_eq!(address.target().worker_id(), 42);
     assert_eq!(address.target().generation(), 3);
+    assert_eq!(
+        address.target().incarnation().map(WorkerIncarnation::get),
+        Some(5)
+    );
     assert_eq!(operation, LifecycleOperation::Revoke);
     assert_eq!(revoked_execution_ids, ["ab".to_string()]);
 }
@@ -204,7 +213,7 @@ fn every_start_response_settlement_field_survives_the_wire() {
     );
 }
 
-/// All three fence fields of `CommitReq` reach the wire and come back.
+/// All four fence fields of `CommitReq` reach the wire and come back.
 #[test]
 fn every_commit_request_fence_field_survives_the_wire() {
     let request = CommitReq {
@@ -212,6 +221,7 @@ fn every_commit_request_fence_field_survives_the_wire() {
         lifecycle_fence: 5,
         target_worker_id: 42,
         target_worker_generation: 3,
+        target_worker_incarnation: 11,
         ..Default::default()
     };
     assert_eq!(
@@ -221,6 +231,7 @@ fn every_commit_request_fence_field_survives_the_wire() {
             0x18, 0x05, // 3 varint = 5  (lifecycle_fence)
             0x20, 0x2A, // 4 varint = 42 (target_worker_id)
             0x28, 0x03, // 5 varint = 3  (target_worker_generation)
+            0x30, 0x0B, // 6 varint = 11 (target_worker_incarnation)
         ]
     );
 
@@ -230,16 +241,82 @@ fn every_commit_request_fence_field_survives_the_wire() {
     assert_eq!(address.fence(), 5);
     assert_eq!(address.target().worker_id(), 42);
     assert_eq!(address.target().generation(), 3);
+    assert_eq!(
+        address.target().incarnation().map(WorkerIncarnation::get),
+        Some(11)
+    );
+}
+
+/// A worker predating `RegisterWorkerReq::worker_incarnation` reports none, and the field puts
+/// no byte on the wire when it does; a worker that mints one encodes it at number 10.
+///
+/// The registration half of PR #167 round 6, finding 3: the incarnation is reported here and
+/// nowhere else, so this is the byte that decides whether a controller can address a generation
+/// to a particular process at all.
+#[test]
+fn the_registration_incarnation_is_absent_for_a_worker_that_mints_none() {
+    let from_legacy_worker = RegisterWorkerReq::decode(&[][..]).unwrap();
+    assert_eq!(from_legacy_worker.worker_incarnation, 0);
+    assert_eq!(WorkerIncarnation::named(0), None);
+
+    assert_eq!(
+        RegisterWorkerReq {
+            worker_incarnation: 0,
+            ..Default::default()
+        }
+        .encode_to_vec(),
+        Vec::<u8>::new(),
+        "no new field may put a byte on the wire when it is at its default"
+    );
+    assert_eq!(
+        RegisterWorkerReq {
+            worker_incarnation: 5,
+            ..Default::default()
+        }
+        .encode_to_vec(),
+        vec![0x50, 0x05],
+        "field 10, varint, 5"
+    );
+}
+
+/// A controller predating `TaskAssignment::worker_incarnation` names none, and the field puts no
+/// byte on the wire when it does.
+///
+/// This is how a worker-leader execution learns which process each of its peers is; a leader
+/// that reads zero addresses its commits to no incarnation, and a generation that has one
+/// refuses them.
+#[test]
+fn the_assignment_incarnation_is_absent_for_a_controller_that_names_none() {
+    let from_legacy_controller = TaskAssignment::decode(&[][..]).unwrap();
+    assert_eq!(from_legacy_controller.worker_incarnation, 0);
+
+    assert_eq!(
+        TaskAssignment {
+            worker_incarnation: 0,
+            ..Default::default()
+        }
+        .encode_to_vec(),
+        Vec::<u8>::new()
+    );
+    assert_eq!(
+        TaskAssignment {
+            worker_incarnation: 5,
+            ..Default::default()
+        }
+        .encode_to_vec(),
+        vec![0x38, 0x05],
+        "field 7, varint, 5"
+    );
 }
 
 /// Each new field of `StartExecutionReq` is carried independently of the others: setting one and
 /// only one leaves every other at its default, on the wire and after the round trip.
 ///
-/// The directive that results is refused in four of the five cases, and that is the point — a
+/// The directive that results is refused in five of the six cases, and that is the point — a
 /// single lifecycle field is never a directive.
 #[test]
 fn each_start_request_fence_field_varies_independently() {
-    let cases: [(&str, StartExecutionReq, Vec<u8>); 5] = [
+    let cases: [(&str, StartExecutionReq, Vec<u8>); 6] = [
         (
             "lifecycle_fence",
             StartExecutionReq {
@@ -279,6 +356,14 @@ fn each_start_request_fence_field_varies_independently() {
                 ..Default::default()
             },
             vec![0x8A, 0x01, 0x02, b'a', b'b'],
+        ),
+        (
+            "target_worker_incarnation",
+            StartExecutionReq {
+                target_worker_incarnation: 5,
+                ..Default::default()
+            },
+            vec![0x90, 0x01, 0x05],
         ),
     ];
 

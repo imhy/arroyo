@@ -15,13 +15,29 @@ use prost::Message;
 
 /// A fence and the generation it addresses, built the only way a sender can build one.
 fn address(fence: u64, worker_id: u64, generation: u64) -> FenceAddress {
+    addressed_to(fence, worker_id, generation, incarnation(5))
+}
+
+/// The same, naming a particular worker process.
+fn addressed_to(
+    fence: u64,
+    worker_id: u64,
+    generation: u64,
+    incarnation: Option<WorkerIncarnation>,
+) -> FenceAddress {
     FenceAddress::under(
         NonZeroU64::new(fence).expect("this fixture names a live fence"),
         LifecycleTarget::in_generation(
             worker_id,
             NonZeroU64::new(generation).expect("this fixture names a live generation"),
+            incarnation,
         ),
     )
+}
+
+/// The incarnation `value` names; `None` for zero, which names none.
+fn incarnation(value: u64) -> Option<WorkerIncarnation> {
+    WorkerIncarnation::named(value)
 }
 
 /// A start request whose every lifecycle field carries a value no directive here asks for.
@@ -34,6 +50,7 @@ fn dirtied_start_request() -> StartExecutionReq {
         lifecycle_fence: 999,
         target_worker_id: 998,
         target_worker_generation: 997,
+        target_worker_incarnation: 996,
         lifecycle_operation: LifecycleOperation::Revoke as i32,
         revoked_execution_ids: vec!["stale".to_string()],
         ..Default::default()
@@ -48,6 +65,7 @@ fn dirtied_commit_request() -> CommitReq {
         lifecycle_fence: 999,
         target_worker_id: 998,
         target_worker_generation: 997,
+        target_worker_incarnation: 996,
     }
 }
 
@@ -161,6 +179,7 @@ fn an_unfenced_commit_directive_stamps_the_bytes_a_legacy_controller_sends() {
         lifecycle_fence: 0,
         target_worker_id: 0,
         target_worker_generation: 0,
+        target_worker_incarnation: 0,
     };
     assert_eq!(req, legacy);
     assert_eq!(req.encode_to_vec(), legacy.encode_to_vec());
@@ -198,16 +217,22 @@ fn restamping_replaces_the_previous_directive_rather_than_merging_with_it() {
 #[test]
 fn the_two_target_constructors_are_one_constructor() {
     for generation in [1u64, 2, u64::MAX] {
-        let nonzero = NonZeroU64::new(generation).unwrap();
-        assert_eq!(
-            LifecycleTarget::addressed(11, generation),
-            Some(LifecycleTarget::in_generation(11, nonzero))
-        );
+        for named in [0u64, 1, u64::MAX] {
+            let nonzero = NonZeroU64::new(generation).unwrap();
+            assert_eq!(
+                LifecycleTarget::addressed(11, generation, named),
+                Some(LifecycleTarget::in_generation(
+                    11,
+                    nonzero,
+                    incarnation(named)
+                ))
+            );
+        }
     }
     assert_eq!(
-        LifecycleTarget::addressed(11, 0),
+        LifecycleTarget::addressed(11, 0, 5),
         None,
-        "generation zero is the sentinel and addresses nothing"
+        "generation zero is the sentinel and addresses nothing, whatever process is named"
     );
 }
 
@@ -260,16 +285,27 @@ fn a_commit_authority_addresses_every_worker_of_one_generation_under_one_fence()
             NonZeroU64::new(generation).unwrap(),
         );
         for worker in [0u64, 7, u64::MAX] {
-            let mut req = CommitReq::default();
-            authority.directive(worker).stamp(&mut req);
-            assert_eq!(req.lifecycle_fence, fence);
-            assert_eq!(req.target_worker_id, worker);
-            assert_eq!(req.target_worker_generation, generation);
-            assert_eq!(
-                commit_directive(&CommitReq::decode(&req.encode_to_vec()[..]).unwrap()).unwrap(),
-                CommitDirective::Fenced(address(fence, worker, generation)),
-                "and a stamped commit decodes back into the directive it was stamped with"
-            );
+            for named in [0u64, 5, u64::MAX] {
+                let mut req = CommitReq::default();
+                authority
+                    .directive(worker, incarnation(named))
+                    .stamp(&mut req);
+                assert_eq!(req.lifecycle_fence, fence);
+                assert_eq!(req.target_worker_id, worker);
+                assert_eq!(req.target_worker_generation, generation);
+                assert_eq!(req.target_worker_incarnation, named);
+                assert_eq!(
+                    commit_directive(&CommitReq::decode(&req.encode_to_vec()[..]).unwrap())
+                        .unwrap(),
+                    CommitDirective::Fenced(addressed_to(
+                        fence,
+                        worker,
+                        generation,
+                        incarnation(named)
+                    )),
+                    "and a stamped commit decodes back into the directive it was stamped with"
+                );
+            }
         }
     }
 }
@@ -283,7 +319,9 @@ fn a_commit_authority_addresses_every_worker_of_one_generation_under_one_fence()
 #[test]
 fn an_unfenced_commit_authority_stamps_the_bytes_a_legacy_sender_sends() {
     let mut req = dirtied_commit_request();
-    CommitAuthority::unfenced().directive(7).stamp(&mut req);
+    CommitAuthority::unfenced()
+        .directive(7, incarnation(5))
+        .stamp(&mut req);
 
     let legacy = CommitReq {
         epoch: 4,
@@ -291,6 +329,7 @@ fn an_unfenced_commit_authority_stamps_the_bytes_a_legacy_sender_sends() {
         lifecycle_fence: 0,
         target_worker_id: 0,
         target_worker_generation: 0,
+        target_worker_incarnation: 0,
     };
     assert_eq!(req, legacy);
     assert_eq!(req.encode_to_vec(), legacy.encode_to_vec());
@@ -311,16 +350,18 @@ fn an_unfenced_commit_authority_stamps_the_bytes_a_legacy_sender_sends() {
 fn a_leaders_commit_authority_keeps_its_starts_fence_and_generation() {
     for (fence, leader, generation, peer) in [(1u64, 0u64, 1u64, 5u64), (4, 7, 2, 8), (9, 3, 6, 3)]
     {
-        let start = address(fence, leader, generation);
-        let directive = start.commit_authority().directive(peer);
+        let start = addressed_to(fence, leader, generation, incarnation(21));
+        // Each worker of the generation is its own process, so the peer's commit names the
+        // peer's incarnation and not the leader's (PR #167 round 6, finding 3).
+        let directive = start.commit_authority().directive(peer, incarnation(22));
         assert_eq!(
             directive,
-            CommitDirective::Fenced(address(fence, peer, generation))
+            CommitDirective::Fenced(addressed_to(fence, peer, generation, incarnation(22)))
         );
         // And the same authority still addresses the leader itself, which is what a job whose
         // leader also runs tasks needs.
         assert_eq!(
-            start.commit_authority().directive(leader),
+            start.commit_authority().directive(leader, incarnation(21)),
             CommitDirective::Fenced(start)
         );
     }
@@ -330,28 +371,38 @@ fn a_leaders_commit_authority_keeps_its_starts_fence_and_generation() {
 /// different request, not a plausible one.
 #[test]
 fn a_mutated_commit_agreement_is_a_different_directive() {
-    let stamp = |authority: CommitAuthority, worker: u64| {
+    let stamp = |authority: CommitAuthority, worker: u64, named: u64| {
         let mut req = CommitReq::default();
-        authority.directive(worker).stamp(&mut req);
+        authority
+            .directive(worker, incarnation(named))
+            .stamp(&mut req);
         req
     };
     let nz = |v: u64| NonZeroU64::new(v).unwrap();
-    let original = stamp(CommitAuthority::under(nz(7), nz(3)), 42);
+    let original = stamp(CommitAuthority::under(nz(7), nz(3)), 42, 5);
 
     for (label, mutated) in [
         (
             "a different fence",
-            stamp(CommitAuthority::under(nz(8), nz(3)), 42),
+            stamp(CommitAuthority::under(nz(8), nz(3)), 42, 5),
         ),
         (
             "a different generation",
-            stamp(CommitAuthority::under(nz(7), nz(4)), 42),
+            stamp(CommitAuthority::under(nz(7), nz(4)), 42, 5),
         ),
         (
             "a different worker",
-            stamp(CommitAuthority::under(nz(7), nz(3)), 43),
+            stamp(CommitAuthority::under(nz(7), nz(3)), 43, 5),
         ),
-        ("no fence at all", stamp(CommitAuthority::unfenced(), 42)),
+        (
+            "a different worker process at the same worker and generation",
+            stamp(CommitAuthority::under(nz(7), nz(3)), 42, 6),
+        ),
+        (
+            "no worker process named at all",
+            stamp(CommitAuthority::under(nz(7), nz(3)), 42, 0),
+        ),
+        ("no fence at all", stamp(CommitAuthority::unfenced(), 42, 5)),
     ] {
         assert_ne!(original, mutated, "{label}");
         assert_ne!(original.encode_to_vec(), mutated.encode_to_vec(), "{label}");

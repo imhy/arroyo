@@ -13,9 +13,9 @@
 //! this must not disturb lives.
 
 use super::tests::{
-    AMBIGUOUS, GENERATION, WORKER, acknowledge, acknowledged, announced, applied,
-    apply_registration_response, call, fence_only, fenced_start, generation, handshaken, register,
-    registered, strict, unfenced,
+    AMBIGUOUS, GENERATION, INCARNATION, SUCCESSOR_INCARNATION, WORKER, acknowledge, acknowledged,
+    announced, applied, apply_registration_response, call, fence_only, fenced_start, generation,
+    handshaken, register, registered, strict, unfenced,
 };
 use crate::{EngineState, WorkerExecutionPhase, WorkerServer};
 use arroyo_rpc::ControlMessage;
@@ -88,14 +88,27 @@ fn unfenced_commit(epoch: u64) -> CommitReq {
     }
 }
 
-/// A commit at `epoch` under `fence`, addressed to worker `to_worker` generation `to_generation`.
+/// A commit at `epoch` under `fence`, addressed to worker `to_worker` generation `to_generation`
+/// running as [`INCARNATION`].
 fn addressed_commit(epoch: u64, fence: u64, to_worker: u64, to_generation: u64) -> CommitReq {
+    addressed_commit_to(epoch, fence, to_worker, to_generation, INCARNATION)
+}
+
+/// The same, naming the process the commit is for.
+fn addressed_commit_to(
+    epoch: u64,
+    fence: u64,
+    to_worker: u64,
+    to_generation: u64,
+    to_incarnation: u64,
+) -> CommitReq {
     CommitReq {
         epoch,
         committing_data: committing_data(),
         lifecycle_fence: fence,
         target_worker_id: to_worker,
         target_worker_generation: to_generation,
+        target_worker_incarnation: to_incarnation,
     }
 }
 
@@ -161,6 +174,7 @@ async fn a_legacy_commit_is_published_exactly_as_it_was_before_the_fence_existed
             lifecycle_fence: 0,
             target_worker_id: 0,
             target_worker_generation: 0,
+            target_worker_incarnation: 0,
         }
         .encode_to_vec(),
         "a legacy commit puts no lifecycle field on the wire at all"
@@ -250,12 +264,15 @@ async fn a_fenced_commit_is_admitted_while_the_registration_answer_is_in_flight(
     );
 }
 
-/// A commit addressed to another worker generation is refused, and the generation is the
-/// discriminator.
+/// A commit addressed to another worker generation — or to another *process* of this one — is
+/// refused, and the address is the discriminator.
 ///
-/// Each half of the address is varied on its own and then both together, against a control that
-/// differs in neither: an implementation that compared only the worker id would publish the
-/// second row, and one that compared only the fence would publish all three.
+/// Each part of the address is varied on its own and then together, against a control that
+/// differs in none: an implementation that compared only the worker id would publish the second
+/// row, one that compared only the fence would publish all of them, and one that stopped at the
+/// worker and the generation would publish the incarnation rows. Those last two are the commit
+/// sibling of PR #167 round 6's finding 3 — a restart reuses the worker id and the generation,
+/// so a commit delayed from before one is addressed to a process that is gone.
 #[tokio::test]
 async fn a_commit_addressed_to_another_generation_is_refused() {
     let (shutdown, server) = registered(false);
@@ -277,6 +294,14 @@ async fn a_commit_addressed_to_another_generation_is_refused() {
         (
             "another worker in another generation",
             addressed_commit(4, 5, WORKER + 1, GENERATION - 1),
+        ),
+        (
+            "a predecessor process of this worker generation",
+            addressed_commit_to(4, 5, WORKER, GENERATION, SUCCESSOR_INCARNATION),
+        ),
+        (
+            "no process at all, from a sender predating the field",
+            addressed_commit_to(4, 5, WORKER, GENERATION, 0),
         ),
     ] {
         let refused = commit(&server, request).await.unwrap_err();
@@ -648,12 +673,18 @@ async fn a_commit_and_a_start_agree_about_which_directives_this_generation_answe
 #[test]
 fn the_authority_a_start_confers_is_the_address_it_was_admitted_under() {
     use crate::lifecycle_fence::guard::{StartAdmission, WorkerLifecycle};
-    use arroyo_rpc::fence_wire::{CommitAuthority, CommitDirective, FenceAddress, LifecycleTarget};
+    use arroyo_rpc::fence_wire::{
+        CommitAuthority, CommitDirective, FenceAddress, LifecycleTarget, WorkerIncarnation,
+    };
     use std::num::NonZeroU64;
 
     let nz = |v: u64| NonZeroU64::new(v).unwrap();
     let conferred = |req: arroyo_rpc::grpc::rpc::StartExecutionReq| {
-        let mut lifecycle = WorkerLifecycle::idle(WORKER, GENERATION);
+        let mut lifecycle = WorkerLifecycle::idle(
+            WORKER,
+            GENERATION,
+            WorkerIncarnation::named(INCARNATION).unwrap(),
+        );
         let announced = lifecycle.announce();
         lifecycle.registered(announced, false);
         // The handshake at the start's own fence: what a controller holds before it may address
@@ -683,10 +714,14 @@ fn the_authority_a_start_confers_is_the_address_it_was_admitted_under() {
     let (authority, mut lifecycle) = conferred(fenced_start("attempt_1", 5));
     assert_eq!(authority, CommitAuthority::under(nz(5), nz(GENERATION)));
     assert_eq!(
-        authority.directive(WORKER + 1),
+        authority.directive(WORKER + 1, WorkerIncarnation::named(INCARNATION)),
         CommitDirective::Fenced(FenceAddress::under(
             nz(5),
-            LifecycleTarget::in_generation(WORKER + 1, nz(GENERATION))
+            LifecycleTarget::in_generation(
+                WORKER + 1,
+                nz(GENERATION),
+                WorkerIncarnation::named(INCARNATION)
+            )
         )),
         "and every other worker of that generation is addressed under the same fence"
     );
@@ -703,5 +738,8 @@ fn the_authority_a_start_confers_is_the_address_it_was_admitted_under() {
     // And the pre-flag-day start confers the pre-flag-day authority.
     let (legacy, _) = conferred(unfenced("attempt_1"));
     assert_eq!(legacy, CommitAuthority::unfenced());
-    assert_eq!(legacy.directive(WORKER), CommitDirective::Unfenced);
+    assert_eq!(
+        legacy.directive(WORKER, WorkerIncarnation::named(INCARNATION)),
+        CommitDirective::Unfenced
+    );
 }
