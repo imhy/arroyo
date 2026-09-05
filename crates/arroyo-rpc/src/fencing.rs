@@ -349,6 +349,65 @@ impl Fencing {
         &self.targets
     }
 
+    /// The same record with its identifiers dropped and its targets marked acknowledged, for a
+    /// fan-out that settled and a generation that is still running (M11.D39d, PR #167 round 5).
+    ///
+    /// A record survives the fan-out that wrote it. What stops being true when every request
+    /// settles is the *inventory* — nothing is owed an answer — and what stays true is the
+    /// *generation*: those workers are running, reachable at these addresses, holding the fence
+    /// they acknowledged. Only the second is what a controller about to publish a refusal has to
+    /// act on, and a healthy generation leaves no other trace of it.
+    ///
+    /// The candidate root goes with the identifiers: an attempt that settled rooted its metadata,
+    /// so there is no unrooted candidate left for anyone to clean up.
+    #[must_use]
+    pub fn settled_and_still_running(&self) -> Self {
+        Self {
+            version: self.version,
+            targets: self
+                .targets
+                .iter()
+                .map(|target| FenceTarget {
+                    attempt_id: None,
+                    state: FenceTargetState::Acknowledged,
+                    ..target.clone()
+                })
+                .collect(),
+            candidate_root: None,
+            fencing_since_millis: self.fencing_since_millis,
+        }
+    }
+
+    /// The same record with every target owed an acknowledgement again (M11.D39d, PR #167
+    /// round 5).
+    ///
+    /// A record survives the generation it names, so what it says once a fan-out has settled is
+    /// *which worker generations can act and where they are reached* — true for as long as they
+    /// run. That is what lets a controller about to publish a refusal fence them first, but only
+    /// if it asks them again, under the fence it has just adopted, rather than reading the
+    /// settled states an earlier and lower fence left behind.
+    ///
+    /// Identifiers are dropped with the states. What is being asked for here is an
+    /// acknowledgement of a *fence*; a revocation naming an identifier an earlier pass already
+    /// settled would be asking a live generation to disown work it is legitimately doing.
+    #[must_use]
+    pub fn reopened(&self) -> Self {
+        Self {
+            version: self.version,
+            targets: self
+                .targets
+                .iter()
+                .map(|target| FenceTarget {
+                    attempt_id: None,
+                    state: FenceTargetState::Pending,
+                    ..target.clone()
+                })
+                .collect(),
+            candidate_root: self.candidate_root.clone(),
+            fencing_since_millis: self.fencing_since_millis,
+        }
+    }
+
     /// The fence-scoped candidate root this attempt published, if it published one.
     ///
     /// A candidate is not authoritative: M11.D39d makes it so only through the conditional row

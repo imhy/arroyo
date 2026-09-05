@@ -626,11 +626,13 @@ impl PhaseContext<'_, '_> {
             }
             Err(e) => Err(self.retryable("failed to initialize workers", e, 10)),
         };
-        // The record is an image of what is outstanding, so it is cleared when the inventory says
-        // nothing is — and only then. An attempt that ends owing something leaves it standing for
-        // `Interrupted::persist_obligation` to update with what it actually owed.
+        // Settled rather than cleared: the identifiers are gone, the generation is not. What the
+        // record still says — which worker generations can act, and where they answer — is what
+        // a controller about to publish a refusal has to fence, and a healthy generation leaves
+        // no other trace of it (PR #167 round 5). An attempt that ends owing something leaves the
+        // record standing for `Interrupted::persist_obligation` to update with what it owed.
         if outcome.is_ok() && issued.outstanding_count() == 0 {
-            self.clear_settled_obligation(&admission).await;
+            self.settle_recorded_obligation(&admission).await;
         }
         (admission, issued, outcome)
     }

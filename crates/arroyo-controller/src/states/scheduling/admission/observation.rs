@@ -212,9 +212,14 @@ impl PhaseContext<'_, '_> {
     /// The fatal [`StateError`] of a refused configuration — a *newer* refusal than the one
     /// that may already be standing.
     pub(crate) fn observe_intent_in_fencing(&mut self) -> Result<FencedIntent, StateError> {
+        // Deferring rather than reporting, because this is the reconciliation of an attempt that
+        // is already ending and whose obligation nothing has discharged. A refusal reported here
+        // replaces that attempt's retryable reason with a fatal one, and the caller publishes
+        // `Failing` on the next line — before the settlement M11.D39d requires (PR #167 round 5).
+        // What it decided is on the writer, and the next entry point's settlement acts on it.
         let decided = self
             .ctx
-            .observe_lifecycle_decision(ConsumptionPoint::InsideInterruptibleWait)?;
+            .observe_deferring_refusal(ConsumptionPoint::InsideInterruptibleWait);
         if let Some(stop) = self.stop_if_desired() {
             return Ok(FencedIntent::Leave(stop));
         }
@@ -240,7 +245,13 @@ impl PhaseContext<'_, '_> {
     /// means — catches a stop that reached the configuration by any route, not only the one
     /// this call just observed.
     fn observe(&mut self, at: ConsumptionPoint) -> Result<PhaseWait, StateError> {
-        let observed = self.ctx.observe_lifecycle_intent(at)?;
+        // The same deferral, for the same reason: a refusal read inside a scheduling attempt is
+        // one no publication may act on yet. This attempt ends on its own reason and the next
+        // one's entry point settles and publishes (PR #167 round 5).
+        let observed = self
+            .ctx
+            .observe_deferring_refusal(at)
+            .unwrap_or(ObservedIntent::Continue);
         Ok(self.leaving_for(observed))
     }
 

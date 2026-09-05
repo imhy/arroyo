@@ -41,6 +41,17 @@ pub(crate) enum ConsumptionPoint {
 }
 
 impl ConsumptionPoint {
+    /// Whether this point is one at which the job is about to *enter* work it cannot take back.
+    ///
+    /// It is the only kind of point at which a deferred refusal may be re-offered, because it is
+    /// the only kind that runs the settlement M11.D39d requires before a refusal is published.
+    /// Serving one inside an interruptible wait would hand it to the reconciliation of the very
+    /// attempt that deferred it, which would replace that attempt's retryable reason with the
+    /// fatal one the deferral existed to avoid (PR #167 round 5).
+    fn enters_irreversible_work(self) -> bool {
+        matches!(self, ConsumptionPoint::BeforeIrreversiblePhase)
+    }
+
     /// The name this point appears under in the job's log.
     fn as_str(self) -> &'static str {
         match self {
@@ -355,7 +366,21 @@ pub(crate) struct LifecycleActor {
     ///
     /// Offered ahead of the mailbox for the same reason the other two are: it is older than
     /// anything in it.
-    standing_refusal: Option<StateBackendError>,
+    deferred_refusal: Option<DeferredRefusal>,
+}
+
+/// A refusal this controller decided and may not act on yet, and the intent version it was
+/// decided at (M11.D39d, PR #167 round 5).
+///
+/// The version is what keeps it *current*. A deferral is a statement about the configuration the
+/// poll had read when it was made; anything the poll reads afterwards is newer truth about the
+/// same job, and [`LifecycleActor::observe`] drops the deferral rather than re-offering it. A
+/// refusal without one would go on being offered for as long as the obligation stayed pending —
+/// starving a stop the operator asked for, and failing the job for a row that had since been
+/// repaired.
+struct DeferredRefusal {
+    error: StateBackendError,
+    version: IntentVersion,
 }
 
 impl LifecycleActor {
@@ -378,7 +403,7 @@ impl LifecycleActor {
             decided: IntentVersion::NONE,
             standing: None,
             standing_adoption: None,
-            standing_refusal: None,
+            deferred_refusal: None,
             mailbox,
         }
     }
@@ -411,19 +436,6 @@ impl LifecycleActor {
             return Some(LifecycleDecision::StopUnderRunningConfig(stop_mode));
         }
 
-        // Then a refusal deferred because the job still owed a fencing obligation. Ahead of
-        // the mailbox and ahead of everything but the stop, because a stop the operator asked
-        // for outranks a configuration this controller will not run (M11.D39d, PR #167 round 4).
-        if let Some(refusal) = self.standing_refusal.take() {
-            info!(
-                job_id = %self.job_id,
-                at = at.as_str(),
-                "re-offering the refusal this job could not act on while it owed a fencing \
-                 obligation"
-            );
-            return Some(LifecycleDecision::Refuse(refusal));
-        }
-
         // Then the adoption a boundary made and handed on, for the same reason and ahead of
         // the mailbox for the reason given on the field.
         if let Some(superseded) = self.standing_adoption.take() {
@@ -436,7 +448,46 @@ impl LifecycleActor {
             return Some(LifecycleDecision::ReofferAdopted(superseded));
         }
 
-        let intent = self.mailbox.newer_than(self.decided)?;
+        // The mailbox is read **before** a deferred refusal is re-offered, and that ordering is
+        // the whole of PR #167 round 5's third finding. A deferred refusal is a decision this
+        // controller made about a configuration it read at some version; anything the poll has
+        // said since is newer truth about the same job, and the mailbox's contract is that the
+        // newest truth wins. Re-offering the old refusal ahead of it would starve a stop for as
+        // long as the obligation stayed pending, and would fail the job for a configuration an
+        // operator had already repaired.
+        let Some(intent) = self.mailbox.newer_than(self.decided) else {
+            // Nothing newer. A refusal deferred because the job still owed a fencing obligation
+            // is offered again — but only where it can be acted on, which is a consumption point
+            // that *enters* irreversible work. The reconciliation of the very attempt that
+            // deferred it reads `InsideInterruptibleWait`, and serving it there would let the
+            // deferral overwrite its own retryable reason with the fatal one it was deferred to
+            // avoid (round 5's second finding).
+            if at.enters_irreversible_work()
+                && let Some(deferred) = self.deferred_refusal.take()
+            {
+                info!(
+                    job_id = %self.job_id,
+                    at = at.as_str(),
+                    version = deferred.version.as_u64(),
+                    "re-offering the refusal this job could not act on while it owed a fencing \
+                     obligation"
+                );
+                return Some(LifecycleDecision::Refuse(deferred.error));
+            }
+            return None;
+        };
+        // Newer truth supersedes a deferred refusal outright: the decision below is made from
+        // the configuration the poll has since read, and the deferred one described a row that
+        // is no longer what the job's record says.
+        if let Some(deferred) = self.deferred_refusal.take() {
+            info!(
+                job_id = %self.job_id,
+                at = at.as_str(),
+                deferred_version = deferred.version.as_u64(),
+                version = intent.version().as_u64(),
+                "a newer configuration intent supersedes the refusal this job had deferred"
+            );
+        }
         self.decided = intent.version();
 
         let decision = self.decide(intent.into_intent());
@@ -483,11 +534,19 @@ impl LifecycleActor {
     /// Called where a refusal is read and the job still owes a fencing obligation. The refusal
     /// is a decision that has been made; what it is waiting for is evidence about workers, not
     /// about configuration, so it is neither withdrawn nor published — it stands until the
-    /// obligation is discharged.
+    /// obligation is discharged, or until the poll says something newer about the same job.
+    ///
+    /// The version it was decided at travels with it, which is what makes the second of those
+    /// possible: [`Self::observe`] reads the mailbox first and drops the deferral whenever there
+    /// is anything newer, so a repaired configuration or a stop is never starved by an
+    /// obligation that stays pending (PR #167 round 5).
     ///
     /// Idempotent by construction: the field holds one refusal, and offering it takes it.
-    pub(crate) fn leave_refusal_standing(&mut self, refusal: StateBackendError) {
-        self.standing_refusal = Some(refusal);
+    pub(crate) fn defer_refusal(&mut self, refusal: StateBackendError) {
+        self.deferred_refusal = Some(DeferredRefusal {
+            error: refusal,
+            version: self.decided,
+        });
     }
 
     /// Turns one classified intent into the transition this job is to make.

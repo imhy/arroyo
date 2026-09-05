@@ -306,6 +306,24 @@
           "name": "a_refusal_is_not_published_while_the_job_still_owes_a_fencing_obligation",
           "kind": "test",
           "path": "crates/arroyo-controller/src/states/mod.rs"
+        },
+        {
+          "crate": "arroyo-controller",
+          "name": "a_refusal_read_while_a_start_is_outstanding_publishes_nothing",
+          "kind": "test",
+          "path": "crates/arroyo-controller/src/states/mod.rs"
+        },
+        {
+          "crate": "arroyo-controller",
+          "name": "a_refusal_fences_a_healthy_running_generation_before_it_is_published",
+          "kind": "test",
+          "path": "crates/arroyo-controller/src/states/mod.rs"
+        },
+        {
+          "crate": "arroyo-controller",
+          "name": "a_deferred_refusal_stays_current_and_is_not_served_into_its_own_reconciliation",
+          "kind": "test",
+          "path": "crates/arroyo-controller/src/states/lifecycle/tests.rs"
         }
       ]
     },

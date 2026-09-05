@@ -1298,6 +1298,20 @@ impl JobContext<'_> {
             }
         }
 
+        // Re-opened before the discharge, and this is what makes the pass fence a *live*
+        // generation rather than only an owed one (PR #167 round 5). A healthy generation's
+        // record says every target is acknowledged — of a fence this pass has just superseded by
+        // adopting a higher one — so discharging it as it stands would answer `Settled` without
+        // a single worker having been asked anything. Asking them again, under the fence this
+        // controller now holds, is exactly M11.D39d's "refusal actively advances the fence at
+        // every worker generation addressable by the old scheduling generation".
+        if let Some(reopened) = self
+            .status
+            .recorded_fencing()
+            .map(arroyo_rpc::fencing::Fencing::reopened)
+        {
+            self.status.record_fencing_obligation(Some(reopened));
+        }
         let mode = self.lifecycle_mode();
         let discharged =
             discharge_recorded_obligation(self.status, &self.db, &self.scheduler, mode).await;
@@ -1345,8 +1359,41 @@ impl JobContext<'_> {
     /// on (M11.D39d, PR #167 round 4).
     pub(crate) fn hand_refusal_to(&mut self, refusal: StateBackendError) {
         if let Some(actor) = self.lifecycle_actor.as_mut() {
-            actor.leave_refusal_standing(refusal);
+            actor.defer_refusal(refusal);
         }
+    }
+
+    /// The same read, deferring a refusal instead of reporting it (M11.D39d, PR #167 round 5).
+    ///
+    /// Every consumption point *inside* a scheduling attempt reads through this. A refusal read
+    /// there cannot be published in any case — the attempt is inside work whose obligation
+    /// nothing has discharged, and reporting it replaces the attempt's own retryable reason with
+    /// a fatal one that publishes `Failing` on the next line — so it is recorded, versioned, and
+    /// offered again at the next point that *enters* irreversible work, which is where the
+    /// settlement it is waiting for runs.
+    ///
+    /// `Ok(None)` for a deferred refusal is the honest answer to what the caller asked: nothing
+    /// the caller can act on was decided. What *was* decided is on the writer, and it is the next
+    /// entry point's.
+    pub(crate) fn observe_deferring_refusal(
+        &mut self,
+        at: ConsumptionPoint,
+    ) -> Option<ObservedIntent> {
+        let decision = self
+            .lifecycle_actor
+            .as_mut()
+            .and_then(|actor| actor.observe(at))?;
+        if let lifecycle::actor::LifecycleDecision::Refuse(error) = decision {
+            self.hand_refusal_to(error);
+            return None;
+        }
+        Some(
+            decision
+                .apply(&mut self.config, &self.pipeline_info.pipeline_id)
+                .unwrap_or_else(|_| {
+                    unreachable!("the refusal arm is the only one `apply` reports an error for")
+                }),
+        )
     }
 
     pub(crate) fn observe_lifecycle_decision(
@@ -1887,6 +1934,39 @@ async fn execute_state<'a>(
             // fatal reason fails it the same way.
             provenance: _,
         }) => {
+            // M11.D39d, PR #167 round 5. The boundary above routes a refusal it reads itself,
+            // but a refusal — or any other fatal reason — raised *inside* a state body reaches
+            // here instead, and publishing `Failing` is what D39d makes conditional: it is
+            // reachable only after every worker generation this job addressed has acknowledged
+            // a superseding fence or been observed terminated. A phase-local refusal, a fencing
+            // reconciliation that coalesced one, and an in-wait read in `Running` all arrive
+            // here, so this is the one place that covers them together.
+            //
+            // A job that still owes publishes nothing and ends its task. The row is left naming
+            // the state it was in, the poll starts a task for it again, and that task's actor
+            // reads the mailbox fresh — so the reason is neither lost nor pinned to a
+            // configuration the poll has since replaced.
+            match ctx.settle_before_publishing_refusal().await {
+                BeforePublishing::Settled => {}
+                BeforePublishing::StillOwed => {
+                    error!(
+                        message = "a fatal reason is not published while this job still owes a \
+                                   fencing obligation",
+                        job_id = %ctx.config.id,
+                        pipeline_id = *ctx.pipeline_info.pipeline_id,
+                        state = state_name,
+                        error_message = message,
+                    );
+                    state_backoff(
+                        ctx.retries_attempted,
+                        &ctx.config.id,
+                        &ctx.pipeline_info.pipeline_id,
+                    )
+                    .await;
+                    return (None, ctx);
+                }
+                BeforePublishing::StoodDown => return (None, ctx),
+            }
             error!(
                 message = "fatal state error",
                 job_id = %ctx.config.id,
@@ -4561,9 +4641,16 @@ mod tests {
 
         /// What makes a file a consumption point: it reads the writer, or it consumes what a
         /// read produced.
-        const OBSERVES: [&str; 3] = [
+        const OBSERVES: [&str; 5] = [
             "observe_lifecycle_intent(",
             "observe_lifecycle_decision(",
+            // The two reads PR #167 rounds 4 and 5 added. `observe_boundary_intent` keeps a
+            // refusal whole so the caller can settle before publishing it;
+            // `observe_deferring_refusal` records one the caller may not act on at all. Both
+            // read the writer, so both make their file a consumption point that has to say what
+            // it does with an adopted configuration.
+            "observe_boundary_intent(",
+            "observe_deferring_refusal(",
             "Waited::Decided(",
         ];
 
@@ -8626,6 +8713,186 @@ mod tests {
     /// generation the scheduler still reports as running. It fails fast, so the row is about the
     /// obligation rather than about a retry budget elapsing.
     const UNREACHABLE: &str = "http://127.0.0.1:1";
+
+    /// **PR #167 round 5.** A refusal fences a *healthy running* generation before it is
+    /// published.
+    ///
+    /// The case every other refusal row misses, because every other one constructs a job that
+    /// owes something. A job whose fan-out **succeeded** owes nothing: no identifier is
+    /// outstanding, and under the old rule its record was cleared on settlement. Its workers are
+    /// still running all the same, still holding the fence they acknowledged — and their commit
+    /// guard admits that fence until a higher one is *actively* acknowledged. So a refusal
+    /// published then leaves a superseded owner's directives admissible at exactly the generation
+    /// the controller has just given up on, with `Failing`'s best-effort teardown the only thing
+    /// between them.
+    ///
+    /// The record therefore survives the fan-out that wrote it, with its identifiers dropped and
+    /// its targets marked acknowledged — what it still says is *which generation can act and
+    /// where it answers* — and the refusal re-opens it and advances the fence it has just adopted
+    /// at every target. Three claims, in the order they have to hold:
+    ///
+    ///   1. a job that scheduled successfully still has a record naming its live generation;
+    ///   2. a refusal is published only after that generation acknowledges the newer fence — with
+    ///      the generation unreachable, nothing about failing the job reaches the row; and
+    ///   3. once it does answer, the acknowledgement is a directive that actually arrived at the
+    ///      worker, under a fence above the one its start carried.
+    #[tokio::test]
+    async fn a_refusal_fences_a_healthy_running_generation_before_it_is_published() {
+        let partition = HealingPartition::partitioned();
+        // Healthy from the start: this row is about a fan-out that *succeeds*.
+        partition.heal();
+        let mut run = SchedulingRun::with_workers(
+            "refusal-healthy-generation",
+            vec![StartsExecution::HealingPartition(Arc::clone(&partition))],
+        )
+        .await;
+        let _owner = run.harness.install_fenced_lifecycle();
+        let mailbox = intent_mailbox();
+        run.harness.install_actor(&mailbox);
+        run.harness
+            .queue()
+            .send(worker_connect_from(WorkerId(7), &run.address(0)))
+            .await
+            .unwrap();
+        run.harness.queue().send(task_started()).await.unwrap();
+
+        // 1. It schedules, and the record survives naming the generation it started.
+        assert_eq!(
+            advanced_to(&run.schedule_through_the_phase_graph().await),
+            Some("Running"),
+            "the control: this fan-out settles, so the job owes nothing"
+        );
+        let recorded = stored_state_context(&run.db);
+        assert_eq!(
+            recorded["fencing"]["targets"][0]["worker_id"].as_u64(),
+            Some(7),
+            "and the row still names the generation that is now running: {recorded}"
+        );
+        assert_eq!(
+            recorded["fencing"]["targets"][0]["attempt_id"].as_str(),
+            None,
+            "with nothing outstanding — what survives is the generation, not the inventory"
+        );
+
+        // 2. A refusal arrives while that generation cannot be reached.
+        partition.deepen();
+        mailbox.submit(LifecycleIntent::Refused(selector_changed()));
+        run.harness.install_actor(&mailbox);
+        let ctx = run.harness.ctx(
+            running_config(StateBackendSelector::Parquet),
+            StateBackendSelector::Parquet,
+        );
+        let (next, _ctx) = execute_state(Box::new(Scheduling {}), ctx).await;
+        assert_ne!(
+            next.map(|state| state.name()),
+            Some("Failing"),
+            "a refusal is not published while the generation it would abandon has not \
+             acknowledged a superseding fence"
+        );
+        assert!(
+            !state_writes(&run.db)
+                .iter()
+                .any(|(state, _)| state == "Failing" || state == "Failed"),
+            "and the row has never named either: {:?}",
+            state_writes(&run.db)
+        );
+
+        // 3. It answers, and only then is the refusal published.
+        partition.heal();
+        let before = run.calls.protocol().len();
+        run.harness.install_actor(&mailbox);
+        let ctx = run.harness.ctx(
+            running_config(StateBackendSelector::Parquet),
+            StateBackendSelector::Parquet,
+        );
+        let (next, _ctx) = execute_state(Box::new(Scheduling {}), ctx).await;
+        assert_eq!(
+            next.map(|state| state.name()),
+            Some("Failing"),
+            "once the generation has acknowledged, the refusal is published"
+        );
+        let advanced: Vec<Directive> = run.calls.protocol().split_off(before);
+        assert!(
+            advanced
+                .iter()
+                .any(|directive| matches!(directive, Directive::FenceOnly(_))),
+            "and it was an acknowledgement the worker actually gave: {advanced:?}"
+        );
+    }
+
+    /// **PR #167 round 5.** A refusal read *while a `StartExecution` is outstanding* publishes
+    /// nothing.
+    ///
+    /// Round 4 gated the refusal a state *boundary* reads. This is the other arrival: a refusal
+    /// the poll submits while an attempt is already inside its fan-out. That one is read by the
+    /// attempt's own fencing reconciliation, on an interruptible wait, and reporting it there
+    /// replaced the attempt's retryable reason with a fatal one — so the caller published
+    /// `Failing` on the next line, before anything had discharged the obligation the fan-out had
+    /// just handed over. The boundary gate never saw it, because the boundary had already run.
+    ///
+    /// So a refusal read anywhere inside a scheduling attempt is *deferred*: recorded on the
+    /// writer, versioned, and offered again at the next point that enters irreversible work,
+    /// which is where the settlement runs. This row asserts the consequence against the **row**:
+    /// the refusal arrives after the worker has been sent a start it will never settle, and
+    /// nothing about failing the job reaches the record.
+    #[tokio::test]
+    async fn a_refusal_read_while_a_start_is_outstanding_publishes_nothing() {
+        let partition = HealingPartition::partitioned();
+        let mut run = SchedulingRun::with_workers(
+            "refusal-mid-attempt",
+            vec![StartsExecution::HealingPartition(Arc::clone(&partition))],
+        )
+        .await;
+        // The job's own lifecycle, so the interrupted fan-out has the owner production gives it;
+        // then this test's own mailbox, so the refusal can be submitted mid-attempt.
+        let _owner = run.harness.install_fenced_lifecycle();
+        let mailbox = intent_mailbox();
+        run.harness.install_actor(&mailbox);
+        run.harness
+            .queue()
+            .send(worker_connect_from(WorkerId(7), &run.address(0)))
+            .await
+            .unwrap();
+
+        let calls = Arc::clone(&run.calls);
+        let db = run.db.clone();
+        let submitted = mailbox.clone();
+        let submit = async move {
+            // Not before the attempt: after the worker has actually been sent the start it will
+            // never settle, which is what puts the obligation in play.
+            loop {
+                if calls
+                    .protocol()
+                    .iter()
+                    .any(|directive| matches!(directive, Directive::Start(_)))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            submitted.submit(LifecycleIntent::Refused(selector_changed()));
+        };
+
+        let ctx = run.harness.ctx(
+            running_config(StateBackendSelector::Parquet),
+            StateBackendSelector::Parquet,
+        );
+        let ((next, _ctx), ()) = tokio::join!(execute_state(Box::new(Scheduling {}), ctx), submit);
+
+        assert_eq!(
+            next.map(|state| state.name()),
+            Some("Scheduling"),
+            "the attempt ends on its own retryable fencing reason: a refusal it read mid-flight \
+             is not a reason to fail the job before anything has been fenced"
+        );
+        assert!(
+            state_writes(&db)
+                .iter()
+                .all(|(state, _)| state == "Scheduling"),
+            "and nothing about failing it reaches the row: {:?}",
+            state_writes(&db)
+        );
+    }
 
     /// **PR #167 round 4.** A refusal is not published while the job still owes.
     ///

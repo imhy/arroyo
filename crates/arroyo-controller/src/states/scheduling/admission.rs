@@ -324,22 +324,38 @@ impl<'a, 'ctx> PhaseContext<'a, 'ctx> {
         }
     }
 
-    /// Clears the obligation this fan-out recorded, once nothing it issued is unsettled.
+    /// Settles the obligation this fan-out recorded, keeping the generation it names.
     ///
-    /// The other half of [`Self::persist_issued_obligation`]: the record is an image of what is
-    /// outstanding, so leaving it behind after every request has an authoritative answer would
-    /// hand the next controller a fence advance it does not owe and hold the job's fencing alert
-    /// up for a job that is running. It is cleared only when the inventory says so, and a failed
-    /// clear is left for the next writer rather than reported — the obligation it describes is
-    /// discharged, so a stale record costs a redundant advance and never a missed one.
-    pub(super) async fn clear_settled_obligation(&mut self, a: &Admission) {
-        if self.ctx.status.recorded_fencing().is_none() {
+    /// The other half of [`Self::persist_issued_obligation`], and **not** a clear (PR #167
+    /// round 5). What the record says has two parts, and only one of them stops being true when
+    /// every request settles: the identifiers this attempt owed an answer for are gone, and the
+    /// worker generation it addressed is *still running*, still reachable at the addresses the
+    /// record names, and still holding the fence it acknowledged.
+    ///
+    /// The second part is what a controller about to publish a refusal needs. M11.D39d makes
+    /// refusal reachable only after every generation this job addressed has acknowledged a
+    /// superseding fence or been observed terminated — and a healthy generation has no
+    /// outstanding fan-out, so a record cleared on settlement leaves nothing to fence it *at*.
+    /// Its workers go on admitting a superseded owner's directives under the fence they already
+    /// hold. So the record survives the generation, with its identifiers dropped and its targets
+    /// marked acknowledged, and is replaced when the next attempt writes its own.
+    ///
+    /// A write that fails is logged rather than reported: the attempt is starting a job, and a
+    /// record that still names outstanding identifiers costs a later pass one redundant fence
+    /// advance per target and settles nothing wrongly.
+    pub(super) async fn settle_recorded_obligation(&mut self, a: &Admission) {
+        let Some(settled) = self
+            .ctx
+            .status
+            .recorded_fencing()
+            .map(arroyo_rpc::fencing::Fencing::settled_and_still_running)
+        else {
             return;
-        }
-        self.ctx.status.record_fencing_obligation(None);
+        };
+        self.ctx.status.record_fencing_obligation(Some(settled));
         match a
             .effect(
-                "clear the fan-out's discharged obligation",
+                "record the generation this fan-out started as settled and still running",
                 self.ctx.publish_status(),
             )
             .await
@@ -348,9 +364,9 @@ impl<'a, 'ctx> PhaseContext<'a, 'ctx> {
             Ok(StatusPublication::Superseded(stale)) => stand_down(stale),
             Err(e) => warn!(
                 error = %e,
-                "this attempt's discharged fan-out obligation could not be cleared from the \
-                 job's row; a later controller will advance its fence at targets that have \
-                 nothing outstanding, which costs a round trip and settles nothing wrongly"
+                "this attempt's settled fan-out obligation could not be written back to the \
+                 job's row; a later pass will advance its fence at targets that have nothing \
+                 outstanding, which costs a round trip and settles nothing wrongly"
             ),
         }
     }

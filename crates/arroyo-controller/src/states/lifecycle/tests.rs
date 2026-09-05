@@ -204,6 +204,77 @@ fn stop_wins_over_refusal() {
     );
 }
 
+/// **PR #167 round 5.** A deferred refusal stays current, and is never served into the
+/// reconciliation of the attempt that deferred it.
+///
+/// A refusal the job may not act on yet — M11.D39d makes publication reachable only after every
+/// worker generation it addressed has settled — is deferred rather than consumed, because
+/// `observe` moves the watermark past the intent that produced it and a refusal merely postponed
+/// would be a refusal lost. Deferring it raises two questions this row is the answer to.
+///
+/// **It must not come back inside the same attempt.** The attempt that defers ends by fencing,
+/// and its reconciliation reads the writer on an interruptible wait. Served there, the deferral
+/// would replace that attempt's retryable reason with the fatal one it was deferred to avoid, and
+/// the job would publish `Failing` on the next line. So it is offered only where it can be acted
+/// on: a consumption point that *enters* irreversible work, which is where the settlement runs.
+///
+/// **It must not outrank newer truth.** A deferral describes the configuration the poll had read
+/// when it was made. Anything the poll has read since is newer truth about the same job, and the
+/// mailbox's contract is that the newest wins — otherwise an obligation that stays pending
+/// starves a stop an operator asked for, and a pass that later settles fails the job for a row
+/// that has since been repaired.
+#[test]
+fn a_deferred_refusal_stays_current_and_is_not_served_into_its_own_reconciliation() {
+    let mailbox = new_mailbox();
+    mailbox.submit(LifecycleIntent::Refused(selector_changed()));
+    let mut actor = actor_for(&mailbox);
+    assert_eq!(
+        actor.observe(ConsumptionPoint::BeforeIrreversiblePhase),
+        Some(LifecycleDecision::Refuse(selector_changed())),
+        "the refusal is decided at the point that can act on it"
+    );
+
+    // The job owed, so the decision was deferred rather than published.
+    actor.defer_refusal(selector_changed());
+    assert_eq!(
+        actor.observe(ConsumptionPoint::InsideInterruptibleWait),
+        None,
+        "and it is not offered to the fencing reconciliation of the attempt that deferred it: \
+         that read is what would turn its own retryable reason back into a fatal one"
+    );
+    assert_eq!(
+        actor.observe(ConsumptionPoint::BeforeIrreversiblePhase),
+        Some(LifecycleDecision::Refuse(selector_changed())),
+        "the next attempt's entry point is offered it, because that is where the settlement it \
+         is waiting for is run"
+    );
+
+    // Deferred again, and this time the poll has since read a row that asks the job to stop.
+    actor.defer_refusal(selector_changed());
+    let mut stopping = running_config();
+    stopping.stop_mode = StopMode::checkpoint;
+    mailbox.submit(LifecycleIntent::classify(
+        StateBackendSelector::Parquet,
+        polled(stopping, None),
+    ));
+    assert_eq!(
+        actor.observe(ConsumptionPoint::BeforeIrreversiblePhase),
+        Some(LifecycleDecision::Adopt(Box::new({
+            let mut adopted = running_config();
+            adopted.stop_mode = StopMode::checkpoint;
+            adopted
+        }))),
+        "newer truth wins: the stop the operator asked for is not starved by an obligation that \
+         stays pending"
+    );
+    assert_eq!(
+        actor.observe(ConsumptionPoint::BeforeIrreversiblePhase),
+        None,
+        "and the superseded refusal is gone rather than waiting behind it — a job cannot be \
+         failed for a configuration the poll has already replaced"
+    );
+}
+
 // -------------------------------------------------------------------------------------
 // D96 row 8 (R4): repeated polls of the same job must not backpressure the poll loop.
 // -------------------------------------------------------------------------------------
