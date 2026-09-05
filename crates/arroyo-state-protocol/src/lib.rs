@@ -48,12 +48,18 @@ impl ProtocolPaths {
     /// Path to the controller-written current generation fence.
     /// The **legacy** single mutable current-generation object.
     ///
-    /// Nothing writes or reads it since PR #167 round 7 replaced it with one immutable marker
-    /// per generation — see [`Self::current_generation_marker`] for why. It is kept named here
-    /// so the path cannot be quietly reused for something else, and so the cleanup guard goes on
-    /// refusing to delete it in a deployment that still has one. A build predating the markers
-    /// finds no object at the new location and fails closed, which is the direction M11.D75's
-    /// worker-first rollout requires.
+    /// Nothing *writes* it since PR #167 round 7 replaced it with one immutable marker per
+    /// generation — see [`Self::current_generation_marker`] for why — but it is still **read**,
+    /// and has to be (PR #167 round 8, finding 2). M11.D75's rollout upgrades workers first, so
+    /// there is a declared window in which an upgraded worker leader is administered by a
+    /// controller that predates the markers and writes only this object. A reader that ignored
+    /// it would find no current generation, accept a `RequireCurrent` initialization against
+    /// `None`, and then have its first checkpoint refused as stale — retiring the leader of a
+    /// job the old controller had started perfectly well.
+    ///
+    /// `read_current_generation` therefore takes whichever of this and the highest marker names
+    /// the higher generation, which is the old controller's during the window and the markers'
+    /// after it.
     pub fn current_generation(&self) -> CheckpointRef {
         self.path("current-generation.json")
     }
@@ -2121,6 +2127,116 @@ mod tests {
         );
         let current: CurrentGeneration = current_marker(&store).await;
         assert_eq!(current.generation, Generation(2));
+    }
+
+    /// **PR #167 round 8, finding 2.** An upgraded worker leader can still publish its first
+    /// checkpoint under a controller that predates the per-generation markers.
+    ///
+    /// M11.D75 upgrades workers *first*, so there is a declared window in which a new worker
+    /// leader is administered by an old controller — and an old controller writes only the
+    /// legacy top-level `current-generation.json`. Round 7's marker-only reader made that window
+    /// fail: no marker means no current generation, a `RequireCurrent` initialization accepts
+    /// `None` and succeeds, and the leader's first `publish_checkpoint` is then refused
+    /// `StaleGeneration`, which its production caller turns into `RetireWorkerLeader`. The wire
+    /// compatibility tests all passed through this, because the regression is in the metadata
+    /// format rather than in an RPC.
+    ///
+    /// The fixture seeds exactly what an old controller leaves — the legacy pointer and the
+    /// generation manifest, and no marker — and drives the two production steps the leader
+    /// takes.
+    #[tokio::test]
+    async fn a_worker_first_upgrade_publishes_its_first_checkpoint_under_an_old_controller() {
+        let store = MemoryProtocolStore::default();
+        let paths = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J"));
+
+        // Exactly an old controller's leavings: the legacy object, and no marker anywhere.
+        let legacy = CurrentGeneration::new(
+            PipelineId::new("P"),
+            JobId::new("J"),
+            Generation(1),
+            from_micros(0),
+        );
+        put_json(&store, &paths.current_generation(), &legacy)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .list_child_directories(paths.generations_prefix().trim_end_matches('/'))
+                .await
+                .unwrap(),
+            Vec::<String>::new(),
+            "the fixture is a job with no marker at all, which is what an old controller leaves"
+        );
+
+        // Step one: the new leader re-initializes the generation the controller made current.
+        let initialization = initialize_generation(
+            &store,
+            InitializeGenerationRequest {
+                pipeline_id: PipelineId::new("P"),
+                job_id: JobId::new("J"),
+                generation: Generation(1),
+                updated_at: from_micros(123),
+                state_backend: StateBackendSelector::Parquet,
+                program_operators: HashSet::new(),
+            },
+            CurrentGenerationPolicy::RequireCurrent,
+        )
+        .await
+        .unwrap();
+        let GenerationInitialization::Initialized {
+            generation_manifest,
+            ..
+        } = initialization
+        else {
+            panic!("the leader's own generation is current, so it initializes: {initialization:?}");
+        };
+
+        // Step two — the one that used to fail. A leader that cannot publish its first
+        // checkpoint is retired, so this is the whole of what the window costs.
+        let checkpoint_ref = paths.checkpoint_manifest(Generation(1), Epoch(1));
+        let checkpoint = checkpoint_for_generation(Generation(1), 1, None, false);
+        let publication = publish_checkpoint(
+            &store,
+            PublishCheckpointRequest {
+                generation_manifest: &generation_manifest,
+                checkpoint_ref: &checkpoint_ref,
+                checkpoint: &checkpoint,
+                created_at: from_micros(456),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            publication,
+            CheckpointPublication::Ready {
+                checkpoint_ref: checkpoint_ref.clone()
+            },
+            "a job the old controller made current is one the new leader may checkpoint"
+        );
+
+        // And the marker authority still wins the moment one exists: an upgraded controller's
+        // generation 2 supersedes the legacy pointer's 1 rather than losing to it.
+        let marker = CurrentGeneration::new(
+            PipelineId::new("P"),
+            JobId::new("J"),
+            Generation(2),
+            from_micros(0),
+        );
+        put_json(
+            &store,
+            &paths.current_generation_marker(Generation(2)),
+            &marker,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            crate::workflow::current_generation(&store, &paths)
+                .await
+                .unwrap(),
+            Some(Generation(2)),
+            "after the flag day the markers are the authority, and the frozen legacy pointer \
+             cannot drag the job back to an older generation"
+        );
     }
 
     /// A deferring initialization is under the same monotonicity rule as a publishing one, and is

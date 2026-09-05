@@ -491,13 +491,96 @@ impl JobStatus {
         &mut self,
         database: &DatabaseSource,
     ) -> Result<AuthorityOutcome<()>, AuthorityWriteError> {
-        match self.authority.adopt(database).await? {
-            AuthorityOutcome::Applied(adopted) => {
-                self.authority = adopted;
-                Ok(AuthorityOutcome::Applied(()))
+        let adopted = match self.authority.adopt(database).await? {
+            AuthorityOutcome::Applied(adopted) => adopted,
+            AuthorityOutcome::Stale(stale) => return Ok(AuthorityOutcome::Stale(stale)),
+        };
+
+        // **The row this controller now holds, not the one it read before it did**
+        // (PR #167 round 8, finding 1). The adoption predicate compares the fence and the epoch
+        // and nothing else, so a *predecessor* still holding them can persist a newer generation
+        // and a complete pre-fan-out obligation between this controller's poll and its CAS, and
+        // the CAS still matches. Keeping the polled snapshot then discards both: recovery reads
+        // an in-memory record that says `NothingRecorded`, the next status write erases the
+        // durable one, and the generation number is reused — which is exactly the uniqueness the
+        // per-generation markers of round 7 rest on.
+        //
+        // Re-reading *after* the CAS is what makes the snapshot consistent with the adoption,
+        // and it is checked rather than assumed: the row must still carry the authority this
+        // adoption installed. If it does not, a third controller adopted after this one and this
+        // snapshot belongs to nobody — which is a stand-down, not a snapshot to act on. A read
+        // *before* the CAS would leave the same window open, which is why this one is after it.
+        let row = self.read_row(database, &adopted).await?;
+        let observed = LifecycleAuthority::observed_in_status(&row).map_err(|e| {
+            AuthorityWriteError::Database {
+                job_id: (*self.id).clone(),
+                operation: "re-read this job's row under the authority its adoption installed",
+                report: format!("{e}"),
             }
-            AuthorityOutcome::Stale(stale) => Ok(AuthorityOutcome::Stale(stale)),
+        })?;
+        if observed.fence() != adopted.fence() || observed.epoch() != adopted.epoch() {
+            return Ok(AuthorityOutcome::Stale(StaleAuthority {
+                job_id: (*self.id).clone(),
+                operation: "re-read this job's row under the authority its adoption installed",
+                presented_fence: adopted.fence(),
+                presented_epoch: adopted.epoch().to_string(),
+            }));
         }
+
+        let Some(state_context) = decode_execution_record(&self.id, &row.state_context) else {
+            return Err(AuthorityWriteError::Database {
+                job_id: (*self.id).clone(),
+                operation: "decode this job's execution record after adopting it",
+                report: "the row's state_context cannot be interpreted by this build".to_string(),
+            });
+        };
+
+        // Every durable field of the row, not only the authority: the generation and the
+        // execution record are what the discharge and the next generation write act on, and a
+        // snapshot that mixed this controller's new authority with a predecessor's older
+        // generation is the defect this re-read exists to close.
+        self.generation = row.run_id.unwrap_or(0).max(0) as u64;
+        self.state = row
+            .state
+            .clone()
+            .unwrap_or_else(|| Created {}.name().to_string());
+        self.start_time = row.start_time;
+        self.finish_time = row.finish_time;
+        self.tasks = row.tasks;
+        self.failure_message = row.failure_message.clone();
+        self.failure_domain = row.failure_domain.clone();
+        self.restarts = row.restarts;
+        self.pipeline_path = row.pipeline_path.clone();
+        self.wasm_path = row.wasm_path.clone();
+        self.restart_nonce = row.restart_nonce;
+        self.state_context = state_context;
+        self.authority = adopted;
+        Ok(AuthorityOutcome::Applied(()))
+    }
+
+    /// This job's row, read on its own.
+    async fn read_row(
+        &self,
+        database: &DatabaseSource,
+        adopted: &LifecycleAuthority,
+    ) -> Result<queries::controller_queries::JobStatusRow, AuthorityWriteError> {
+        let client = adopted.client(database).await?;
+        let mut rows =
+            queries::controller_queries::fetch_job_status_by_id(&client, &self.id.as_str())
+                .await
+                .map_err(|e| AuthorityWriteError::Database {
+                    job_id: (*self.id).clone(),
+                    operation: "re-read this job's row under the authority its adoption installed",
+                    report: format!("{e:?}"),
+                })?;
+        if rows.len() != 1 {
+            return Err(AuthorityWriteError::Database {
+                job_id: (*self.id).clone(),
+                operation: "re-read this job's row under the authority its adoption installed",
+                report: format!("the job's row was read back {} times, not once", rows.len()),
+            });
+        }
+        Ok(rows.remove(0))
     }
 
     /// The M11.D39d status write: the columns M11.T08 wrote unconditionally, written only

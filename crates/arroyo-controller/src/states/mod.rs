@@ -3872,7 +3872,12 @@ mod tests {
             .unwrap();
         connection
             .execute(
-                "INSERT INTO job_statuses (id, state) VALUES ('job_abc', ?1)",
+                // `run_id` is stated rather than left at its default because the in-memory
+                // `job_status` fixture says generation 1, and since PR #167 round 8 an adoption
+                // reconciles the status to the row it CAS'd. In production the two cannot
+                // disagree — the status *is* the row — so a fixture whose row said 0 while its
+                // status said 1 was modelling a state that does not occur.
+                "INSERT INTO job_statuses (id, state, run_id) VALUES ('job_abc', ?1, 1)",
                 [state],
             )
             .unwrap();
@@ -4018,10 +4023,18 @@ mod tests {
         );
     }
 
+    /// The generation the fixture's row and its in-memory status both start at.
+    ///
+    /// One constant, because since PR #167 round 8 an adoption reconciles the status to the row
+    /// it CAS'd: a fixture whose two halves disagreed would be modelling a state production
+    /// cannot reach, and the disagreement showed up as a job waiting forever for a worker
+    /// generation it had already renumbered.
+    const FIXTURE_GENERATION: u64 = 1;
+
     fn job_status(restart_nonce: i32) -> JobStatus {
         JobStatus {
             id: Arc::new("job_abc".to_string()),
-            generation: 1,
+            generation: FIXTURE_GENERATION,
             state: "Running".to_string(),
             start_time: None,
             finish_time: None,
@@ -10360,7 +10373,7 @@ mod tests {
         );
         assert_eq!(
             authority_writes(&fenced.db),
-            [(ADOPTED_FENCE, 0)],
+            [(ADOPTED_FENCE, FIXTURE_GENERATION)],
             "and the phase graph adopts exactly once, while the row still holds the generation \
              the fixture created it with — so the adoption CAS ran before the preamble's first \
              other effect wrote a generation at all, which is M11.D39d's 'before any effect'"

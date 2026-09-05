@@ -19,7 +19,7 @@ use crate::states::lifecycle::fence::{
 };
 use crate::states::scheduling::START_EXECUTION_RECONCILE_ATTEMPTS;
 use crate::states::scheduling::fanout::IssuedAttempts;
-use arroyo_rpc::fencing::MAX_ATTEMPT_ID_CHARS;
+use arroyo_rpc::fencing::{FenceTarget, FenceTargetState, Fencing, MAX_ATTEMPT_ID_CHARS};
 use arroyo_rpc::metadata_root::{MAX_CONTROLLER_EPOCH_CHARS, MetadataRoot};
 use arroyo_types::WorkerId;
 
@@ -140,6 +140,85 @@ pub(super) async fn adopt(status: &mut crate::JobStatus, database: &DatabaseSour
         status.adopt_lifecycle_authority(database).await,
         Ok(AuthorityOutcome::Applied(())),
         "an uncontested adoption must be applied"
+    );
+}
+
+/// **PR #167 round 8, finding 1.** Adoption acquires the row it *installed* its authority on,
+/// not the one it read before the CAS.
+///
+/// The adoption predicate compares the fence and the epoch and nothing else, so a predecessor
+/// still holding both can persist a newer generation and a complete pre-fan-out obligation
+/// between a replacement's poll and its CAS — and the CAS still matches. Keeping the polled
+/// snapshot then discards both at once: the replacement's recovery reads an in-memory record
+/// that says nothing is owed, its next status write erases the durable one, and it reuses the
+/// generation number its predecessor had just taken. That last part is what the per-generation
+/// markers of round 7 rest on, so this is not only a lost obligation.
+///
+/// The ordering is executed against the real migrated schema through the production poll,
+/// adoption and conditional write. Three things are asserted, and the third is the one round 7
+/// silently depended on: the replacement sees the predecessor's obligation, it sees the
+/// predecessor's generation, and it therefore cannot mint a generation the predecessor already
+/// used.
+#[tokio::test]
+async fn adoption_acquires_the_row_its_own_cas_installed_authority_on() {
+    let (database, _connection) = migrated_job_named("adoption-snapshot");
+
+    // A holds the job and B polls the row, so both are looking at the same fence and epoch.
+    let mut predecessor = cold_status(&database).await;
+    adopt(&mut predecessor, &database).await;
+    let mut replacement = cold_status(&database).await;
+
+    // A advances the job *after* B's poll: a new generation, and the complete obligation its
+    // fan-out is about to owe. Both are written under the authority A still holds.
+    predecessor.generation = 1;
+    predecessor.record_fencing_obligation(Some(
+        Fencing::record(
+            vec![FenceTarget {
+                worker_id: 7,
+                generation: 1,
+                attempt_id: Some("0123456789abcdef0123456789abcdef".to_string()),
+                rpc_address: Some("http://10.0.0.1:9191".to_string()),
+                incarnation: std::num::NonZeroU64::new(21),
+                state: FenceTargetState::Pending,
+            }],
+            None,
+            Some(1_700_000_000_000),
+        )
+        .expect("the fixture obligation is writable"),
+    ));
+    assert!(
+        matches!(
+            super::publish_status(&predecessor, &database).await,
+            Ok(super::StatusPublication::Published)
+        ),
+        "the predecessor still holds the job, so its write lands"
+    );
+
+    // B now adopts. Its CAS matches, because fence and epoch are all the predicate compares.
+    adopt(&mut replacement, &database).await;
+
+    assert_eq!(
+        replacement.generation, 1,
+        "the replacement takes the generation the row now carries, so it cannot mint one its \
+         predecessor already used — which is what the per-generation markers assume"
+    );
+    let recovered = replacement
+        .recorded_fencing()
+        .expect("the replacement inherits the obligation written since its poll");
+    assert_eq!(
+        recovered.targets().len(),
+        1,
+        "and it inherits the whole of it, so its discharge has something to fence"
+    );
+    assert_eq!(recovered.targets()[0].worker_id, 7);
+
+    // And the predecessor, which the CAS superseded, can no longer write over any of it.
+    assert!(
+        matches!(
+            super::publish_status(&predecessor, &database).await,
+            Ok(super::StatusPublication::Superseded(_))
+        ),
+        "the superseded controller's next write matches no row"
     );
 }
 
@@ -1158,8 +1237,10 @@ async fn fence_duel_installs_exactly_one_authoritative_root() {
 
     // The first controller adopts and publishes a candidate for its generation.
     let mut loser = cold_status(&database).await;
-    loser.generation = GENERATION;
     adopt(&mut loser, &database).await;
+    // After the adoption, because adoption now takes the row's generation (PR #167 round 8):
+    // the production preamble raises the generation after it has the job, in that order.
+    loser.generation = GENERATION;
     let loser_candidate = candidate_for(&loser);
     loser_candidate
         .publish(&provider)
@@ -1169,13 +1250,13 @@ async fn fence_duel_installs_exactly_one_authoritative_root() {
     // A replacement controller reads the row the first one left and adopts it in turn. This is
     // the duel: both hold an authority the row *did* carry, and only one of them still does.
     let mut winner = cold_status(&database).await;
-    winner.generation = GENERATION;
     assert_eq!(
         winner.authority().fence(),
         loser.authority().fence(),
         "the replacement reads the authority the first controller installed"
     );
     adopt(&mut winner, &database).await;
+    winner.generation = GENERATION;
     let winner_candidate = candidate_for(&winner);
     assert_ne!(
         winner_candidate.key(),
@@ -1249,13 +1330,13 @@ async fn stale_controller_candidate_never_becomes_authoritative_root() {
     let (database, _connection) = migrated_job();
 
     let mut stale = cold_status(&database).await;
-    stale.generation = GENERATION;
     adopt(&mut stale, &database).await;
+    stale.generation = GENERATION;
     let held_before = stale.authority().clone();
 
     let mut winner = cold_status(&database).await;
-    winner.generation = GENERATION;
     adopt(&mut winner, &database).await;
+    winner.generation = GENERATION;
     let winner_candidate = candidate_for(&winner);
     winner_candidate
         .publish(&provider)

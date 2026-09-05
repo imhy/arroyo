@@ -226,7 +226,22 @@ where
         .map(|current| current.generation))
 }
 
-/// The same, as the whole record the marker holds.
+/// The same, as the whole record.
+///
+/// The highest **marker**, or the job's legacy top-level pointer when that names a higher
+/// generation — which during the declared worker-first window it does, because the controller
+/// writing it has not been upgraded yet (M11.D75, PR #167 round 8, finding 2). Reading markers
+/// alone is a metadata-format regression on exactly the deployment order the rollout requires:
+/// an upgraded worker leader would find no marker, initialize under `RequireCurrent` against
+/// `None`, and then have its first checkpoint refused as stale, retiring the leader of a job the
+/// old controller had started perfectly well.
+///
+/// Taking the higher of the two is what keeps both true at once. During the window only the old
+/// controller advances the job, so its pointer is the higher and wins. After the flag day only
+/// markers are written, so the pointer is frozen below every generation a new controller
+/// creates and the marker wins — which is what preserves the monotonic marker authority round 7
+/// established. The two can never be advanced concurrently, because the adoption CAS admits one
+/// controller.
 pub async fn read_current_generation<S>(
     store: &S,
     paths: &ProtocolPaths,
@@ -242,14 +257,22 @@ where
         .collect();
     generations.sort_unstable_by(|a, b| b.cmp(a));
 
+    let mut highest: Option<CurrentGeneration> = None;
     for generation in generations {
-        let generation = Generation(generation);
-        let path = paths.current_generation_marker(generation);
+        let path = paths.current_generation_marker(Generation(generation));
         if let Some(current) = read_json::<_, CurrentGeneration>(store, &path).await? {
-            return Ok(Some(current));
+            highest = Some(current);
+            break;
         }
     }
-    Ok(None)
+
+    // The legacy object, which only a controller predating the markers writes.
+    let legacy = read_json::<_, CurrentGeneration>(store, &paths.current_generation()).await?;
+    Ok(match (highest, legacy) {
+        (Some(marker), Some(legacy)) if legacy.generation > marker.generation => Some(legacy),
+        (Some(marker), _) => Some(marker),
+        (None, legacy) => legacy,
+    })
 }
 
 /// Result of [`initialize_generation`]./// Result of [`initialize_generation`].

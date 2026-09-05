@@ -157,14 +157,34 @@ impl LifecycleAuthority {
     ///
     /// [`MalformedAuthority`] if the row's fence is negative.
     pub fn observed(row: &controller_queries::Job) -> Result<Self, MalformedAuthority> {
-        let fence = u64::try_from(row.lifecycle_fence).map_err(|_| MalformedAuthority {
-            job_id: row.id.clone(),
-            fence: row.lifecycle_fence,
+        Self::from_columns(&row.id, row.lifecycle_fence, &row.controller_epoch)
+    }
+
+    /// The same, from a `job_statuses` row read on its own.
+    ///
+    /// The adoption re-read (PR #167 round 8) reads `job_statuses` and nothing else — the
+    /// generation and the execution record it needs all live there, and joining `job_configs`
+    /// would make the authority depend on a table that says nothing about who holds the job.
+    pub fn observed_in_status(
+        row: &controller_queries::JobStatusRow,
+    ) -> Result<Self, MalformedAuthority> {
+        Self::from_columns(&row.id, row.lifecycle_fence, &row.controller_epoch)
+    }
+
+    /// The two columns that carry an authority, wherever they were read from.
+    fn from_columns(
+        job_id: &str,
+        lifecycle_fence: i64,
+        controller_epoch: &str,
+    ) -> Result<Self, MalformedAuthority> {
+        let fence = u64::try_from(lifecycle_fence).map_err(|_| MalformedAuthority {
+            job_id: job_id.to_string(),
+            fence: lifecycle_fence,
         })?;
         Ok(Self {
-            job_id: Arc::new(row.id.clone()),
+            job_id: Arc::new(job_id.to_string()),
             fence: LifecycleFence(fence),
-            epoch: ControllerEpoch(row.controller_epoch.clone()),
+            epoch: ControllerEpoch(controller_epoch.to_string()),
         })
     }
 

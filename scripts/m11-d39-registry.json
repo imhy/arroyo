@@ -284,6 +284,12 @@
           "name": "two_cold_controllers_recovering_a_running_leader_job_do_not_both_administer_it",
           "kind": "test",
           "path": "crates/arroyo-controller/src/states/lifecycle/fence_tests.rs"
+        },
+        {
+          "crate": "arroyo-controller",
+          "name": "adoption_acquires_the_row_its_own_cas_installed_authority_on",
+          "kind": "test",
+          "path": "crates/arroyo-controller/src/states/lifecycle/fence_tests.rs"
         }
       ]
     },
@@ -550,6 +556,12 @@
           "name": "fence_protocol_covers_both_controller_modes",
           "kind": "test",
           "path": "crates/arroyo-controller/src/states/lifecycle/faults_tests.rs"
+        },
+        {
+          "crate": "arroyo-state-protocol",
+          "name": "a_worker_first_upgrade_publishes_its_first_checkpoint_under_an_old_controller",
+          "kind": "test",
+          "path": "crates/arroyo-state-protocol/src/lib.rs"
         }
       ],
       "distinct_path": "Reads config().job_controller and asserts it resolves to the topology ARROYO__JOB_CONTROLLER declares, so a broken figment mapping cannot make the two cells the same process. Then branches on that value: in controller mode it asserts the commit fence comes from the JobController's own FenceProtocol; in worker-leader mode it asserts prepare_handover returns before building one, so the fence can only come from the CommitAuthority the leader's own fenced start conferred — and asserts both routes produce the same fence and target. The match over JobControllerMode is exhaustive."

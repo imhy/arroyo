@@ -31,6 +31,26 @@ SELECT
 FROM job_configs c
 INNER JOIN job_statuses s ON c.id = s.id;
 
+--! job_status_by_id : JobStatusRow(state?, start_time?, finish_time?, tasks?, failure_message?, failure_domain?, run_id?, pipeline_path?, wasm_path?)
+SELECT
+    id,
+    state,
+    start_time,
+    finish_time,
+    tasks,
+    failure_message,
+    failure_domain,
+    restarts,
+    run_id,
+    pipeline_path,
+    wasm_path,
+    restart_nonce,
+    state_context,
+    lifecycle_fence,
+    controller_epoch
+FROM job_statuses
+WHERE id = :job_id;
+
 --! adopt_job_lifecycle
 UPDATE job_statuses
 SET lifecycle_fence = lifecycle_fence + 1,
