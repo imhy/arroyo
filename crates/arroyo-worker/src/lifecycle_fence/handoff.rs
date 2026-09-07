@@ -54,11 +54,35 @@
 //! [`CommitHandoffPlan::reserve`] counts the demand per channel before it holds anything and,
 //! where any channel cannot meet its demand, holds nothing and records why; the guard then
 //! refuses the commit definitively, after the fence decision, like every other handoff refusal.
+//!
+//! # One reserver at a time
+//!
+//! That bound is per commit; it says nothing about commits reserving *concurrently* (PR #167
+//! round 10). A reservation is taken slot by slot and every slot already held is kept while the
+//! next is awaited, so two commits that each need two slots of a channel with two free can each
+//! take one and wait on the other for ever — and M11.D39g's fault model delivers duplicates, so
+//! sixteen copies of one commit against a sixteen-slot channel is a finite, reachable state in
+//! which every slot is a held permit, nothing is a message, and the operator has nothing to
+//! drain. The reservation therefore runs behind [`HandoffGate`], an asynchronous mutex the worker
+//! owns: exactly one commit reserves at a time, and a commit waiting at the gate holds nothing.
+//! The one inside it has a demand every channel can hold, so every slot it still lacks is free
+//! or a message the operator will drain, and its wait ends. The gate is separate from the
+//! lifecycle lock and is never taken under it, so a fence acknowledgement never waits at it;
+//! [`CommitHandoffPlan::reserve`] takes the gate itself, so no caller can reserve around it.
 
 use arroyo_rpc::ControlMessage;
 use std::collections::HashMap;
+use tokio::sync::Mutex;
 use tokio::sync::mpsc::{OwnedPermit, Sender};
 use tonic::Status;
+
+/// Admits one commit at a time to the reservation of its operator capacity.
+///
+/// Owned by the worker beside the lifecycle lock and never taken under it. See the module
+/// documentation for why a reservation must not run concurrently with another: a partial
+/// reservation is capacity no operator can free.
+#[derive(Debug, Default)]
+pub(crate) struct HandoffGate(Mutex<()>);
 
 /// The channels one commit would be published on, resolved under the lifecycle lock and decided
 /// nothing about.
@@ -84,18 +108,21 @@ impl CommitHandoffPlan {
         self
     }
 
-    /// Waits for one slot on every channel in the plan and holds all of them.
+    /// Waits for one slot on every channel in the plan and holds all of them, as the only
+    /// commit reserving behind `gate` while it does.
     ///
     /// Awaited with the lifecycle lock released. A channel whose receiver is gone yields no
     /// permit; that is recorded rather than answered, so that the fence decision — which the
-    /// guard takes first — is still the first thing this commit is told.
-    pub(crate) async fn reserve(self) -> CommitReservation {
+    /// guard takes first — is still the first thing this commit is told. Dropping the future
+    /// releases the gate and every permit it held.
+    pub(crate) async fn reserve(self, gate: &HandoffGate) -> CommitReservation {
         if let Some(unholdable) = self.unholdable() {
             return CommitReservation {
                 operators: HashMap::new(),
                 unholdable: Some(unholdable),
             };
         }
+        let _one_reserver_at_a_time = gate.0.lock().await;
         let mut operators = HashMap::with_capacity(self.operators.len());
         for (operator_id, channels) in self.operators {
             let mut slots = Vec::with_capacity(channels.len());

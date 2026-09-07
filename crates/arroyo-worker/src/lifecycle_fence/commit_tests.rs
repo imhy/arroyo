@@ -751,53 +751,69 @@ async fn a_commit_is_published_into_the_execution_that_reserved_it_or_into_none(
 /// only slot and wait for a second that no operator can free — the slot it holds is not a
 /// message — so the guard refuses it instead, and holds nothing while it does. Capacity is the
 /// dimension varied; the request is the same.
+/// A second operator chained onto [`OPERATOR`]'s node, so that one commit needs two slots on
+/// each of that node's channels.
+const SECOND_OPERATOR: &str = "op_2";
+
+/// A pre-flag-day commit at epoch 4 naming both [`OPERATOR`] and [`SECOND_OPERATOR`].
+fn two_operator_commit() -> CommitReq {
+    let mut data = committing_data();
+    data.insert(
+        SECOND_OPERATOR.to_string(),
+        committing_data().remove(OPERATOR).unwrap(),
+    );
+    CommitReq {
+        epoch: 4,
+        committing_data: data,
+        ..Default::default()
+    }
+}
+
+/// Puts `server` into `Running` with both operators chained on node 1, behind the one channel.
+fn running_both_on_one_node(
+    server: &WorkerServer,
+    shutdown: &Shutdown,
+    tx: Sender<ControlMessage>,
+) {
+    *server.state.lifecycle.lock().unwrap().execution_mut() =
+        WorkerExecutionPhase::Running(EngineState {
+            sources: vec![],
+            sinks: vec![],
+            operator_to_node: HashMap::from([
+                (OPERATOR.to_string(), 1u32),
+                (SECOND_OPERATOR.to_string(), 1u32),
+            ]),
+            operator_controls: HashMap::from([(1u32, vec![tx])]),
+            shutdown_guard: shutdown.guard("engine-state"),
+        });
+}
+
 #[tokio::test]
 async fn a_commit_that_could_never_hold_its_slots_at_once_is_refused_not_waited_for() {
-    const SECOND_OPERATOR: &str = "op_2";
-    let two_operators = || {
-        let mut data = committing_data();
-        data.insert(
-            SECOND_OPERATOR.to_string(),
-            committing_data().remove(OPERATOR).unwrap(),
-        );
-        CommitReq {
-            epoch: 4,
-            committing_data: data,
-            ..Default::default()
-        }
-    };
-    let running_both_on_one_node = |server: &WorkerServer, shutdown: &Shutdown, tx| {
-        *server.state.lifecycle.lock().unwrap().execution_mut() =
-            WorkerExecutionPhase::Running(EngineState {
-                sources: vec![],
-                sinks: vec![],
-                operator_to_node: HashMap::from([
-                    (OPERATOR.to_string(), 1u32),
-                    (SECOND_OPERATOR.to_string(), 1u32),
-                ]),
-                operator_controls: HashMap::from([(1u32, vec![tx])]),
-                shutdown_guard: shutdown.guard("engine-state"),
-            });
-    };
-
     // Room for both: published to both, once each, in one step.
     let (shutdown, server) = registered(false);
     let (tx, mut rx) = channel(2);
     running_both_on_one_node(&server, &shutdown, tx);
-    timeout(Duration::from_secs(1), commit(&server, two_operators()))
-        .await
-        .expect("a reservation the channel can hold completes")
-        .expect("published");
+    timeout(
+        Duration::from_secs(1),
+        commit(&server, two_operator_commit()),
+    )
+    .await
+    .expect("a reservation the channel can hold completes")
+    .expect("published");
     assert_eq!(drain(&mut rx), vec![published(4), published(4)]);
 
     // Room for one: refused at once, nothing held, nothing published.
     let (shutdown, server) = registered(false);
     let (tx, mut rx) = channel(1);
     running_both_on_one_node(&server, &shutdown, tx.clone());
-    let refused = timeout(Duration::from_secs(1), commit(&server, two_operators()))
-        .await
-        .expect("a reservation that can never complete is refused, not waited for")
-        .unwrap_err();
+    let refused = timeout(
+        Duration::from_secs(1),
+        commit(&server, two_operator_commit()),
+    )
+    .await
+    .expect("a reservation that can never complete is refused, not waited for")
+    .unwrap_err();
     assert_eq!(refused.code(), Code::FailedPrecondition);
     assert_eq!(
         refused.message(),
@@ -808,6 +824,78 @@ async fn a_commit_that_could_never_hold_its_slots_at_once_is_refused_not_waited_
         tx.capacity(),
         1,
         "a refused reservation holds no slot on the channel it could not fill"
+    );
+}
+
+/// Concurrent duplicates of a commit all publish, and no partial reservation keeps the channel.
+///
+/// The review's round-10 interleaving: a channel with two slots, a commit needing both, and four
+/// copies of it in flight while the channel is full. A reservation taken slot by slot and kept
+/// while the next is awaited lets two copies take one slot each and wait on the other for ever —
+/// held permits are not messages, so the operator draining the channel frees nothing. Behind the
+/// gate one copy reserves at a time, so every copy is answered: four copies, each published to
+/// both operators, eight messages through a two-slot channel that an operator drains meanwhile,
+/// and afterwards the channel is entirely free. Duplication is inside M11.D39g's fault model, so
+/// four is a small instance of a reachable state, not a stress test.
+#[tokio::test]
+async fn concurrent_duplicate_commits_all_publish_and_none_keeps_a_partial_reservation() {
+    let (shutdown, server) = registered(false);
+    let (tx, mut rx) = channel(2);
+    running_both_on_one_node(&server, &shutdown, tx.clone());
+    let held = [
+        tx.clone().try_reserve_owned().expect("slot one is free"),
+        tx.clone().try_reserve_owned().expect("slot two is free"),
+    ];
+
+    // The operator: drains whatever is published, and reports how many commits it heard.
+    let operator = tokio::spawn(async move {
+        let mut heard = 0usize;
+        while heard < 8 {
+            match rx.recv().await {
+                Some(ControlMessage::Commit { epoch: 4, .. }) => heard += 1,
+                other => panic!("the operator heard {other:?}"),
+            }
+        }
+        heard
+    });
+
+    let copies = async {
+        tokio::join!(
+            commit(&server, two_operator_commit()),
+            commit(&server, two_operator_commit()),
+            commit(&server, two_operator_commit()),
+            commit(&server, two_operator_commit()),
+        )
+    };
+    // The four are in flight against a full channel before the slots are released, which is the
+    // state the gate exists for; `join!` polls them all before the release below is reached.
+    tokio::pin!(copies);
+    assert!(
+        timeout(Duration::from_millis(50), &mut copies)
+            .await
+            .is_err(),
+        "four commits against a full channel are all waiting"
+    );
+    drop(held);
+
+    let outcomes = timeout(Duration::from_secs(5), &mut copies)
+        .await
+        .expect("every copy is answered once the operator drains — none waits for ever");
+    let (a, b, c, d) = outcomes;
+    for outcome in [a, b, c, d] {
+        outcome.expect("each copy is published, whole");
+    }
+    assert_eq!(
+        timeout(Duration::from_secs(5), operator)
+            .await
+            .expect("the operator hears all eight")
+            .unwrap(),
+        8
+    );
+    assert_eq!(
+        tx.capacity(),
+        2,
+        "no copy keeps a slot after it is answered"
     );
 }
 

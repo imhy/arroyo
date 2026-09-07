@@ -48,6 +48,7 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::job_controller::controller::WorkerJobController;
 use crate::lifecycle_fence::guard::{Announced, StartAdmission, StartAdmitted, WorkerLifecycle};
+use crate::lifecycle_fence::handoff::HandoffGate;
 use crate::utils::{MAX_TASK_ERROR_FIELD_BYTES, maybe_truncate, to_d2};
 use arroyo_datastream::logical::LogicalProgram;
 use arroyo_planner::physical::new_registry;
@@ -245,6 +246,11 @@ pub struct WorkerState {
     /// admitted directive's effect awaited after this is released, is what would reintroduce
     /// the validate→apply gap the fence exists to close.
     lifecycle: Arc<Mutex<WorkerLifecycle>>,
+    /// Admits one commit at a time to reserving operator capacity (PR #167 round 10).
+    ///
+    /// Separate from `lifecycle` and never taken under it: a fence acknowledgement never waits
+    /// here. See [`crate::lifecycle_fence::handoff`].
+    commit_handoff: Arc<HandoffGate>,
     network: Arc<Mutex<Option<NetworkManager>>>,
     // used to send messages to the local job controller -- only on the leader node
     job_controller_tx: Arc<OnceLock<Sender<RunningMessage>>>,
@@ -810,6 +816,7 @@ impl WorkerServer {
                     run_id,
                     incarnation,
                 ))),
+                commit_handoff: Arc::new(HandoffGate::default()),
                 network: Arc::new(Mutex::new(None)),
                 job_controller_tx: Arc::new(OnceLock::new()),
                 worker_context: WorkerContext {
@@ -1177,9 +1184,10 @@ impl WorkerGrpc for WorkerServer {
             .unwrap()
             .plan_commit_handoff(&req);
 
-        // One slot on every one of them, awaited with the lock released. A fence acknowledgement
-        // that lands while this waits is one this commit will be decided *after*.
-        let reservation = plan.reserve().await;
+        // One slot on every one of them, awaited with the lock released and one commit at a
+        // time. A fence acknowledgement that lands while this waits is one this commit will be
+        // decided *after*.
+        let reservation = plan.reserve(&self.state.commit_handoff).await;
 
         // The decision and the publication, one critical section, nothing awaited.
         self.state
