@@ -241,8 +241,9 @@ pub struct WorkerState {
     ///
     /// The two are one value because M11.D39d requires fence advancement and `StartExecution`
     /// admission to be serialized under the same non-blocking guard; see
-    /// [`crate::lifecycle_fence::guard`]. A second lock, or a fence held outside this one, is
-    /// what would reintroduce the validate→apply gap the fence exists to close.
+    /// [`crate::lifecycle_fence::guard`]. A second lock, a fence held outside this one, or an
+    /// admitted directive's effect awaited after this is released, is what would reintroduce
+    /// the validate→apply gap the fence exists to close.
     lifecycle: Arc<Mutex<WorkerLifecycle>>,
     network: Arc<Mutex<Option<NetworkManager>>>,
     // used to send messages to the local job controller -- only on the leader node
@@ -1155,52 +1156,37 @@ impl WorkerGrpc for WorkerServer {
     /// nothing below this line reads those fields again, so for such a commit what follows is
     /// byte-for-byte the M11.T08 path.
     ///
-    /// The committing data is reachable only out of
-    /// [`AdmittedCommit`](crate::lifecycle_fence::guard::AdmittedCommit), so this handler cannot
-    /// publish a commit it did not put through that decision.
+    /// The committing data is reachable only inside
+    /// [`WorkerLifecycle::publish_commit`](crate::lifecycle_fence::guard::WorkerLifecycle::publish_commit),
+    /// so this handler cannot publish a commit it did not put through that decision, and cannot
+    /// publish one anywhere but under the lock that decided it (PR #167 round 9). What it
+    /// contributes is the order: the capacity publication needs is reserved with the lock
+    /// released, so that the decision and the publication can then be one non-awaiting step
+    /// under it. See [`crate::lifecycle_fence::handoff`] for why the wait is in front of the
+    /// decision rather than the fence acknowledgement being held behind the wait.
     async fn commit(&self, request: Request<CommitReq>) -> Result<Response<CommitResp>, Status> {
         let req = request.into_inner();
         debug!("received commit request {:?}", req);
 
-        let (epoch, sender_commit_map_pairs) = {
-            let lifecycle = self.state.lifecycle.lock().unwrap();
-            let (epoch, committing_data) = lifecycle.admit_commit(req)?.into_parts();
-            let engine_state = match lifecycle.execution() {
-                WorkerExecutionPhase::WaitingOnLeader { engine_state, .. }
-                | WorkerExecutionPhase::Running(engine_state) => engine_state,
-                _ => {
-                    return Err(Status::failed_precondition("Worker not in running phase"));
-                }
-            };
+        // Which channels this commit would be published on — read under the lock, decided
+        // nothing.
+        let plan = self
+            .state
+            .lifecycle
+            .lock()
+            .unwrap()
+            .plan_commit_handoff(&req);
 
-            let mut sender_commit_map_pairs = vec![];
-            for (operator_id, commit_operator) in committing_data {
-                let node_id = engine_state
-                    .operator_to_node
-                    .get(&operator_id)
-                    .unwrap_or_else(|| panic!("Could not find node for operator id {operator_id}"));
-                let nodes = engine_state.operator_controls.get(node_id).unwrap().clone();
-                let commit_map: HashMap<_, _> = commit_operator
-                    .committing_data
-                    .into_iter()
-                    .map(|(table, backend_data)| (table, backend_data.commit_data_by_subtask))
-                    .collect();
-                sender_commit_map_pairs.push((nodes, commit_map));
-            }
-            (epoch, sender_commit_map_pairs)
-        };
+        // One slot on every one of them, awaited with the lock released. A fence acknowledgement
+        // that lands while this waits is one this commit will be decided *after*.
+        let reservation = plan.reserve().await;
 
-        for (senders, commit_map) in sender_commit_map_pairs {
-            for sender in senders {
-                sender
-                    .send(ControlMessage::Commit {
-                        epoch: epoch as u32,
-                        commit_data: commit_map.clone(),
-                    })
-                    .await
-                    .unwrap();
-            }
-        }
+        // The decision and the publication, one critical section, nothing awaited.
+        self.state
+            .lifecycle
+            .lock()
+            .unwrap()
+            .publish_commit(req, reservation)?;
         Ok(Response::new(CommitResp {}))
     }
 

@@ -36,6 +36,15 @@
 //! fence; [`WorkerLifecycle::admit_commit`] says why, and its `&self` receiver is what makes it
 //! so.
 //!
+//! An admitted commit is also *published* here, under the same lock, and that is the fourth
+//! structural carrier (PR #167 round 9). [`AdmittedCommit`] opens only inside this module, so
+//! the committing data cannot leave the guard; [`WorkerLifecycle::publish_commit`] is the one
+//! operation that admits and publishes, and it is synchronous, so nothing between the decision
+//! and the last operator's copy of it can yield to a fence acknowledgement. The capacity that
+//! publication needs is held *before* the call, by [`super::handoff`], which is what lets it be
+//! non-awaiting: a commit either linearizes before the acknowledgement and reaches every
+//! operator, or after it and reaches none.
+//!
 //! # What is not decided here
 //!
 //! Nothing about the wire shape: `arroyo_rpc::fence_wire` turns the flat protobuf fields back
@@ -43,8 +52,10 @@
 //! reports what it observed, and which issued attempts that settles is the controller's
 //! accounting (M11.T26e).
 
-use crate::WorkerExecutionPhase;
 use crate::lifecycle_fence::attempt_ids::{AttemptDisposition, AttemptIdRefusal, AttemptIds};
+use crate::lifecycle_fence::handoff::{CommitHandoffPlan, CommitReservation};
+use crate::{EngineState, WorkerExecutionPhase};
+use arroyo_rpc::ControlMessage;
 use arroyo_rpc::fence_wire::{
     CommitAuthority, CommitDirective, FenceAddress, LifecycleTarget, StartDirective,
     WorkerIncarnation, commit_directive, start_directive,
@@ -125,6 +136,11 @@ impl AppliedStart {
 /// so the committing data cannot be read by a handler that did not put the request through the
 /// fence decision first. That is the difference between a check and a funnel: there is no
 /// `CommitReq` in scope for a caller to reach past the guard for.
+///
+/// It opens only inside this module, for [`WorkerLifecycle::publish_commit`]. A handler that
+/// could carry the committing data out of the guard could publish it after releasing the lock,
+/// and that is the gap PR #167 round 9 closed: an awaited send outside the lock linearizes
+/// after a fence acknowledgement the admission preceded.
 #[must_use]
 #[derive(Debug)]
 pub(crate) struct AdmittedCommit {
@@ -134,7 +150,7 @@ pub(crate) struct AdmittedCommit {
 
 impl AdmittedCommit {
     /// The epoch this commit publishes and the operator data it publishes for it.
-    pub(crate) fn into_parts(self) -> (u64, HashMap<String, OperatorCommitData>) {
+    fn into_parts(self) -> (u64, HashMap<String, OperatorCommitData>) {
         (self.epoch, self.committing_data)
     }
 }
@@ -354,6 +370,112 @@ impl WorkerLifecycle {
             epoch: req.epoch,
             committing_data: req.committing_data,
         })
+    }
+
+    /// The execution a commit publishes into, if this phase has one.
+    ///
+    /// The one place the phases that accept a commit are listed, so that the plan taken before
+    /// the decision and the decision itself cannot disagree about which phase has operators.
+    /// `WaitingOnLeader` is one of them: a worker whose leader has not initialized yet already
+    /// runs the operators that commit.
+    ///
+    /// # Errors
+    ///
+    /// M11.T08's phase refusal, unchanged.
+    #[allow(clippy::result_large_err)]
+    fn committing_engine(&self) -> Result<&EngineState, Status> {
+        match &self.execution {
+            WorkerExecutionPhase::WaitingOnLeader { engine_state, .. }
+            | WorkerExecutionPhase::Running(engine_state) => Ok(engine_state),
+            WorkerExecutionPhase::Idle
+            | WorkerExecutionPhase::Initializing { .. }
+            | WorkerExecutionPhase::Failed { .. } => {
+                Err(Status::failed_precondition("Worker not in running phase"))
+            }
+        }
+    }
+
+    /// The channels `req` would be published on, and nothing about whether it will be.
+    ///
+    /// Read under the caller's lock, decided nothing: an operator this phase does not host, or a
+    /// phase with no execution, simply contributes no channel. Every refusal the request can
+    /// earn — fence, phase, or a channel that turns out not to be this execution's — is given by
+    /// [`Self::publish_commit`], after the fence decision, which is the order M11.D39d asks for.
+    pub(crate) fn plan_commit_handoff(&self, req: &CommitReq) -> CommitHandoffPlan {
+        let Ok(engine) = self.committing_engine() else {
+            return CommitHandoffPlan::default();
+        };
+        req.committing_data
+            .keys()
+            .fold(
+                CommitHandoffPlan::default(),
+                |plan, operator_id| match engine
+                    .operator_to_node
+                    .get(operator_id)
+                    .and_then(|node_id| engine.operator_controls.get(node_id))
+                {
+                    Some(channels) => plan.with_operator(operator_id.clone(), channels),
+                    None => plan,
+                },
+            )
+    }
+
+    /// Admits or refuses `req` and, if it is admitted, publishes it to every operator it names —
+    /// one synchronous step under the caller's lock (M11.D39d, PR #167 round 9).
+    ///
+    /// The decision is [`Self::admit_commit`]'s and comes first; the phase is asked second, as
+    /// M11.T08 did; then every operator's handoff is taken out of `reservation` and checked
+    /// against the channels this execution publishes to *before* any operator is sent anything.
+    /// Publication itself spends permits that were reserved with the lock released, so it cannot
+    /// block and cannot yield: no fence acknowledgement can land between the admission and the
+    /// last operator's copy of the commit, and none can land between one operator's copy and
+    /// another's.
+    ///
+    /// # Errors
+    ///
+    /// A definitive `Status` for every refusal, in this order: the fence decision's, the phase
+    /// refusal, then [`CommitReservation::take`]'s for a reservation that does not match this
+    /// execution. Nothing is published on any error.
+    ///
+    /// # Panics
+    ///
+    /// As M11.T08 did, on a commit naming an operator this worker's program does not know or a
+    /// node this worker does not host; reached only after the fence decision admitted the
+    /// commit, so a directive the guard refuses cannot reach it.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn publish_commit(
+        &self,
+        req: CommitReq,
+        mut reservation: CommitReservation,
+    ) -> Result<(), Status> {
+        let (epoch, committing_data) = self.admit_commit(req)?.into_parts();
+        let engine = self.committing_engine()?;
+
+        let mut publications = Vec::with_capacity(committing_data.len());
+        for (operator_id, commit_operator) in committing_data {
+            let node_id = engine
+                .operator_to_node
+                .get(&operator_id)
+                .unwrap_or_else(|| panic!("Could not find node for operator id {operator_id}"));
+            let channels = engine.operator_controls.get(node_id).unwrap();
+            let permits = reservation.take(&operator_id, channels)?;
+            let commit_map: HashMap<_, _> = commit_operator
+                .committing_data
+                .into_iter()
+                .map(|(table, backend_data)| (table, backend_data.commit_data_by_subtask))
+                .collect();
+            publications.push((permits, commit_map));
+        }
+
+        for (permits, commit_map) in publications {
+            for permit in permits {
+                permit.send(ControlMessage::Commit {
+                    epoch: epoch as u32,
+                    commit_data: commit_map.clone(),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Decides what to do, reading state and changing none of it.

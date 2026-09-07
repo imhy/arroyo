@@ -24,7 +24,11 @@ use arroyo_rpc::grpc::rpc::{CommitReq, CommitResp, OperatorCommitData, TableComm
 use arroyo_server_common::shutdown::Shutdown;
 use prost::Message;
 use std::collections::HashMap;
-use tokio::sync::mpsc::{Receiver, channel};
+use std::future::Future;
+use std::pin::Pin;
+use std::time::Duration;
+use tokio::sync::mpsc::{OwnedPermit, Receiver, Sender, channel};
+use tokio::time::timeout;
 use tonic::{Code, Request, Status};
 
 /// The operator this job's commits name, and the table inside it.
@@ -38,15 +42,62 @@ const TABLE: &str = "t";
 /// finishes initializing; nothing here forges an admission.
 fn running(shutdown: &Shutdown, server: &WorkerServer) -> Receiver<ControlMessage> {
     let (tx, rx) = channel(8);
+    running_behind(shutdown, server, vec![tx]);
+    rx
+}
+
+/// Puts `server` into `Running` behind exactly these operator control channels, all for the one
+/// node [`OPERATOR`] runs on — several channels model several subtasks of that node.
+fn running_behind(
+    shutdown: &Shutdown,
+    server: &WorkerServer,
+    controls: Vec<Sender<ControlMessage>>,
+) {
     *server.state.lifecycle.lock().unwrap().execution_mut() =
         WorkerExecutionPhase::Running(EngineState {
             sources: vec![],
             sinks: vec![],
             operator_to_node: HashMap::from([(OPERATOR.to_string(), 1u32)]),
-            operator_controls: HashMap::from([(1u32, vec![tx])]),
+            operator_controls: HashMap::from([(1u32, controls)]),
             shutdown_guard: shutdown.guard("engine-state"),
         });
-    rx
+}
+
+/// An operator control channel with room for exactly one message, and that one slot already
+/// taken by the test — the operator is "full" until the permit is dropped.
+///
+/// Holding the slot as a permit rather than as a queued message keeps the channel's contents
+/// closed-form: whatever is read off it afterwards was published by the commit under test.
+fn full_channel() -> (
+    Sender<ControlMessage>,
+    Receiver<ControlMessage>,
+    OwnedPermit<ControlMessage>,
+) {
+    let (tx, rx) = channel(1);
+    let held = tx
+        .clone()
+        .try_reserve_owned()
+        .expect("the only slot is free");
+    (tx, rx, held)
+}
+
+/// A commit handler call that is expected to be *waiting* — for operator capacity — and not
+/// yet answered.
+type InFlight<'a> = Pin<Box<dyn Future<Output = Result<CommitResp, Status>> + 'a>>;
+
+/// Starts `req` through the production handler and proves it has not answered.
+///
+/// Fifty milliseconds is a deadline for a future that is expected to stay pending, not a race
+/// against one that is expected to finish: a handler that answers inside it fails the test
+/// loudly, and one that is waiting for capacity has nothing to make progress on until the test
+/// gives it some.
+async fn in_flight(server: &WorkerServer, req: CommitReq) -> InFlight<'_> {
+    let mut call: InFlight<'_> = Box::pin(commit(server, req));
+    assert!(
+        timeout(Duration::from_millis(50), &mut call).await.is_err(),
+        "the commit must wait for operator capacity, not answer without it"
+    );
+    call
 }
 
 /// What every commit in this file publishes: one operator, one table, one subtask.
@@ -483,6 +534,284 @@ async fn a_fenced_commit_neither_advances_the_fence_nor_activates_strict_mode() 
 }
 
 // ---------------------------------------------------------------------------------------------
+// Publication is under the guard (PR #167 round 9)
+// ---------------------------------------------------------------------------------------------
+
+/// D96 row 19, the commit half — a commit that is waiting for operator capacity when a newer
+/// fence is acknowledged is refused, and no operator ever hears it.
+///
+/// The interleaving the review found (PR #167 round 9): an old-fence commit passes the fence
+/// decision, its operator's control channel is full, and while it waits for capacity a
+/// `FENCE_ONLY` at a higher fence is acknowledged and the replacement controller publishes
+/// `Refused`; the operator then frees a slot and the stale commit is enqueued after the
+/// refusal. There are exactly two reachable orders now and a closed-form outcome for each,
+/// like `fence_ack_serializes_with_start_application` for the start: the commit is decided
+/// after it holds the capacity to act, so the acknowledgement lands entirely before that
+/// decision or entirely after the publication.
+#[tokio::test]
+async fn a_commit_waiting_for_operator_capacity_is_refused_by_a_fence_acknowledged_meanwhile() {
+    // Order B — the acknowledgement linearizes first. The commit is at this generation's own
+    // fence, 5, and would be admitted on the spot if the operator had room.
+    let (shutdown, server) = handshaken(5);
+    let (_tx, mut rx, held) = full_channel();
+    running_behind(&shutdown, &server, vec![_tx.clone()]);
+    let call = in_flight(&server, fenced_commit(4, 5)).await;
+
+    // The acknowledgement does not wait for the operator: the guard is free while the commit
+    // waits for capacity, so the replacement controller's handshake is answered at once.
+    acknowledge(&server, 9);
+    assert_eq!(
+        drain(&mut rx),
+        vec![],
+        "nothing was published before the acknowledgement"
+    );
+
+    // The operator frees its slot. The commit now gets its decision, and the decision is the
+    // one the fence at 9 gives a commit at 5.
+    drop(held);
+    let refused = call.await.unwrap_err();
+    assert_eq!(refused.code(), Code::FailedPrecondition);
+    assert_eq!(
+        refused.message(),
+        "lifecycle fence 5 is older than fence 9 this worker generation has acknowledged"
+    );
+    assert_eq!(
+        drain(&mut rx),
+        vec![],
+        "a commit refused after the acknowledgement reaches no operator"
+    );
+    assert_eq!(acknowledged(&server), 9);
+
+    // Order A — the same commit, the same full operator, no acknowledgement in between: the
+    // wait is for capacity only, and the commit is published once it has it.
+    let (shutdown_a, server_a) = handshaken(5);
+    let (tx_a, mut rx_a, held_a) = full_channel();
+    running_behind(&shutdown_a, &server_a, vec![tx_a]);
+    let call_a = in_flight(&server_a, fenced_commit(4, 5)).await;
+    drop(held_a);
+    call_a.await.expect("published once the operator has room");
+    assert_eq!(drain(&mut rx_a), vec![published(4)]);
+    assert_eq!(
+        acknowledged(&server_a),
+        5,
+        "a commit still acknowledges no fence"
+    );
+}
+
+/// A commit reaches every operator or none: an acknowledgement cannot land between one
+/// subtask's copy and another's.
+///
+/// The review's second interleaving — with several senders, one commit partially published on
+/// opposite sides of the acknowledgement. The node has two subtasks; the first has room and the
+/// second is full. Under the old handler the first subtask's copy was enqueued before the wait
+/// on the second, and the acknowledgement then split the commit in two. Both halves are varied:
+/// which subtask is full, and whether an acknowledgement lands during the wait.
+#[tokio::test]
+async fn a_commit_is_published_to_every_operator_or_to_none() {
+    for full in [0usize, 1] {
+        for acknowledged_meanwhile in [false, true] {
+            let (shutdown, server) = handshaken(5);
+            let (tx_full, mut rx_full, held) = full_channel();
+            let (tx_free, mut rx_free) = channel(8);
+            let controls = if full == 0 {
+                vec![tx_full, tx_free]
+            } else {
+                vec![tx_free, tx_full]
+            };
+            running_behind(&shutdown, &server, controls);
+            let call = in_flight(&server, fenced_commit(4, 5)).await;
+            assert_eq!(
+                (drain(&mut rx_free), drain(&mut rx_full)),
+                (vec![], vec![]),
+                "subtask {full} full: no subtask hears a commit that is still waiting"
+            );
+
+            if acknowledged_meanwhile {
+                acknowledge(&server, 9);
+            }
+            drop(held);
+            let outcome = call.await;
+
+            if acknowledged_meanwhile {
+                assert_eq!(outcome.unwrap_err().code(), Code::FailedPrecondition);
+                assert_eq!(
+                    (drain(&mut rx_free), drain(&mut rx_full)),
+                    (vec![], vec![]),
+                    "subtask {full} full, acknowledged meanwhile: neither subtask hears it"
+                );
+            } else {
+                outcome.expect("published");
+                assert_eq!(
+                    (drain(&mut rx_free), drain(&mut rx_full)),
+                    (vec![published(4)], vec![published(4)]),
+                    "subtask {full} full, no acknowledgement: both subtasks hear it, once"
+                );
+            }
+        }
+    }
+}
+
+/// A commit is published into the execution that reserved its capacity, or into none.
+///
+/// The reservation is capacity on the channels the phase had when the commit arrived; the guard
+/// does not trust that the phase still has them. Three things can change while the commit waits,
+/// each varied on its own: the phase can lose its execution, the execution can be replaced by
+/// another with channels of its own, and a channel's receiver can go away. The commit is the
+/// pre-flag-day one, deliberately — it carries no fence for the guard to refuse it by, so the
+/// only thing standing between it and a stranger's operators is this check.
+#[tokio::test]
+async fn a_commit_is_published_into_the_execution_that_reserved_it_or_into_none() {
+    // The phase lost its execution while the commit waited.
+    let (shutdown, server) = registered(false);
+    let (tx, mut rx, held) = full_channel();
+    running_behind(&shutdown, &server, vec![tx]);
+    let call = in_flight(&server, unfenced_commit(4)).await;
+    *server.state.lifecycle.lock().unwrap().execution_mut() = WorkerExecutionPhase::Idle;
+    drop(held);
+    let refused = call.await.unwrap_err();
+    assert_eq!(refused.code(), Code::FailedPrecondition);
+    assert_eq!(refused.message(), "Worker not in running phase");
+    assert_eq!(
+        drain(&mut rx),
+        vec![],
+        "the execution that is gone hears nothing"
+    );
+
+    // The execution was replaced by another, with room to spare, while the commit waited.
+    let (shutdown, server) = registered(false);
+    let (tx_old, mut rx_old, held) = full_channel();
+    running_behind(&shutdown, &server, vec![tx_old]);
+    let call = in_flight(&server, unfenced_commit(4)).await;
+    let mut rx_new = running(&shutdown, &server);
+    drop(held);
+    let refused = call.await.unwrap_err();
+    assert_eq!(refused.code(), Code::FailedPrecondition);
+    assert_eq!(
+        refused.message(),
+        "operator op_1's control channels changed while this commit waited for capacity"
+    );
+    assert_eq!(
+        (drain(&mut rx_old), drain(&mut rx_new)),
+        (vec![], vec![]),
+        "neither the execution that reserved it nor the one that replaced it hears it"
+    );
+
+    // The execution grew a subtask while the commit waited: the same node, one more channel.
+    let (shutdown, server) = registered(false);
+    let (tx_old, mut rx_old, held) = full_channel();
+    running_behind(&shutdown, &server, vec![tx_old.clone()]);
+    let call = in_flight(&server, unfenced_commit(4)).await;
+    let (tx_extra, mut rx_extra) = channel(8);
+    running_behind(&shutdown, &server, vec![tx_old, tx_extra]);
+    drop(held);
+    assert_eq!(call.await.unwrap_err().code(), Code::FailedPrecondition);
+    assert_eq!(
+        (drain(&mut rx_old), drain(&mut rx_extra)),
+        (vec![], vec![]),
+        "a commit reserved for one subtask is not published to two"
+    );
+
+    // A channel's receiver went away before the commit could hold a slot on it. The old handler
+    // panicked here, after the lock was released, and answered nothing; the new one decides and
+    // publishes under the lock, so what it must not do is carry that panic in there.
+    let (shutdown, server) = registered(false);
+    let (tx, rx) = channel(8);
+    running_behind(&shutdown, &server, vec![tx]);
+    drop(rx);
+    let refused = commit(&server, unfenced_commit(4)).await.unwrap_err();
+    assert_eq!(refused.code(), Code::FailedPrecondition);
+    assert_eq!(
+        refused.message(),
+        "an operator op_1 control channel closed while this commit waited for capacity"
+    );
+    assert!(
+        !server.state.lifecycle.is_poisoned(),
+        "a closed operator is a refusal, not a poisoned guard"
+    );
+
+    // And the fence decision still comes first, in every one of those: a commit the guard
+    // refuses is refused by the guard, whatever became of the operators meanwhile.
+    let (shutdown, server) = handshaken(9);
+    let (tx, rx) = channel(8);
+    running_behind(&shutdown, &server, vec![tx]);
+    drop(rx);
+    let refused = commit(&server, fenced_commit(4, 5)).await.unwrap_err();
+    assert_eq!(
+        refused.message(),
+        "lifecycle fence 5 is older than fence 9 this worker generation has acknowledged",
+        "the fence refusal, not the closed channel, is what a stale commit is told"
+    );
+}
+
+/// A commit whose reservation could never complete is refused, not waited for.
+///
+/// Chained operators share a node's subtask channels, so a commit naming two operators on one
+/// node needs two slots at once on each of them. Where the channel holds two, the commit is
+/// published to both, as one step; where it holds one, the old shape of the wait would hold the
+/// only slot and wait for a second that no operator can free — the slot it holds is not a
+/// message — so the guard refuses it instead, and holds nothing while it does. Capacity is the
+/// dimension varied; the request is the same.
+#[tokio::test]
+async fn a_commit_that_could_never_hold_its_slots_at_once_is_refused_not_waited_for() {
+    const SECOND_OPERATOR: &str = "op_2";
+    let two_operators = || {
+        let mut data = committing_data();
+        data.insert(
+            SECOND_OPERATOR.to_string(),
+            committing_data().remove(OPERATOR).unwrap(),
+        );
+        CommitReq {
+            epoch: 4,
+            committing_data: data,
+            ..Default::default()
+        }
+    };
+    let running_both_on_one_node = |server: &WorkerServer, shutdown: &Shutdown, tx| {
+        *server.state.lifecycle.lock().unwrap().execution_mut() =
+            WorkerExecutionPhase::Running(EngineState {
+                sources: vec![],
+                sinks: vec![],
+                operator_to_node: HashMap::from([
+                    (OPERATOR.to_string(), 1u32),
+                    (SECOND_OPERATOR.to_string(), 1u32),
+                ]),
+                operator_controls: HashMap::from([(1u32, vec![tx])]),
+                shutdown_guard: shutdown.guard("engine-state"),
+            });
+    };
+
+    // Room for both: published to both, once each, in one step.
+    let (shutdown, server) = registered(false);
+    let (tx, mut rx) = channel(2);
+    running_both_on_one_node(&server, &shutdown, tx);
+    timeout(Duration::from_secs(1), commit(&server, two_operators()))
+        .await
+        .expect("a reservation the channel can hold completes")
+        .expect("published");
+    assert_eq!(drain(&mut rx), vec![published(4), published(4)]);
+
+    // Room for one: refused at once, nothing held, nothing published.
+    let (shutdown, server) = registered(false);
+    let (tx, mut rx) = channel(1);
+    running_both_on_one_node(&server, &shutdown, tx.clone());
+    let refused = timeout(Duration::from_secs(1), commit(&server, two_operators()))
+        .await
+        .expect("a reservation that can never complete is refused, not waited for")
+        .unwrap_err();
+    assert_eq!(refused.code(), Code::FailedPrecondition);
+    assert_eq!(
+        refused.message(),
+        "publishing this commit would need 2 slots at once on an operator control channel that holds 1"
+    );
+    assert_eq!(drain(&mut rx), vec![]);
+    assert_eq!(
+        tx.capacity(),
+        1,
+        "a refused reservation holds no slot on the channel it could not fill"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
 // The enumeration
 // ---------------------------------------------------------------------------------------------
 
@@ -494,9 +823,10 @@ async fn a_fenced_commit_neither_advances_the_fence_nor_activates_strict_mode() 
 /// (`transport_settlement`), so a refusal here ends the sender's attempt rather than being
 /// re-offered against a generation that has already answered.
 ///
-/// The one outcome that is not in this list is the phase refusal a commit gets when the worker
-/// is not running: it is M11.T08's, unchanged, and it is reached only after the fence decision
-/// has admitted the directive.
+/// The phase refusal a commit gets when the worker is not running is M11.T08's, unchanged, and
+/// is reached only after the fence decision has admitted the directive; the three refusals below
+/// it are the handoff's (PR #167 round 9), reached in the same place, and listed because they
+/// are new answers this worker can give.
 #[tokio::test]
 async fn every_commit_refusal_this_worker_gives_is_definitive() {
     let mut codes: Vec<(&str, Code)> = vec![];
@@ -575,6 +905,43 @@ async fn every_commit_refusal_this_worker_gives_is_definitive() {
             .code(),
         ));
     }
+    {
+        let (shutdown, server) = registered(false);
+        let (tx, rx) = channel(8);
+        running_behind(&shutdown, &server, vec![tx]);
+        drop(rx);
+        codes.push((
+            "an operator channel closed while waiting for capacity",
+            commit(&server, unfenced_commit(4))
+                .await
+                .unwrap_err()
+                .code(),
+        ));
+    }
+    {
+        let (shutdown, server) = registered(false);
+        let (tx, _rx, held) = full_channel();
+        running_behind(&shutdown, &server, vec![tx]);
+        let call = in_flight(&server, unfenced_commit(4)).await;
+        let _replacement_rx = running(&shutdown, &server);
+        drop(held);
+        codes.push((
+            "the execution changed while waiting for capacity",
+            call.await.unwrap_err().code(),
+        ));
+    }
+    {
+        let (shutdown, server) = registered(false);
+        let (tx, _rx) = channel(1);
+        running_behind(&shutdown, &server, vec![tx.clone(), tx]);
+        codes.push((
+            "a reservation that could never be held at once",
+            commit(&server, unfenced_commit(4))
+                .await
+                .unwrap_err()
+                .code(),
+        ));
+    }
 
     assert_eq!(
         codes,
@@ -596,6 +963,18 @@ async fn every_commit_refusal_this_worker_gives_is_definitive() {
             (
                 "lifecycle fields that are half a directive",
                 Code::InvalidArgument
+            ),
+            (
+                "an operator channel closed while waiting for capacity",
+                Code::FailedPrecondition
+            ),
+            (
+                "the execution changed while waiting for capacity",
+                Code::FailedPrecondition
+            ),
+            (
+                "a reservation that could never be held at once",
+                Code::FailedPrecondition
             ),
         ]
     );

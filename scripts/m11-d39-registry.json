@@ -438,6 +438,18 @@
           "name": "fence_ack_serializes_with_start_application",
           "kind": "test",
           "path": "crates/arroyo-worker/src/lifecycle_fence/tests.rs"
+        },
+        {
+          "crate": "arroyo-worker",
+          "name": "a_commit_waiting_for_operator_capacity_is_refused_by_a_fence_acknowledged_meanwhile",
+          "kind": "test",
+          "path": "crates/arroyo-worker/src/lifecycle_fence/commit_tests.rs"
+        },
+        {
+          "crate": "arroyo-worker",
+          "name": "a_commit_is_published_to_every_operator_or_to_none",
+          "kind": "test",
+          "path": "crates/arroyo-worker/src/lifecycle_fence/commit_tests.rs"
         }
       ]
     },
