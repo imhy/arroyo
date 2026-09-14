@@ -1,18 +1,17 @@
 use crate::ProtocolPaths;
+use crate::gc::liveness::{CheckpointLiveness, LivenessRefusal};
 use crate::store::{ProtocolStore, StoreError, read_protobuf};
 use crate::types::{CheckpointRef, Epoch, Generation, ProtocolError};
 use crate::validated::{CheckpointHistory, CollectingJob, validate_history};
-use arroyo_rpc::grpc::rpc::{
-    CheckpointManifest, ExpiringKeyedTimeTableCheckpointMetadata,
-    GlobalKeyedTableTaskCheckpointMetadata, TableCheckpointMetadata, TableEnum,
-};
+use arroyo_rpc::grpc::rpc::{CheckpointManifest, TableCheckpointMetadata, TableEnum};
+use arroyo_rpc::state_backend::validate_restored_manifest;
 use arroyo_rpc::state_backend::validated::Validated;
-use arroyo_rpc::state_backend::{StateBackendSelector, validate_restored_manifest};
 use futures::{TryStreamExt, stream};
-use prost::Message;
 use std::collections::HashSet;
 use std::path::Path;
 use tracing::debug;
+
+pub mod liveness;
 
 const MAX_CONCURRENT_DELETES: usize = 32;
 
@@ -24,11 +23,24 @@ pub(crate) struct CheckpointOwner {
 
 /// Deletes the leader-mode checkpoint history below `new_min_epoch`.
 ///
-/// `job` is the state backend the job selected, handed in by the caller rather than read from
-/// anywhere ambient. Every manifest reachable from `head` — retained and expiring alike — is
-/// validated against it while the history is classified, which is strictly before the first
-/// delete: the reachable chain is the only thing that names the files this function removes, and
-/// a chain some other backend wrote must not have its files named by this one's traversal.
+/// `job` is the selected backend's [`CheckpointLiveness`] implementation, handed in by the
+/// caller rather than read from anywhere ambient. It is one value doing two jobs, and
+/// deliberately so. Its [`CheckpointLiveness::state_backend`] is the backend every manifest
+/// reachable from `head` — retained and expiring alike — is validated against while the history
+/// is classified, which is strictly before the first delete: the reachable chain is the only
+/// thing that names the files this function removes, and a chain some other backend wrote must
+/// not have its files named by this one's traversal. Its
+/// [`table_data_files`](CheckpointLiveness::table_data_files) is what reads those names out of
+/// each table's backend-specific payload.
+///
+/// Until M11.T09-S5 those were two arguments — a selector, and this function's own decode of
+/// the parquet payload formats — and nothing related them. A job on any other backend passed
+/// the selector check and then had its manifests read through parquet's decoder, whose answer
+/// for a format it was not written for is not an error but a *different* file list; the
+/// protected set and the candidate set are both built from that answer, so a name dropped from
+/// a retained checkpoint's list while an expiring one still carries it is a live file
+/// classified as collectable. Taking the resolver instead of the selector is what makes the
+/// backend that decodes and the backend the history is checked against the same statement.
 ///
 /// Classification and deletion are two functions with a
 /// [`Validated<CheckpointHistory>`] between them (design item M11.D39c). The traversal checks
@@ -49,14 +61,15 @@ pub(crate) struct CheckpointOwner {
 /// # Errors
 ///
 /// Returns [`StoreError::StateBackend`] if any reachable manifest disagrees with `job`,
-/// [`StoreError::Protocol`] if one is not the checkpoint its reference names, or
-/// [`StoreError::IncompleteManifest`] if an entry of one is headed for another checkpoint — in
-/// each case nothing has been deleted — alongside the storage and protocol failures traversal
-/// can otherwise produce.
+/// [`StoreError::Protocol`] if one is not the checkpoint its reference names,
+/// [`StoreError::IncompleteManifest`] if an entry of one is headed for another checkpoint, or
+/// [`StoreError::UnresolvedTableLiveness`] if `job` cannot name the files one of its tables
+/// keeps alive — in each case nothing has been deleted — alongside the storage and protocol
+/// failures traversal can otherwise produce.
 pub async fn cleanup_leader_checkpoints<S>(
     store: &S,
     paths: &ProtocolPaths,
-    job: StateBackendSelector,
+    job: &dyn CheckpointLiveness,
     head: CheckpointRef,
     new_min_epoch: Epoch,
 ) -> Result<(), StoreError>
@@ -65,7 +78,9 @@ where
 {
     let cleanup = validate_history(
         classify_checkpoint_history(store, paths, job, head, new_min_epoch).await?,
-        CollectingJob { state_backend: job },
+        CollectingJob {
+            state_backend: job.state_backend(),
+        },
     )?;
 
     delete_classified_history(store, &cleanup).await
@@ -164,14 +179,18 @@ where
 /// the reachable chain, but not full manifests. That memory cost is required to safely handle
 /// cumulative table metadata such as expiring keyed-time tables.
 ///
-/// Each manifest is checked against `job` at the point it is read, before its files are added to
-/// either set — so the selector check costs no extra reads, and a disagreement anywhere in the
-/// chain aborts classification with an empty plan rather than a partial one. That per-object
-/// check is the untrusted-bytes guard: the parent link that continues the traversal and the file
-/// refs that become delete candidates both come out of the manifest, so who wrote it has to be
-/// known before any of that is interpreted. The claim about the *chain* is separate, and is what
-/// [`CheckpointHistory`]'s own check makes; the reduced evidence collected here is what lets it
-/// be made without buffering the file lists a second time.
+/// Each manifest is checked against `job`'s backend at the point it is read, before its files
+/// are added to either set — so the selector check costs no extra reads, and a disagreement
+/// anywhere in the chain aborts classification with an empty plan rather than a partial one.
+/// That per-object check is the untrusted-bytes guard: the parent link that continues the
+/// traversal and the file refs that become delete candidates both come out of the manifest, so
+/// who wrote it has to be known before any of that is interpreted. The claim about the *chain*
+/// is separate, and is what [`CheckpointHistory`]'s own check makes; the reduced evidence
+/// collected here is what lets it be made without buffering the file lists a second time.
+///
+/// `job` is also what reads the file names out of each table's payload, and a refusal from it
+/// returns from here — before a [`CheckpointHistory`] exists, and therefore before anything the
+/// deletion could take.
 ///
 /// `paths` is recorded on the history as it opens rather than used to read: the traversal
 /// starts at `current` and then follows the parent links it finds. Recording it here is what
@@ -180,7 +199,7 @@ where
 async fn classify_checkpoint_history<S>(
     store: &S,
     paths: &ProtocolPaths,
-    job: StateBackendSelector,
+    job: &dyn CheckpointLiveness,
     current: CheckpointRef,
     new_min_epoch: Epoch,
 ) -> Result<CheckpointHistory, StoreError>
@@ -211,7 +230,7 @@ where
         // Untrusted bytes: this manifest was just read back from storage, and everything below
         // — the parent link that continues the traversal and the file refs that become delete
         // candidates — comes out of it. Check who wrote it before any of that is used.
-        validate_restored_manifest(job, &manifest)?;
+        validate_restored_manifest(job.state_backend(), &manifest)?;
 
         let owner = CheckpointOwner {
             generation: Generation(manifest.generation),
@@ -236,7 +255,7 @@ where
             .into());
         }
 
-        let files = checkpoint_data_files(&checkpoint_ref, &manifest)?;
+        let files = checkpoint_data_files(&checkpoint_ref, &manifest, job)?;
         if manifest.epoch < *new_min_epoch {
             old_checkpoints.push(owner);
             candidate_files.extend(files);
@@ -258,9 +277,14 @@ where
     Ok(history)
 }
 
+/// Every data file the tables of one checkpoint's manifest name.
+///
+/// The walk over operators and tables is this crate's — it is what decides which manifest
+/// entries are asked about at all — and the reading of each entry's payload is `liveness`'s.
 fn checkpoint_data_files(
     manifest_path: &CheckpointRef,
     checkpoint: &CheckpointManifest,
+    liveness: &dyn CheckpointLiveness,
 ) -> Result<Vec<CheckpointRef>, StoreError> {
     let mut files = vec![];
     for operator in &checkpoint.operators {
@@ -279,6 +303,7 @@ fn checkpoint_data_files(
                 table_name,
                 manifest_path,
                 metadata,
+                liveness,
                 &mut files,
             )?;
         }
@@ -287,46 +312,57 @@ fn checkpoint_data_files(
     Ok(files)
 }
 
+/// Appends the data files one table's checkpoint metadata names.
+///
+/// Two of the three steps here are this crate's and stay here. A metadata entry that states no
+/// table type is refused before any implementation is consulted, so "nothing named a kind"
+/// cannot be mistaken for "nothing named a file" — that refusal is the same message, naming the
+/// same operator and table, that this function has produced since leader GC existed. And every
+/// name that comes back is validated by [`CheckpointRef::new`] before it can join a delete plan,
+/// which is where a path's shape is checked; whether it is also in this job's namespace is
+/// [`CheckpointHistory`]'s check, over the whole plan.
+///
+/// The middle step — what the payload's bytes mean — is `liveness`'s, and a refusal from it
+/// propagates out of the classification rather than shortening the list.
 fn table_checkpoint_data_files(
     operator_id: &str,
     table_name: &str,
     metadata_path: &CheckpointRef,
     metadata: &TableCheckpointMetadata,
+    liveness: &dyn CheckpointLiveness,
     files: &mut Vec<CheckpointRef>,
 ) -> Result<(), StoreError> {
-    match metadata.table_type() {
-        TableEnum::MissingTableType => {
-            return Err(StoreError::InvalidProtobuf {
+    if metadata.table_type() == TableEnum::MissingTableType {
+        return Err(StoreError::InvalidProtobuf {
+            path: metadata_path.clone(),
+            msg: format!(
+                "table metadata for operator '{}' table '{}' is missing table type",
+                operator_id, table_name
+            ),
+        });
+    }
+
+    let named = liveness
+        .table_data_files(metadata)
+        .map_err(|refusal| match refusal {
+            // Undecodable bytes are reported exactly as this function has always reported
+            // them: the payload is corrupt, which is a property of the object rather than of
+            // which backend was asked.
+            LivenessRefusal::UndecodablePayload { source, .. } => StoreError::DecodeProtobuf {
                 path: metadata_path.clone(),
-                msg: format!(
-                    "table metadata for operator '{}' table '{}' is missing table type",
-                    operator_id, table_name
-                ),
-            });
-        }
-        TableEnum::GlobalKeyValue => {
-            let metadata = GlobalKeyedTableTaskCheckpointMetadata::decode(metadata.data.as_slice())
-                .map_err(|e| StoreError::DecodeProtobuf {
-                    path: metadata_path.clone(),
-                    source: e,
-                })?;
+                source,
+            },
+            refusal @ (LivenessRefusal::UnservedTableKind { .. }
+            | LivenessRefusal::WrongTableKind { .. }) => StoreError::UnresolvedTableLiveness {
+                path: metadata_path.clone(),
+                operator_id: operator_id.to_string(),
+                table: table_name.to_string(),
+                source: refusal,
+            },
+        })?;
 
-            for file in metadata.files {
-                files.push(CheckpointRef::new(file.clone())?);
-            }
-        }
-        TableEnum::ExpiringKeyedTimeTable => {
-            let metadata =
-                ExpiringKeyedTimeTableCheckpointMetadata::decode(metadata.data.as_slice())
-                    .map_err(|e| StoreError::DecodeProtobuf {
-                        path: metadata_path.clone(),
-                        source: e,
-                    })?;
-
-            for file in metadata.files {
-                files.push(CheckpointRef::new(file.file)?);
-            }
-        }
+    for file in named {
+        files.push(CheckpointRef::new(file)?);
     }
 
     Ok(())

@@ -22,7 +22,8 @@ use arroyo_rpc::{
     grpc::{api, rpc::TableConfig},
 };
 use arroyo_state::{
-    global_table_config, tables::global_keyed_map::GlobalKeyedView, timestamp_table_config,
+    global_table_config, tables::expiring_time_key_view::ExpiringTimeKeyViewDrain,
+    tables::global_keyed_map::GlobalKeyedView, timestamp_table_config,
 };
 use arroyo_types::{CheckpointBarrier, Watermark, from_nanos, print_time, to_nanos};
 use datafusion::{execution::context::SessionContext, physical_plan::ExecutionPlan};
@@ -819,11 +820,11 @@ impl ArrowOperator for SessionAggregatingWindowFunc {
             .get_expiring_time_key_table("s", start_time)
             .await?;
 
-        let all_batches = table.all_batches_for_watermark(start_time);
-
-        for (_max_timestamp, batches) in all_batches {
-            for batch in batches {
-                let batch = self.filter_batch_by_time(batch.clone(), start_time)?;
+        {
+            let mut all_batches = table.all_batches_for_watermark(start_time);
+            while let Some(batch) = all_batches.next().await {
+                let (_max_timestamp, batch) = batch?;
+                let batch = self.filter_batch_by_time(batch, start_time)?;
                 if batch.num_rows() == 0 {
                     continue;
                 }
@@ -888,7 +889,7 @@ impl ArrowOperator for SessionAggregatingWindowFunc {
             .ok_or_else(|| anyhow!("expected timestamp column"))?)
         .ok_or_else(|| anyhow!("expected max timestamp"))?;
 
-        table.insert(from_nanos(max_timestamp as u128), sorted.clone());
+        table.insert(from_nanos(max_timestamp as u128), sorted.clone())?;
 
         self.add_at_watermark(sorted, current_watermark).await?;
         Ok(())

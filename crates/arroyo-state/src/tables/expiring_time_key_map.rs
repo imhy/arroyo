@@ -23,8 +23,7 @@ use arroyo_rpc::{
 };
 use arroyo_storage::StorageProviderRef;
 use arroyo_types::{
-    CheckpointFilePathLayout, TaskInfo, from_micros, from_nanos, print_time, server_for_hash,
-    to_micros,
+    CheckpointFilePathLayout, TaskInfo, from_micros, from_nanos, server_for_hash, to_micros,
 };
 use datafusion::parquet::arrow::async_reader::ParquetObjectReader;
 use futures::{Stream, StreamExt, TryStreamExt};
@@ -44,10 +43,10 @@ use super::{
 use crate::{
     CheckpointMessage, StateMessage, TableData, parquet::ParquetStats,
     schemas::SchemaWithHashAndOperation,
+    tables::expiring_time_key_view::parquet_view::ExpiringTimeKeyView,
 };
 use arroyo_rpc::df::{ArroyoSchema, ArroyoSchemaRef};
 use arroyo_rpc::errors::StateError;
-use tracing::debug;
 
 #[derive(Debug, Clone)]
 pub struct ExpiringTimeKeyTable {
@@ -60,6 +59,16 @@ pub struct ExpiringTimeKeyTable {
 }
 
 impl ExpiringTimeKeyTable {
+    /// The event-time span this table keeps behind the watermark.
+    pub(crate) fn retention(&self) -> Duration {
+        self.retention
+    }
+
+    /// The table name this subtask's state messages are addressed to.
+    pub(crate) fn table_name(&self) -> &str {
+        &self.table_name
+    }
+
     pub(crate) async fn get_view(
         &self,
         state_tx: Sender<StateMessage>,
@@ -123,12 +132,7 @@ impl ExpiringTimeKeyTable {
             }
         }
 
-        Ok(ExpiringTimeKeyView {
-            flushed_batches_by_max_timestamp: data,
-            parent: self.clone(),
-            batches_to_flush: BTreeMap::new(),
-            state_tx,
-        })
+        Ok(ExpiringTimeKeyView::new(self.clone(), data, state_tx))
     }
     async fn call_on_filtered_batches<T, F>(
         &self,
@@ -359,15 +363,19 @@ impl Table for ExpiringTimeKeyTable {
         self.task_info.clone()
     }
 
+    fn data_files(checkpoint: &Self::TableCheckpointMessage) -> Vec<String> {
+        checkpoint
+            .files
+            .iter()
+            .map(|file: &ParquetTimeFile| file.file.clone())
+            .collect()
+    }
+
     fn files_to_keep(
         _config: Self::ConfigMessage,
         checkpoint: Self::TableCheckpointMessage,
     ) -> Result<HashSet<String>, StateError> {
-        Ok(checkpoint
-            .files
-            .into_iter()
-            .map(|file: ParquetTimeFile| file.file)
-            .collect())
+        Ok(Self::data_files(&checkpoint).into_iter().collect())
     }
     fn apply_compacted_checkpoint(
         &self,
@@ -818,112 +826,6 @@ impl ExpiringTimeKeyTableCheckpointer {
             Some(current_stats) => {
                 current_stats.merge(parquet_stats);
             }
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct ExpiringTimeKeyView {
-    parent: ExpiringTimeKeyTable,
-    flushed_batches_by_max_timestamp: BTreeMap<SystemTime, Vec<RecordBatch>>,
-    batches_to_flush: BTreeMap<SystemTime, Vec<RecordBatch>>,
-    state_tx: Sender<StateMessage>,
-}
-
-impl ExpiringTimeKeyView {
-    pub async fn flush(&mut self, watermark: Option<SystemTime>) -> Result<(), StateError> {
-        while let Some((max_timestamp, mut batches)) = self.batches_to_flush.pop_first() {
-            if watermark
-                .map(|watermark| max_timestamp < watermark - self.parent.retention)
-                .unwrap_or(false)
-            {
-                continue;
-            }
-            for batch in &batches {
-                self.state_tx
-                    .send(StateMessage::TableData {
-                        table: self.parent.table_name.to_string(),
-                        data: TableData::RecordBatch(batch.clone()),
-                    })
-                    .await
-                    .expect("queue closed");
-            }
-            self.flushed_batches_by_max_timestamp
-                .entry(max_timestamp)
-                .or_default()
-                .append(&mut batches);
-        }
-        if let Some(watermark) = watermark {
-            let cutoff = watermark - self.parent.retention;
-            self.flushed_batches_by_max_timestamp =
-                self.flushed_batches_by_max_timestamp.split_off(&cutoff);
-        }
-        Ok(())
-    }
-
-    pub fn insert(&mut self, max_timestamp: SystemTime, batch: RecordBatch) {
-        self.batches_to_flush
-            .entry(max_timestamp)
-            .or_default()
-            .push(batch);
-    }
-
-    pub fn all_batches_for_watermark(
-        &self,
-        watermark: Option<SystemTime>,
-    ) -> impl Iterator<Item = (&SystemTime, &Vec<RecordBatch>)> {
-        // TODO: decide how to manage hash range ownership. Previously this was done by iterating over the contents of the record batch.
-        // Should we use statistics?
-        let cutoff = watermark
-            .map(|watermark| watermark - self.parent.retention)
-            .unwrap_or_else(|| SystemTime::UNIX_EPOCH);
-        debug!("CUTOFF IS {}", print_time(cutoff));
-        let flushed_range = self.flushed_batches_by_max_timestamp.range(cutoff..);
-        let buffered_range = self.batches_to_flush.range(cutoff..);
-        flushed_range.chain(buffered_range)
-    }
-
-    pub fn expire_timestamp(&mut self, timestamp: SystemTime) -> Vec<RecordBatch> {
-        let flushed_batches = self.flushed_batches_by_max_timestamp.remove(&timestamp);
-        let buffered_batches = self.batches_to_flush.remove(&timestamp);
-        match (flushed_batches, buffered_batches) {
-            (None, None) => vec![],
-            (None, Some(batches)) | (Some(batches), None) => batches,
-            (Some(mut flushed_batches), Some(mut buffered_batches)) => {
-                flushed_batches.append(&mut buffered_batches);
-                flushed_batches
-            }
-        }
-    }
-
-    pub async fn flush_timestamp(&mut self, bin_start: SystemTime) {
-        let Some(batches_to_flush) = self.batches_to_flush.remove(&bin_start) else {
-            return;
-        };
-        let flushed_vec = self
-            .flushed_batches_by_max_timestamp
-            .entry(bin_start)
-            .or_default();
-        for batch in batches_to_flush {
-            flushed_vec.push(batch.clone());
-            self.state_tx
-                .send(StateMessage::TableData {
-                    table: self.parent.table_name.to_string(),
-                    data: TableData::RecordBatch(batch),
-                })
-                .await
-                .expect("queue closed");
-        }
-    }
-
-    pub fn get_min_time(&self) -> Option<SystemTime> {
-        match (
-            self.batches_to_flush.keys().next(),
-            self.flushed_batches_by_max_timestamp.keys().next(),
-        ) {
-            (None, None) => None,
-            (None, Some(time)) | (Some(time), None) => Some(*time),
-            (Some(buffered_time), Some(flushed_time)) => Some(*buffered_time.min(flushed_time)),
         }
     }
 }

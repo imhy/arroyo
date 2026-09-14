@@ -124,7 +124,7 @@ impl InstantJoin {
             .downcast_ref::<TimestampNanosecondArray>()
             .expect("should have timestamp column");
         let max_timestamp = max(time_column).expect("should have max timestamp");
-        table.insert(from_nanos(max_timestamp as u128), batch.clone());
+        table.insert(from_nanos(max_timestamp as u128), batch.clone())?;
         let min_timestamp = min(time_column).expect("should have min timestamp");
         if ctx
             .last_present_watermark()
@@ -170,6 +170,44 @@ impl InstantJoin {
         }
         Ok(())
     }
+    /// Replays one side's restored state through the live batch path, one batch at a
+    /// time.
+    ///
+    /// [`Self::process_side`] needs `ctx` — it writes the batch back to the same view —
+    /// so the drain cannot hold a borrow of that view across the call. It therefore pulls
+    /// through `next_drained_batch`, which returns one owned batch and releases the view,
+    /// instead of a stream that would borrow it for the whole replay. Nothing here
+    /// accumulates: the largest live value is the single `RecordBatch` being replayed.
+    ///
+    /// The drain's range is fixed when it begins. A view built for `on_start` has
+    /// nothing buffered yet, so the drain has no pending range at all and the batches
+    /// `process_side` buffers on the way through are outside it — a replayed batch is
+    /// never handed back a second time.
+    async fn restore_side(
+        &mut self,
+        side: Side,
+        watermark: Option<SystemTime>,
+        ctx: &mut OperatorContext,
+    ) -> DataflowResult<()> {
+        let token = ctx
+            .table_manager
+            .get_expiring_time_key_table(side.name(), watermark)
+            .await?
+            .begin_batch_drain(watermark);
+        loop {
+            let next = ctx
+                .table_manager
+                .get_expiring_time_key_table(side.name(), watermark)
+                .await?
+                .next_drained_batch(token)
+                .await?;
+            let Some((_time, batch)) = next else {
+                return Ok(());
+            };
+            self.process_side(side, batch, ctx).await?;
+        }
+    }
+
     async fn process_left(
         &mut self,
         record_batch: RecordBatch,
@@ -204,28 +242,8 @@ impl ArrowOperator for InstantJoin {
 
     async fn on_start(&mut self, ctx: &mut OperatorContext) -> DataflowResult<()> {
         let watermark = ctx.last_present_watermark();
-        let left_table = ctx
-            .table_manager
-            .get_expiring_time_key_table("left", watermark)
-            .await?;
-        let left_batches: Vec<_> = left_table
-            .all_batches_for_watermark(watermark)
-            .flat_map(|(_time, batches)| batches.clone())
-            .collect();
-        for batch in left_batches {
-            self.process_left(batch.clone(), ctx).await?;
-        }
-        let right_table = ctx
-            .table_manager
-            .get_expiring_time_key_table("right", watermark)
-            .await?;
-        let right_batches: Vec<_> = right_table
-            .all_batches_for_watermark(watermark)
-            .flat_map(|(_time, batches)| batches.clone())
-            .collect();
-        for batch in right_batches {
-            self.process_right(batch.clone(), ctx).await?;
-        }
+        self.restore_side(Side::Left, watermark, ctx).await?;
+        self.restore_side(Side::Right, watermark, ctx).await?;
         Ok(())
     }
 

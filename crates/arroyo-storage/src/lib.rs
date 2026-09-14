@@ -3,10 +3,10 @@ use arroyo_rpc::retry;
 use aws::ArroyoCredentialProvider;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
-use object_store::aws::AmazonS3ConfigKey;
-use object_store::azure::MicrosoftAzureBuilder;
+use object_store::aws::{AmazonS3, AmazonS3ConfigKey};
+use object_store::azure::{MicrosoftAzure, MicrosoftAzureBuilder};
 use object_store::buffered::BufWriter;
-use object_store::gcp::GoogleCloudStorageBuilder;
+use object_store::gcp::{GoogleCloudStorage, GoogleCloudStorageBuilder};
 use object_store::multipart::{MultipartStore, PartId};
 use object_store::path::Path;
 use object_store::{Error, ObjectMeta};
@@ -52,9 +52,86 @@ pub enum StorageProviderFor {
     Controller { storage_url: Option<String> },
 }
 
+/// The concrete `object_store` implementation behind a [`StorageProvider`], with its
+/// type still intact.
+///
+/// [`StorageProvider::get_backing_store`] hands out an `Arc<dyn ObjectStore>`, and a
+/// consumer that has to establish what the store can *physically* do — native ranged
+/// GET, whole-object PUT that publishes atomically, multipart whose completion
+/// publishes atomically — cannot recover that from an erased handle. Nor can it take
+/// the store's word for it: a store supplies its own `Display`, so anything it says
+/// about itself is forgeable. The concrete type is the one witness that is not, so
+/// this enum carries it out of the constructor that built the store.
+///
+/// The `Arc` in each variant is the **same allocation** the provider serves its own
+/// requests through. [`StorageProvider::get_backing_store`] is this handle cloned and
+/// coerced, never a second store rebuilt at the same location, so the typed handle and
+/// the erased one always describe one store — see
+/// [`as_object_store`](Self::as_object_store).
+///
+/// # Why R2 has no variant of its own
+///
+/// [`BackendConfig::R2`] is served by an `AmazonS3`: `construct_r2` builds one with
+/// `AmazonS3Builder` pointed at a Cloudflare endpoint. An R2 provider's backing store
+/// therefore *is* an `AmazonS3`, and a separate variant would name a type that does
+/// not exist. The one way R2 differs operationally — it rejects a multipart upload
+/// whose non-final parts differ in size — is a property of the configured backend
+/// rather than of the client type, and it is already published by
+/// [`StorageProvider::requires_same_part_sizes`]. Spelling it here too would give that
+/// fact a second source free to drift from the first, and would invite a consumer to
+/// read capabilities off a variant name instead of off the type.
+#[derive(Debug, Clone)]
+pub enum BackingStoreHandle {
+    /// Amazon S3 — and Cloudflare R2, which `construct_r2` also builds as an
+    /// `AmazonS3`.
+    AmazonS3(Arc<AmazonS3>),
+    /// Google Cloud Storage.
+    GoogleCloudStorage(Arc<GoogleCloudStorage>),
+    /// Azure Blob Storage.
+    MicrosoftAzure(Arc<MicrosoftAzure>),
+    /// A local directory, rooted at the provider's configured path.
+    LocalFileSystem(Arc<LocalFileSystem>),
+}
+
+impl BackingStoreHandle {
+    /// The same store, erased: exactly the value
+    /// [`StorageProvider::get_backing_store`] returns.
+    ///
+    /// "The same" is literal rather than equivalent — this clones the `Arc` and
+    /// coerces it, so both views share one allocation and
+    /// `Arc::ptr_eq(&handle.as_object_store(), &provider.get_backing_store())` holds
+    /// for every provider.
+    pub fn as_object_store(&self) -> Arc<dyn ObjectStore> {
+        match self {
+            Self::AmazonS3(store) => store.clone(),
+            Self::GoogleCloudStorage(store) => store.clone(),
+            Self::MicrosoftAzure(store) => store.clone(),
+            Self::LocalFileSystem(store) => store.clone(),
+        }
+    }
+
+    /// The same store as a [`MultipartStore`], for the implementations that provide
+    /// one.
+    ///
+    /// `None` for [`LocalFileSystem`], which does not implement the trait — the same
+    /// store [`StorageProvider::as_multipart`] already returns `None` for.
+    fn as_multipart_store(&self) -> Option<Arc<dyn MultipartStore>> {
+        match self {
+            Self::AmazonS3(store) => Some(store.clone()),
+            Self::GoogleCloudStorage(store) => Some(store.clone()),
+            Self::MicrosoftAzure(store) => Some(store.clone()),
+            Self::LocalFileSystem(_) => None,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct StorageProvider {
     config: BackendConfig,
+    /// The backing store with its concrete type intact. `object_store` and
+    /// `multipart_store` below are derived from this one value by
+    /// [`StorageProvider::with_backing`], so all three are views of one allocation.
+    backing: BackingStoreHandle,
     object_store: Arc<dyn ObjectStore>,
     multipart_store: Option<Arc<dyn MultipartStore>>,
     canonical_url: String,
@@ -424,6 +501,29 @@ fn last<I: Sized, const COUNT: usize>(opts: [Option<I>; COUNT]) -> Option<I> {
 }
 
 impl StorageProvider {
+    /// Assemble a provider around the store that has just been built.
+    ///
+    /// The **only** place a `StorageProvider` value is constructed, which is what
+    /// makes "the typed handle and the erased handle are one allocation" a property
+    /// of the type rather than of each constructor remembering to clone instead of
+    /// rebuild. Every `construct_*` below hands its concrete client here, and the
+    /// erased `object_store` and `multipart_store` views are derived from it.
+    fn with_backing(
+        config: BackendConfig,
+        backing: BackingStoreHandle,
+        canonical_url: String,
+        storage_options: HashMap<String, String>,
+    ) -> Self {
+        Self {
+            config,
+            object_store: backing.as_object_store(),
+            multipart_store: backing.as_multipart_store(),
+            backing,
+            canonical_url,
+            storage_options,
+        }
+    }
+
     pub async fn for_url(url: &str) -> Result<Self, StorageError> {
         Self::for_url_with_options(url, HashMap::new()).await
     }
@@ -565,18 +665,15 @@ impl StorageProvider {
             canonical_url = format!("{canonical_url}/{key}");
         }
 
-        let object_store = Arc::new(builder.build()?);
-
-        Ok(Self {
-            config: BackendConfig::S3(config),
-            object_store: object_store.clone(),
-            multipart_store: Some(object_store),
+        Ok(Self::with_backing(
+            BackendConfig::S3(config),
+            BackingStoreHandle::AmazonS3(Arc::new(builder.build()?)),
             canonical_url,
-            storage_options: s3_options
+            s3_options
                 .into_iter()
                 .map(|(k, v)| (k.as_ref().to_string(), v))
                 .collect(),
-        })
+        ))
     }
 
     async fn construct_r2(
@@ -639,15 +736,14 @@ impl StorageProvider {
             .with_endpoint(endpoint)
             .with_virtual_hosted_style_request(false);
 
-        let object_store = Arc::new(builder.build()?);
-
-        Ok(Self {
-            config: BackendConfig::R2(config),
-            object_store: object_store.clone(),
-            multipart_store: Some(object_store),
+        Ok(Self::with_backing(
+            BackendConfig::R2(config),
+            // R2 is served by an `AmazonS3` against a Cloudflare endpoint, so the
+            // handle names the client type that was actually built.
+            BackingStoreHandle::AmazonS3(Arc::new(builder.build()?)),
             canonical_url,
-            storage_options: HashMap::new(),
-        })
+            HashMap::new(),
+        ))
     }
 
     async fn construct_gcs(config: GCSConfig) -> Result<Self, StorageError> {
@@ -671,15 +767,12 @@ impl StorageProvider {
             canonical_url = format!("{canonical_url}/{key}");
         }
 
-        let object_store = Arc::new(builder.build()?);
-
-        Ok(Self {
-            config: BackendConfig::GCS(config),
-            object_store: object_store.clone(),
-            multipart_store: Some(object_store),
+        Ok(Self::with_backing(
+            BackendConfig::GCS(config),
+            BackingStoreHandle::GoogleCloudStorage(Arc::new(builder.build()?)),
             canonical_url,
-            storage_options: HashMap::new(),
-        })
+            HashMap::new(),
+        ))
     }
 
     async fn construct_azure(config: AzureConfig) -> Result<Self, StorageError> {
@@ -691,15 +784,12 @@ impl StorageProvider {
             config.account, config.container
         );
 
-        let object_store = Arc::new(builder.build()?);
-
-        Ok(Self {
-            config: BackendConfig::Azure(config),
-            object_store: object_store.clone(),
-            multipart_store: Some(object_store),
+        Ok(Self::with_backing(
+            BackendConfig::Azure(config),
+            BackingStoreHandle::MicrosoftAzure(Arc::new(builder.build()?)),
             canonical_url,
-            storage_options: HashMap::new(),
-        })
+            HashMap::new(),
+        ))
     }
 
     async fn construct_local(config: LocalConfig) -> Result<Self, StorageError> {
@@ -710,18 +800,17 @@ impl StorageProvider {
             ))
         })?;
 
-        let object_store = Arc::new(
+        let backing = BackingStoreHandle::LocalFileSystem(Arc::new(
             LocalFileSystem::new_with_prefix(&config.path).map_err(Into::<StorageError>::into)?,
-        );
+        ));
 
         let canonical_url = format!("file://{}", config.path);
-        Ok(Self {
-            config: BackendConfig::Local(config),
-            object_store,
-            multipart_store: None,
+        Ok(Self::with_backing(
+            BackendConfig::Local(config),
+            backing,
             canonical_url,
-            storage_options: HashMap::new(),
-        })
+            HashMap::new(),
+        ))
     }
 
     pub fn requires_same_part_sizes(&self) -> bool {
@@ -891,6 +980,27 @@ impl StorageProvider {
         }
     }
 
+    /// The key prefix this provider namespaces every object under, owned.
+    ///
+    /// **The** supported way to hand the prefix to a consumer that will talk to the
+    /// backing store directly — see [`get_backing_store`](Self::get_backing_store),
+    /// whose caller owes exactly this. It is *defined* as
+    /// `qualify_path(&Path::default())` rather than re-derived, so it cannot disagree
+    /// with the qualification the provider's own operations apply: the `Some` arm of
+    /// [`qualify_path`](Self::qualify_path) returns the configured key by
+    /// construction, and its `None` arm returns the empty path, which is the
+    /// "no prefix configured" case.
+    ///
+    /// [`get_key`](Self::get_key) is **not** an alternative spelling of this. It
+    /// re-parses a URL with `with_key = true`, which for a `file://` URL pops the
+    /// last path segment off as a key while [`for_url`](Self::for_url) keeps that
+    /// segment in the filesystem root — so the two disagree for local providers — and
+    /// it fails outright for a URL with no key, where the answer here is the empty
+    /// path.
+    pub fn configured_prefix(&self) -> Path {
+        self.qualify_path(&Path::default()).into_owned()
+    }
+
     pub async fn delete_if_present(&self, path: impl Into<Path>) -> Result<(), StorageError> {
         let path = path.into();
         let path = self.qualify_path(&path);
@@ -953,9 +1063,32 @@ impl StorageProvider {
     ///
     /// The backing store only knows about buckets, so it is *your* responsibility when using
     /// raw object store methods to prepend the key as well (for example, by using
-    /// `ArroyoStorage::qualify_path`).
+    /// `ArroyoStorage::qualify_path`, or by taking the prefix from
+    /// [`configured_prefix`](Self::configured_prefix), which is that call with the
+    /// empty path).
+    ///
+    /// The concrete implementation is erased here. A consumer that needs to know what
+    /// the store can physically do must take [`backing_handle`](Self::backing_handle)
+    /// instead — it is the same allocation with its type intact.
     pub fn get_backing_store(&self) -> Arc<dyn ObjectStore> {
         self.object_store.clone()
+    }
+
+    /// The backing store with its concrete type intact — the same allocation
+    /// [`get_backing_store`](Self::get_backing_store) hands out erased.
+    ///
+    /// This is the handle a capability-checking consumer needs. What a store can
+    /// physically do is a property of its implementation, and an `Arc<dyn
+    /// ObjectStore>` has already thrown that away; see [`BackingStoreHandle`] for why
+    /// the type, rather than anything the store reports about itself, is the witness.
+    ///
+    /// It is half of a handoff: pair it with
+    /// [`configured_prefix`](Self::configured_prefix), which supplies the key
+    /// everything under this provider is namespaced by. Both come from this one
+    /// provider, so the store and the prefix a consumer ends up holding describe the
+    /// same location by construction.
+    pub fn backing_handle(&self) -> BackingStoreHandle {
+        self.backing.clone()
     }
 
     pub async fn head(&self, path: impl Into<Path>) -> Result<ObjectMeta, StorageError> {
@@ -1046,10 +1179,19 @@ impl StorageProvider {
 #[cfg(test)]
 mod tests {
     use arroyo_types::to_nanos;
+    use object_store::aws::AmazonS3Builder;
+    use object_store::azure::MicrosoftAzureBuilder;
+    use object_store::gcp::GoogleCloudStorageBuilder;
+    use object_store::local::LocalFileSystem;
     use object_store::path::Path;
+    use std::collections::HashMap;
+    use std::sync::Arc;
     use std::time::SystemTime;
 
-    use crate::{BackendConfig, StorageProvider, matchers};
+    use crate::{
+        AzureConfig, BackendConfig, BackingStoreHandle, GCSConfig, LocalConfig, R2Config, S3Config,
+        StorageProvider, matchers,
+    };
 
     #[test]
     fn test_regex_compilation() {
@@ -1317,6 +1459,277 @@ mod tests {
                 key: Some("my-file.pdf".into()),
             })
         );
+    }
+
+    /// The address of the allocation an `Arc` owns, with any trait-object metadata
+    /// discarded.
+    ///
+    /// Two `Arc`s of *different* trait-object types cannot be compared with
+    /// `Arc::ptr_eq` at all, and that is exactly the comparison the handoff needs: the
+    /// erased `Arc<dyn ObjectStore>` and the `Arc<dyn MultipartStore>` must be two
+    /// views of one store, not two stores.
+    fn address<T: ?Sized>(arc: &Arc<T>) -> *const () {
+        Arc::as_ptr(arc).cast::<()>()
+    }
+
+    /// One provider shape per [`BackendConfig`] variant, each paired with the concrete
+    /// `object_store` client its own `construct_*` builds, and with whether that client
+    /// implements [`MultipartStore`](object_store::multipart::MultipartStore).
+    ///
+    /// Every client here is built offline. `AmazonS3Builder`, `GoogleCloudStorageBuilder`
+    /// and `MicrosoftAzureBuilder` resolve credentials lazily — `build()` only assembles
+    /// a credential *provider* — so construction issues no request and reads no
+    /// credential file. `key` is threaded through so the prefix matrix below can vary it
+    /// independently of the backend.
+    fn backends(
+        root: &std::path::Path,
+        key: Option<Path>,
+    ) -> Vec<(&'static str, BackendConfig, BackingStoreHandle, bool)> {
+        let amazon_s3 = || {
+            Arc::new(
+                AmazonS3Builder::new()
+                    .with_bucket_name("bucket")
+                    .build()
+                    .expect("an S3 client builds without credentials or network"),
+            )
+        };
+        vec![
+            (
+                "S3",
+                BackendConfig::S3(S3Config {
+                    endpoint: None,
+                    region: Some("us-east-1".to_string()),
+                    bucket: "bucket".to_string(),
+                    key: key.clone(),
+                }),
+                BackingStoreHandle::AmazonS3(amazon_s3()),
+                true,
+            ),
+            (
+                // R2 is an `AmazonS3` against a Cloudflare endpoint, which is why it
+                // shares the handle variant and not the config variant.
+                "R2",
+                BackendConfig::R2(R2Config {
+                    account_id: "0123456789abcdef".to_string(),
+                    bucket: "bucket".to_string(),
+                    jurisdiction: None,
+                    key: key.clone(),
+                }),
+                BackingStoreHandle::AmazonS3(amazon_s3()),
+                true,
+            ),
+            (
+                "GCS",
+                BackendConfig::GCS(GCSConfig {
+                    bucket: "bucket".to_string(),
+                    key: key.clone(),
+                }),
+                BackingStoreHandle::GoogleCloudStorage(Arc::new(
+                    GoogleCloudStorageBuilder::new()
+                        .with_bucket_name("bucket")
+                        .build()
+                        .expect("a GCS client builds without credentials or network"),
+                )),
+                true,
+            ),
+            (
+                "Azure",
+                BackendConfig::Azure(AzureConfig {
+                    account: "account".to_string(),
+                    container: "container".to_string(),
+                    key: key.clone(),
+                }),
+                BackingStoreHandle::MicrosoftAzure(Arc::new(
+                    MicrosoftAzureBuilder::new()
+                        .with_account("account")
+                        .with_container_name("container")
+                        .build()
+                        .expect("an Azure client builds without credentials or network"),
+                )),
+                true,
+            ),
+            (
+                "Local",
+                BackendConfig::Local(LocalConfig {
+                    path: root.display().to_string(),
+                    key,
+                }),
+                BackingStoreHandle::LocalFileSystem(Arc::new(
+                    LocalFileSystem::new_with_prefix(root).expect("a local store at a real root"),
+                )),
+                false,
+            ),
+        ]
+    }
+
+    /// The typed handle, the erased handle and the multipart handle are three views of
+    /// **one allocation**, for every backend shape.
+    ///
+    /// This is the property the capability handoff rests on. A consumer takes
+    /// `backing_handle()` to learn what the store is and `get_backing_store()` to talk
+    /// to it; if those were two stores built at the same location the first would be
+    /// describing something the second is not, and nothing downstream could tell. It
+    /// is asserted by address rather than by behaviour because "the same location"
+    /// would pass a behavioural check just as well — which is precisely the mistake
+    /// this replaces.
+    #[test]
+    fn every_backend_hands_all_three_views_one_allocation() {
+        let root = std::env::temp_dir().join(format!("arroyo-backing-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("a scratch root");
+
+        let mut seen = Vec::new();
+        for (name, config, handle, has_multipart) in backends(&root, None) {
+            let typed = handle.as_object_store();
+            let provider = StorageProvider::with_backing(
+                config,
+                handle,
+                "test://provider".to_string(),
+                HashMap::new(),
+            );
+
+            let erased = provider.get_backing_store();
+            assert!(
+                Arc::ptr_eq(&typed, &erased),
+                "{name}: get_backing_store must hand out the store the provider was \
+                 built on, not a second one"
+            );
+            assert!(
+                Arc::ptr_eq(&provider.backing_handle().as_object_store(), &erased),
+                "{name}: backing_handle and get_backing_store must describe one store"
+            );
+
+            match (provider.as_multipart(), has_multipart) {
+                (Some(multipart), true) => assert_eq!(
+                    address(&multipart),
+                    address(&erased),
+                    "{name}: the multipart view must be the same allocation"
+                ),
+                (None, false) => {}
+                (found, _) => panic!(
+                    "{name}: multipart support is {}, expected {has_multipart}",
+                    found.is_some()
+                ),
+            }
+            seen.push(name);
+        }
+
+        assert_eq!(
+            seen,
+            vec!["S3", "R2", "GCS", "Azure", "Local"],
+            "every BackendConfig variant must be exercised"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `configured_prefix()` is `qualify_path(&Path::default())`, for every backend and
+    /// every key shape — including the no-key case, where it is the empty path.
+    ///
+    /// The two are crossed rather than both re-derived from the config: `qualify_path`
+    /// is what every provider operation already applies, so a consumer that takes the
+    /// prefix from here and qualifies keys itself lands where the provider lands. The
+    /// closed-form expectation is asserted too, so a `qualify_path` that started
+    /// returning something else would fail here rather than agreeing with itself.
+    #[test]
+    fn the_configured_prefix_is_qualification_of_the_empty_path() {
+        let root = std::env::temp_dir().join(format!("arroyo-prefix-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("a scratch root");
+
+        // No key, one segment, several — the three shapes a parsed URL can produce.
+        let keys: [(Option<Path>, &str); 3] = [
+            (None, ""),
+            (Some("job-1".into()), "job-1"),
+            (
+                Some("job-1/operator-7/ckpt".into()),
+                "job-1/operator-7/ckpt",
+            ),
+        ];
+
+        for (key, expected) in keys {
+            for (name, config, handle, _) in backends(&root, key.clone()) {
+                let provider = StorageProvider::with_backing(
+                    config,
+                    handle,
+                    "test://provider".to_string(),
+                    HashMap::new(),
+                );
+
+                assert_eq!(
+                    provider.configured_prefix().as_ref(),
+                    expected,
+                    "{name}: the configured prefix must be the key the config carries"
+                );
+                assert_eq!(
+                    provider.configured_prefix(),
+                    provider.qualify_path(&Path::default()).into_owned(),
+                    "{name}: the configured prefix must be qualification of the empty path"
+                );
+                // And it really is the prefix the provider applies to a real key.
+                // Bound to a local: `qualify_path` returns a `Cow` that may borrow its
+                // argument, so a temporary would not outlive the comparison.
+                let key = Path::from("manifest/cp1");
+                let qualified = provider.qualify_path(&key);
+                let expected_qualified: Path = provider
+                    .configured_prefix()
+                    .parts()
+                    .chain(key.parts())
+                    .collect();
+                assert_eq!(
+                    qualified.as_ref(),
+                    &expected_qualified,
+                    "{name}: qualifying under the published prefix must reach the \
+                     provider's own path"
+                );
+            }
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The end-to-end half: a provider built from a URL by its real constructor hands
+    /// both views one allocation, and publishes the prefix its own URL carries.
+    ///
+    /// `file://` and `gs://` build with no credentials at all; `r2://` needs an access
+    /// key and secret, which are passed explicitly as storage options rather than read
+    /// from the environment so the test does not depend on the machine it runs on.
+    /// `s3://` is deliberately absent: `construct_s3` loads the AWS SDK's default
+    /// config to resolve a region, which reaches for instance metadata on a machine
+    /// that has none. Its client type is `AmazonS3`, the same variant `r2://` exercises
+    /// here and `backends` covers above.
+    #[tokio::test]
+    async fn a_provider_built_from_a_url_serves_one_allocation() {
+        let root = std::env::temp_dir().join(format!("arroyo-url-backing-{}", std::process::id()));
+        let cases: Vec<(String, HashMap<String, String>, &str)> = vec![
+            (format!("file://{}", root.display()), HashMap::new(), ""),
+            ("gs://bucket/job-1".to_string(), HashMap::new(), "job-1"),
+            (
+                "r2://0123456789abcdef@bucket/job-1/ckpt".to_string(),
+                HashMap::from([
+                    ("r2_access_key_id".to_string(), "key".to_string()),
+                    ("r2_secret_access_key".to_string(), "secret".to_string()),
+                ]),
+                "job-1/ckpt",
+            ),
+        ];
+
+        for (url, options, expected_prefix) in cases {
+            let provider = StorageProvider::for_url_with_options(&url, options)
+                .await
+                .unwrap_or_else(|e| panic!("{url} builds a provider: {e}"));
+
+            assert!(
+                Arc::ptr_eq(
+                    &provider.backing_handle().as_object_store(),
+                    &provider.get_backing_store()
+                ),
+                "{url}: the typed and erased handles must be one allocation"
+            );
+            assert_eq!(
+                provider.configured_prefix().as_ref(),
+                expected_prefix,
+                "{url}: the published prefix must be the URL's own key"
+            );
+        }
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[tokio::test]

@@ -7,9 +7,7 @@ use anyhow::{Result, anyhow, bail};
 use arroyo_rpc::CompactionResult;
 use arroyo_rpc::{
     CheckpointCompleted, ControlResp,
-    grpc::rpc::{
-        SubtaskCheckpointMetadata, TableConfig, TableEnum, TableSubtaskCheckpointMetadata,
-    },
+    grpc::rpc::{SubtaskCheckpointMetadata, TableConfig, TableSubtaskCheckpointMetadata},
 };
 use arroyo_storage::StorageProviderRef;
 use arroyo_types::{CheckpointBarrier, Data, Key, TaskInfo, from_micros, to_micros};
@@ -18,15 +16,12 @@ use tokio::sync::{
     oneshot,
 };
 
-use super::expiring_time_key_map::{
-    ExpiringTimeKeyTable, ExpiringTimeKeyView, KeyTimeView, UncachedKeyValueView,
-};
-use super::global_keyed_map::GlobalKeyedView;
+use super::expiring_time_key_map::{ExpiringTimeKeyTable, KeyTimeView, UncachedKeyValueView};
+use super::expiring_time_key_view::ExpiringTimeKeyViewApi;
+use super::global_keyed_map::{GlobalKeyedView, restore};
 use super::{ErasedCheckpointer, ErasedTable, MigratableState};
-use crate::{
-    BackingStore, StateBackend, StateMessage, get_storage_provider,
-    tables::global_keyed_map::GlobalKeyedTable,
-};
+use crate::provider::{TableKind, registry};
+use crate::{BackingStore, StateBackend, StateMessage, get_storage_provider};
 use crate::{CheckpointMessage, TableData};
 use arroyo_rpc::MetadataOrManifest;
 use arroyo_rpc::errors::{DataflowResult, StateError};
@@ -43,7 +38,26 @@ pub struct TableManager {
     writer: BackendWriter,
     task_info: Arc<TaskInfo>,
     storage: StorageProviderRef,
+    /// Views whose types this crate must name, recovered by `Any` downcast.
+    ///
+    /// The expiring-time-key view moved to [`Self::expiring_views`] (design item M11.D11).
+    /// The global-keyed, key-time, and uncached key-value views stay here because their
+    /// APIs are still generic (`GlobalKeyedView<K, V>`) or still hand out borrowed Arrow
+    /// data, so none of them is expressible as a `dyn` view. For the global-keyed view that
+    /// is not a gap: design item M11.D15c puts the backend seam *below* it, as a
+    /// bounded-page loader, precisely because `GlobalKeyedView<K, V>` cannot be a trait
+    /// object — so the view a backend's state produces is cached here while the backend
+    /// choice is still made through the registry.
     caches: HashMap<String, Box<dyn Any + Send>>,
+    /// The typed view map D11 requires: expiring-time-key views are owned trait objects,
+    /// so a view can come from any backend and its lifetime is independent of the
+    /// `Arc<dyn ErasedTable>` it was built from.
+    ///
+    /// A table name is in this map or in [`Self::caches`], never both: each getter
+    /// refuses a name the other already holds, which is the same
+    /// [`StateError::WrongTableKind`] a failed downcast produced when one map served all
+    /// four kinds.
+    expiring_views: HashMap<String, Box<dyn ExpiringTimeKeyViewApi + Send>>,
 }
 
 pub struct BackendWriter {
@@ -274,11 +288,18 @@ impl TableManager {
     /// therefore written by parquet, which is why it restores into a parquet job and is
     /// refused by a stateengine one.
     ///
+    /// Each table is then built by the provider that the job's selector and the table's
+    /// logical kind name (design item M11.D20, family (a)). The lookup is one immutable read per
+    /// table, made once here when the subtask's state is built and never on the record
+    /// path; a selector with no provider is a typed refusal rather than a fall back to
+    /// parquet, so a job cannot be quietly run on a backend it did not select.
+    ///
     /// # Errors
     ///
     /// Returns the [`arroyo_rpc::state_backend::StateBackendError`] the restored configs
-    /// raised, alongside the pre-existing failures of loading and constructing state.
-    /// Callers that need the selector failure typed can downcast it.
+    /// raised, alongside the pre-existing failures of loading and constructing state —
+    /// which now include a table config that states no kind and a selector this process has
+    /// no provider for. Callers that need the selector failure typed can downcast it.
     pub async fn load(
         task_info: Arc<TaskInfo>,
         table_configs: HashMap<String, TableConfig>,
@@ -310,25 +331,19 @@ impl TableManager {
                 let table_restore_from = checkpoint_metadata.as_ref().and_then(|metadata| {
                     metadata.table_checkpoint_metadata.get(table_name).cloned()
                 });
-                let erased_table = match table_config.table_type() {
-                    TableEnum::MissingTableType => bail!("should have table type"),
-                    TableEnum::GlobalKeyValue => {
-                        Arc::new(<GlobalKeyedTable as ErasedTable>::from_config(
-                            table_config.clone(),
-                            task_info.clone(),
-                            storage.clone(),
-                            table_restore_from,
-                        )?) as Arc<dyn ErasedTable>
-                    }
-                    TableEnum::ExpiringKeyedTimeTable => {
-                        Arc::new(<ExpiringTimeKeyTable as ErasedTable>::from_config(
-                            table_config.clone(),
-                            task_info.clone(),
-                            storage.clone(),
-                            table_restore_from,
-                        )?) as Arc<dyn ErasedTable>
-                    }
-                };
+                // The job's selector, not the table config's copy of it: the two were
+                // already checked against each other at the acquisition boundary
+                // (`apply_job_state_backend`, design item M11.D13b) and the restored
+                // checkpoint's copy a few lines above. Re-deriving the key from the
+                // config here would be a second, weaker comparison of values that have
+                // already been proven equal.
+                let kind = TableKind::of_config(table_name, table_config)?;
+                let erased_table = registry().provider(task_info.state_backend, kind)?.table(
+                    table_config.clone(),
+                    task_info.clone(),
+                    storage.clone(),
+                    table_restore_from,
+                )?;
                 Ok((table_name.to_string(), erased_table))
             })
             .collect::<Result<HashMap<_, _>>>()?;
@@ -379,6 +394,7 @@ impl TableManager {
                 task_info,
                 storage: Arc::clone(&storage),
                 caches: HashMap::new(),
+                expiring_views: HashMap::new(),
             },
             watermark,
         ))
@@ -428,10 +444,57 @@ impl TableManager {
             .expect("checkpoint queue closed");
     }
 
+    /// Refuses a table name the other view map already holds.
+    ///
+    /// One name held two views would mean two live handles writing the same table's state
+    /// through different code paths. A single `Any` cache made that unrepresentable
+    /// because the second getter's downcast failed; now that expiring views live in their
+    /// own map, each getter has to check the other.
+    fn reject_foreign_cache(
+        held_elsewhere: bool,
+        table_name: &str,
+        expected: &'static str,
+    ) -> Result<(), StateError> {
+        if held_elsewhere {
+            return Err(StateError::WrongTableKind {
+                table: table_name.to_string(),
+                expected,
+            });
+        }
+        Ok(())
+    }
+
+    /// The cached global key/value view for `table_name`, restoring it on first use.
+    ///
+    /// The restore goes through the backend-neutral bounded-page seam (design item
+    /// M11.D15c): the job's selector picks a provider, the provider starts a
+    /// [`GlobalKeyValueLoad`], and the decode above the seam turns its pages into this
+    /// `GlobalKeyedView<K, V>`. The view stays in the `Any` cache because it is generic
+    /// over `K` and `V` and so is not expressible as a `dyn` view — which is exactly why
+    /// D15c makes the seam a loader rather than a view.
+    ///
+    /// The lookup happens inside the cache-miss branch, so it is made once per table name
+    /// per subtask and never on the record path.
+    ///
+    /// # Errors
+    ///
+    /// [`StateError::NoRegisteredTable`] when the job has no such table,
+    /// [`StateError::WrongTableKind`] when the table is not a global key/value table or
+    /// when another kind of view is already cached under this name, and
+    /// [`StateError::Other`] carrying a [`LookupError`](crate::provider::LookupError) when
+    /// this process has no provider for the job's backend. Nothing is cached on any of
+    /// these paths, so a failed restore leaves no partial view behind.
+    ///
+    /// [`GlobalKeyValueLoad`]: crate::tables::global_key_value_load::GlobalKeyValueLoad
     pub async fn get_global_keyed_state<K: Key, V: Data>(
         &mut self,
         table_name: &str,
     ) -> Result<&mut GlobalKeyedView<K, V>, StateError> {
+        Self::reject_foreign_cache(
+            self.expiring_views.contains_key(table_name),
+            table_name,
+            "global_keyed_state",
+        )?;
         // this is done because populating it is async, so can't use or_insert().
         if let std::collections::hash_map::Entry::Vacant(e) =
             self.caches.entry(table_name.to_string())
@@ -443,17 +506,13 @@ impl TableManager {
                         table: table_name.to_string(),
                     })?;
 
-            let global_keyed_table = table_implementation
-                .as_any()
-                .downcast_ref::<GlobalKeyedTable>()
-                .ok_or_else(|| StateError::WrongTableKind {
-                    table: table_name.to_string(),
-                    expected: "global_keyed_state",
-                })?;
-
-            let saved_data = global_keyed_table
-                .memory_view::<K, V>(self.writer.sender.clone())
+            let loader = registry()
+                .global_key_value_provider(self.task_info.state_backend)
+                .map_err(|e| e.for_table(table_name))?
+                .global_key_value_load(table_name, &**table_implementation)
                 .await?;
+            let saved_data =
+                restore::view::<K, V>(table_name, loader, self.writer.sender.clone()).await?;
 
             let cache: Box<dyn Any + Send> = Box::new(saved_data);
             e.insert(cache);
@@ -470,10 +529,26 @@ impl TableManager {
         Ok(cache)
     }
 
+    /// [`Self::get_global_keyed_state`] with the migrating decode: a source written one
+    /// state version back is migrated as it is read.
+    ///
+    /// The two getters differ only in that decode. They drain the same seam, through the
+    /// same provider lookup, with the same page walk.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`Self::get_global_keyed_state`] returns, plus
+    /// [`StateError::UnsupportedStateVersion`] for state more than one version behind
+    /// `V::VERSION`.
     pub async fn get_global_keyed_state_migratable<K: Key, V: MigratableState>(
         &mut self,
         table_name: &str,
     ) -> Result<&mut GlobalKeyedView<K, V>, StateError> {
+        Self::reject_foreign_cache(
+            self.expiring_views.contains_key(table_name),
+            table_name,
+            "global_keyed_state",
+        )?;
         if let std::collections::hash_map::Entry::Vacant(e) =
             self.caches.entry(table_name.to_string())
         {
@@ -484,17 +559,14 @@ impl TableManager {
                         table: table_name.to_string(),
                     })?;
 
-            let global_keyed_table = table_implementation
-                .as_any()
-                .downcast_ref::<GlobalKeyedTable>()
-                .ok_or_else(|| StateError::WrongTableKind {
-                    table: table_name.to_string(),
-                    expected: "global_keyed_state",
-                })?;
-
-            let saved_data = global_keyed_table
-                .memory_view_migratable::<K, V>(self.writer.sender.clone())
+            let loader = registry()
+                .global_key_value_provider(self.task_info.state_backend)
+                .map_err(|e| e.for_table(table_name))?
+                .global_key_value_load(table_name, &**table_implementation)
                 .await?;
+            let saved_data =
+                restore::view_migratable::<K, V>(table_name, loader, self.writer.sender.clone())
+                    .await?;
 
             let cache: Box<dyn Any + Send> = Box::new(saved_data);
             e.insert(cache);
@@ -511,13 +583,38 @@ impl TableManager {
         Ok(cache)
     }
 
+    /// The cached expiring-time-key view for `table_name`, building it on first use.
+    ///
+    /// The view is owned by this manager — it lives in the manager's own view map as a
+    /// `Box<dyn ExpiringTimeKeyViewApi + Send>` — and the caller gets a borrow of it that
+    /// ends with the caller's own borrow of the manager (design item M11.D13). The view
+    /// is not borrowed out of the `Arc<dyn ErasedTable>` the table lives in, so a backend
+    /// whose view type this crate does not name can supply one.
+    ///
+    /// Which backend supplies it is the job's selector, resolved through
+    /// [`registry`](crate::provider::registry()) (design item M11.D20, family (a)). The lookup happens
+    /// inside the cache-miss branch, so it is made once per table name per subtask and
+    /// never on the record path.
+    ///
+    /// # Errors
+    ///
+    /// [`StateError::NoRegisteredTable`] when the job has no such table,
+    /// [`StateError::WrongTableKind`] when the table is not an expiring time-key table or
+    /// when another kind of view is already cached under this name, and
+    /// [`StateError::Other`] carrying a [`LookupError`](crate::provider::LookupError) when this process
+    /// has no provider for the job's backend.
     pub async fn get_expiring_time_key_table(
         &mut self,
         table_name: &str,
         watermark: Option<SystemTime>,
-    ) -> Result<&mut ExpiringTimeKeyView, StateError> {
+    ) -> Result<&mut (dyn ExpiringTimeKeyViewApi + Send), StateError> {
+        Self::reject_foreign_cache(
+            self.caches.contains_key(table_name),
+            table_name,
+            "expiring_time_key_table",
+        )?;
         if let std::collections::hash_map::Entry::Vacant(e) =
-            self.caches.entry(table_name.to_string())
+            self.expiring_views.entry(table_name.to_string())
         {
             let table_implementation =
                 self.tables
@@ -525,28 +622,22 @@ impl TableManager {
                     .ok_or_else(|| StateError::NoRegisteredTable {
                         table: table_name.to_string(),
                     })?;
-            let expiring_time_key_table = table_implementation
-                .as_any()
-                .downcast_ref::<ExpiringTimeKeyTable>()
-                .ok_or_else(|| StateError::WrongTableKind {
-                    table: table_name.to_string(),
-                    expected: "expiring_time_key_table",
-                })?;
-            let saved_data = expiring_time_key_table
-                .get_view(self.writer.sender.clone(), watermark)
+            let view = registry()
+                .expiring_time_key_provider(self.task_info.state_backend)
+                .map_err(|e| e.for_table(table_name))?
+                .expiring_time_key_view(
+                    table_name,
+                    &**table_implementation,
+                    self.writer.sender.clone(),
+                    watermark,
+                )
                 .await?;
-            let cache: Box<dyn Any + Send> = Box::new(saved_data);
-            e.insert(cache);
+            e.insert(view);
         }
-        let cache = self.caches.get_mut(table_name).unwrap();
-        let cache: &mut ExpiringTimeKeyView =
-            cache
-                .downcast_mut()
-                .ok_or_else(|| StateError::WrongTableKind {
-                    table: table_name.to_string(),
-                    expected: "expiring_time_key_table",
-                })?;
-        Ok(cache)
+        Ok(&mut **self
+            .expiring_views
+            .get_mut(table_name)
+            .expect("just inserted if it was missing"))
     }
 
     pub async fn get_key_time_table(
@@ -554,6 +645,11 @@ impl TableManager {
         table_name: &str,
         watermark: Option<SystemTime>,
     ) -> Result<&mut KeyTimeView, StateError> {
+        Self::reject_foreign_cache(
+            self.expiring_views.contains_key(table_name),
+            table_name,
+            "key_time_table",
+        )?;
         if let std::collections::hash_map::Entry::Vacant(e) =
             self.caches.entry(table_name.to_string())
         {
@@ -591,6 +687,11 @@ impl TableManager {
         &mut self,
         table_name: &str,
     ) -> Result<&mut UncachedKeyValueView, StateError> {
+        Self::reject_foreign_cache(
+            self.expiring_views.contains_key(table_name),
+            table_name,
+            "uncached_key_value",
+        )?;
         if let std::collections::hash_map::Entry::Vacant(e) =
             self.caches.entry(table_name.to_string())
         {

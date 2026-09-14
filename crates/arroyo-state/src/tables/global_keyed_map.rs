@@ -1,6 +1,6 @@
 use crate::{CheckpointMessage, StateMessage, TableData};
 use arrow_array::{BinaryArray, RecordBatch};
-use arrow_schema::{ArrowError, DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Schema};
 use arroyo_rpc::errors::StateError;
 use arroyo_rpc::grpc::rpc::{
     GlobalKeyedTableSubtaskCheckpointMetadata, GlobalKeyedTableTaskCheckpointMetadata,
@@ -11,15 +11,12 @@ use arroyo_types::{Data, Key, TaskInfo, to_micros};
 use bincode::config;
 
 use once_cell::sync::Lazy;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::{
     arrow::ArrowWriter,
     basic::ZstdLevel,
     file::properties::{EnabledStatistics, WriterProperties},
 };
 use tracing::debug;
-
-use std::iter::Zip;
 
 use arroyo_rpc::grpc::rpc::GlobalKeyedTableConfig;
 use std::time::SystemTime;
@@ -30,11 +27,15 @@ use std::{
 };
 use tokio::sync::mpsc::Sender;
 
+use super::global_key_value_load::LoadPageLimits;
+use super::global_key_value_load::parquet_load::ParquetGlobalKeyValueLoad;
 use super::{
     CheckpointParquetMetadata, CompactionConfig, MigratableState, Table, TableEpochCheckpointer,
     table_checkpoint_path,
 };
-use tracing::info;
+
+pub(crate) mod restore;
+
 static GLOBAL_KEY_VALUE_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
     let fields = vec![
         Field::new("key", DataType::Binary, false), // non-nullable BinaryArray for 'key'
@@ -53,153 +54,52 @@ pub struct GlobalKeyedTable {
 }
 
 impl GlobalKeyedTable {
-    #[allow(clippy::type_complexity)]
-    fn get_key_value_iterator<'a>(
-        &self,
-        record_batch: &'a RecordBatch,
-    ) -> Result<
-        Zip<impl Iterator<Item = Option<&'a [u8]>>, impl Iterator<Item = Option<&'a [u8]>>>,
-        StateError,
-    > {
-        let key_column = record_batch.column_by_name("key").ok_or_else(|| {
-            StateError::ArrowError(ArrowError::SchemaError("missing column 'key'".to_string()))
-        })?;
-        let value_column = record_batch.column_by_name("value").ok_or_else(|| {
-            StateError::ArrowError(ArrowError::SchemaError(
-                "missing column 'value'".to_string(),
-            ))
-        })?;
-        let cast_key_column = key_column
-            .as_any()
-            .downcast_ref::<arrow_array::BinaryArray>()
-            .ok_or_else(|| {
-                StateError::ArrowError(ArrowError::CastError(
-                    "failed to downcast key to binary".to_string(),
-                ))
-            })?;
-        let cast_value_column = value_column
-            .as_any()
-            .downcast_ref::<arrow_array::BinaryArray>()
-            .ok_or_else(|| {
-                StateError::ArrowError(ArrowError::CastError(
-                    "failed to downcast value column to BinaryArray".to_string(),
-                ))
-            })?;
-        Ok(cast_key_column.into_iter().zip(cast_value_column))
+    /// A bounded-page loader over this table's restored checkpoint files (design item
+    /// M11.D15c).
+    ///
+    /// This is the parquet backend's implementation of the backend-neutral seam; the
+    /// loader owns copies of what it reads from, so it is independent of this table's
+    /// lifetime. `files` is the union of every predecessor subtask's checkpoint object,
+    /// so a loader reads all of them, in order.
+    pub fn loader(&self) -> ParquetGlobalKeyValueLoad {
+        ParquetGlobalKeyValueLoad::new(
+            self.table_name.clone(),
+            self.storage_provider.clone(),
+            self.files.clone(),
+            LoadPageLimits::DEFAULT,
+        )
     }
 
-    async fn load_with_version<K: Key, V: Data>(
-        &self,
-        state_tx: Sender<StateMessage>,
-        version: u32,
-    ) -> Result<GlobalKeyedView<K, V>, StateError> {
-        let mut data = HashMap::new();
-        for file in &self.files {
-            let contents = self.storage_provider.get(file.as_str()).await?;
-            let reader = ParquetRecordBatchReaderBuilder::try_new(contents)?.build()?;
-
-            for batch in reader {
-                for (key, value) in self.get_key_value_iterator(&batch?)? {
-                    let key = key.ok_or_else(|| StateError::Other {
-                        table: self.table_name.clone(),
-                        error: "unexpected null key from record batch".to_string(),
-                    })?;
-                    let value = value.ok_or_else(|| StateError::Other {
-                        table: self.table_name.clone(),
-                        error: "unexpected null value from record batch".to_string(),
-                    })?;
-                    data.insert(
-                        bincode::decode_from_slice(key, config::standard())?.0,
-                        bincode::decode_from_slice(value, config::standard())?.0,
-                    );
-                }
-            }
-        }
-        Ok(GlobalKeyedView {
-            table_name: self.table_name.to_string(),
-            data,
-            state_tx,
-            version,
-        })
-    }
-
+    /// The restored state of this table, decoded as `K` and `V`.
+    ///
+    /// The walk this used to perform is [`Self::loader`]'s; what is left here is the
+    /// decode, which lives above the seam in this module's `restore` submodule and is
+    /// shared with every other backend.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`StateError`] raised by reading a checkpoint object and by a key or
+    /// value that does not decode as a `K` or a `V`.
     pub async fn memory_view<K: Key, V: Data>(
         &self,
         state_tx: Sender<StateMessage>,
     ) -> Result<GlobalKeyedView<K, V>, StateError> {
-        self.load_with_version(state_tx, 0).await
+        restore::view(&self.table_name, Box::new(self.loader()), state_tx).await
     }
 
-    /// Load state with version-aware migration support.
+    /// The restored state of this table, decoded as `K` and `V` and migrating sources
+    /// written one state version back.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`Self::memory_view`] returns, plus
+    /// [`StateError::UnsupportedStateVersion`] for a checkpoint object more than one
+    /// version behind `V::VERSION`.
     pub async fn memory_view_migratable<K: Key, V: MigratableState>(
         &self,
         state_tx: Sender<StateMessage>,
     ) -> Result<GlobalKeyedView<K, V>, StateError> {
-        let mut data = HashMap::new();
-        for file in &self.files {
-            let contents = self.storage_provider.get(file.as_str()).await?;
-            let reader = ParquetRecordBatchReaderBuilder::try_new(contents)?;
-
-            let metadata = CheckpointParquetMetadata::from(
-                reader.metadata().file_metadata().key_value_metadata(),
-            );
-
-            let migrating = if metadata.state_version == V::VERSION {
-                false
-            } else if metadata.state_version + 1 == V::VERSION {
-                info!(
-                    "Migrating state for table '{}' in {} from version {} to version {}",
-                    self.table_name,
-                    file,
-                    metadata.state_version,
-                    V::VERSION
-                );
-                true
-            } else {
-                // we only support 1 step migration at this point
-                return Err(StateError::UnsupportedStateVersion {
-                    table: self.table_name.clone(),
-                    found: metadata.state_version,
-                    expected: V::VERSION,
-                });
-            };
-
-            for batch in reader.build()? {
-                for (key, value) in self.get_key_value_iterator(&batch?)? {
-                    let key = key.ok_or_else(|| StateError::Other {
-                        table: self.table_name.clone(),
-                        error: "unexpected null key from record batch".to_string(),
-                    })?;
-                    let value = value.ok_or_else(|| StateError::Other {
-                        table: self.table_name.clone(),
-                        error: "unexpected null value from record batch".to_string(),
-                    })?;
-
-                    let (k, v) = if migrating {
-                        let decoded_key: K = bincode::decode_from_slice(key, config::standard())?.0;
-                        let old_value: V::PreviousVersion =
-                            bincode::decode_from_slice(value, config::standard())?.0;
-
-                        let new_value = V::migrate(old_value)?;
-                        (decoded_key, new_value)
-                    } else {
-                        (
-                            bincode::decode_from_slice(key, config::standard())?.0,
-                            bincode::decode_from_slice(value, config::standard())?.0,
-                        )
-                    };
-
-                    data.insert(k, v);
-                }
-            }
-        }
-
-        Ok(GlobalKeyedView {
-            table_name: self.table_name.to_string(),
-            data,
-            state_tx,
-            version: V::VERSION,
-        })
+        restore::view_migratable(&self.table_name, Box::new(self.loader()), state_tx).await
     }
 }
 
@@ -296,11 +196,15 @@ impl Table for GlobalKeyedTable {
         self.task_info.clone()
     }
 
+    fn data_files(checkpoint: &Self::TableCheckpointMessage) -> Vec<String> {
+        checkpoint.files.clone()
+    }
+
     fn files_to_keep(
         _config: Self::ConfigMessage,
         checkpoint: Self::TableCheckpointMessage,
     ) -> Result<std::collections::HashSet<String>, StateError> {
-        Ok(checkpoint.files.into_iter().collect())
+        Ok(Self::data_files(&checkpoint).into_iter().collect())
     }
 
     fn committing_data(

@@ -8,6 +8,7 @@ use arroyo_operator::{
 };
 use arroyo_rpc::errors::DataflowResult;
 use arroyo_rpc::grpc::{api, rpc::TableConfig};
+use arroyo_state::tables::expiring_time_key_view::ExpiringTimeKeyViewDrain;
 use arroyo_state::timestamp_table_config;
 use arroyo_types::{CheckpointBarrier, Watermark, from_nanos, print_time, to_nanos};
 use datafusion::common::ScalarValue;
@@ -148,7 +149,7 @@ impl SlidingAggregatingWindowFunc<SystemTime> {
                     columns.push(timestamp_array);
                     let state_batch =
                         RecordBatch::try_new(self.partial_schema.schema.clone(), columns)?;
-                    partial_table.insert(bin_start, state_batch);
+                    partial_table.insert(bin_start, state_batch)?;
                     bin_exec.finished_batches.push(batch);
                 }
             }
@@ -156,8 +157,10 @@ impl SlidingAggregatingWindowFunc<SystemTime> {
                 self.tiered_record_batches.insert(batch, bin_start)?;
             }
         }
-        partial_table.flush_timestamp(bin_end).await;
-        partial_table.expire_timestamp(bin_end - self.width + self.slide);
+        partial_table.flush_timestamp(bin_end).await?;
+        partial_table
+            .expire_timestamp(bin_end - self.width + self.slide)
+            .await?;
         let interval_start = bin_end - self.width;
         let interval_end = bin_end;
         {
@@ -561,20 +564,21 @@ impl ArrowOperator for SlidingAggregatingWindowFunc<SystemTime> {
             .await?;
         // bins before the watermark should be put into the TieredRecordBatchHolder, those after in the exec.
         let watermark_bin = self.bin_start(watermark.unwrap_or(SystemTime::UNIX_EPOCH));
-        for (timestamp, batches) in table.all_batches_for_watermark(watermark) {
-            let bin = self.bin_start(*timestamp);
-            if bin < watermark_bin {
-                for batch in batches {
-                    self.tiered_record_batches
-                        .insert(batch.clone(), bin)
-                        .unwrap();
+        {
+            let mut batches = table.all_batches_for_watermark(watermark);
+            while let Some(batch) = batches.next().await {
+                let (timestamp, batch) = batch?;
+                let bin = self.bin_start(timestamp);
+                if bin < watermark_bin {
+                    self.tiered_record_batches.insert(batch, bin).unwrap();
+                    continue;
                 }
-                continue;
+                self.execs
+                    .entry(bin)
+                    .or_default()
+                    .finished_batches
+                    .push(batch);
             }
-            let holder = self.execs.entry(bin).or_default();
-            batches
-                .iter()
-                .for_each(|batch| holder.finished_batches.push(batch.clone()));
         }
 
         if self.tiered_record_batches.is_empty() {
@@ -728,7 +732,7 @@ impl ArrowOperator for SlidingAggregatingWindowFunc<SystemTime> {
                 columns.push(timestamp_array);
                 let state_batch =
                     RecordBatch::try_new(self.partial_schema.schema.clone(), columns)?;
-                table.insert(*bin, state_batch);
+                table.insert(*bin, state_batch)?;
                 exec.finished_batches.push(batch);
             }
         }

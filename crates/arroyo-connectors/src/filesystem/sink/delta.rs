@@ -17,7 +17,6 @@ use deltalake::{
 use deltalake::kernel::transaction::CommitBuilder;
 use itertools::Itertools;
 use object_store::ObjectStore;
-use object_store::path::Path;
 use std::sync::Arc;
 use std::{
     collections::{HashMap, HashSet},
@@ -52,8 +51,6 @@ pub(crate) async fn load_or_create_table(
     deltalake::aws::register_handlers(None);
     deltalake::gcp::register_handlers(None);
 
-    let empty_path = &Path::parse("").unwrap();
-
     let (backing_store, url): (Arc<dyn ObjectStore>, _) = match storage_provider.config() {
         BackendConfig::S3(S3Config { bucket, .. }) | BackendConfig::R2(R2Config { bucket, .. }) => {
             (
@@ -61,11 +58,7 @@ pub(crate) async fn load_or_create_table(
                     storage_provider.get_backing_store(),
                     true,
                 )?),
-                format!(
-                    "s3://{}/{}",
-                    bucket,
-                    storage_provider.qualify_path(empty_path)
-                ),
+                format!("s3://{}/{}", bucket, storage_provider.configured_prefix()),
             )
         }
         BackendConfig::GCS(gcs) => (
@@ -73,7 +66,7 @@ pub(crate) async fn load_or_create_table(
             format!(
                 "gs://{}/{}",
                 gcs.bucket,
-                storage_provider.qualify_path(empty_path)
+                storage_provider.configured_prefix()
             ),
         ),
         BackendConfig::Azure(azure) => (
@@ -81,7 +74,7 @@ pub(crate) async fn load_or_create_table(
             format!(
                 "abfs://{}/{}",
                 azure.container,
-                storage_provider.qualify_path(empty_path)
+                storage_provider.configured_prefix()
             ),
         ),
         BackendConfig::Local(_) => (storage_provider.get_backing_store(), "/".to_string()),

@@ -9,6 +9,11 @@ edition = "2024"
 arroyo-types = { path = "../arroyo-types" }
 arroyo-rpc = { path = "../arroyo-rpc" }
 arroyo-storage = { path = "../arroyo-storage" }
+# The GC liveness seam this crate's providers implement is declared by the checkpoint
+# protocol, which is the crate that deletes with the answer (M11.P49). The edge runs this
+# way only: `arroyo-state-protocol` must never depend on `arroyo-state`, and now cannot —
+# cargo refuses a dependency cycle, so this line is what enforces the direction.
+arroyo-state-protocol = { path = "../arroyo-state-protocol" }
 
 datafusion = { workspace = true }
 
@@ -30,3 +35,14 @@ lazy_static = { workspace = true }
 object_store = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# Repeated from [dependencies] so the external seam test — which must compile against the
+# public API the way another crate would — can use them.
+arroyo-rpc = { path = "../arroyo-rpc" }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true }

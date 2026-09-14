@@ -17,6 +17,8 @@ use std::time::SystemTime;
 use tracing::debug;
 
 pub mod expiring_time_key_map;
+pub mod expiring_time_key_view;
+pub mod global_key_value_load;
 pub mod global_keyed_map;
 pub mod table_manager;
 
@@ -165,6 +167,15 @@ pub(crate) trait Table: Send + Sync + 'static + Clone {
     fn table_type() -> TableEnum;
 
     fn task_info(&self) -> Arc<TaskInfo>;
+
+    /// The data files `checkpoint` names, in the order its payload records them.
+    ///
+    /// This is the one statement of which field of this table's checkpoint payload holds a
+    /// file name. Both questions that ask it are derived from it rather than repeating it:
+    /// [`Self::files_to_keep`] deduplicates it into the set a checkpoint cleanup subtracts,
+    /// and the provider's `table_data_files` hands the ordered list to leader GC's liveness
+    /// seam, which validates each name into a `CheckpointRef` of its own.
+    fn data_files(checkpoint: &Self::TableCheckpointMessage) -> Vec<String>;
 
     fn files_to_keep(
         config: Self::ConfigMessage,

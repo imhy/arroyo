@@ -10,6 +10,7 @@ use arroyo_operator::operator::{
 use arroyo_planner::schemas::add_timestamp_field_arrow;
 use arroyo_rpc::errors::DataflowResult;
 use arroyo_rpc::grpc::{api, rpc::TableConfig};
+use arroyo_state::tables::expiring_time_key_view::ExpiringTimeKeyViewDrain;
 use arroyo_state::timestamp_table_config;
 use arroyo_types::{CheckpointBarrier, Watermark, from_nanos, print_time, to_nanos};
 use datafusion::common::ScalarValue;
@@ -237,12 +238,15 @@ impl ArrowOperator for TumblingAggregatingWindowFunc<SystemTime> {
             .table_manager
             .get_expiring_time_key_table("t", watermark)
             .await?;
-        for (timestamp, batch) in table.all_batches_for_watermark(watermark) {
-            let bin = self.bin_start(*timestamp);
-            let holder = self.execs.entry(bin).or_default();
-            batch
-                .iter()
-                .for_each(|batch| holder.finished_batches.push(batch.clone()));
+        let mut batches = table.all_batches_for_watermark(watermark);
+        while let Some(batch) = batches.next().await {
+            let (timestamp, batch) = batch?;
+            let bin = self.bin_start(timestamp);
+            self.execs
+                .entry(bin)
+                .or_default()
+                .finished_batches
+                .push(batch);
         }
         Ok(())
     }
@@ -458,7 +462,7 @@ impl ArrowOperator for TumblingAggregatingWindowFunc<SystemTime> {
                     *bin,
                     self.partial_schema.schema.clone(),
                 )?;
-                table.insert(*bin, state_batch);
+                table.insert(*bin, state_batch)?;
                 exec.finished_batches.push(batch);
             }
         }

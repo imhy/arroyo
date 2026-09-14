@@ -1,3 +1,4 @@
+use crate::gc::liveness::LivenessRefusal;
 use crate::types::{CheckpointRef, ProtocolError};
 use arroyo_rpc::errors::StorageError;
 use arroyo_rpc::state_backend::{IncompleteManifest, StateBackendError};
@@ -54,6 +55,30 @@ pub enum StoreError {
     /// inner error names the operators that made the manifest unusable.
     #[error(transparent)]
     IncompleteManifest(#[from] IncompleteManifest),
+    /// The selected state backend could not name the files one table's checkpoint metadata
+    /// keeps alive.
+    ///
+    /// Raised while classifying a leader-mode garbage collection, so nothing has been deleted.
+    /// It is a refusal rather than an empty file list on purpose: the files a table names are
+    /// what protect them from the pass, so a backend that cannot read a payload has to stop the
+    /// pass instead of withdrawing that protection. The operator and table are named here
+    /// because the inner refusal is about a backend and a table kind, not about which entry of
+    /// which manifest carried them.
+    #[error(
+        "no state backend implementation can say which files table '{table}' of operator \
+         '{operator_id}' keeps alive in the checkpoint metadata at {path}: {source}"
+    )]
+    UnresolvedTableLiveness {
+        /// The manifest the table's metadata was read from.
+        path: CheckpointRef,
+        /// The operator whose table could not be read.
+        operator_id: String,
+        /// The table that could not be read.
+        table: String,
+        /// Why the backend declined.
+        #[source]
+        source: LivenessRefusal,
+    },
 }
 
 /// Minimal storage interface required by the protocol workflows.

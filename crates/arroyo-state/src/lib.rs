@@ -27,6 +27,7 @@ use tokio::sync::Mutex;
 
 mod metrics;
 pub mod parquet;
+pub mod provider;
 pub(crate) mod schemas;
 pub mod tables;
 pub mod validated;

@@ -862,6 +862,13 @@ impl WorkerJobController {
         // The job's authoritative selector, the same one the model checkpoints and compacts
         // with. Leader GC deletes files named by manifests it reads back, so it is handed the
         // selector explicitly and refuses a history any other backend wrote.
+        //
+        // Since M11.T09-S5 it is handed the selector's *provider liveness resolver* rather
+        // than the selector, because GC also has to read each table's backend-specific
+        // checkpoint payload to learn which files it keeps alive. The resolver reports the
+        // selector it was looked up under, so those are one statement instead of two: the
+        // backend whose payload format is decoded is the backend every manifest is checked
+        // against.
         let state_backend = self.model.state_backend;
 
         let new_min = Epoch((*self.model.epoch).saturating_sub(CHECKPOINTS_TO_KEEP));
@@ -882,10 +889,13 @@ impl WorkerJobController {
         let start = Instant::now();
         Some(tokio::spawn(async move {
             let storage = get_storage_provider(&StorageProviderFor::Worker).await?;
+            // Refused, rather than run through another backend's decoder, when this process
+            // has no providers for the job's backend.
+            let liveness = arroyo_state::provider::liveness(state_backend)?;
             cleanup_leader_checkpoints(
                 storage.as_ref(),
                 &paths,
-                state_backend,
+                &liveness,
                 last_checkpoint,
                 new_min,
             )

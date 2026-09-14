@@ -15,6 +15,7 @@ use arroyo_rpc::df::ArroyoSchema;
 use arroyo_rpc::errors::DataflowResult;
 use arroyo_rpc::grpc::rpc::TableConfig;
 use arroyo_rpc::{df::ArroyoSchemaRef, grpc::api};
+use arroyo_state::tables::expiring_time_key_view::ExpiringTimeKeyViewDrain;
 use arroyo_state::timestamp_table_config;
 use arroyo_types::{CheckpointBarrier, Watermark, from_nanos};
 use datafusion::execution::SendableRecordBatchStream;
@@ -23,7 +24,7 @@ use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_proto::physical_plan::AsExecutionPlan;
 use datafusion_proto::protobuf::PhysicalPlanNode;
-use futures::{lock::Mutex, stream::FuturesUnordered};
+use futures::{StreamExt, lock::Mutex, stream::FuturesUnordered};
 use prost::Message;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tracing::warn;
@@ -133,13 +134,13 @@ impl ArrowOperator for WindowFunctionOperator {
             .table_manager
             .get_expiring_time_key_table("input", watermark)
             .await?;
-        for (timestamp, batches) in table.all_batches_for_watermark(watermark) {
-            let exec = self.get_or_insert_exec(*timestamp).await;
-            for batch in batches {
-                exec.sender
-                    .send(batch.clone())
-                    .map_err(|e| anyhow!("failed to send batch: {:?}", e))?;
-            }
+        let mut batches = table.all_batches_for_watermark(watermark);
+        while let Some(batch) = batches.next().await {
+            let (timestamp, batch) = batch?;
+            let exec = self.get_or_insert_exec(timestamp).await;
+            exec.sender
+                .send(batch)
+                .map_err(|e| anyhow!("failed to send batch: {:?}", e))?;
         }
         Ok(())
     }
@@ -156,7 +157,7 @@ impl ArrowOperator for WindowFunctionOperator {
             .get_expiring_time_key_table("input", current_watermark)
             .await?;
         for (batch, timestamp) in self.filter_and_split_batches(batch, current_watermark)? {
-            table.insert(timestamp, batch.clone());
+            table.insert(timestamp, batch.clone())?;
             let bin_exec = self.get_or_insert_exec(timestamp).await;
             bin_exec
                 .sender

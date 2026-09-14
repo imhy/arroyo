@@ -185,6 +185,7 @@ impl ProtocolPaths {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gc::liveness::fixture::{ClaimsStateEngine, ParquetPayloads, RefusesExpiring};
     use crate::gc::{CheckpointOwner, cleanup_leader_checkpoints, delete_classified_history};
     use crate::resolve::{
         EpochClaimOutcome, ParentCheckpointStatus, ResolveDecision, ResolveFailure,
@@ -674,7 +675,7 @@ mod tests {
         cleanup_leader_checkpoints(
             &store,
             &paths,
-            StateBackendSelector::Parquet,
+            &ParquetPayloads,
             checkpoint3_ref.clone(),
             Epoch(2),
         )
@@ -752,7 +753,7 @@ mod tests {
         cleanup_leader_checkpoints(
             &store,
             &paths,
-            StateBackendSelector::Parquet,
+            &ParquetPayloads,
             checkpoint2_ref.clone(),
             Epoch(2),
         )
@@ -763,15 +764,9 @@ mod tests {
         assert!(!exists(&store, &expired_file).await);
 
         let deleted_count = store.deleted_objects().len();
-        cleanup_leader_checkpoints(
-            &store,
-            &paths,
-            StateBackendSelector::Parquet,
-            checkpoint2_ref,
-            Epoch(2),
-        )
-        .await
-        .unwrap();
+        cleanup_leader_checkpoints(&store, &paths, &ParquetPayloads, checkpoint2_ref, Epoch(2))
+            .await
+            .unwrap();
         assert_eq!(deleted_count, store.deleted_objects().len());
         assert!(exists(&store, &shared_file).await);
     }
@@ -809,7 +804,7 @@ mod tests {
         cleanup_leader_checkpoints(
             &store,
             &paths,
-            StateBackendSelector::Parquet,
+            &ParquetPayloads,
             paths.checkpoint_manifest(Generation(1), Epoch(2)),
             Epoch(2),
         )
@@ -837,7 +832,7 @@ mod tests {
         cleanup_leader_checkpoints(
             &store,
             &paths,
-            StateBackendSelector::Parquet,
+            &ParquetPayloads,
             paths.checkpoint_manifest(Generation(1), Epoch(3)),
             Epoch(3),
         )
@@ -911,7 +906,7 @@ mod tests {
         cleanup_leader_checkpoints(
             &store,
             &paths,
-            StateBackendSelector::Parquet,
+            &ParquetPayloads,
             paths.checkpoint_manifest(Generation(1), Epoch(2)),
             Epoch(2),
         )
@@ -951,7 +946,7 @@ mod tests {
         let err = cleanup_leader_checkpoints(
             &store,
             &paths,
-            StateBackendSelector::Parquet,
+            &ParquetPayloads,
             paths.checkpoint_manifest(Generation(1), Epoch(3)),
             Epoch(3),
         )
@@ -974,7 +969,7 @@ mod tests {
         cleanup_leader_checkpoints(
             &store,
             &paths,
-            StateBackendSelector::Parquet,
+            &ParquetPayloads,
             paths.checkpoint_manifest(Generation(1), Epoch(3)),
             Epoch(3),
         )
@@ -1014,7 +1009,7 @@ mod tests {
         let err = cleanup_leader_checkpoints(
             &store,
             &paths,
-            StateBackendSelector::Parquet,
+            &ParquetPayloads,
             paths.checkpoint_manifest(Generation(1), Epoch(2)),
             Epoch(2),
         )
@@ -1038,15 +1033,9 @@ mod tests {
         let head = paths.checkpoint_manifest(Generation(1), Epoch(2));
         write_gc_checkpoint(&store, &paths, 2, None, vec![global_operator(vec![])]).await;
 
-        let err = cleanup_leader_checkpoints(
-            &store,
-            &paths,
-            StateBackendSelector::Parquet,
-            head,
-            Epoch(3),
-        )
-        .await
-        .unwrap_err();
+        let err = cleanup_leader_checkpoints(&store, &paths, &ParquetPayloads, head, Epoch(3))
+            .await
+            .unwrap_err();
 
         assert!(matches!(
             err,
@@ -1119,7 +1108,7 @@ mod tests {
         cleanup_leader_checkpoints(
             &store,
             &paths,
-            StateBackendSelector::Parquet,
+            &ParquetPayloads,
             paths.checkpoint_manifest(Generation(1), Epoch(2)),
             Epoch(2),
         )
@@ -1179,7 +1168,7 @@ mod tests {
         let err = cleanup_leader_checkpoints(
             &store,
             &paths,
-            StateBackendSelector::Parquet,
+            &ParquetPayloads,
             paths.checkpoint_manifest(Generation(1), Epoch(3)),
             Epoch(3),
         )
@@ -1236,7 +1225,7 @@ mod tests {
         let err = cleanup_leader_checkpoints(
             &store,
             &paths,
-            StateBackendSelector::Parquet,
+            &ParquetPayloads,
             paths.checkpoint_manifest(Generation(1), Epoch(2)),
             Epoch(2),
         )
@@ -1279,7 +1268,7 @@ mod tests {
         let err = cleanup_leader_checkpoints(
             &store,
             &paths,
-            StateBackendSelector::Parquet,
+            &ParquetPayloads,
             paths.checkpoint_manifest(Generation(1), Epoch(2)),
             Epoch(2),
         )
@@ -1296,6 +1285,275 @@ mod tests {
         );
         assert!(store.deleted_objects().is_empty());
         assert!(exists(&store, &old_file).await);
+    }
+
+    /// An operator whose one table states no table type, which is the protobuf default and
+    /// therefore what a writer that never set the field produces.
+    fn typeless_operator(files: Vec<CheckpointRef>) -> OperatorCheckpointMetadata {
+        let mut operator = global_operator(files);
+        for metadata in operator.table_checkpoint_metadata.values_mut() {
+            metadata.table_type = TableEnum::MissingTableType.into();
+        }
+        operator
+    }
+
+    /// A table metadata that names no kind is refused, in the message leader GC has always
+    /// used, naming the operator and the table.
+    ///
+    /// This refusal stayed in `gc` when the payload decode moved out, and it had to: a kind
+    /// is what selects an implementation, so an entry that names none cannot reach one. If it
+    /// did, "no kind was named" and "no files were named" would arrive at the classifier as
+    /// the same answer, and the files of the checkpoint below the boundary would lose their
+    /// protection rather than stop the pass.
+    #[tokio::test]
+    async fn cleanup_refuses_a_table_that_states_no_table_type() {
+        let store = MemoryProtocolStore::default();
+        let paths = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J"));
+        let old_file = data_ref(&paths, 1);
+        let checkpoint1_ref = paths.checkpoint_manifest(Generation(1), Epoch(1));
+
+        store.put_bytes(&old_file, b"1".to_vec()).await.unwrap();
+        write_gc_checkpoint(
+            &store,
+            &paths,
+            1,
+            None,
+            vec![typeless_operator(vec![old_file.clone()])],
+        )
+        .await;
+        write_gc_checkpoint(&store, &paths, 2, Some(1), vec![global_operator(vec![])]).await;
+
+        let err = cleanup_leader_checkpoints(
+            &store,
+            &paths,
+            &ParquetPayloads,
+            paths.checkpoint_manifest(Generation(1), Epoch(2)),
+            Epoch(2),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, StoreError::InvalidProtobuf { .. }), "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "protobuf at path at {checkpoint1_ref} is invalid: table metadata for operator \
+                 'op' table 'table' is missing table type"
+            )
+        );
+        assert!(store.deleted_objects().is_empty());
+        assert!(store.deleted_directories().is_empty());
+        assert!(exists(&store, &old_file).await);
+    }
+
+    /// A table whose kind the resolver cannot speak for is refused, naming the operator and
+    /// the table — never classified as keeping no files alive.
+    #[tokio::test]
+    async fn cleanup_refuses_a_table_kind_the_resolver_does_not_speak_for() {
+        let store = MemoryProtocolStore::default();
+        let paths = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J"));
+        let expiring_file = checkpoint_ref(&format!(
+            "{}/operator-expiring-op/table-expiring-old",
+            paths.checkpoint_dir(Generation(1), Epoch(1))
+        ));
+        let checkpoint1_ref = paths.checkpoint_manifest(Generation(1), Epoch(1));
+
+        store
+            .put_bytes(&expiring_file, b"1".to_vec())
+            .await
+            .unwrap();
+        write_gc_checkpoint(
+            &store,
+            &paths,
+            1,
+            None,
+            vec![expiring_operator(
+                "expiring-op",
+                vec![expiring_file.clone()],
+            )],
+        )
+        .await;
+        // Global-only above the boundary, so the entry that is refused is the one in the
+        // checkpoint this pass would otherwise have collected.
+        write_gc_checkpoint(&store, &paths, 2, Some(1), vec![global_operator(vec![])]).await;
+
+        let err = cleanup_leader_checkpoints(
+            &store,
+            &paths,
+            &RefusesExpiring,
+            paths.checkpoint_manifest(Generation(1), Epoch(2)),
+            Epoch(2),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                StoreError::UnresolvedTableLiveness {
+                    ref operator_id,
+                    ref table,
+                    ..
+                } if operator_id == "expiring-op" && table == "expiring-table"
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "no state backend implementation can say which files table 'expiring-table' of \
+                 operator 'expiring-op' keeps alive in the checkpoint metadata at \
+                 {checkpoint1_ref}: the \"parquet\" state backend has no implementation for \
+                 ExpiringKeyedTimeTable table metadata"
+            )
+        );
+        assert!(exists(&store, &expiring_file).await);
+    }
+
+    /// A refusal about one table stops the whole pass, and stops it before the first delete.
+    ///
+    /// This is the case the seam exists for. The manifest below the retention boundary carries
+    /// a global table the resolver reads perfectly well *and* an expiring table it cannot, so
+    /// "nothing was deleted" is about the refusal rather than about the pass having had
+    /// nothing to collect: without it, the global table's file, the manifest, the epoch record
+    /// and the committed marker of epoch 1 would all have gone.
+    #[tokio::test]
+    async fn a_refused_table_leaves_the_whole_history_undeleted() {
+        let store = MemoryProtocolStore::default();
+        let paths = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J"));
+        let global_file = data_ref(&paths, 1);
+        let expiring_file = checkpoint_ref(&format!(
+            "{}/operator-expiring-op/table-expiring-old",
+            paths.checkpoint_dir(Generation(1), Epoch(1))
+        ));
+        let checkpoint1_ref = paths.checkpoint_manifest(Generation(1), Epoch(1));
+
+        for file in [&global_file, &expiring_file] {
+            store.put_bytes(file, b"data".to_vec()).await.unwrap();
+        }
+        write_gc_checkpoint(
+            &store,
+            &paths,
+            1,
+            None,
+            vec![
+                global_operator(vec![global_file.clone()]),
+                expiring_operator("expiring-op", vec![expiring_file.clone()]),
+            ],
+        )
+        .await;
+        write_gc_checkpoint(&store, &paths, 2, Some(1), vec![global_operator(vec![])]).await;
+
+        // The same history, the same boundary, collected with a resolver that reads both
+        // payloads: epoch 1 is collectable, which is what makes the refusal below a refusal
+        // rather than a no-op.
+        let collectable = MemoryProtocolStore::default();
+        for file in [&global_file, &expiring_file] {
+            collectable.put_bytes(file, b"data".to_vec()).await.unwrap();
+        }
+        write_gc_checkpoint(
+            &collectable,
+            &paths,
+            1,
+            None,
+            vec![
+                global_operator(vec![global_file.clone()]),
+                expiring_operator("expiring-op", vec![expiring_file.clone()]),
+            ],
+        )
+        .await;
+        write_gc_checkpoint(
+            &collectable,
+            &paths,
+            2,
+            Some(1),
+            vec![global_operator(vec![])],
+        )
+        .await;
+        cleanup_leader_checkpoints(
+            &collectable,
+            &paths,
+            &ParquetPayloads,
+            paths.checkpoint_manifest(Generation(1), Epoch(2)),
+            Epoch(2),
+        )
+        .await
+        .unwrap();
+        assert!(!exists(&collectable, &global_file).await);
+        assert!(!exists(&collectable, &expiring_file).await);
+        assert!(!exists(&collectable, &checkpoint1_ref).await);
+
+        let err = cleanup_leader_checkpoints(
+            &store,
+            &paths,
+            &RefusesExpiring,
+            paths.checkpoint_manifest(Generation(1), Epoch(2)),
+            Epoch(2),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(err, StoreError::UnresolvedTableLiveness { .. }),
+            "{err:?}"
+        );
+        assert_eq!(store.deleted_objects(), Vec::<String>::new());
+        assert_eq!(store.deleted_directories(), Vec::<String>::new());
+        assert!(exists(&store, &global_file).await);
+        assert!(exists(&store, &expiring_file).await);
+        assert!(exists(&store, &checkpoint1_ref).await);
+        assert!(exists(&store, &paths.epoch_record(Epoch(1))).await);
+        assert!(exists(&store, &paths.committed_marker(Generation(1), Epoch(1))).await);
+    }
+
+    /// The backend a history is checked against is the resolver's own, and comes from nowhere
+    /// else.
+    ///
+    /// `cleanup_leader_checkpoints` used to take a selector beside the payload decode, and
+    /// nothing related them: a job could be collected under one backend's selector while its
+    /// manifests were read through another's decoder. The resolver is now the single statement
+    /// of both, and this is the row that pins it — the same parquet history, the same parquet
+    /// payload reader, differing only in the backend the resolver reports.
+    #[tokio::test]
+    async fn a_history_is_checked_against_the_resolvers_own_backend() {
+        let store = MemoryProtocolStore::default();
+        let paths = ProtocolPaths::new(PipelineId::new("P"), JobId::new("J"));
+        let old_file = data_ref(&paths, 1);
+
+        store.put_bytes(&old_file, b"1".to_vec()).await.unwrap();
+        write_gc_checkpoint(
+            &store,
+            &paths,
+            1,
+            None,
+            vec![operator_with_selector(
+                global_operator(vec![old_file.clone()]),
+                "parquet",
+            )],
+        )
+        .await;
+        write_gc_checkpoint(&store, &paths, 2, Some(1), vec![global_operator(vec![])]).await;
+        let head = paths.checkpoint_manifest(Generation(1), Epoch(2));
+
+        let err =
+            cleanup_leader_checkpoints(&store, &paths, &ClaimsStateEngine, head.clone(), Epoch(2))
+                .await
+                .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::StateBackend(StateBackendError::CheckpointMismatch { .. })
+            ),
+            "{err:?}"
+        );
+        assert!(store.deleted_objects().is_empty());
+        assert!(exists(&store, &old_file).await);
+
+        // The same call, differing only in which backend the resolver reports.
+        cleanup_leader_checkpoints(&store, &paths, &ParquetPayloads, head, Epoch(2))
+            .await
+            .unwrap();
+        assert!(!exists(&store, &old_file).await);
     }
 
     /// The wiring row for finding 1 on the collecting path: leader GC refuses a reachable
@@ -1353,7 +1611,7 @@ mod tests {
         let err = cleanup_leader_checkpoints(
             &store,
             &paths,
-            StateBackendSelector::Parquet,
+            &ParquetPayloads,
             paths.checkpoint_manifest(Generation(1), Epoch(2)),
             Epoch(2),
         )
@@ -1420,7 +1678,7 @@ mod tests {
         let err = cleanup_leader_checkpoints(
             &store,
             &paths,
-            StateBackendSelector::Parquet,
+            &ParquetPayloads,
             paths.checkpoint_manifest(Generation(1), Epoch(2)),
             Epoch(2),
         )
@@ -1483,7 +1741,7 @@ mod tests {
         cleanup_leader_checkpoints(
             &store,
             &paths,
-            StateBackendSelector::Parquet,
+            &ParquetPayloads,
             paths.checkpoint_manifest(Generation(2), Epoch(4)),
             Epoch(3),
         )
@@ -1713,7 +1971,7 @@ mod tests {
         cleanup_leader_checkpoints(
             &store,
             &collected,
-            StateBackendSelector::Parquet,
+            &ParquetPayloads,
             collected.checkpoint_manifest(Generation(1), Epoch(2)),
             Epoch(2),
         )

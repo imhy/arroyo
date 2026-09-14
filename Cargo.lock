@@ -967,6 +967,7 @@ dependencies = [
  "arrow-ord",
  "arrow-schema",
  "arroyo-rpc",
+ "arroyo-state-protocol",
  "arroyo-storage",
  "arroyo-types",
  "async-trait",
@@ -981,6 +982,7 @@ dependencies = [
  "prost",
  "serde",
  "serde_json",
+ "thiserror 2.0.12",
  "tokio",
  "tracing",
 ]
