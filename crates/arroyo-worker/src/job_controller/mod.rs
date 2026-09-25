@@ -201,6 +201,9 @@ pub mod model;
 mod commit_wiring_tests;
 
 #[cfg(test)]
+mod adoption_window_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use arroyo_rpc::checkpoints::CreateCheckpointReq;

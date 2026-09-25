@@ -10,6 +10,7 @@
 use crate::job_controller::model::{
     CommitBody, JobState, RunningJobModel, TaskStatus, WorkerState, WorkerStatus,
 };
+use crate::lifecycle_fence::guard::WorkerLifecycle;
 use crate::{EngineState, WorkerExecutionPhase, WorkerServer};
 use arroyo_datastream::logical::LogicalProgram;
 use arroyo_rpc::ControlMessage;
@@ -31,13 +32,13 @@ use arroyo_state_protocol::types::{Epoch, Generation};
 use arroyo_types::{JobId, MachineId, PipelineId, WorkerId};
 use std::collections::HashMap;
 use std::num::NonZeroU64;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::mpsc::Receiver;
 
 /// The generation every worker in this file runs under, and the fence its leader was started
 /// under. Both above 1 so a predecessor and a lower fence can be addressed.
-const GENERATION: u64 = 3;
+pub(super) const GENERATION: u64 = 3;
 const FENCE: u64 = 5;
 const OPERATOR: &str = "op_1";
 
@@ -48,20 +49,23 @@ const OPERATOR: &str = "op_1";
 const INCARNATION: u64 = 21;
 
 /// [`INCARNATION`] as the address type carries it.
-fn incarnation() -> Option<WorkerIncarnation> {
+pub(super) fn incarnation() -> Option<WorkerIncarnation> {
     WorkerIncarnation::named(INCARNATION)
 }
 
 /// A real worker serving on loopback, with one operator control channel this test can read.
-struct LiveWorker {
+pub(super) struct LiveWorker {
     _shutdown: Shutdown,
-    client: WorkerClient,
-    control: Receiver<ControlMessage>,
+    pub(super) client: WorkerClient,
+    pub(super) control: Receiver<ControlMessage>,
+    /// The served worker's own lifecycle, shared with the server rather than copied, so a row can
+    /// read the floor and strict mode from the worker's state instead of inferring them.
+    pub(super) lifecycle: Arc<Mutex<WorkerLifecycle>>,
 }
 
 /// Starts a production [`WorkerServer`] for `worker_id`/`generation`, registers it, puts it into
 /// `Running`, and connects a client to it.
-async fn live_worker(worker_id: u64, generation: u64) -> LiveWorker {
+pub(super) async fn live_worker(worker_id: u64, generation: u64) -> LiveWorker {
     let shutdown = Shutdown::new("commit-wiring-test", SignalBehavior::None);
     let server = WorkerServer::new(
         MachineId(Arc::new("machine_1".to_string())),
@@ -88,6 +92,7 @@ async fn live_worker(worker_id: u64, generation: u64) -> LiveWorker {
             shutdown_guard: shutdown.guard("engine-state"),
         });
 
+    let lifecycle = server.state.lifecycle.clone();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(
@@ -105,11 +110,12 @@ async fn live_worker(worker_id: u64, generation: u64) -> LiveWorker {
         _shutdown: shutdown,
         client: worker_client(channel, WorkerId(worker_id)),
         control,
+        lifecycle,
     }
 }
 
 /// The leader's model, holding `authority` and one worker.
-fn leader_model(
+pub(super) fn leader_model(
     authority: CommitAuthority,
     worker: WorkerId,
     client: WorkerClient,
@@ -155,7 +161,7 @@ fn leader_model(
 }
 
 /// One operator, one table, one subtask.
-fn body(epoch: u64) -> CommitBody {
+pub(super) fn body(epoch: u64) -> CommitBody {
     CommitBody {
         epoch,
         committing_data: HashMap::from([(
@@ -173,7 +179,7 @@ fn body(epoch: u64) -> CommitBody {
 }
 
 /// What the worker published, in an order-independent shape.
-fn published(
+pub(super) fn published(
     control: &mut Receiver<ControlMessage>,
 ) -> Vec<(u32, Vec<(String, Vec<(u32, Vec<u8>)>)>)> {
     let mut seen = vec![];
@@ -192,11 +198,11 @@ fn published(
     seen
 }
 
-fn expected(epoch: u32) -> Vec<(u32, Vec<(String, Vec<(u32, Vec<u8>)>)>)> {
+pub(super) fn expected(epoch: u32) -> Vec<(u32, Vec<(String, Vec<(u32, Vec<u8>)>)>)> {
     vec![(epoch, vec![("t".to_string(), vec![(0u32, vec![1, 2, 3])])])]
 }
 
-fn nz(value: u64) -> NonZeroU64 {
+pub(super) fn nz(value: u64) -> NonZeroU64 {
     NonZeroU64::new(value).expect("this fixture names a live value")
 }
 
