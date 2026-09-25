@@ -184,7 +184,13 @@ pub(crate) enum DischargeReason {
     /// address — it reconnects to the leader the row names, and what makes it exclusive is the
     /// adoption CAS. Re-opening here would demand a fresh acknowledgement from workers this
     /// controller is not superseding, and a partition would then wedge a job that is running
-    /// perfectly well. Those workers learn this controller's fence at its first fenced directive.
+    /// perfectly well. Those workers are therefore never sent this controller's fence here, and no
+    /// commit teaches it to them — a commit's fence is a guard the worker checks and never
+    /// acknowledges (`WorkerLifecycle::admit_commit(&self)`) — so a delayed commit under an
+    /// inherited worker's old fence stays admissible until that worker acknowledges a
+    /// `FENCE_ONLY` or `REVOKE` at or above this controller's fence, or is observed terminated
+    /// (M11.T27). The job's root is still this controller's alone: the conditional `job_statuses`
+    /// update refuses the superseded controller's.
     AdoptingTheGenerationItNames,
 }
 

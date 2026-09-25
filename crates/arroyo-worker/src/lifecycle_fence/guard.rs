@@ -358,12 +358,16 @@ impl WorkerLifecycle {
         match commit_directive(&req).map_err(|e| Status::invalid_argument(e.to_string()))? {
             CommitDirective::Unfenced => self.fence.unfenced_is_still_admissible()?,
             // Deliberately *not* `acknowledged_this_fence`, which the start path requires. A
-            // commit is issued by whatever controller is administering the job now, and a
-            // controller that adopts an already-running job holds a fence above the one its
-            // workers acknowledged without ever re-handshaking them — that is a takeover, not a
-            // forgery, and refusing it would make a running job uncommittable by its own owner.
-            // A start is different: one is only ever issued out of an `AcknowledgedTarget`, so
-            // requiring the acknowledgement costs a live controller nothing.
+            // commit's fence is checked as a floor: an adoption of an already-running
+            // worker-leader execution never re-handshakes the workers it inherits (M11.D39d), so a
+            // fence above the one they acknowledged is a takeover, not a forgery, and the
+            // exact-fence rule would refuse it. No landed sender commits above the floor today —
+            // the leader keeps committing under the fence its own start conferred — so this is
+            // the guard's contract rather than a live route, and it is why a delayed commit under
+            // the old fence stays admissible until a `FENCE_ONLY` or `REVOKE` raises the floor
+            // (M11.T27). A start is different: one is only ever issued out of an
+            // `AcknowledgedTarget`, so requiring the acknowledgement costs a live controller
+            // nothing.
             CommitDirective::Fenced(address) => self.fence.addressed_to_this_generation(address)?,
         }
         Ok(AdmittedCommit {
@@ -743,10 +747,13 @@ impl FenceState {
     /// The worker end of M11.D39d's active handshake. `addressed_to_this_generation` asks the
     /// monotonicity question — is this fence one I have moved past? — and that is the right
     /// question for the handshake itself, which is how a generation *learns* a fence. It is the
-    /// wrong question for a directive that applies a program or publishes a commit: those are
-    /// only ever issued under a fence the issuer has already heard this generation acknowledge,
-    /// so accepting one under any other fence accepts a directive no live controller could have
-    /// sent (PR #167 round 2).
+    /// wrong question for a directive that applies a program: a start is only ever issued out of
+    /// an `AcknowledgedTarget`, under a fence the issuer has already heard this generation
+    /// acknowledge, so accepting one under any other fence accepts a start no live controller
+    /// could have sent (PR #167 round 2). A commit is deliberately not asked it — see
+    /// [`WorkerLifecycle::admit_commit`] — and since a start admitted here is at the fence already
+    /// acknowledged, a start never raises the floor either: only an admitted `FENCE_ONLY` or
+    /// `REVOKE` does (M11.T27).
     ///
     /// # Errors
     ///

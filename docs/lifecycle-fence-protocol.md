@@ -1,7 +1,8 @@
 # Lifecycle fence: protocol, schema and D39 conformance
 
-> API/protobuf reference for the durable job-lifecycle fence (M11.T26, design M11.D39d/D39e),
-> and the conformance note that says which named D39 invariant each part carries.
+> API/protobuf reference for the durable job-lifecycle fence (M11.T26, design M11.D39d/D39e;
+> the commit rule in §4 and the row-38 supplement in §7 are M11.T27's), and the conformance note
+> that says which named D39 invariant each part carries.
 >
 > The deployment ordering these fields imply is `docs/lifecycle-fence-rollout.md`. Read that
 > before upgrading anything.
@@ -75,7 +76,8 @@ in `docs/lifecycle-fence-rollout.md` §4 rests on.
 | `TaskAssignment` | 7 | `worker_incarnation` | `uint64` | This assignment names no process. Carried because a worker leader issues its generation's commits and has no registration exchange of its own to learn its peers' incarnations from; a leader that reads `0` addresses its commits to no incarnation, and a generation that has one refuses them. |
 
 `CommitResp` gains nothing: M11.P54a's list ends at "commit fence", and D39e(v) settles issued
-*start* attempts.
+*start* attempts. So no commit is ever acknowledged, and a commit's fence never raises a
+generation's floor (§4, item 4).
 
 `RegisterWorkerReq` also carries **`reserved 3, 7;`**. Both tags once held
 `string` fields (`job_id`, `job_hash`) that were removed without being reserved, so reusing
@@ -147,10 +149,28 @@ is no second lock and no validate-then-apply gap:
 3. **In strict mode, fence-less is refused.** So is a directive addressed to another worker id or
    another generation (endpoint reuse), and so is one under a fence below the highest this
    generation has acknowledged.
-4. **Applied and revoked identifiers are recorded, hard-capped, and never evicted.** The cap is
+4. **A commit's fence is a guard: it is checked and never acknowledged.**
+   `WorkerLifecycle::admit_commit(&self)` asks a fenced `CommitReq` the same addressing question
+   a start is asked — item 1's registration gate included — and refuses it `FailedPrecondition`
+   under a fence below the one this generation has acknowledged or when it is addressed to
+   another worker id, generation or process; an unfenced commit is refused in strict mode, as in
+   item 3. It changes nothing: the receiver is `&self`, so the commit path cannot raise the
+   floor or turn strict mode on, and `CommitResp` carries no fence for a controller to read.
+   Only an acknowledged `FENCE_ONLY` or `REVOKE` raises the floor. A fenced `START` never does:
+   the start path admits one only at the exact fence this generation has already acknowledged
+   (`acknowledged_this_fence`, PR #167 round 2), and a generation that is running refuses every
+   start at its phase check. So a commit under a fence above the floor is admitted without
+   teaching the generation that fence — the window an already-running worker-leader adoption
+   leaves open, per worker generation, until that generation acknowledges a `FENCE_ONLY` or
+   `REVOKE` at or above the adopted fence or is observed terminated
+   (`docs/lifecycle-fence-rollout.md` §4). This rule is about `CommitReq`:
+   `CheckpointReq.is_commit` reaches `ControlMessage::Commit` without this guard, but no landed
+   sender sets it (the only setter, `job_controller/model.rs`, sets `false`) — pre-existing, and
+   already disclosed by M11.T26.
+5. **Applied and revoked identifiers are recorded, hard-capped, and never evicted.** The cap is
    derived from the controller's own finite issued-attempt bound rather than chosen; overflow
    fails closed with `ResourceExhausted`.
-5. **A contended phase answers `Aborted` having applied nothing** — from `try_lock`, above the
+6. **A contended phase answers `Aborted` having applied nothing** — from `try_lock`, above the
    guard, so no fence was advanced and no identifier recorded.
 
 ## 5. The durable `Fencing` record
@@ -188,12 +208,12 @@ outside the shape the table-data deletion rules match.
 | **D39a** — one writer decides and publishes; no cross-task gate, mutex or counter | The per-job intent mailbox and the state task's lifecycle actor. The M11.T08 refusal gate was removed by M11.T26h's activation change. | `arroyo-controller` `states/lifecycle/{intent,actor}.rs` |
 | **D39b** — typestate `Scheduling`; irreversible effects consume `Admission`; `recv` only on token-free types; interrupted fan-out transfers attempts *and* authority as one unit | The phase graph and its compile-fail fixtures; the per-job settlement owner | `states/scheduling/{phases,fanout}.rs`, `states/lifecycle/settlement.rs` |
 | **D39c** — validate-then-act tokens | `Validated<T>` at the five destructive/publishing families | `arroyo-rpc` `state_backend/validated.rs` |
-| **D39d** — durable fence carried on the wire and acknowledged at the worker | §1, §2, §4, §5, §6 | migrations, `proto/rpc.proto`, `states/lifecycle/fence.rs`, `arroyo-worker` `lifecycle_fence/` |
+| **D39d** — durable fence carried on the wire and acknowledged at the worker; the already-running **worker-leader** adoption exception, whose commit window only an acknowledged `FENCE_ONLY`/`REVOKE` at or above the adopted fence or an observed termination ends (M11.T27) | §1, §2, §4, §5, §6; rollout runbook §4 | migrations, `proto/rpc.proto`, `states/lifecycle/fence.rs`, `arroyo-worker` `lifecycle_fence/`; T27's `arroyo-worker` `job_controller/adoption_window_tests.rs` and `arroyo-controller` `states/lifecycle/adoption_window_tests.rs` |
 | **D39e** — worker start protocol: capability negotiation, registration-gated strict mode, same-guard fence/start serialization, bounded identity, definitive `Aborted`, bounded ambiguous retry | §2, §3, §4 | `arroyo-worker` `lifecycle_fence/{guard,attempt_ids}.rs`, `states/lifecycle/protocol.rs` |
 | **D39f** — immutable, fail-closed selector classification | A job's selector is fixed at its first execution; a row that disagrees earns a typed refusal; an undecodable record skips the job | `states/lifecycle/classification.rs` |
 | **D39g** — declared fault model, safety over per-job availability | Named injections for loss, duplication, reorder, delay, crash/restart/partition, endpoint reuse and post-flag-day skew, in both controller topologies | `states/lifecycle/faults.rs`, `arroyo-worker` `lifecycle_fence/faults.rs` |
 | **D75** — worker-first rollout, one-way flag day | The rollout runbook and the mixed-version harness | `docs/lifecycle-fence-rollout.md`, `arroyo-worker` `lifecycle_fence/rollout_tests.rs` |
-| **D96** — every PR-#157 finding mapped to a named invariant and a named executable check; 37 rows green in both topologies | The machine-readable registry and its runner | `scripts/m11-d39-registry.json`, `scripts/m11-d39-matrix.sh` |
+| **D96** — every PR-#157 finding mapped to a named invariant and a named executable check; 37 rows (M11.T26, immutable) green in both topologies, plus row 38 (the M11.T27 supplement, topology-dependent) | The machine-readable registries and their runners — T26's unchanged, T27's separate | T26: `scripts/m11-d39-registry.json`, `scripts/m11-d39-matrix.sh`; T27: `scripts/m11-t27-supplement-registry.json`, `scripts/m11-t27-supplement.sh` |
 
 ### Running the conformance matrix
 
@@ -204,7 +224,24 @@ bash scripts/m11-d39-matrix.sh
 It first proves that every registered test name resolves to **exactly one** test across the six
 packages, then executes every row once per `ARROYO__JOB_CONTROLLER` value. A row is green only
 when both cells pass. Topology-dependent rows additionally assert that the distinct path was
-reached. The expected report is **74/74 cells, 37/37 rows**.
+reached. The expected report is **74/74 cells, 37/37 rows**, and it stays that: T26's matrix is
+not rewritten to include later rows.
+
+```bash
+bash scripts/m11-t27-supplement.sh                   # row 38 alone
+bash scripts/m11-t27-supplement.sh --with-aggregate  # T26's matrix unchanged, row 38, sign-off
+```
+
+The supplement first refuses to run unless T26's registry and runner are byte-identical to
+their blobs at its registry's `base_pin` and its own row ids continue T26's; it then resolves
+and runs row 38 — eight tests, listed in the rollout runbook §9 — by T26's rules, in both
+topologies. Row 38 is topology-dependent: its route test asserts that the adoption window opens
+under a worker leader and never opens in controller mode. Its expected report
+(`target/m11-t27-supplement-report.json`) is **2/2 cells, 1/1 row**. With `--with-aggregate` it
+runs T26's runner unchanged first (still 74/74 cells, 37/37 rows) and writes
+`target/m11-lifecycle-signoff.json`, the current M11 lifecycle sign-off: **38 checks / 76
+topology-specific results**, with the two halves' counts kept apart. It refuses the sign-off,
+naming the failed half, unless both halves are green.
 
 ### What is deliberately outside the model
 
