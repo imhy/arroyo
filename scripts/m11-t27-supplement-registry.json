@@ -1,0 +1,103 @@
+{
+  "schema": "m11-d39-registry/1",
+  "milestone": "M11.T27g",
+  "design": [
+    "M11.D39d",
+    "M11.D75",
+    "M11.D96"
+  ],
+  "plan": "plans/M11/T27-takeover-fence-contract.md",
+  "base_pin": "4565b1f268c973e15ac9631a8ff793d313d526db",
+  "supplements": {
+    "registry": "scripts/m11-d39-registry.json",
+    "runner": "scripts/m11-d39-matrix.sh",
+    "rows": 37,
+    "why": "T26's historical D96 aggregate (M11.T26h) is immutable; its rows are never edited or re-run from here, and this registry's rows continue its ids."
+  },
+  "packages": [
+    "arroyo-controller",
+    "arroyo-worker",
+    "arroyo-rpc",
+    "arroyo-api",
+    "arroyo-state",
+    "arroyo-state-protocol"
+  ],
+  "topologies": [
+    {
+      "id": "controller",
+      "env": {
+        "ARROYO__JOB_CONTROLLER": "controller"
+      },
+      "why": "JobControllerMode::Controller — the job controller runs in the controller process."
+    },
+    {
+      "id": "worker-leader",
+      "env": {
+        "ARROYO__JOB_CONTROLLER": "worker"
+      },
+      "why": "JobControllerMode::Worker — the job controller runs on a worker leader."
+    }
+  ],
+  "rows": [
+    {
+      "id": 38,
+      "owner": "T27",
+      "owner_verbatim": "T27, Round-64 post-merge extension",
+      "requirement": "Already-running worker-leader adoption: a commit never advances the inherited worker's floor; only an acknowledged FENCE_ONLY/REVOKE at or above the adopted fence, or observed termination, ends the window; the superseded controller cannot install its root",
+      "topology": "dependent",
+      "fixture": "portable",
+      "tests": [
+        {
+          "crate": "arroyo-worker",
+          "name": "already_running_adoption_commit_does_not_advance_worker_fence",
+          "kind": "test",
+          "path": "crates/arroyo-worker/src/job_controller/adoption_window_tests.rs"
+        },
+        {
+          "crate": "arroyo-worker",
+          "name": "a_revoke_at_the_adopted_fence_closes_the_adoption_window",
+          "kind": "test",
+          "path": "crates/arroyo-worker/src/job_controller/adoption_window_tests.rs"
+        },
+        {
+          "crate": "arroyo-worker",
+          "name": "a_start_at_the_adopted_fence_does_not_close_the_adoption_window",
+          "kind": "test",
+          "path": "crates/arroyo-worker/src/job_controller/adoption_window_tests.rs"
+        },
+        {
+          "crate": "arroyo-worker",
+          "name": "only_a_fence_above_the_stale_one_closes_the_adoption_window",
+          "kind": "test",
+          "path": "crates/arroyo-worker/src/job_controller/adoption_window_tests.rs"
+        },
+        {
+          "crate": "arroyo-worker",
+          "name": "only_an_acknowledgement_teaches_a_running_generation_the_adopted_fence",
+          "kind": "test",
+          "path": "crates/arroyo-worker/src/job_controller/adoption_window_tests.rs"
+        },
+        {
+          "crate": "arroyo-controller",
+          "name": "an_already_running_adoption_leaves_the_old_generation_unfenced_only_under_a_worker_leader",
+          "kind": "test",
+          "path": "crates/arroyo-controller/src/states/lifecycle/adoption_window_tests.rs"
+        },
+        {
+          "crate": "arroyo-controller",
+          "name": "an_observed_termination_settles_the_generation_an_already_running_adoption_inherits",
+          "kind": "test",
+          "path": "crates/arroyo-controller/src/states/lifecycle/adoption_window_tests.rs"
+        },
+        {
+          "crate": "arroyo-controller",
+          "name": "the_controller_an_already_running_adoption_superseded_cannot_install_its_root",
+          "kind": "test",
+          "path": "crates/arroyo-controller/src/states/lifecycle/adoption_window_tests.rs"
+        }
+      ],
+      "distinct_path": "an_already_running_adoption_leaves_the_old_generation_unfenced_only_under_a_worker_leader first asserts config().job_controller is the topology ARROYO__JOB_CONTROLLER declares, so the two cells cannot be one process under two labels, then asserts one closed-form route per topology over the same Running row whose previous controller held fence 5. In worker-leader mode start recovers the row as Running and the leader route (adopt_before_administering, discharging as AdoptingTheGenerationItNames) adopts fence 6 and sends the inherited generation nothing, leaving its acknowledged record un-reopened: the window opens. In controller mode start recovers it as Compiling and the Scheduling preamble's superseding discharge (SupersedingTheGenerationsItNames) sends that generation exactly one advance under the adopted fence 6, addressed to the recorded generation and process, and settles on its answer: the window never opens. The match over JobControllerMode is exhaustive, so the worker-leader cell proves the leader route was taken, not merely that the row ran again.",
+      "note": "The five arroyo-worker tests (T27a and the worker's T27b controls) read no topology; they are the row's guard half. The other two arroyo-controller tests (T27b termination, T27c root authority) build their controller through StateMachine::new, whose start reads the knob, but assert nothing that depends on it."
+    }
+  ]
+}
