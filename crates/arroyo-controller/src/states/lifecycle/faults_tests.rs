@@ -232,7 +232,7 @@ async fn refusal_and_phase_entry_linearize_once() {
 ///
 /// `scheduling.rs` and `scheduling/admission.rs` each derive `leader_mode` from this expression
 /// and nothing else does; `the_topology_has_exactly_two_production_derivations` pins that.
-fn process_topology() -> JobControllerMode {
+pub(super) fn process_topology() -> JobControllerMode {
     if matches!(config().job_controller, JobControllerMode::Worker) {
         JobControllerMode::Worker
     } else {

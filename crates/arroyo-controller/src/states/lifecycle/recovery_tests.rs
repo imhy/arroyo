@@ -54,13 +54,13 @@ use crate::schedulers::{GenerationObservation, Scheduler, SchedulerError, StartP
 use crate::states::scheduling::fanout::Accounting;
 
 /// The scheduling generation the obligations below were addressed to.
-const GENERATION: u64 = 4;
+pub(super) const GENERATION: u64 = 4;
 
 /// The worker the obligations below name.
-const WORKER: WorkerId = WorkerId(7);
+pub(super) const WORKER: WorkerId = WorkerId(7);
 
 /// The identifier that worker was issued.
-const ATTEMPT: &str = "0123456789abcdef0123456789abcdef";
+pub(super) const ATTEMPT: &str = "0123456789abcdef0123456789abcdef";
 
 // ---------------------------------------------------------------------------------------------
 // Fixtures
@@ -71,7 +71,7 @@ const ATTEMPT: &str = "0123456789abcdef0123456789abcdef";
 /// Durable, because the controller that registered it is gone: a fenced advance names the
 /// process it is for, and the record is the only thing that can tell its successor which
 /// (M11.D39d, PR #167 round 6).
-const INCARNATION: u64 = 21;
+pub(super) const INCARNATION: u64 = 21;
 
 /// One recorded target, pending, reachable at `address` if it is reachable at all.
 fn pending_target(address: Option<String>) -> FenceTarget {
@@ -87,7 +87,7 @@ fn pending_target(address: Option<String>) -> FenceTarget {
 
 /// The obligation an interrupted attempt would have left: one pending target, one unrooted
 /// candidate, and an origin an hour ago.
-fn obligation(address: Option<String>) -> Fencing {
+pub(super) fn obligation(address: Option<String>) -> Fencing {
     Fencing::record(
         vec![pending_target(address)],
         Some("pl_1/job/generations/4/candidates/c.json".to_string()),
@@ -117,7 +117,11 @@ fn job(row: &str) -> (String, DatabaseSource, Arc<Mutex<Connection>>) {
 /// Straight SQL rather than through the publication funnel, because this is the *previous*
 /// controller's write: a row a process that is gone left behind, which is what a recovering
 /// controller reads.
-fn seed_obligation(job_id: &str, connection: &Mutex<Connection>, record: Option<&Fencing>) {
+pub(super) fn seed_obligation(
+    job_id: &str,
+    connection: &Mutex<Connection>,
+    record: Option<&Fencing>,
+) {
     let context = StateContext {
         version: 1,
         leader: None,
@@ -144,7 +148,7 @@ fn seed_obligation(job_id: &str, connection: &Mutex<Connection>, record: Option<
 /// fence 1 — so the highest fence anything in a recovered record could have been issued under
 /// is 0, and every acknowledgement supersedes it. A row about the height check has to start
 /// from a job some controller has already held.
-fn seed_previous_authority(job_id: &str, connection: &Mutex<Connection>, fence: i64) {
+pub(super) fn seed_previous_authority(job_id: &str, connection: &Mutex<Connection>, fence: i64) {
     connection
         .lock()
         .unwrap()
@@ -160,7 +164,7 @@ fn seed_previous_authority(job_id: &str, connection: &Mutex<Connection>, fence: 
 /// This is what "read back after a controller restart" means here: the value is decoded from the
 /// column by the same `StateContext` a fresh controller decodes, and nothing in this process is
 /// consulted.
-fn recorded(job_id: &str, connection: &Mutex<Connection>) -> Option<Fencing> {
+pub(super) fn recorded(job_id: &str, connection: &Mutex<Connection>) -> Option<Fencing> {
     let raw: String = connection
         .lock()
         .unwrap()
@@ -181,7 +185,7 @@ fn recorded(job_id: &str, connection: &Mutex<Connection>) -> Option<Fencing> {
 
 /// What the scheduler under test says about a job's live worker generations.
 #[derive(Clone)]
-enum Lists {
+pub(super) enum Lists {
     /// These worker generations are still running, and nothing else is.
     Live(Vec<(u64, WorkerId)>),
     /// The listing itself failed.
@@ -190,10 +194,10 @@ enum Lists {
     Untracked,
 }
 
-struct TestScheduler(Lists);
+pub(super) struct TestScheduler(Lists);
 
 impl TestScheduler {
-    fn shared(lists: Lists) -> Arc<dyn Scheduler> {
+    pub(super) fn shared(lists: Lists) -> Arc<dyn Scheduler> {
         Arc::new(TestScheduler(lists))
     }
 }
@@ -249,7 +253,7 @@ impl Scheduler for TestScheduler {
 
 /// How a [`FenceWorker`] answers a `FENCE_ONLY` directive.
 #[derive(Clone)]
-enum Answers {
+pub(super) enum Answers {
     /// Announces that it has been asked and then waits, so a row can drop the recovery pass
     /// while a directive is in flight. Acknowledges once released.
     Pausing(Arc<Paused>),
@@ -267,7 +271,7 @@ enum Answers {
 
 /// A worker that has been asked to advance its fence and has not answered yet.
 #[derive(Default)]
-struct Paused {
+pub(super) struct Paused {
     /// Fired from inside the handler, so no row has to guess when the directive arrived.
     asked: tokio::sync::Notify,
     /// Fired by a row to let the handler acknowledge.
@@ -275,7 +279,7 @@ struct Paused {
 }
 
 #[derive(Default)]
-struct Directives {
+pub(super) struct Directives {
     /// Every `(fence, generation)` this worker was addressed under, in arrival order.
     /// Every directive this worker was sent, as `(fence, generation, incarnation)`.
     ///
@@ -283,7 +287,7 @@ struct Directives {
     /// to carry: the controller that registered these workers is gone, so if the record does not
     /// name the process, the advance names none and a generation that has one refuses it
     /// (M11.D39d, PR #167 round 6).
-    seen: Mutex<Vec<(u64, u64, Option<u64>)>>,
+    pub(super) seen: Mutex<Vec<(u64, u64, Option<u64>)>>,
 }
 
 struct FenceWorker {
@@ -386,7 +390,7 @@ impl WorkerGrpc for FenceWorker {
 }
 
 /// Serves a [`FenceWorker`] on a loopback port and returns the address the record would name.
-async fn serve(answers: Answers) -> (String, Arc<Directives>) {
+pub(super) async fn serve(answers: Answers) -> (String, Arc<Directives>) {
     let directives = Arc::new(Directives::default());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = format!("http://{}", listener.local_addr().unwrap());

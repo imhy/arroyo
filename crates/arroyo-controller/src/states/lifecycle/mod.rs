@@ -79,6 +79,8 @@ pub(crate) mod settlement;
 pub(crate) mod waiting;
 
 #[cfg(test)]
+mod adoption_window_tests;
+#[cfg(test)]
 mod fault_model_tests;
 /// M11.D39g's declared fault model, as named reusable injections (M11.T26g).
 #[cfg(test)]
