@@ -15,10 +15,12 @@
 //!    `WorkerState`'s one mutex holds. There is no handle to the fence that does not go through
 //!    that lock, so fence advancement and start admission cannot interleave — not because the
 //!    handler remembers to take one lock, but because there is only one thing to lock.
-//! 2. [`WorkerLifecycle::admit_start`] is the single operation. It advances the fence, revokes,
-//!    decides, and moves the phase in one call, so there is no window in which a request has
-//!    been validated but not yet applied, and no way to advance the fence without deciding the
-//!    request that came with it.
+//! 2. [`WorkerLifecycle::admit_start_step`] is the single operation. It advances the fence,
+//!    revokes, decides, and moves the phase in one call, so there is no window in which a request
+//!    has been validated but not yet applied, and no way to advance the fence without deciding
+//!    the request that came with it. (A raise that must first wait for in-flight deletions takes
+//!    an earlier call that closes deletion admission and changes nothing else; see "A raise waits
+//!    for the deletions admitted under the fence it moves past" below.)
 //! 3. `WorkerExecutionPhase::Initializing` carries a [`StartAdmitted`] whose field is private to
 //!    this module, so no other code can put the worker into the phase that means "a start was
 //!    admitted"; and the [`AppliedStart`] that admission returns yields its response only by
@@ -45,6 +47,34 @@
 //! non-awaiting: a commit either linearizes before the acknowledgement and reaches every
 //! operator, or after it and reaches none.
 //!
+//! # A raise waits for the deletions admitted under the fence it moves past
+//!
+//! The acknowledged fence is also the ownership generation this execution's tables delete
+//! under (ruling M11.T10R6), and a table must not delete under it once a higher one is
+//! acknowledged: the controller may hand the lineage to a successor the moment it reads the
+//! acknowledgement (M11.T10b.02 as amended by the PR #200 review, 2026-09-26; M11.D39d). So a
+//! directive that raises the fence is decided in up to two steps, both
+//! [`WorkerLifecycle::admit_start_step`]:
+//!
+//! 1. under the lock, the whole plan is validated — the fence decision, the phase, the
+//!    identifier record ([`AttemptIds::check`]) — and, if the directive raises the fence while
+//!    deletions admitted under it are in flight, deletion admission is **closed** and the
+//!    [`PendingRaise`] handed back ([`StartStep::Drain`]); nothing else changes;
+//! 2. with the lock **released**, the handler awaits the drain, then takes the lock again and
+//!    decides the directive afresh with the drained raise, which is what publishes the fence —
+//!    in the same critical section as the revocations, the settlement and every other effect.
+//!
+//! With nothing in flight the close drains at once and the directive is one step, exactly as
+//! before. Either way the acknowledgement, and whatever the directive decides with it, happen in
+//! one critical section, so starts and commits still linearize before or after it; a deletion
+//! now does too: admitted before the close, its request returns before the fence publishes;
+//! asked for after, it is refused (`arroyo_state::ownership`). The wait never holds the lock, so
+//! every other lifecycle operation — a commit, a phase read, another directive — proceeds while a
+//! raise drains; and it never gives up on its own, because a request still unresolved could land
+//! after ownership moved (the ownership module's docs say what that does and does not cover). A
+//! raise whose handler is cancelled, or whose second step finds the directive refused, is
+//! dropped, which reopens deletion admission under the fence still acknowledged.
+//!
 //! # What is not decided here
 //!
 //! Nothing about the wire shape: `arroyo_rpc::fence_wire` turns the flat protobuf fields back
@@ -64,7 +94,9 @@ use arroyo_rpc::grpc::rpc::{
     CommitReq, LifecycleOperation, OperatorCommitData, StartExecutionOutcome, StartExecutionReq,
     StartExecutionResp,
 };
-use arroyo_state::ownership::{AcknowledgedFence, AcknowledgedFenceWriter};
+use arroyo_state::ownership::{
+    AcknowledgedFence, AcknowledgedFenceWriter, DrainedRaise, PendingRaise, Raise,
+};
 use std::collections::HashMap;
 use std::time::SystemTime;
 use tonic::Status;
@@ -79,7 +111,7 @@ fn describe_incarnation(incarnation: Option<WorkerIncarnation>) -> String {
     incarnation.map_or_else(|| "none".to_string(), |i| i.get().to_string())
 }
 
-/// Proof that a start was admitted by [`WorkerLifecycle::admit_start`].
+/// Proof that a start was admitted by [`WorkerLifecycle::admit_start_step`].
 ///
 /// `WorkerExecutionPhase::Initializing` carries one, and the field below is private to this
 /// module, so that phase is unconstructible anywhere else. The worker cannot be put into the
@@ -99,6 +131,19 @@ pub(crate) enum StartAdmission {
     Apply(AppliedStart),
     /// Nothing to apply; answer with this response.
     Settled(StartExecutionResp),
+}
+
+/// One step of [`WorkerLifecycle::admit_start_step`] (module docs, "A raise waits for the
+/// deletions admitted under the fence it moves past").
+#[must_use]
+#[derive(Debug)]
+pub(crate) enum StartStep {
+    /// Decided, in this step's critical section.
+    Decided(StartAdmission),
+    /// The directive raises the fence while deletions admitted under it are in flight. Deletion
+    /// admission is closed and nothing else changed: await [`PendingRaise::drained`] with the
+    /// lock released, then decide the same request again with the drained raise.
+    Drain(PendingRaise),
 }
 
 /// An admitted start, which yields its response only by starting the execution.
@@ -214,8 +259,9 @@ struct FenceState {
     ///
     /// Held as the one writer of the cell this execution's tables read it through
     /// ([`WorkerLifecycle::acknowledged_fence_handle`], ruling M11.T10R6). The writer is not
-    /// `Clone` and is raised only by [`Self::acknowledge`], so the value a table reads is this
-    /// field and nothing else can move it.
+    /// `Clone` and is raised only by [`WorkerLifecycle::admit_start_step`], under this value's
+    /// lock and only once the deletions admitted under the fence it moves past have returned, so
+    /// the value a table reads is this field and nothing else can move it.
     acknowledged: AcknowledgedFenceWriter,
     ids: AttemptIds,
 }
@@ -322,7 +368,14 @@ impl WorkerLifecycle {
     }
 
     /// Advances the fence, applies the revocations, and admits or refuses the request — in that
-    /// order, in one call, under the caller's lock on this value.
+    /// order, in one call, under the caller's lock on this value — or, for a directive that
+    /// raises the fence while deletions admitted under it are in flight, closes deletion
+    /// admission and hands back the raise to drain ([`StartStep::Drain`]), changing nothing else.
+    ///
+    /// `drained` is the raise an earlier step of the same request handed back, drained with the
+    /// lock released; the request is planned afresh around it, so whatever changed meanwhile is
+    /// decided now. A drained raise the fresh plan does not need — the fence already reached, or
+    /// the directive refused — is dropped, which reopens deletion admission.
     ///
     /// # Errors
     ///
@@ -331,12 +384,13 @@ impl WorkerLifecycle {
     /// `Unavailable`): a refusal here is an authoritative answer about this generation, not a
     /// transport outcome, and re-sending the same identifier can never change it.
     #[allow(clippy::result_large_err)]
-    pub(crate) fn admit_start(
+    pub(crate) fn admit_start_step(
         &mut self,
         req: &StartExecutionReq,
-    ) -> Result<StartAdmission, Status> {
+        drained: Option<DrainedRaise>,
+    ) -> Result<StartStep, Status> {
         let plan = self.plan(req)?;
-        self.commit(plan)
+        self.commit(plan, drained)
     }
 
     /// Admits or refuses a commit directive, under the caller's lock on this value.
@@ -369,7 +423,7 @@ impl WorkerLifecycle {
     ///
     /// # Errors
     ///
-    /// A definitive `Status` for every refusal, for the reason [`Self::admit_start`] gives.
+    /// A definitive `Status` for every refusal, for the reason [`Self::admit_start_step`] gives.
     #[allow(clippy::result_large_err)]
     pub(crate) fn admit_commit(&self, req: CommitReq) -> Result<AdmittedCommit, Status> {
         match commit_directive(&req).map_err(|e| Status::invalid_argument(e.to_string()))? {
@@ -610,14 +664,22 @@ impl WorkerLifecycle {
         }
     }
 
-    /// Carries out a plan.
+    /// Carries out a plan — or, if it raises the fence while deletions are in flight, closes
+    /// deletion admission and stops there.
     ///
-    /// The identifier record is written first because it is the only step that can still fail:
-    /// a refusal here leaves the acknowledged fence and the execution phase exactly as the plan
-    /// found them, so a directive the worker could not record is a directive it did not
-    /// acknowledge either.
+    /// Everything that can refuse is checked before anything changes: the identifier record
+    /// first, without writing it, so a directive it would refuse neither closes deletion
+    /// admission nor waits for a drain; then the raise, which either hands back the pending raise
+    /// — having changed nothing but the close, which dropping it undoes — or is ready to publish.
+    /// Only then is the record written (it cannot refuse now: nothing changed it since the check,
+    /// under the same lock) and the fence published, so a directive the worker could not record
+    /// is a directive it did not acknowledge either.
     #[allow(clippy::result_large_err)]
-    fn commit(&mut self, plan: AdmissionPlan<'_>) -> Result<StartAdmission, Status> {
+    fn commit(
+        &mut self,
+        plan: AdmissionPlan<'_>,
+        drained: Option<DrainedRaise>,
+    ) -> Result<StartStep, Status> {
         let (address, revoke, apply) = match &plan {
             AdmissionPlan::Apply {
                 address,
@@ -630,10 +692,31 @@ impl WorkerLifecycle {
             AdmissionPlan::AlreadyApplied { address, revoke } => (*address, *revoke, None),
         };
 
-        self.fence.ids.record(revoke, apply).map_err(refusal)?;
-        self.fence.acknowledge(address);
+        self.fence.ids.check(revoke, apply).map_err(refusal)?;
+        // A start is admitted only at the fence already acknowledged, so only `FENCE_ONLY` and
+        // `REVOKE` reach `Ready` or `Drain`; an unfenced directive raises nothing, and a drained
+        // raise handed in with one is dropped here.
+        let ready = match address {
+            None => None,
+            Some(address) => match self.fence.acknowledged.prepare(address.fence(), drained) {
+                Raise::NotAbove => None,
+                Raise::Ready(ready) => Some(ready),
+                Raise::Drain(pending) => return Ok(StartStep::Drain(pending)),
+            },
+        };
 
-        Ok(match plan {
+        self.fence.ids.record(revoke, apply).map_err(refusal)?;
+        // Acknowledging: the fence only rises, and acknowledging a fenced operation is one of the
+        // two things that activate strict mode for a generation (M11.D39e(i)). An unfenced
+        // directive acknowledges nothing and changes neither.
+        if let Some(ready) = ready {
+            ready.publish();
+        }
+        if address.is_some() {
+            self.fence.strict = true;
+        }
+
+        Ok(StartStep::Decided(match plan {
             AdmissionPlan::Apply { .. } => {
                 self.execution = WorkerExecutionPhase::Initializing {
                     started_at: SystemTime::now(),
@@ -655,7 +738,7 @@ impl WorkerLifecycle {
             AdmissionPlan::AlreadyApplied { .. } => {
                 StartAdmission::Settled(self.fence.settlement(StartExecutionOutcome::Applied))
             }
-        })
+        }))
     }
 }
 
@@ -798,18 +881,6 @@ impl FenceState {
                 acknowledged,
             )
         }))
-    }
-
-    /// Raises the highest acknowledged fence and turns strict mode on.
-    ///
-    /// Monotone in both: the fence only rises, and acknowledging a fenced operation is one of the
-    /// two things that activate strict mode for a generation (M11.D39e(i)). An unfenced directive
-    /// acknowledges nothing and changes neither.
-    fn acknowledge(&mut self, address: Option<FenceAddress>) {
-        if let Some(address) = address {
-            self.acknowledged.raise(address.fence());
-            self.strict = true;
-        }
     }
 
     /// The response this generation gives for `outcome`.

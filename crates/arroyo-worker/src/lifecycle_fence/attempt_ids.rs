@@ -188,6 +188,42 @@ impl AttemptIds {
         revoke: &[String],
         apply: Option<&str>,
     ) -> Result<(), AttemptIdRefusal> {
+        let additions = self.additions(revoke, apply)?;
+        // Every rule has passed; nothing below can fail.
+        for id in additions {
+            self.revoked.insert(id.to_string());
+        }
+        if let Some(id) = apply {
+            self.applied = Some(id.to_string());
+        }
+        Ok(())
+    }
+
+    /// Whether [`Self::record`] would take `revoke` and `apply` — the same rules, changing
+    /// nothing.
+    ///
+    /// For a directive the guard must decide in two steps: one that raises the lifecycle fence
+    /// closes deletion admission and waits for in-flight deletions before it records anything
+    /// (`guard::WorkerLifecycle::admit_start_step`), and a directive this record would refuse
+    /// must be refused before that wait, not after it.
+    ///
+    /// # Errors
+    ///
+    /// Every variant of [`AttemptIdRefusal`], exactly as [`Self::record`] would return it.
+    pub(crate) fn check(
+        &self,
+        revoke: &[String],
+        apply: Option<&str>,
+    ) -> Result<(), AttemptIdRefusal> {
+        self.additions(revoke, apply).map(|_| ())
+    }
+
+    /// Every rule [`Self::record`] enforces, checked; the revocations it would add.
+    fn additions<'a>(
+        &self,
+        revoke: &'a [String],
+        apply: Option<&str>,
+    ) -> Result<BTreeSet<&'a str>, AttemptIdRefusal> {
         for id in revoke.iter().map(String::as_str).chain(apply) {
             let found = id.chars().count();
             if found == 0 || found > MAX_ATTEMPT_ID_CHARS {
@@ -223,15 +259,7 @@ impl AttemptIds {
         if held + added > MAX_TRACKED_ATTEMPT_IDS {
             return Err(AttemptIdRefusal::Overflow { held, added });
         }
-
-        // Every rule has passed; nothing below can fail.
-        for id in additions {
-            self.revoked.insert(id.to_string());
-        }
-        if let Some(id) = apply {
-            self.applied = Some(id.to_string());
-        }
-        Ok(())
+        Ok(additions)
     }
 
     /// The identifier this generation applied, if it applied one.

@@ -21,7 +21,7 @@ use arroyo_rpc::grpc::rpc::{
 };
 use arroyo_rpc::state_backend::StateBackendSelector;
 use arroyo_rpc::{ControlResp, MetadataOrManifest};
-use arroyo_state::ownership::{AcknowledgedFence, AcknowledgedFenceWriter};
+use arroyo_state::ownership::{AcknowledgedFence, AcknowledgedFenceWriter, Raise};
 use arroyo_state::provider::{
     ExpiringTimeKeyProvider, GlobalKeyValueProvider, ProviderRegistry, ProviderRegistryBuilder,
     StateBackendProvider, TableKind, install,
@@ -703,8 +703,12 @@ async fn barrier_hooks_run_before_the_checkpoint_is_enqueued_and_read_the_live_f
     assert_completed(next_control(&mut control).await, 1);
 
     // The fence rises between barriers, as an already-running adoption raises it, and the
-    // handle each table kept at barrier 1 reads the rise with no barrier in between.
-    writer.raise(7);
+    // handle each table kept at barrier 1 reads the rise with no barrier in between. No table
+    // here holds a deletion guard, so the raise closes, drains and publishes in one step.
+    let Raise::Ready(ready) = writer.prepare(7, None) else {
+        panic!("no deletion is in flight")
+    };
+    assert_eq!(ready.publish(), 7);
     for (table, _) in TABLES {
         assert_eq!(journal.kept_fence(table).get(), 7);
     }

@@ -47,7 +47,9 @@ use tonic::{Request, Response, Status};
 use tracing::{debug, error, info, trace, warn};
 
 use crate::job_controller::controller::WorkerJobController;
-use crate::lifecycle_fence::guard::{Announced, StartAdmission, StartAdmitted, WorkerLifecycle};
+use crate::lifecycle_fence::guard::{
+    Announced, StartAdmission, StartAdmitted, StartStep, WorkerLifecycle,
+};
 use crate::lifecycle_fence::handoff::HandoffGate;
 use crate::utils::{MAX_TASK_ERROR_FIELD_BYTES, maybe_truncate, to_d2};
 use arroyo_datastream::logical::LogicalProgram;
@@ -127,7 +129,8 @@ enum WorkerExecutionPhase {
     Idle,
     Initializing {
         started_at: SystemTime,
-        /// Proof that [`WorkerLifecycle::admit_start`] admitted the start this phase belongs to.
+        /// Proof that [`WorkerLifecycle::admit_start_step`] admitted the start this phase belongs
+        /// to.
         ///
         /// Its field is private to `lifecycle_fence::guard`, so this variant cannot be built
         /// anywhere else. "The worker is initializing an execution" and "the fence guard admitted
@@ -854,6 +857,57 @@ impl WorkerServer {
         &self.state.worker_context.job_id
     }
 
+    /// The lifecycle lock, or the definitive answer for a handler that cannot have it now.
+    ///
+    /// Never park a server handler inside one synchronous poll. A client stream (or its
+    /// controller process) can disappear while a blocking mutex wait is in progress, and tonic
+    /// cannot cancel that poll; the stale handler could otherwise acquire the lock later and start
+    /// behind a refusal published by a replacement controller.
+    ///
+    /// `Aborted` is definitive "nothing applied" (M11.D39e(iii)): this contention answer is given
+    /// before either step of `admit_start_step` decides anything, so no fence was advanced, no
+    /// identifier recorded and no phase moved — a raise that had closed deletion admission is
+    /// dropped with it, which reopens that admission. Only a later scheduling attempt may retry
+    /// it.
+    #[allow(clippy::result_large_err)]
+    fn try_lifecycle(&self) -> Result<std::sync::MutexGuard<'_, WorkerLifecycle>, Status> {
+        match self.state.lifecycle.try_lock() {
+            Ok(lifecycle) => Ok(lifecycle),
+            Err(TryLockError::WouldBlock) => {
+                Err(Status::aborted("Worker execution phase is busy; retry"))
+            }
+            Err(TryLockError::Poisoned(_)) => {
+                Err(Status::internal("Worker execution phase lock is poisoned"))
+            }
+        }
+    }
+
+    /// The response for a decided start, spawning the initialization an admitted one needs.
+    ///
+    /// The response is reachable only through [`AppliedStart::start`]'s closure, so an admitted
+    /// start cannot be reported applied without its initialization having been handed off; and
+    /// the authority it is handed is the one the admission established, so a leader's commits go
+    /// out under the fence its own start carried.
+    ///
+    /// [`AppliedStart::start`]: crate::lifecycle_fence::guard::AppliedStart::start
+    fn answer(&self, admission: StartAdmission, req: StartExecutionReq) -> StartExecutionResp {
+        match admission {
+            StartAdmission::Settled(response) => response,
+            StartAdmission::Apply(applied) => {
+                let state = self.state.clone();
+                let shutdown_guard = self.shutdown_guard.clone_temporary();
+                applied.start(move |commit_authority| {
+                    self.shutdown_guard.spawn_temporary(async move {
+                        state
+                            .initialize(shutdown_guard, req, commit_authority)
+                            .await;
+                        Ok(())
+                    });
+                })
+            }
+        }
+    }
+
     pub async fn start_async(self) -> Result<()> {
         let config = config();
         let listener = TcpListener::bind(SocketAddr::new(
@@ -1062,52 +1116,46 @@ impl WorkerGrpc for WorkerServer {
     /// the one non-blocking guard (M11.D39d, M11.D39e).
     ///
     /// Every decision below the `try_lock` belongs to
-    /// [`WorkerLifecycle::admit_start`](crate::lifecycle_fence::guard::WorkerLifecycle::admit_start):
-    /// this handler contributes the lock discipline and the initialization it spawns, and holds
-    /// no fence state of its own to get out of step with the guard's.
+    /// [`WorkerLifecycle::admit_start_step`](crate::lifecycle_fence::guard::WorkerLifecycle::admit_start_step):
+    /// this handler contributes the lock discipline, the drain it awaits between the two steps of
+    /// a raise, and the initialization it spawns, and holds no fence state of its own to get out
+    /// of step with the guard's.
+    ///
+    /// A directive that raises the fence while this execution's tables have deletions in flight
+    /// under it is decided in two steps (`lifecycle_fence::guard`'s module docs): the first
+    /// closes deletion admission, then the drain is awaited **with the lock released** — so every
+    /// other lifecycle call proceeds meanwhile — and the second step decides the directive and
+    /// publishes the fence. Dropping this future during the wait abandons the raise: nothing is
+    /// acknowledged and deletion admission reopens under the fence still acknowledged.
     async fn start_execution(
         &self,
         request: Request<StartExecutionReq>,
     ) -> Result<Response<StartExecutionResp>, Status> {
         let req = request.into_inner();
-        // Never park a server handler inside one synchronous poll. A client stream (or its
-        // controller process) can disappear while a blocking mutex wait is in progress, and
-        // tonic cannot cancel that poll; the stale handler could otherwise acquire the lock
-        // later and start behind a refusal published by a replacement controller.
-        //
-        // `Aborted` is definitive "nothing applied" (M11.D39e(iii)): this contention answer is
-        // given before `admit_start` runs, so no fence was advanced, no identifier recorded and
-        // no phase moved. Only a later scheduling attempt may retry it.
-        let mut lifecycle = match self.state.lifecycle.try_lock() {
-            Ok(lifecycle) => lifecycle,
-            Err(TryLockError::WouldBlock) => {
-                return Err(Status::aborted("Worker execution phase is busy; retry"));
-            }
-            Err(TryLockError::Poisoned(_)) => {
-                return Err(Status::internal("Worker execution phase lock is poisoned"));
+        let pending = {
+            let mut lifecycle = self.try_lifecycle()?;
+            match lifecycle.admit_start_step(&req, None)? {
+                StartStep::Decided(admission) => {
+                    return Ok(Response::new(self.answer(admission, req)));
+                }
+                StartStep::Drain(pending) => pending,
             }
         };
 
-        Ok(Response::new(match lifecycle.admit_start(&req)? {
-            StartAdmission::Settled(response) => response,
-            StartAdmission::Apply(applied) => {
-                let state = self.state.clone();
-                let shutdown_guard = self.shutdown_guard.clone_temporary();
+        // Nothing is held here but the raise's claim on deletion admission: no lock, no guard.
+        let drained = pending.drained().await;
 
-                // The response is reachable only through this closure, so an admitted start
-                // cannot be reported applied without its initialization having been handed off;
-                // and the authority it is handed is the one the admission established, so a
-                // leader's commits go out under the fence its own start carried.
-                applied.start(move |commit_authority| {
-                    self.shutdown_guard.spawn_temporary(async move {
-                        state
-                            .initialize(shutdown_guard, req, commit_authority)
-                            .await;
-                        Ok(())
-                    });
-                })
-            }
-        }))
+        let mut lifecycle = self.try_lifecycle()?;
+        match lifecycle.admit_start_step(&req, Some(drained))? {
+            StartStep::Decided(admission) => Ok(Response::new(self.answer(admission, req))),
+            // Not reached for one request: planned again, it asks for the same fence, which the
+            // raise it drained is for. Handled rather than assumed — dropping the raise reopens
+            // deletion admission, and nothing was applied.
+            StartStep::Drain(_) => Err(Status::aborted(
+                "Worker lifecycle fence raise was superseded while it drained; nothing was \
+                 applied; retry",
+            )),
+        }
     }
 
     async fn checkpoint(

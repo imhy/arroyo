@@ -21,6 +21,8 @@ pub(crate) mod handoff;
 mod attempt_ids_tests;
 #[cfg(test)]
 mod commit_tests;
+#[cfg(test)]
+mod drain_tests;
 /// M11.D39g's declared fault model, as named reusable injections (M11.T26g).
 #[cfg(test)]
 mod faults;
