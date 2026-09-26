@@ -27,6 +27,7 @@ use std::{
 use tracing::{debug, error};
 
 mod aws;
+mod endpoint;
 
 /// A reference-counted reference to a [StorageProvider].
 pub type StorageProviderRef = Arc<StorageProvider>;
@@ -136,6 +137,10 @@ pub struct StorageProvider {
     multipart_store: Option<Arc<dyn MultipartStore>>,
     canonical_url: String,
     storage_options: HashMap<String, String>,
+    /// The endpoint the backing client was built to talk to, read off its final builder
+    /// (the `endpoint` module); `None` when this crate cannot tell. See
+    /// [`StorageProvider::effective_endpoint`].
+    effective_endpoint: Option<String>,
 }
 
 impl Debug for StorageProvider {
@@ -513,6 +518,7 @@ impl StorageProvider {
         backing: BackingStoreHandle,
         canonical_url: String,
         storage_options: HashMap<String, String>,
+        effective_endpoint: Option<String>,
     ) -> Self {
         Self {
             config,
@@ -521,6 +527,7 @@ impl StorageProvider {
             backing,
             canonical_url,
             storage_options,
+            effective_endpoint,
         }
     }
 
@@ -665,6 +672,7 @@ impl StorageProvider {
             canonical_url = format!("{canonical_url}/{key}");
         }
 
+        let effective_endpoint = endpoint::s3(&builder);
         Ok(Self::with_backing(
             BackendConfig::S3(config),
             BackingStoreHandle::AmazonS3(Arc::new(builder.build()?)),
@@ -673,6 +681,7 @@ impl StorageProvider {
                 .into_iter()
                 .map(|(k, v)| (k.as_ref().to_string(), v))
                 .collect(),
+            effective_endpoint,
         ))
     }
 
@@ -736,6 +745,7 @@ impl StorageProvider {
             .with_endpoint(endpoint)
             .with_virtual_hosted_style_request(false);
 
+        let effective_endpoint = endpoint::s3(&builder);
         Ok(Self::with_backing(
             BackendConfig::R2(config),
             // R2 is served by an `AmazonS3` against a Cloudflare endpoint, so the
@@ -743,6 +753,7 @@ impl StorageProvider {
             BackingStoreHandle::AmazonS3(Arc::new(builder.build()?)),
             canonical_url,
             HashMap::new(),
+            effective_endpoint,
         ))
     }
 
@@ -767,11 +778,13 @@ impl StorageProvider {
             canonical_url = format!("{canonical_url}/{key}");
         }
 
+        let effective_endpoint = endpoint::gcs(&builder);
         Ok(Self::with_backing(
             BackendConfig::GCS(config),
             BackingStoreHandle::GoogleCloudStorage(Arc::new(builder.build()?)),
             canonical_url,
             HashMap::new(),
+            effective_endpoint,
         ))
     }
 
@@ -784,11 +797,13 @@ impl StorageProvider {
             config.account, config.container
         );
 
+        let effective_endpoint = endpoint::azure(&builder);
         Ok(Self::with_backing(
             BackendConfig::Azure(config),
             BackingStoreHandle::MicrosoftAzure(Arc::new(builder.build()?)),
             canonical_url,
             HashMap::new(),
+            effective_endpoint,
         ))
     }
 
@@ -810,6 +825,8 @@ impl StorageProvider {
             backing,
             canonical_url,
             HashMap::new(),
+            // A local directory has no network endpoint to vouch for.
+            None,
         ))
     }
 
@@ -1089,6 +1106,20 @@ impl StorageProvider {
     /// same location by construction.
     pub fn backing_handle(&self) -> BackingStoreHandle {
         self.backing.clone()
+    }
+
+    /// The endpoint the backing client was built to talk to, read off the final builder
+    /// the client was built from — the configured S3/R2 endpoint or AWS S3 in the
+    /// configured region, the Azure account URL, the GCS base URL — or `None` when this
+    /// crate cannot tell (an S3 Express bucket, the Azure emulator, an unreadable
+    /// service-account key, a local directory). See the `endpoint` module for each rule.
+    ///
+    /// A client's type does not fix its endpoint — an `AmazonS3` is also R2 and every
+    /// S3-compatible service — so a consumer that trusts one endpoint's listing and
+    /// durability compares its declaration with this value, from the same provider as
+    /// [`backing_handle`](Self::backing_handle), and trusts nothing when it is `None`.
+    pub fn effective_endpoint(&self) -> Option<&str> {
+        self.effective_endpoint.as_deref()
     }
 
     pub async fn head(&self, path: impl Into<Path>) -> Result<ObjectMeta, StorageError> {
@@ -1585,6 +1616,7 @@ mod tests {
                 handle,
                 "test://provider".to_string(),
                 HashMap::new(),
+                None,
             );
 
             let erased = provider.get_backing_store();
@@ -1651,6 +1683,7 @@ mod tests {
                     handle,
                     "test://provider".to_string(),
                     HashMap::new(),
+                    None,
                 );
 
                 assert_eq!(
@@ -1684,8 +1717,31 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// The endpoint the provider `a_provider_built_from_a_url_serves_one_allocation` builds
+    /// for `url` must report, spelled independently of the `endpoint` module: none for a
+    /// local directory, the R2 account's Cloudflare endpoint, and Google's base URL.
+    /// `from_env` would replace the last with a service-account key's `gcs_base_url`, so on a
+    /// host whose environment configures a key that row is not asserted (outer `None`).
+    fn expected_endpoint(url: &str) -> Option<Option<&'static str>> {
+        if url.starts_with("file://") {
+            return Some(None);
+        }
+        if url.starts_with("r2://") {
+            return Some(Some("https://0123456789abcdef.r2.cloudflarestorage.com"));
+        }
+        let keyed = [
+            "GOOGLE_SERVICE_ACCOUNT",
+            "GOOGLE_SERVICE_ACCOUNT_PATH",
+            "GOOGLE_SERVICE_ACCOUNT_KEY",
+        ]
+        .iter()
+        .any(|var| std::env::var_os(var).is_some());
+        (!keyed).then_some(Some("https://storage.googleapis.com"))
+    }
+
     /// The end-to-end half: a provider built from a URL by its real constructor hands
-    /// both views one allocation, and publishes the prefix its own URL carries.
+    /// both views one allocation, publishes the prefix its own URL carries, and reports
+    /// the endpoint its client was built for ([`expected_endpoint`]).
     ///
     /// `file://` and `gs://` build with no credentials at all; `r2://` needs an access
     /// key and secret, which are passed explicitly as storage options rather than read
@@ -1714,6 +1770,13 @@ mod tests {
             let provider = StorageProvider::for_url_with_options(&url, options)
                 .await
                 .unwrap_or_else(|e| panic!("{url} builds a provider: {e}"));
+            if let Some(expected) = expected_endpoint(&url) {
+                assert_eq!(
+                    provider.effective_endpoint(),
+                    expected,
+                    "{url}: the endpoint its client was built for"
+                );
+            }
 
             assert!(
                 Arc::ptr_eq(
