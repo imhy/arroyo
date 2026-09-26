@@ -1,89 +1,103 @@
 //! The worker's acknowledged lifecycle fence, as the ownership generation a table reads
-//! (plan M11.T10b.01, ruling M11.T10R6), and the deletion gate on it (M11.T10b.02 as amended
-//! by the PR #200 review, 2026-09-26).
+//! (plan M11.T10b.01, ruling M11.T10R6), and the ownership gate on it (M11.T10b.02 as amended by
+//! the PR #200 reviews, 2026-09-26).
 //!
 //! A worker generation's lifecycle guard (`arroyo-worker`'s `lifecycle_fence::guard`) records
 //! the highest lifecycle fence it has acknowledged. The value rises only when the guard admits a
 //! fenced `START`, `FENCE_ONLY` or `REVOKE` directive, and it can rise while the worker's tasks
 //! keep running: an already-running adoption is acknowledged with `FENCE_ONLY`/`REVOKE` and
 //! restarts nothing (M11.T27). Under the legacy (unfenced) protocol nothing is ever
-//! acknowledged and the value stays zero. A table whose deletions must stop when ownership
-//! moves cannot therefore take the fence once, at construction: it has to read the value as it
-//! is now.
+//! acknowledged and the value stays zero. A table whose requests must be ordered against a move
+//! of ownership cannot therefore take the fence once, at construction: it has to ask about the
+//! value as it is now.
 //!
 //! [`AcknowledgedFence`] is that read — a cheaply cloned, `Send + Sync` handle onto one cell —
 //! and [`AcknowledgedFenceWriter`] is the cell's only writer. They are two types so that "only
 //! the lifecycle guard moves the fence" is a property of the types rather than a convention:
 //!
 //! - a reader has no method that writes, and reaches the cell only through
-//!   [`AcknowledgedFence::get`] and the deletion gate below;
+//!   [`AcknowledgedFence::get`] and the ownership gate below;
 //! - a writer is not `Clone`, and [`AcknowledgedFenceWriter::prepare`] takes `&mut self`, so the
 //!   one writer a guard owns is raised only by code holding exclusive access to it — in
 //!   `arroyo-worker`, under the lock that serialises fence advancement with start admission.
 //!
-//! # The deletion gate: every deletion linearizes before or after the acknowledgement
+//! # The ownership gate: every fenced request linearizes before or after the acknowledgement
 //!
-//! A table deleting objects under the ownership generation it read must not keep deleting once
-//! a higher fence is acknowledged: the controller may hand ownership to a successor the moment
-//! it reads the acknowledgement. Reading the fence again before each request does not close
-//! that, because a request already sent cannot be recalled. So a deleter asks the fence itself:
+//! The controller may hand a table's lineage to a successor the moment it reads a higher fence
+//! acknowledged. Two kinds of table request must not straddle that moment ([`FencedRequest`]):
 //!
-//! - [`AcknowledgedFence::admit_deletion`] returns a [`DeletionGuard`] only while the
-//!   acknowledged fence **equals** the generation the deleter's authorization was declared
-//!   under **and** no raise is pending, checked and registered under the gate's one lock. The
-//!   guard is held for the request; dropping it — the request returned, the deleter unwound, or
-//!   its future was cancelled — deregisters it.
+//! - a **deletion** under the ownership generation the table read must not reach the store
+//!   after the acknowledgement: it was judged against the old owner's roots, and the successor
+//!   may re-publish the name it removes;
+//! - a **reservation** — the PUT of a durable record a successor's restore lists after the
+//!   acknowledgement, and allocates above — must have returned before the acknowledgement, or
+//!   the successor may list without it.
+//!
+//! Reading the fence again before each request does not close either, because a request already
+//! sent cannot be recalled. So a table asks the fence itself:
+//!
+//! - [`AcknowledgedFence::admit`] returns a [`RequestGuard`] for one request of one kind only
+//!   while the acknowledged fence **equals** the generation the request asks under **and** no
+//!   raise is pending, checked and registered under the gate's one lock. The guard is held for
+//!   the request; dropping it — the request returned, the requester unwound, or its future was
+//!   cancelled — deregisters it, from the count of the kind it was admitted for.
 //! - A raise is two-phase. [`AcknowledgedFenceWriter::prepare`] first **closes** admission
-//!   under the current fence ([`Raise::Drain`]): from then on no guard is admitted under it.
-//!   The raise then **drains** — [`PendingRaise::drained`] waits, asynchronously, until every
-//!   guard admitted before the close has dropped — and only a drained raise is
-//!   [`Raise::Ready`] to **publish** the higher value. A raise dropped before it publishes
-//!   reopens admission under the fence that is still acknowledged.
+//!   under the current fence ([`Raise::Drain`]): from then on no request of either kind is
+//!   admitted under it. The raise then **drains** — [`PendingRaise::drained`] waits,
+//!   asynchronously, until every guard of either kind admitted before the close has dropped —
+//!   and only a drained raise is [`Raise::Ready`] to **publish** the higher value. A raise
+//!   dropped before it publishes reopens admission under the fence that is still acknowledged.
 //!
-//! So a deletion either holds its guard before the close — and the higher fence is not
+//! So a fenced request either holds its guard before the close — and the higher fence is not
 //! published, let alone acknowledged, until its request returned — or asks after the close and
-//! is refused ([`DeletionRefused::Rising`]), or asks after the publication and is refused
-//! ([`DeletionRefused::Moved`]).
+//! is refused ([`AdmissionRefused::Rising`]), or asks after the publication and is refused
+//! ([`AdmissionRefused::Moved`]). The gate counts the kinds apart ([`GateStatus`]) so a stuck
+//! drain names what it waits for; a raise waits for both.
 //!
 //! ## What the gate cannot establish
 //!
 //! A guard is dropped when the **client's** request returns. A request the client stopped
 //! waiting for — its own timeout or retry budget spent — returns an error while the server may
-//! still apply a DELETE it had received; and a worker process that is killed takes its guards
-//! with it while such a request is on the wire. Whether a store applies a request after its
-//! client gave up is the store's property, not this gate's: the gate orders every deletion
-//! whose client call is unresolved before the acknowledgement, never a server-side effect after
-//! the client call ended. The drain therefore never gives up on its own: a stuck request keeps
-//! the raise waiting (reported every [`LONG_DRAIN_WAIT`] by a warning and
-//! [`DeletionGateStatus::long_drain_waits`]), and the acknowledgement — hence the ownership
-//! transfer that waits for it — waits with it.
+//! still apply it; and a worker process that is killed takes its guards with it while such a
+//! request is on the wire. Whether a store applies a request after its client gave up is the
+//! store's property, not this gate's: the gate orders every fenced request whose client call is
+//! unresolved before the acknowledgement, never a server-side effect after the client call
+//! ended. The drain therefore never gives up on its own: a stuck request keeps the raise waiting
+//! (reported every [`LONG_DRAIN_WAIT`] by a warning and [`GateStatus::long_drain_waits`]), and
+//! the acknowledgement — hence the ownership transfer that waits for it — waits with it. A guard
+//! that is never dropped (`mem::forget`) keeps every later raise of its fence waiting the same
+//! way: the gate fails closed.
 //!
 //! ```
-//! use arroyo_state::ownership::{AcknowledgedFenceWriter, DeletionRefused, Raise};
+//! use arroyo_state::ownership::{
+//!     AcknowledgedFenceWriter, AdmissionRefused, FencedRequest, Raise,
+//! };
 //!
 //! let mut writer = AcknowledgedFenceWriter::unacknowledged();
 //! let fence = writer.reader();
 //! let kept = fence.clone();
 //! assert_eq!(fence.get(), 0);
 //!
-//! // A deletion under the acknowledged fence holds the raise to 4 back.
-//! let deleting = fence.admit_deletion(0).expect("admitted under the acknowledged fence");
+//! // A reservation under the acknowledged fence holds the raise to 4 back.
+//! let reserving = fence
+//!     .admit(0, FencedRequest::Reservation)
+//!     .expect("admitted under the acknowledged fence");
 //! let Raise::Drain(pending) = writer.prepare(4, None) else { unreachable!() };
-//! assert_eq!(kept.get(), 0, "not published while the deletion is in flight");
+//! assert_eq!(kept.get(), 0, "not published while the reservation is in flight");
 //! assert_eq!(
-//!     fence.admit_deletion(0).unwrap_err(),
-//!     DeletionRefused::Rising { acknowledged: 0, requested: 0 },
+//!     fence.admit(0, FencedRequest::Deletion).unwrap_err(),
+//!     AdmissionRefused::Rising { acknowledged: 0, requested: 0, request: FencedRequest::Deletion },
 //! );
 //! let pending = pending.try_drained().unwrap_err();
 //!
-//! drop(deleting);
-//! let drained = pending.try_drained().expect("the deletion returned");
+//! drop(reserving);
+//! let drained = pending.try_drained().expect("the reservation returned");
 //! let Raise::Ready(ready) = writer.prepare(4, Some(drained)) else { unreachable!() };
 //! assert_eq!(ready.publish(), 4);
 //! assert_eq!((fence.get(), kept.get()), (4, 4));
 //! assert_eq!(
-//!     fence.admit_deletion(0).unwrap_err(),
-//!     DeletionRefused::Moved { acknowledged: 4, requested: 0 },
+//!     fence.admit(0, FencedRequest::Reservation).unwrap_err(),
+//!     AdmissionRefused::Moved { acknowledged: 4, requested: 0, request: FencedRequest::Reservation },
 //! );
 //!
 //! // The fence only rises.
@@ -124,6 +138,7 @@ mod raise;
 #[cfg(test)]
 mod tests;
 
+use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -131,13 +146,33 @@ use gate::Gate;
 
 pub use raise::{DrainedRaise, PendingRaise, Raise, ReadyRaise};
 
-/// How long a raise waits for in-flight deletions before it reports the wait — a warning and
-/// one [`DeletionGateStatus::long_drain_waits`] — and goes on waiting. It never stops waiting on
-/// its own (module docs, "What the gate cannot establish").
+/// How long a raise waits for in-flight fenced requests before it reports the wait — a warning
+/// and one [`GateStatus::long_drain_waits`] — and goes on waiting. It never stops waiting on its
+/// own (module docs, "What the gate cannot establish").
 pub const LONG_DRAIN_WAIT: Duration = Duration::from_secs(10);
 
+/// What a fenced request is for (module docs): the kind a [`RequestGuard`] is admitted, counted
+/// and released as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FencedRequest {
+    /// A deletion — one store DELETE, or one bounded call that issues deletes — judged against
+    /// the old owner's roots.
+    Deletion,
+    /// A reservation: the PUT of one durable record a successor lists after the acknowledgement.
+    Reservation,
+}
+
+impl fmt::Display for FencedRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            FencedRequest::Deletion => "deletion",
+            FencedRequest::Reservation => "reservation",
+        })
+    }
+}
+
 /// A read-only handle onto a worker generation's highest acknowledged lifecycle fence, and its
-/// deletion gate.
+/// ownership gate.
 ///
 /// Zero means no fence has been acknowledged. Every clone reads the same cell, so a table
 /// that keeps a clone reads the current value at any later time, and successive reads never
@@ -149,7 +184,7 @@ pub struct AcknowledgedFence {
 
 impl AcknowledgedFence {
     /// A handle no writer exists for: it reads zero — no fence acknowledged — for as long as
-    /// it lives, and its deletion gate admits every deletion under zero.
+    /// it lives, and its gate admits every fenced request under zero.
     ///
     /// For executions that run under no lifecycle guard: the in-process engine
     /// (`Program::local_from_logical`) and tests.
@@ -164,25 +199,31 @@ impl AcknowledgedFence {
         self.gate.acknowledged()
     }
 
-    /// Admits one deletion under `generation` — the ownership generation the deleter's
-    /// authorization was declared under — if the acknowledged fence equals it and no raise is
-    /// pending; the check and the registration are one step under the gate's lock (module docs).
+    /// Admits one request of kind `request` under `generation` — the ownership generation the
+    /// requester acts under — if the acknowledged fence equals it and no raise is pending; the
+    /// check and the registration are one step under the gate's lock (module docs).
     ///
     /// Hold the guard for exactly the request it covers, and drop it when the request returns.
     ///
     /// # Errors
     ///
-    /// [`DeletionRefused::Rising`] while a raise is pending, else [`DeletionRefused::Moved`]
+    /// [`AdmissionRefused::Rising`] while a raise is pending, else [`AdmissionRefused::Moved`]
     /// when the acknowledged fence is not `generation` — in either direction.
-    pub fn admit_deletion(&self, generation: u64) -> Result<DeletionGuard, DeletionRefused> {
-        self.gate.admit(generation)?;
-        Ok(DeletionGuard {
+    pub fn admit(
+        &self,
+        generation: u64,
+        request: FencedRequest,
+    ) -> Result<RequestGuard, AdmissionRefused> {
+        self.gate.admit(generation, request)?;
+        Ok(RequestGuard {
             gate: Arc::clone(&self.gate),
+            request,
+            generation,
         })
     }
 
-    /// What the deletion gate holds now: the gauge a stuck drain shows up on.
-    pub fn deletion_gate(&self) -> DeletionGateStatus {
+    /// What the gate holds now: the gauge a stuck drain shows up on.
+    pub fn gate_status(&self) -> GateStatus {
         self.gate.status()
     }
 }
@@ -222,7 +263,8 @@ impl AcknowledgedFenceWriter {
     /// - [`Raise::NotAbove`] when `fence` is not above the acknowledged fence — nothing to raise;
     ///   a `drained` raise handed in is dropped, which reopens the admission it closed;
     /// - [`Raise::Ready`] when `drained` is this gate's, drained for exactly `fence` — or when
-    ///   closing admission finds no deletion in flight, so the whole raise is one step;
+    ///   closing admission finds no request of either kind in flight, so the whole raise is one
+    ///   step;
     /// - [`Raise::Drain`] otherwise: admission under the current fence is now closed, and the
     ///   pending raise must be drained and handed back.
     ///
@@ -249,60 +291,84 @@ impl AcknowledgedFenceWriter {
     }
 }
 
-/// One deletion admitted under the acknowledged fence (module docs). While it lives, no raise
-/// of that fence publishes; dropping it deregisters the deletion.
+/// One fenced request admitted under the acknowledged fence (module docs). While it lives, no
+/// raise of that fence publishes; dropping it deregisters the request from its kind's count.
 ///
-/// `Send`, so a deleter may take it where the request runs — a blocking pool, another task.
-/// Dropping it is how the deletion ends; `mem::forget` on it keeps every later raise of this
+/// Built only by [`AcknowledgedFence::admit`], after the gate counted it: its kind and
+/// generation are the ones admitted, and nothing changes them, so the drop releases exactly the
+/// kind that was counted.
+///
+/// `Send`, so a requester may take it where the request runs — a blocking pool, another task.
+/// Dropping it is how the request ends; `mem::forget` on it keeps every later raise of this
 /// fence waiting, which fails closed — nothing is acknowledged — but is reported only by the
 /// stuck drain's warning.
-#[must_use = "a deletion guard admits one request; dropping it at once admits none"]
+#[must_use = "a request guard admits one request; dropping it at once admits none"]
 #[derive(Debug)]
-pub struct DeletionGuard {
+pub struct RequestGuard {
     gate: Arc<Gate>,
+    request: FencedRequest,
+    generation: u64,
 }
 
-impl Drop for DeletionGuard {
-    fn drop(&mut self) {
-        self.gate.release();
+impl RequestGuard {
+    /// The kind of request admitted.
+    pub fn request(&self) -> FencedRequest {
+        self.request
+    }
+
+    /// The generation it was admitted under: while the guard lives, the acknowledged fence.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 }
 
-/// Why [`AcknowledgedFence::admit_deletion`] admitted nothing.
+impl Drop for RequestGuard {
+    fn drop(&mut self) {
+        self.gate.release(self.request);
+    }
+}
+
+/// Why [`AcknowledgedFence::admit`] admitted nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum DeletionRefused {
+pub enum AdmissionRefused {
     /// A raise above `acknowledged` has closed admission and not yet published or been
     /// abandoned.
     #[error(
-        "a deletion under ownership generation {requested} was refused: a raise of the \
-         acknowledged lifecycle fence {acknowledged} is draining its in-flight deletions"
+        "a {request} under ownership generation {requested} was refused: a raise of the \
+         acknowledged lifecycle fence {acknowledged} is draining its in-flight requests"
     )]
     Rising {
-        /// The fence acknowledged when the deletion asked.
+        /// The fence acknowledged when the request asked.
         acknowledged: u64,
-        /// The generation the deletion asked under.
+        /// The generation the request asked under.
         requested: u64,
+        /// The kind of request refused.
+        request: FencedRequest,
     },
-    /// The acknowledged fence is not the generation the deletion asked under.
+    /// The acknowledged fence is not the generation the request asked under.
     #[error(
-        "a deletion under ownership generation {requested} was refused: the acknowledged \
+        "a {request} under ownership generation {requested} was refused: the acknowledged \
          lifecycle fence is {acknowledged}"
     )]
     Moved {
-        /// The fence acknowledged when the deletion asked.
+        /// The fence acknowledged when the request asked.
         acknowledged: u64,
-        /// The generation the deletion asked under.
+        /// The generation the request asked under.
         requested: u64,
+        /// The kind of request refused.
+        request: FencedRequest,
     },
 }
 
-/// A snapshot of one deletion gate: the fence it guards, and what is holding a raise back.
+/// A snapshot of one ownership gate: the fence it guards, and what is holding a raise back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DeletionGateStatus {
+pub struct GateStatus {
     /// The acknowledged fence.
     pub acknowledged: u64,
     /// Deletions admitted and not yet returned.
-    pub in_flight: usize,
+    pub deletions_in_flight: usize,
+    /// Reservations admitted and not yet returned.
+    pub reservations_in_flight: usize,
     /// Raises that closed admission and have neither published nor been abandoned.
     pub raises_pending: usize,
     /// Drain waits that ran past their budget — [`LONG_DRAIN_WAIT`] each in production —

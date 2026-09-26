@@ -203,9 +203,9 @@ impl AttemptIds {
     /// nothing.
     ///
     /// For a directive the guard must decide in two steps: one that raises the lifecycle fence
-    /// closes deletion admission and waits for in-flight deletions before it records anything
-    /// (`guard::WorkerLifecycle::admit_start_step`), and a directive this record would refuse
-    /// must be refused before that wait, not after it.
+    /// closes the admission of fenced requests and waits for in-flight ones before it records
+    /// anything (`guard::WorkerLifecycle::admit_start_step`), and a directive this record would
+    /// refuse must be refused before that wait, not after it.
     ///
     /// # Errors
     ///

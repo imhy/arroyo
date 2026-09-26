@@ -704,9 +704,9 @@ async fn barrier_hooks_run_before_the_checkpoint_is_enqueued_and_read_the_live_f
 
     // The fence rises between barriers, as an already-running adoption raises it, and the
     // handle each table kept at barrier 1 reads the rise with no barrier in between. No table
-    // here holds a deletion guard, so the raise closes, drains and publishes in one step.
+    // here holds a request guard, so the raise closes, drains and publishes in one step.
     let Raise::Ready(ready) = writer.prepare(7, None) else {
-        panic!("no deletion is in flight")
+        panic!("no fenced request is in flight")
     };
     assert_eq!(ready.publish(), 7);
     for (table, _) in TABLES {

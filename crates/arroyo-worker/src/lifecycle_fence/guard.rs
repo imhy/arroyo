@@ -18,9 +18,9 @@
 //! 2. [`WorkerLifecycle::admit_start_step`] is the single operation. It advances the fence,
 //!    revokes, decides, and moves the phase in one call, so there is no window in which a request
 //!    has been validated but not yet applied, and no way to advance the fence without deciding
-//!    the request that came with it. (A raise that must first wait for in-flight deletions takes
-//!    an earlier call that closes deletion admission and changes nothing else; see "A raise waits
-//!    for the deletions admitted under the fence it moves past" below.)
+//!    the request that came with it. (A raise that must first wait for in-flight fenced requests
+//!    takes an earlier call that closes their admission and changes nothing else; see "A raise
+//!    waits for the fenced requests admitted under the fence it moves past" below.)
 //! 3. `WorkerExecutionPhase::Initializing` carries a [`StartAdmitted`] whose field is private to
 //!    this module, so no other code can put the worker into the phase that means "a start was
 //!    admitted"; and the [`AppliedStart`] that admission returns yields its response only by
@@ -47,19 +47,21 @@
 //! non-awaiting: a commit either linearizes before the acknowledgement and reaches every
 //! operator, or after it and reaches none.
 //!
-//! # A raise waits for the deletions admitted under the fence it moves past
+//! # A raise waits for the fenced requests admitted under the fence it moves past
 //!
-//! The acknowledged fence is also the ownership generation this execution's tables delete
-//! under (ruling M11.T10R6), and a table must not delete under it once a higher one is
-//! acknowledged: the controller may hand the lineage to a successor the moment it reads the
-//! acknowledgement (M11.T10b.02 as amended by the PR #200 review, 2026-09-26; M11.D39d). So a
-//! directive that raises the fence is decided in up to two steps, both
-//! [`WorkerLifecycle::admit_start_step`]:
+//! The acknowledged fence is also the ownership generation this execution's tables make their
+//! fenced requests under (ruling M11.T10R6): a table must not delete under it once a higher one
+//! is acknowledged, and a reservation record it writes under it must have returned before a
+//! higher one is — the controller may hand the lineage to a successor, whose restore lists those
+//! records, the moment it reads the acknowledgement (M11.T10b.02 as amended by the PR #200
+//! reviews, 2026-09-26; M11.D39d). So a directive that raises the fence is decided in up to two
+//! steps, both [`WorkerLifecycle::admit_start_step`]:
 //!
 //! 1. under the lock, the whole plan is validated — the fence decision, the phase, the
 //!    identifier record ([`AttemptIds::check`]) — and, if the directive raises the fence while
-//!    deletions admitted under it are in flight, deletion admission is **closed** and the
-//!    [`PendingRaise`] handed back ([`StartStep::Drain`]); nothing else changes;
+//!    deletions or reservations admitted under it are in flight, admission of both kinds is
+//!    **closed** and the [`PendingRaise`] handed back ([`StartStep::Drain`]); nothing else
+//!    changes;
 //! 2. with the lock **released**, the handler awaits the drain, then takes the lock again and
 //!    decides the directive afresh with the drained raise, which is what publishes the fence —
 //!    in the same critical section as the revocations, the settlement and every other effect.
@@ -67,13 +69,13 @@
 //! With nothing in flight the close drains at once and the directive is one step, exactly as
 //! before. Either way the acknowledgement, and whatever the directive decides with it, happen in
 //! one critical section, so starts and commits still linearize before or after it; a deletion
-//! now does too: admitted before the close, its request returns before the fence publishes;
-//! asked for after, it is refused (`arroyo_state::ownership`). The wait never holds the lock, so
-//! every other lifecycle operation — a commit, a phase read, another directive — proceeds while a
-//! raise drains; and it never gives up on its own, because a request still unresolved could land
-//! after ownership moved (the ownership module's docs say what that does and does not cover). A
-//! raise whose handler is cancelled, or whose second step finds the directive refused, is
-//! dropped, which reopens deletion admission under the fence still acknowledged.
+//! and a reservation now do too: admitted before the close, its request returns before the fence
+//! publishes; asked for after, it is refused (`arroyo_state::ownership`). The wait never holds
+//! the lock, so every other lifecycle operation — a commit, a phase read, another directive —
+//! proceeds while a raise drains; and it never gives up on its own, because a request still
+//! unresolved could land after ownership moved (the ownership module's docs say what that does
+//! and does not cover). A raise whose handler is cancelled, or whose second step finds the
+//! directive refused, is dropped, which reopens admission under the fence still acknowledged.
 //!
 //! # What is not decided here
 //!
@@ -134,15 +136,15 @@ pub(crate) enum StartAdmission {
 }
 
 /// One step of [`WorkerLifecycle::admit_start_step`] (module docs, "A raise waits for the
-/// deletions admitted under the fence it moves past").
+/// fenced requests admitted under the fence it moves past").
 #[must_use]
 #[derive(Debug)]
 pub(crate) enum StartStep {
     /// Decided, in this step's critical section.
     Decided(StartAdmission),
-    /// The directive raises the fence while deletions admitted under it are in flight. Deletion
-    /// admission is closed and nothing else changed: await [`PendingRaise::drained`] with the
-    /// lock released, then decide the same request again with the drained raise.
+    /// The directive raises the fence while fenced requests admitted under it are in flight.
+    /// Their admission is closed and nothing else changed: await [`PendingRaise::drained`] with
+    /// the lock released, then decide the same request again with the drained raise.
     Drain(PendingRaise),
 }
 
@@ -260,8 +262,8 @@ struct FenceState {
     /// Held as the one writer of the cell this execution's tables read it through
     /// ([`WorkerLifecycle::acknowledged_fence_handle`], ruling M11.T10R6). The writer is not
     /// `Clone` and is raised only by [`WorkerLifecycle::admit_start_step`], under this value's
-    /// lock and only once the deletions admitted under the fence it moves past have returned, so
-    /// the value a table reads is this field and nothing else can move it.
+    /// lock and only once the fenced requests admitted under the fence it moves past have
+    /// returned, so the value a table reads is this field and nothing else can move it.
     acknowledged: AcknowledgedFenceWriter,
     ids: AttemptIds,
 }
@@ -369,13 +371,13 @@ impl WorkerLifecycle {
 
     /// Advances the fence, applies the revocations, and admits or refuses the request — in that
     /// order, in one call, under the caller's lock on this value — or, for a directive that
-    /// raises the fence while deletions admitted under it are in flight, closes deletion
+    /// raises the fence while fenced requests admitted under it are in flight, closes their
     /// admission and hands back the raise to drain ([`StartStep::Drain`]), changing nothing else.
     ///
     /// `drained` is the raise an earlier step of the same request handed back, drained with the
     /// lock released; the request is planned afresh around it, so whatever changed meanwhile is
     /// decided now. A drained raise the fresh plan does not need — the fence already reached, or
-    /// the directive refused — is dropped, which reopens deletion admission.
+    /// the directive refused — is dropped, which reopens admission.
     ///
     /// # Errors
     ///
@@ -664,12 +666,12 @@ impl WorkerLifecycle {
         }
     }
 
-    /// Carries out a plan — or, if it raises the fence while deletions are in flight, closes
-    /// deletion admission and stops there.
+    /// Carries out a plan — or, if it raises the fence while fenced requests are in flight,
+    /// closes their admission and stops there.
     ///
     /// Everything that can refuse is checked before anything changes: the identifier record
-    /// first, without writing it, so a directive it would refuse neither closes deletion
-    /// admission nor waits for a drain; then the raise, which either hands back the pending raise
+    /// first, without writing it, so a directive it would refuse neither closes admission nor
+    /// waits for a drain; then the raise, which either hands back the pending raise
     /// — having changed nothing but the close, which dropping it undoes — or is ready to publish.
     /// Only then is the record written (it cannot refuse now: nothing changed it since the check,
     /// under the same lock) and the fence published, so a directive the worker could not record

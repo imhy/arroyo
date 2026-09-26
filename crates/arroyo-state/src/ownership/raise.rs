@@ -14,8 +14,8 @@ use super::{AcknowledgedFenceWriter, LONG_DRAIN_WAIT};
 pub enum Raise<'a> {
     /// The fence asked for is not above the acknowledged one: nothing to raise.
     NotAbove,
-    /// Admission under the acknowledged fence is closed and deletions admitted before the
-    /// close are in flight: drain this, then hand the drained raise back to `prepare`.
+    /// Admission under the acknowledged fence is closed and requests admitted before the close
+    /// are in flight: drain this, then hand the drained raise back to `prepare`.
     Drain(PendingRaise),
     /// Drained: publish it.
     Ready(ReadyRaise<'a>),
@@ -39,13 +39,13 @@ impl Drop for Ticket {
     }
 }
 
-/// A raise that has closed deletion admission under the acknowledged fence and has not yet
-/// seen the deletions admitted before the close return.
+/// A raise that has closed admission under the acknowledged fence and has not yet seen the
+/// requests of either kind admitted before the close return.
 ///
 /// `Send`, and it does not borrow the writer: the worker awaits the drain with its lifecycle
 /// lock released. Dropping it — a cancelled handler, a refused directive — abandons the raise:
 /// nothing was acknowledged, so admission under the fence still acknowledged reopens.
-#[must_use = "dropping a pending raise abandons it and reopens deletion admission"]
+#[must_use = "dropping a pending raise abandons it and reopens admission"]
 #[derive(Debug)]
 pub struct PendingRaise {
     ticket: Ticket,
@@ -73,7 +73,8 @@ impl PendingRaise {
     ///
     /// # Errors
     ///
-    /// This raise, unchanged, while a deletion admitted before the close is in flight.
+    /// This raise, unchanged, while a request of either kind admitted before the close is in
+    /// flight.
     pub fn try_drained(self) -> Result<DrainedRaise, PendingRaise> {
         if self.ticket.gate.is_drained() {
             Ok(DrainedRaise {
@@ -84,9 +85,10 @@ impl PendingRaise {
         }
     }
 
-    /// Waits at most `budget` for the drain. A wait that runs out is reported — a warning and
-    /// one [`long_drain_waits`](super::DeletionGateStatus::long_drain_waits) — and hands the
-    /// raise back, still pending: running out never publishes.
+    /// Waits at most `budget` for the drain — no request of either kind in flight. A wait that
+    /// runs out is reported — a warning and one
+    /// [`long_drain_waits`](super::GateStatus::long_drain_waits) — and hands the raise back,
+    /// still pending: running out never publishes.
     ///
     /// # Errors
     ///
@@ -121,10 +123,10 @@ impl PendingRaise {
     }
 }
 
-/// A raise whose close has been observed with no deletion in flight. Admission stayed closed
-/// since, so none is in flight still: hand it to [`AcknowledgedFenceWriter::prepare`] to
-/// publish. Dropping it abandons the raise.
-#[must_use = "dropping a drained raise abandons it and reopens deletion admission"]
+/// A raise whose close has been observed with no request of either kind in flight. Admission
+/// stayed closed since, so none is in flight still: hand it to
+/// [`AcknowledgedFenceWriter::prepare`] to publish. Dropping it abandons the raise.
+#[must_use = "dropping a drained raise abandons it and reopens admission"]
 #[derive(Debug)]
 pub struct DrainedRaise {
     ticket: Ticket,
@@ -148,7 +150,7 @@ impl DrainedRaise {
 
 /// A drained raise, matched to the writer whose gate it closed: it borrows that writer, so it
 /// can publish nowhere else, and nothing else can move the fence meanwhile.
-#[must_use = "dropping a ready raise abandons it and reopens deletion admission"]
+#[must_use = "dropping a ready raise abandons it and reopens admission"]
 #[derive(Debug)]
 pub struct ReadyRaise<'a> {
     writer: &'a mut AcknowledgedFenceWriter,

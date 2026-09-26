@@ -1,17 +1,18 @@
-//! The acknowledged fence and its deletion gate (M11.T10b.01/.02).
+//! The acknowledged fence and its ownership gate (M11.T10b.01/.02), for each [`FencedRequest`]
+//! kind.
 //!
 //! The gate's rows, each identity varied alone against a control that admits: the acknowledged
-//! fence against the generation asked under (below, equal, above), a pending raise, a guard
-//! dropped normally, by an unwinding deleter and by a cancelled future, and a guard that is never
-//! dropped. Then the raise itself: one in flight holds the publication back and one asked for
-//! after the close is refused; a raise that runs out of wait budget reports and keeps waiting;
-//! one abandoned reopens admission under the fence still acknowledged; two at once publish in
-//! either order and never lower the fence; a drained raise handed to another writer, or for
-//! another fence, cannot publish there.
+//! fence against the generation asked under (below, equal, above) and the kind, independently; a
+//! pending raise; the two kinds counted apart, each guard naming and releasing exactly what it was
+//! admitted for; a request of either kind holding a raise back, and a raise waiting for both; a
+//! guard dropped normally, by an unwinding requester and by a cancelled future, and a guard that
+//! is never dropped. `tests/raise.rs` has the raise itself: running out of wait budget, abandoned
+//! at each phase, two at once, and a drained raise handed to the wrong writer or fence.
+
+mod raise;
 
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::pin::pin;
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
@@ -19,6 +20,8 @@ use super::*;
 
 /// Long enough never to run out in a test that waits for something that has already happened.
 const FOREVER: Duration = Duration::from_secs(3600);
+
+const KINDS: [FencedRequest; 2] = [FencedRequest::Deletion, FencedRequest::Reservation];
 
 fn is_shareable<T: Clone + Send + Sync + 'static>() {}
 fn is_send<T: Send + 'static>() {}
@@ -28,7 +31,7 @@ fn raise_now(writer: &mut AcknowledgedFenceWriter, fence: u64) -> u64 {
     match writer.prepare(fence, None) {
         Raise::Ready(ready) => ready.publish(),
         Raise::NotAbove => writer.get(),
-        Raise::Drain(pending) => panic!("{} deletions in flight", pending.target()),
+        Raise::Drain(pending) => panic!("requests in flight: a raise to {}", pending.target()),
     }
 }
 
@@ -40,9 +43,55 @@ fn acknowledged_at(fence: u64) -> (AcknowledgedFenceWriter, AcknowledgedFence) {
     (writer, reader)
 }
 
-fn status(fence: &AcknowledgedFence) -> (u64, usize, usize) {
-    let status = fence.deletion_gate();
-    (status.acknowledged, status.in_flight, status.raises_pending)
+/// `(acknowledged, deletions, reservations, raises pending)`.
+fn status(fence: &AcknowledgedFence) -> (u64, usize, usize, usize) {
+    let status = fence.gate_status();
+    (
+        status.acknowledged,
+        status.deletions_in_flight,
+        status.reservations_in_flight,
+        status.raises_pending,
+    )
+}
+
+/// `n` requests of `kind` in flight, as `(deletions, reservations)`.
+fn only(kind: FencedRequest, n: usize) -> (usize, usize) {
+    match kind {
+        FencedRequest::Deletion => (n, 0),
+        FencedRequest::Reservation => (0, n),
+    }
+}
+
+/// A raise is pending over `acknowledged`: every admission of either kind under `asked` is
+/// refused as rising, naming its own kind and generation.
+fn rising_for_both(fence: &AcknowledgedFence, acknowledged: u64, asked: u64) {
+    for request in KINDS {
+        assert_eq!(
+            fence.admit(asked, request).unwrap_err(),
+            AdmissionRefused::Rising {
+                acknowledged,
+                requested: asked,
+                request
+            },
+            "{request} under {asked}"
+        );
+    }
+}
+
+/// The fence is `acknowledged`: every admission of either kind under `asked` is refused as
+/// moved.
+fn moved_for_both(fence: &AcknowledgedFence, acknowledged: u64, asked: u64) {
+    for request in KINDS {
+        assert_eq!(
+            fence.admit(asked, request).unwrap_err(),
+            AdmissionRefused::Moved {
+                acknowledged,
+                requested: asked,
+                request
+            },
+            "{request} under {asked}"
+        );
+    }
 }
 
 fn poll_once<F: Future>(future: std::pin::Pin<&mut F>) -> Poll<F::Output> {
@@ -53,7 +102,7 @@ fn poll_once<F: Future>(future: std::pin::Pin<&mut F>) -> Poll<F::Output> {
 fn a_reader_is_a_cheap_shareable_handle_and_every_token_moves_across_threads() {
     is_shareable::<AcknowledgedFence>();
     is_send::<AcknowledgedFenceWriter>();
-    is_send::<DeletionGuard>();
+    is_send::<RequestGuard>();
     is_send::<PendingRaise>();
     is_send::<DrainedRaise>();
 }
@@ -72,7 +121,11 @@ fn every_reader_follows_the_writer_and_the_fence_only_rises() {
         assert!(matches!(writer.prepare(lower, None), Raise::NotAbove));
     }
     assert_eq!((writer.get(), early.get(), late.get()), (4, 4, 4));
-    assert_eq!(status(&early), (4, 0, 0), "a refused raise closed nothing");
+    assert_eq!(
+        status(&early),
+        (4, 0, 0, 0),
+        "a refused raise closed nothing"
+    );
 
     assert_eq!(raise_now(&mut writer, 9), 9);
     assert_eq!((early.get(), late.clone().get()), (9, 9));
@@ -85,350 +138,269 @@ fn an_unfenced_handle_reads_zero_is_no_writers_cell_and_admits_under_zero_only()
     raise_now(&mut writer, 7);
     assert_eq!(unfenced.get(), 0);
     assert_eq!(unfenced.clone().get(), 0);
-    drop(unfenced.admit_deletion(0).expect("admitted under zero"));
-    assert_eq!(
-        unfenced.admit_deletion(7).unwrap_err(),
-        DeletionRefused::Moved {
-            acknowledged: 0,
-            requested: 7
-        }
-    );
+    for request in KINDS {
+        drop(unfenced.admit(0, request).expect("admitted under zero"));
+    }
+    moved_for_both(&unfenced, 0, 7);
 }
 
-/// The admission row: the generation asked under against the acknowledged fence, each way, and
-/// a pending raise — which refuses even the generation that would otherwise match — against the
-/// control that registers exactly one deletion until its guard drops.
+/// The admission row, for each kind: the generation asked under against the acknowledged fence,
+/// each way — the refusal names the kind and the generation asked — and a pending raise, which
+/// refuses even the generation that would otherwise match, against the control that registers
+/// exactly one request of its kind until its guard drops.
 #[test]
 fn admission_needs_the_acknowledged_fence_and_no_pending_raise() {
-    let (mut writer, fence) = acknowledged_at(5);
-    for asked in [4, 6, 0, u64::MAX] {
-        assert_eq!(
-            fence.admit_deletion(asked).unwrap_err(),
-            DeletionRefused::Moved {
-                acknowledged: 5,
-                requested: asked
-            },
-            "{asked}"
-        );
-    }
-    assert_eq!(status(&fence), (5, 0, 0));
-
-    let control = fence.admit_deletion(5).expect("the control");
-    let second = fence
-        .admit_deletion(5)
-        .expect("admission counts, it does not exclude");
-    assert_eq!(status(&fence), (5, 2, 0));
-    drop((control, second));
-    assert_eq!(status(&fence), (5, 0, 0));
-
-    let Raise::Ready(ready) = writer.prepare(6, None) else {
-        panic!("nothing in flight: one step")
-    };
-    // Not yet published: the close alone refuses every generation.
-    for asked in [5, 6] {
-        assert_eq!(
-            fence.admit_deletion(asked).unwrap_err(),
-            DeletionRefused::Rising {
-                acknowledged: 5,
-                requested: asked
-            },
-            "{asked}"
-        );
-    }
-    assert_eq!(ready.publish(), 6);
-    assert_eq!(status(&fence), (6, 0, 0));
-    drop(
-        fence
-            .admit_deletion(6)
-            .expect("open under the published fence"),
-    );
-}
-
-/// The reviewer's case at the gate: a deletion in flight when the raise closes holds the
-/// publication back — the reader still sees the old fence — and nothing asked for after the close
-/// is admitted under any generation; once it returns, the raise publishes, and only the new fence
-/// admits.
-#[test]
-fn a_deletion_in_flight_holds_the_raise_back_and_none_is_admitted_after_the_close() {
-    let (mut writer, fence) = acknowledged_at(3);
-    let in_flight = fence.admit_deletion(3).expect("admitted before the close");
-
-    let Raise::Drain(pending) = writer.prepare(4, None) else {
-        panic!("a deletion is in flight")
-    };
-    assert_eq!(pending.target(), 4);
-    assert_eq!(status(&fence), (3, 1, 1));
-    assert!(fence.admit_deletion(3).is_err() && fence.admit_deletion(4).is_err());
-    let pending = pending.try_drained().expect_err("still in flight");
-    assert_eq!(fence.get(), 3, "not published");
-
-    drop(in_flight);
-    assert_eq!(status(&fence), (3, 0, 1), "drained, still closed");
-    assert!(
-        fence.admit_deletion(3).is_err(),
-        "closed until it publishes"
-    );
-    let drained = pending.try_drained().expect("drained");
-    let Raise::Ready(ready) = writer.prepare(4, Some(drained)) else {
-        panic!("drained for exactly 4")
-    };
-    assert_eq!(ready.publish(), 4);
-    assert_eq!(status(&fence), (4, 0, 0));
-    assert_eq!(
-        fence.admit_deletion(3).unwrap_err(),
-        DeletionRefused::Moved {
-            acknowledged: 4,
-            requested: 3
+    for request in KINDS {
+        let (mut writer, fence) = acknowledged_at(5);
+        for asked in [4, 6, 0, u64::MAX] {
+            assert_eq!(
+                fence.admit(asked, request).unwrap_err(),
+                AdmissionRefused::Moved {
+                    acknowledged: 5,
+                    requested: asked,
+                    request
+                },
+                "{request} under {asked}"
+            );
         }
-    );
-    drop(fence.admit_deletion(4).expect("open under 4"));
+        assert_eq!(
+            status(&fence),
+            (5, 0, 0, 0),
+            "{request}: a refusal counts nothing"
+        );
+
+        let control = fence.admit(5, request).expect("the control");
+        let second = fence
+            .admit(5, request)
+            .expect("admission counts, it does not exclude");
+        let (deletions, reservations) = only(request, 2);
+        assert_eq!(status(&fence), (5, deletions, reservations, 0), "{request}");
+        drop((control, second));
+        assert_eq!(status(&fence), (5, 0, 0, 0), "{request}");
+
+        let Raise::Ready(ready) = writer.prepare(6, None) else {
+            panic!("nothing in flight: one step")
+        };
+        // Not yet published: the close alone refuses every generation, of either kind.
+        for asked in [5, 6] {
+            rising_for_both(&fence, 5, asked);
+        }
+        assert_eq!(ready.publish(), 6);
+        assert_eq!(status(&fence), (6, 0, 0, 0));
+        moved_for_both(&fence, 6, 5);
+        drop(
+            fence
+                .admit(6, request)
+                .expect("open under the published fence"),
+        );
+    }
 }
 
-/// A guard dropped by an unwinding deleter, and one owned by a future that is cancelled, both
-/// deregister; one that is never dropped keeps the raise waiting — fail-closed.
+/// A guard names the kind and the generation it was admitted for — while it lives, the
+/// acknowledged fence — and its drop takes one from its own kind's count and never the other's.
+#[test]
+fn each_kind_is_counted_apart_and_a_guard_names_what_it_was_admitted_for() {
+    let (_writer, fence) = acknowledged_at(5);
+    let deletion = fence.admit(5, FencedRequest::Deletion).expect("deletion");
+    let reservation = fence
+        .admit(5, FencedRequest::Reservation)
+        .expect("reservation");
+    let second = fence.admit(5, FencedRequest::Reservation).expect("another");
+    assert_eq!(
+        (deletion.request(), deletion.generation()),
+        (FencedRequest::Deletion, 5)
+    );
+    assert_eq!(
+        (reservation.request(), reservation.generation()),
+        (FencedRequest::Reservation, 5)
+    );
+    assert_eq!(status(&fence), (5, 1, 2, 0));
+    drop(deletion);
+    assert_eq!(status(&fence), (5, 0, 2, 0));
+    drop(reservation);
+    assert_eq!(status(&fence), (5, 0, 1, 0));
+    drop(second);
+    assert_eq!(status(&fence), (5, 0, 0, 0));
+}
+
+/// The reviewer's case at the gate, for each kind: a request in flight when the raise closes
+/// holds the publication back — the reader still sees the old fence, the guard's generation — and
+/// nothing of either kind asked for after the close is admitted under any generation; once it
+/// returns, the raise publishes, and only the new fence admits.
+#[test]
+fn a_request_of_either_kind_in_flight_holds_the_raise_back_and_none_is_admitted_after_the_close() {
+    for request in KINDS {
+        let (mut writer, fence) = acknowledged_at(3);
+        let in_flight = fence.admit(3, request).expect("admitted before the close");
+
+        let Raise::Drain(pending) = writer.prepare(4, None) else {
+            panic!("a {request} is in flight")
+        };
+        assert_eq!(pending.target(), 4);
+        let (deletions, reservations) = only(request, 1);
+        assert_eq!(status(&fence), (3, deletions, reservations, 1), "{request}");
+        for asked in [3, 4] {
+            rising_for_both(&fence, 3, asked);
+        }
+        let pending = pending.try_drained().expect_err("still in flight");
+        assert_eq!(
+            fence.get(),
+            in_flight.generation(),
+            "{request}: not published"
+        );
+
+        drop(in_flight);
+        assert_eq!(status(&fence), (3, 0, 0, 1), "drained, still closed");
+        rising_for_both(&fence, 3, 3);
+        let drained = pending.try_drained().expect("drained");
+        let Raise::Ready(ready) = writer.prepare(4, Some(drained)) else {
+            panic!("drained for exactly 4")
+        };
+        assert_eq!(ready.publish(), 4);
+        assert_eq!(status(&fence), (4, 0, 0, 0));
+        moved_for_both(&fence, 4, 3);
+        for other in KINDS {
+            drop(fence.admit(4, other).expect("open under 4"));
+        }
+    }
+}
+
+/// `is_drained` needs both counts at zero: with one request of each kind in flight, releasing
+/// either leaves the raise pending, in either order, and the asynchronous drain wakes only for
+/// the last.
+#[tokio::test]
+async fn a_raise_waits_for_both_kinds() {
+    for deletion_first in [true, false] {
+        let label = format!("deletion first: {deletion_first}");
+        let (mut writer, fence) = acknowledged_at(2);
+        let deletion = fence.admit(2, FencedRequest::Deletion).expect("deletion");
+        let reservation = fence
+            .admit(2, FencedRequest::Reservation)
+            .expect("reservation");
+        let Raise::Drain(pending) = writer.prepare(3, None) else {
+            panic!("both in flight")
+        };
+        let mut draining = std::pin::pin!(pending.drained());
+        assert!(poll_once(draining.as_mut()).is_pending(), "{label}");
+        let (remaining, left) = if deletion_first {
+            drop(deletion);
+            (reservation, (2, 0, 1, 1))
+        } else {
+            drop(reservation);
+            (deletion, (2, 1, 0, 1))
+        };
+        assert_eq!(status(&fence), left, "{label}");
+        assert!(
+            poll_once(draining.as_mut()).is_pending(),
+            "{label}: the other kind is in flight"
+        );
+        drop(remaining);
+        let drained = tokio::time::timeout(FOREVER, draining)
+            .await
+            .expect("woken by the last release");
+        let Raise::Ready(ready) = writer.prepare(3, Some(drained)) else {
+            panic!("drained for 3")
+        };
+        assert_eq!(ready.publish(), 3, "{label}");
+    }
+}
+
+/// For each kind: a guard dropped by an unwinding requester, and one owned by a future that is
+/// cancelled, both deregister; one that is never dropped keeps the raise waiting — fail-closed —
+/// and stays counted under its kind.
 #[tokio::test]
 async fn a_guard_deregisters_on_unwind_and_cancellation_and_a_leaked_one_keeps_the_raise_waiting() {
-    let (mut writer, fence) = acknowledged_at(2);
+    for request in KINDS {
+        let (mut writer, fence) = acknowledged_at(2);
 
-    let unwound = catch_unwind(AssertUnwindSafe(|| {
-        let _guard = fence.admit_deletion(2).expect("admitted");
-        panic!("the store call unwound");
-    }));
-    assert!(unwound.is_err());
-    assert_eq!(status(&fence), (2, 0, 0), "deregistered by the unwind");
+        let unwound = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = fence.admit(2, request).expect("admitted");
+            panic!("the store call unwound");
+        }));
+        assert!(unwound.is_err());
+        assert_eq!(
+            status(&fence),
+            (2, 0, 0, 0),
+            "{request}: deregistered by the unwind"
+        );
 
-    let reader = fence.clone();
-    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
-    let deleting = tokio::spawn(async move {
-        let _guard = reader.admit_deletion(2).expect("admitted");
-        entered_tx.send(()).expect("the test waits");
-        std::future::pending::<()>().await;
-    });
-    entered_rx.await.expect("the deleter holds its guard");
-    assert_eq!(status(&fence), (2, 1, 0));
-    deleting.abort();
-    assert!(deleting.await.expect_err("aborted").is_cancelled());
-    assert_eq!(
-        status(&fence),
-        (2, 0, 0),
-        "deregistered by the cancellation"
-    );
+        let reader = fence.clone();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
+        let requesting = tokio::spawn(async move {
+            let _guard = reader.admit(2, request).expect("admitted");
+            entered_tx.send(()).expect("the test waits");
+            std::future::pending::<()>().await;
+        });
+        entered_rx.await.expect("the requester holds its guard");
+        let (deletions, reservations) = only(request, 1);
+        assert_eq!(status(&fence), (2, deletions, reservations, 0), "{request}");
+        requesting.abort();
+        assert!(requesting.await.expect_err("aborted").is_cancelled());
+        assert_eq!(
+            status(&fence),
+            (2, 0, 0, 0),
+            "{request}: deregistered by the cancellation"
+        );
 
-    std::mem::forget(fence.admit_deletion(2).expect("admitted"));
-    let Raise::Drain(pending) = writer.prepare(3, None) else {
-        panic!("the leaked guard is in flight")
-    };
-    let pending = pending
-        .wait_for(Duration::from_millis(1))
-        .await
-        .expect_err("a leaked guard never drains");
-    assert_eq!(fence.get(), 2, "and nothing is acknowledged");
-    assert_eq!(fence.deletion_gate().long_drain_waits, 1);
-    drop(pending);
-    assert_eq!(
-        status(&fence),
-        (2, 1, 0),
-        "abandoned: open again, the leak still counted"
-    );
-}
-
-/// The timeout case: a request that does not return within the wait budget keeps the raise
-/// waiting — reported, never published — and a deletion asked for meanwhile under either
-/// generation is refused; once the request returns, the same raise publishes and the new fence
-/// admits.
-#[tokio::test]
-async fn a_raise_that_runs_out_of_budget_reports_keeps_waiting_and_never_publishes() {
-    let (mut writer, fence) = acknowledged_at(7);
-    let stuck = fence.admit_deletion(7).expect("admitted before the close");
-    let Raise::Drain(mut pending) = writer.prepare(8, None) else {
-        panic!("in flight")
-    };
-    for waits in 1..=3 {
-        pending = pending
+        std::mem::forget(fence.admit(2, request).expect("admitted"));
+        let Raise::Drain(pending) = writer.prepare(3, None) else {
+            panic!("the leaked guard is in flight")
+        };
+        let pending = pending
             .wait_for(Duration::from_millis(1))
             .await
-            .expect_err("the request has not returned");
-        let now = fence.deletion_gate();
+            .expect_err("a leaked guard never drains");
+        assert_eq!(fence.get(), 2, "{request}: and nothing is acknowledged");
+        assert_eq!(fence.gate_status().long_drain_waits, 1);
+        drop(pending);
         assert_eq!(
-            (
-                now.acknowledged,
-                now.in_flight,
-                now.raises_pending,
-                now.long_drain_waits
-            ),
-            (7, 1, 1, waits)
+            status(&fence),
+            (2, deletions, reservations, 0),
+            "{request}: abandoned — open again, the leak still counted under its kind"
         );
-        for asked in [7, 8] {
-            assert!(matches!(
-                fence.admit_deletion(asked),
-                Err(DeletionRefused::Rising {
-                    acknowledged: 7,
-                    ..
-                })
-            ));
-        }
-    }
-
-    // `drained` waits as long as it takes: here, until the request returns.
-    let mut draining = pin!(pending.drained());
-    assert!(poll_once(draining.as_mut()).is_pending());
-    drop(stuck);
-    let drained = tokio::time::timeout(FOREVER, draining)
-        .await
-        .expect("woken by the release");
-    let Raise::Ready(ready) = writer.prepare(8, Some(drained)) else {
-        panic!("drained for 8")
-    };
-    assert_eq!(ready.publish(), 8);
-    drop(fence.admit_deletion(8).expect("open under 8"));
-    assert_eq!(fence.deletion_gate().long_drain_waits, 3);
-}
-
-/// A raise dropped at each phase — closed, drained, ready — publishes nothing and reopens
-/// admission under the fence still acknowledged.
-#[test]
-fn an_abandoned_raise_reopens_admission_under_the_fence_still_acknowledged() {
-    let (mut writer, fence) = acknowledged_at(1);
-
-    let guard = fence.admit_deletion(1).expect("admitted");
-    let Raise::Drain(pending) = writer.prepare(2, None) else {
-        panic!("in flight")
-    };
-    drop(pending);
-    assert_eq!(status(&fence), (1, 1, 0));
-    drop(guard);
-
-    let Raise::Ready(ready) = writer.prepare(2, None) else {
-        panic!("nothing in flight")
-    };
-    drop(ready);
-    assert_eq!(status(&fence), (1, 0, 0));
-
-    let guard = fence.admit_deletion(1).expect("admitted");
-    let Raise::Drain(pending) = writer.prepare(2, None) else {
-        panic!("in flight")
-    };
-    drop(guard);
-    drop(pending.try_drained().expect("drained"));
-    assert_eq!(status(&fence), (1, 0, 0));
-    drop(fence.admit_deletion(1).expect("open under 1 again"));
-}
-
-/// Two raises at once, as two concurrent directives would make: admission stays closed until
-/// both have published or been abandoned, the fence ends at the higher target whichever order they
-/// publish in, and a lower target handed back after a higher one published is `NotAbove` — its
-/// drained raise dropped, never published.
-#[test]
-fn two_raises_at_once_close_until_both_settle_and_never_lower_the_fence() {
-    for higher_first in [true, false] {
-        let (mut writer, fence) = acknowledged_at(4);
-        let guard = fence.admit_deletion(4).expect("admitted");
-        let Raise::Drain(low) = writer.prepare(5, None) else {
-            panic!("in flight")
-        };
-        let Raise::Drain(high) = writer.prepare(7, None) else {
-            panic!("in flight")
-        };
-        assert_eq!(status(&fence), (4, 1, 2));
-        drop(guard);
-        let (low, high) = (
-            low.try_drained().expect("drained"),
-            high.try_drained().expect("drained"),
-        );
-        if higher_first {
-            let Raise::Ready(ready) = writer.prepare(7, Some(high)) else {
-                panic!("ready")
-            };
-            assert_eq!(ready.publish(), 7);
-            assert_eq!(status(&fence), (7, 0, 1), "the other still holds it closed");
-            assert!(fence.admit_deletion(7).is_err());
-            assert!(matches!(writer.prepare(5, Some(low)), Raise::NotAbove));
-        } else {
-            let Raise::Ready(ready) = writer.prepare(5, Some(low)) else {
-                panic!("ready")
-            };
-            assert_eq!(ready.publish(), 5);
-            assert_eq!(status(&fence), (5, 0, 1));
-            let Raise::Ready(ready) = writer.prepare(7, Some(high)) else {
-                panic!("ready")
-            };
-            assert_eq!(ready.publish(), 7);
-        }
-        assert_eq!(status(&fence), (7, 0, 0), "higher first: {higher_first}");
-        drop(fence.admit_deletion(7).expect("open under 7"));
     }
 }
 
-/// A drained raise is matched to the writer and the fence it closed: handed to another writer,
-/// or back for another fence, it is dropped and a fresh close taken — its own gate reopens, and it
-/// publishes nothing anywhere.
-#[test]
-fn a_drained_raise_publishes_only_on_its_own_writer_for_its_own_fence() {
-    let (mut mine, my_fence) = acknowledged_at(2);
-    let (mut other, other_fence) = acknowledged_at(2);
-
-    let Raise::Drain(pending) = ({
-        let guard = my_fence.admit_deletion(2).expect("admitted");
-        let raise = mine.prepare(3, None);
-        drop(guard);
-        raise
-    }) else {
-        panic!("in flight at the close")
-    };
-    let foreign = pending.try_drained().expect("drained");
-    let in_flight = other_fence
-        .admit_deletion(2)
-        .expect("admitted on the other gate");
-    let Raise::Drain(fresh) = other.prepare(3, Some(foreign)) else {
-        panic!("the other gate's own close finds its deletion in flight")
-    };
-    assert_eq!(
-        status(&my_fence),
-        (2, 0, 0),
-        "mine abandoned, not published"
-    );
-    assert_eq!(status(&other_fence), (2, 1, 1), "the other closed afresh");
-    drop((fresh, in_flight));
-
-    let Raise::Drain(pending) = ({
-        let guard = my_fence.admit_deletion(2).expect("admitted");
-        let raise = mine.prepare(3, None);
-        drop(guard);
-        raise
-    }) else {
-        panic!("in flight at the close")
-    };
-    let for_three = pending.try_drained().expect("drained");
-    let Raise::Ready(ready) = mine.prepare(9, Some(for_three)) else {
-        panic!("a fresh close for 9, nothing in flight")
-    };
-    assert_eq!(
-        status(&my_fence),
-        (2, 0, 1),
-        "one claim: the stale one released first"
-    );
-    assert_eq!(ready.publish(), 9);
-    assert_eq!(status(&my_fence), (9, 0, 0));
-}
-
+/// Every refusal, for every kind, renders its whole sentence — an exhaustive table, so a new
+/// variant or kind fails to compile here until its sentence is pinned.
 #[test]
 fn every_refusal_renders_its_whole_sentence() {
-    assert_eq!(
-        DeletionRefused::Rising {
-            acknowledged: 4,
-            requested: 4
+    for request in KINDS {
+        let word = match request {
+            FencedRequest::Deletion => "deletion",
+            FencedRequest::Reservation => "reservation",
+        };
+        assert_eq!(request.to_string(), word);
+        let rows = [
+            (
+                AdmissionRefused::Rising {
+                    acknowledged: 4,
+                    requested: 3,
+                    request,
+                },
+                format!(
+                    "a {word} under ownership generation 3 was refused: a raise of the \
+                     acknowledged lifecycle fence 4 is draining its in-flight requests"
+                ),
+            ),
+            (
+                AdmissionRefused::Moved {
+                    acknowledged: 5,
+                    requested: 4,
+                    request,
+                },
+                format!(
+                    "a {word} under ownership generation 4 was refused: the acknowledged \
+                     lifecycle fence is 5"
+                ),
+            ),
+        ];
+        for (refusal, sentence) in rows {
+            match refusal {
+                AdmissionRefused::Rising { .. } | AdmissionRefused::Moved { .. } => {
+                    assert_eq!(refusal.to_string(), sentence);
+                }
+            }
         }
-        .to_string(),
-        "a deletion under ownership generation 4 was refused: a raise of the acknowledged \
-         lifecycle fence 4 is draining its in-flight deletions"
-    );
-    assert_eq!(
-        DeletionRefused::Moved {
-            acknowledged: 5,
-            requested: 4
-        }
-        .to_string(),
-        "a deletion under ownership generation 4 was refused: the acknowledged lifecycle fence \
-         is 5"
-    );
+    }
 }

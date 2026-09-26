@@ -1,4 +1,4 @@
-//! The state one deletion gate keeps behind its lock (the parent module's docs say what it is
+//! The state one ownership gate keeps behind its lock (the parent module's docs say what it is
 //! for).
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -8,33 +8,49 @@ use std::time::Duration;
 use tokio::sync::Notify;
 use tracing::warn;
 
-use super::{DeletionGateStatus, DeletionRefused};
+use super::{AdmissionRefused, FencedRequest, GateStatus};
 
-/// One acknowledged fence and its deletion gate.
+/// One acknowledged fence and its ownership gate.
 ///
-/// `acknowledged` is written only under `state`'s lock, by [`Gate::publish`], so a deletion
+/// `acknowledged` is written only under `state`'s lock, by [`Gate::publish`], so a request
 /// admitted under that lock and a publication are totally ordered; it is an atomic so that
 /// [`Gate::acknowledged`] — every table's per-barrier read — takes no lock.
 #[derive(Debug, Default)]
 pub(super) struct Gate {
     acknowledged: AtomicU64,
     state: Mutex<GateState>,
-    /// Woken when the last in-flight deletion drops.
+    /// Woken when the last in-flight request, of either kind, drops.
     drained: Notify,
 }
 
 /// What the lock guards.
 ///
-/// Neither count can overflow: every deletion guard and every raise ticket it counts holds a
-/// clone of this gate's `Arc`, and `Arc` aborts the process before its count passes
-/// `isize::MAX`.
+/// No count can overflow: every request guard and every raise ticket it counts holds a clone of
+/// this gate's `Arc`, and `Arc` aborts the process before its count passes `isize::MAX`.
 #[derive(Debug, Default)]
 struct GateState {
     /// Deletion guards alive.
-    in_flight: usize,
+    deletions: usize,
+    /// Reservation guards alive.
+    reservations: usize,
     /// Raise tickets alive: while any is, admission is closed.
     raises_pending: usize,
     long_drain_waits: u64,
+}
+
+impl GateState {
+    /// The in-flight count of `request`'s kind.
+    fn in_flight(&mut self, request: FencedRequest) -> &mut usize {
+        match request {
+            FencedRequest::Deletion => &mut self.deletions,
+            FencedRequest::Reservation => &mut self.reservations,
+        }
+    }
+
+    /// No request of either kind in flight: what a raise waits for.
+    fn is_drained(&self) -> bool {
+        self.deletions == 0 && self.reservations == 0
+    }
 }
 
 impl Gate {
@@ -48,31 +64,42 @@ impl Gate {
         self.acknowledged.load(Ordering::Acquire)
     }
 
-    /// Registers one deletion under `generation`, or says why not.
-    pub(super) fn admit(&self, generation: u64) -> Result<(), DeletionRefused> {
+    /// Registers one request of kind `request` under `generation`, or says why not.
+    pub(super) fn admit(
+        &self,
+        generation: u64,
+        request: FencedRequest,
+    ) -> Result<(), AdmissionRefused> {
         let mut state = self.lock();
         let acknowledged = self.acknowledged();
         if state.raises_pending > 0 {
-            return Err(DeletionRefused::Rising {
+            return Err(AdmissionRefused::Rising {
                 acknowledged,
                 requested: generation,
+                request,
             });
         }
         if acknowledged != generation {
-            return Err(DeletionRefused::Moved {
+            return Err(AdmissionRefused::Moved {
                 acknowledged,
                 requested: generation,
+                request,
             });
         }
-        state.in_flight += 1;
+        *state.in_flight(request) += 1;
         Ok(())
     }
 
-    /// Deregisters one deletion, waking a drain if it was the last.
-    pub(super) fn release(&self) {
+    /// Deregisters one request of kind `request`, waking a drain if nothing of either kind is in
+    /// flight any more.
+    ///
+    /// Called only by `RequestGuard`'s drop, with the kind that guard was admitted for — after
+    /// [`Gate::admit`] counted it under this same lock — so the count it takes from is at least
+    /// one.
+    pub(super) fn release(&self, request: FencedRequest) {
         let mut state = self.lock();
-        state.in_flight -= 1;
-        if state.in_flight == 0 {
+        *state.in_flight(request) -= 1;
+        if state.is_drained() {
             self.drained.notify_waiters();
         }
     }
@@ -82,14 +109,14 @@ impl Gate {
         self.lock().raises_pending += 1;
     }
 
-    /// Whether no deletion is in flight. Stable once true while a raise is pending: nothing is
-    /// admitted while one is.
+    /// Whether no request of either kind is in flight. Stable once true while a raise is
+    /// pending: nothing is admitted while one is.
     pub(super) fn is_drained(&self) -> bool {
-        self.lock().in_flight == 0
+        self.lock().is_drained()
     }
 
-    /// Waits until no deletion is in flight. Registers for the wake-up before it looks, so a
-    /// release between the look and the wait is not lost.
+    /// Waits until no request of either kind is in flight. Registers for the wake-up before it
+    /// looks, so a release between the look and the wait is not lost.
     pub(super) async fn until_drained(&self) {
         loop {
             let notified = self.drained.notified();
@@ -104,18 +131,19 @@ impl Gate {
 
     /// A raise to `target` waited `waited` and is still draining: report it.
     pub(super) fn note_long_wait(&self, target: u64, waited: Duration) {
-        let in_flight = {
+        let (deletions, reservations) = {
             let mut state = self.lock();
             state.long_drain_waits = state.long_drain_waits.saturating_add(1);
-            state.in_flight
+            (state.deletions, state.reservations)
         };
         warn!(
             target_fence = target,
             acknowledged = self.acknowledged(),
-            in_flight,
+            deletions_in_flight = deletions,
+            reservations_in_flight = reservations,
             waited_ms = waited.as_millis() as u64,
-            "a lifecycle fence raise is waiting for deletions admitted under the acknowledged \
-             fence; it is not acknowledged until every one of them returns"
+            "a lifecycle fence raise is waiting for deletions and reservations admitted under the \
+             acknowledged fence; it is not acknowledged until every one of them returns"
         );
     }
 
@@ -132,11 +160,12 @@ impl Gate {
         self.lock().raises_pending -= 1;
     }
 
-    pub(super) fn status(&self) -> DeletionGateStatus {
+    pub(super) fn status(&self) -> GateStatus {
         let state = self.lock();
-        DeletionGateStatus {
+        GateStatus {
             acknowledged: self.acknowledged(),
-            in_flight: state.in_flight,
+            deletions_in_flight: state.deletions,
+            reservations_in_flight: state.reservations,
             raises_pending: state.raises_pending,
             long_drain_waits: state.long_drain_waits,
         }

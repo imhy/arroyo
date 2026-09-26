@@ -866,8 +866,8 @@ impl WorkerServer {
     ///
     /// `Aborted` is definitive "nothing applied" (M11.D39e(iii)): this contention answer is given
     /// before either step of `admit_start_step` decides anything, so no fence was advanced, no
-    /// identifier recorded and no phase moved — a raise that had closed deletion admission is
-    /// dropped with it, which reopens that admission. Only a later scheduling attempt may retry
+    /// identifier recorded and no phase moved — a raise that had closed the admission of fenced
+    /// requests is dropped with it, which reopens that admission. Only a later scheduling attempt may retry
     /// it.
     #[allow(clippy::result_large_err)]
     fn try_lifecycle(&self) -> Result<std::sync::MutexGuard<'_, WorkerLifecycle>, Status> {
@@ -1121,12 +1121,13 @@ impl WorkerGrpc for WorkerServer {
     /// a raise, and the initialization it spawns, and holds no fence state of its own to get out
     /// of step with the guard's.
     ///
-    /// A directive that raises the fence while this execution's tables have deletions in flight
-    /// under it is decided in two steps (`lifecycle_fence::guard`'s module docs): the first
-    /// closes deletion admission, then the drain is awaited **with the lock released** — so every
-    /// other lifecycle call proceeds meanwhile — and the second step decides the directive and
-    /// publishes the fence. Dropping this future during the wait abandons the raise: nothing is
-    /// acknowledged and deletion admission reopens under the fence still acknowledged.
+    /// A directive that raises the fence while this execution's tables have fenced requests —
+    /// deletions or reservations — in flight under it is decided in two steps
+    /// (`lifecycle_fence::guard`'s module docs): the first closes their admission, then the drain
+    /// is awaited **with the lock released** — so every other lifecycle call proceeds meanwhile —
+    /// and the second step decides the directive and publishes the fence. Dropping this future
+    /// during the wait abandons the raise: nothing is acknowledged and admission reopens under the
+    /// fence still acknowledged.
     async fn start_execution(
         &self,
         request: Request<StartExecutionReq>,
@@ -1142,7 +1143,7 @@ impl WorkerGrpc for WorkerServer {
             }
         };
 
-        // Nothing is held here but the raise's claim on deletion admission: no lock, no guard.
+        // Nothing is held here but the raise's claim on admission: no lock, no guard.
         let drained = pending.drained().await;
 
         let mut lifecycle = self.try_lifecycle()?;
@@ -1150,7 +1151,7 @@ impl WorkerGrpc for WorkerServer {
             StartStep::Decided(admission) => Ok(Response::new(self.answer(admission, req))),
             // Not reached for one request: planned again, it asks for the same fence, which the
             // raise it drained is for. Handled rather than assumed — dropping the raise reopens
-            // deletion admission, and nothing was applied.
+            // admission, and nothing was applied.
             StartStep::Drain(_) => Err(Status::aborted(
                 "Worker lifecycle fence raise was superseded while it drained; nothing was \
                  applied; retry",
