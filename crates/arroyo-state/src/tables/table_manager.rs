@@ -20,9 +20,10 @@ use super::expiring_time_key_map::{ExpiringTimeKeyTable, KeyTimeView, UncachedKe
 use super::expiring_time_key_view::ExpiringTimeKeyViewApi;
 use super::global_keyed_map::{GlobalKeyedView, restore};
 use super::{ErasedCheckpointer, ErasedTable, MigratableState};
+use crate::ownership::AcknowledgedFence;
 use crate::provider::{TableKind, registry};
 use crate::{BackingStore, StateBackend, StateMessage, get_storage_provider};
-use crate::{CheckpointMessage, TableData};
+use crate::{BarrierRefusal, CheckpointMessage, TableData};
 use arroyo_rpc::MetadataOrManifest;
 use arroyo_rpc::errors::{DataflowResult, StateError};
 use arroyo_rpc::grpc::rpc::OperatorCheckpointMetadata;
@@ -32,12 +33,21 @@ use tracing::{debug, error, info, warn};
 #[allow(unused)]
 pub struct TableManager {
     epoch: u32,
+    /// The epoch this subtask restored from, or 1 on a fresh start; never read.
+    ///
+    /// Not the controller's retention floor, although it shares the name: that is the
+    /// barrier's `min_epoch`, which [`Self::checkpoint`] forwards to every table as
+    /// [`CheckpointMessage::min_epoch`]. A table learns the restored epoch through
+    /// [`ErasedTable::restored`].
     min_epoch: u32,
     // ordered by table, then epoch.
     tables: HashMap<String, Arc<dyn ErasedTable>>,
     writer: BackendWriter,
     task_info: Arc<TaskInfo>,
     storage: StorageProviderRef,
+    /// The worker's acknowledged lifecycle fence, handed to every table's barrier hook
+    /// (ruling M11.T10R6).
+    acknowledged_fence: AcknowledgedFence,
     /// Views whose types this crate must name, recovered by `Any` downcast.
     ///
     /// The expiring-time-key view moved to [`Self::expiring_views`] (design item M11.D11).
@@ -128,6 +138,14 @@ impl BackendFlusher {
                     match op {
                         Some(StateMessage::Checkpoint(checkpoint)) => {
                             checkpoint_epoch = Some(checkpoint);
+                        }
+                        Some(StateMessage::BarrierRefused(refusal)) => {
+                            error!(
+                                table = %refusal.table,
+                                epoch = refusal.epoch,
+                                "table refused the checkpoint at its barrier hook"
+                            );
+                            return Err(refusal.error.into());
                         }
                         Some(StateMessage::Compaction(compacted_tables_message)) => {
                             compacted_tables = Some(compacted_tables_message);
@@ -300,11 +318,18 @@ impl TableManager {
     /// raised, alongside the pre-existing failures of loading and constructing state —
     /// which now include a table config that states no kind and a selector this process has
     /// no provider for. Callers that need the selector failure typed can downcast it.
+    ///
+    /// When the subtask restored, every table's [`ErasedTable::restored`] is then called
+    /// with the restored epoch, after all of them are constructed and before the flusher is
+    /// started (ruling M11.T10R7); a table's refusal fails `load` with that table's
+    /// [`StateError`], and no flusher is started. `acknowledged_fence` is kept for the barrier
+    /// hooks [`Self::checkpoint`] runs (ruling M11.T10R6).
     pub async fn load(
         task_info: Arc<TaskInfo>,
         table_configs: HashMap<String, TableConfig>,
         tx: Sender<ControlResp>,
         restore_from: Option<&MetadataOrManifest>,
+        acknowledged_fence: AcknowledgedFence,
     ) -> Result<(Self, Option<SystemTime>)> {
         let (watermark, checkpoint_metadata) = if let Some(metadata) = restore_from {
             let operator_metadata =
@@ -350,6 +375,7 @@ impl TableManager {
 
         let epoch;
         let min_epoch;
+        let restored_epoch;
         let mut last_epoch_checkpoints = HashMap::new();
         match checkpoint_metadata {
             Some(metadata) => {
@@ -359,6 +385,7 @@ impl TableManager {
                 };
                 epoch = operator_metadata.epoch + 1;
                 min_epoch = operator_metadata.epoch;
+                restored_epoch = Some(operator_metadata.epoch);
                 for (table, table_metadata) in metadata.table_checkpoint_metadata.clone() {
                     let table_implementation = tables
                         .get(&table)
@@ -373,6 +400,13 @@ impl TableManager {
             None => {
                 epoch = 1;
                 min_epoch = 1;
+                restored_epoch = None;
+            }
+        }
+
+        if let Some(restored_epoch) = restored_epoch {
+            for table in tables.values() {
+                table.restored(restored_epoch)?;
             }
         }
 
@@ -393,6 +427,7 @@ impl TableManager {
                 writer,
                 task_info,
                 storage: Arc::clone(&storage),
+                acknowledged_fence,
                 caches: HashMap::new(),
                 expiring_views: HashMap::new(),
             },
@@ -400,15 +435,33 @@ impl TableManager {
         ))
     }
 
+    /// Starts checkpoint `barrier.epoch` for this subtask's tables.
+    ///
+    /// Every table's [`ErasedTable::on_checkpoint_barrier`] runs first, here on the operator
+    /// task, with the checkpoint message and the acknowledged fence; only then is the message
+    /// enqueued for the flusher, which hands it to each table's `finish` (plan M11.T10b.01).
+    /// The message's `min_epoch` is the barrier's — the controller's retention floor — and
+    /// not this manager's own `min_epoch` field.
+    ///
+    /// A hook's refusal is not returned from here: sources reach this through
+    /// `SourceOperator::start_checkpoint`, which cannot fail. The refusal is enqueued in the
+    /// checkpoint's place instead, and the flusher fails the task with the table's error when
+    /// it reaches it, as it does for an error from `finish`.
     pub async fn checkpoint(&mut self, barrier: CheckpointBarrier, watermark: Option<SystemTime>) {
+        let checkpoint = CheckpointMessage {
+            epoch: barrier.epoch,
+            time: barrier.timestamp,
+            watermark,
+            then_stop: barrier.then_stop,
+            min_epoch: barrier.min_epoch,
+        };
+        let message = match self.run_barrier_hooks(&checkpoint) {
+            Ok(()) => StateMessage::Checkpoint(checkpoint),
+            Err(refusal) => StateMessage::BarrierRefused(refusal),
+        };
         self.writer
             .sender
-            .send(StateMessage::Checkpoint(CheckpointMessage {
-                epoch: barrier.epoch,
-                time: barrier.timestamp,
-                watermark,
-                then_stop: barrier.then_stop,
-            }))
+            .send(message)
             .await
             .expect("should be able to send checkpoint");
 
@@ -418,6 +471,20 @@ impl TableManager {
                 Err(err) => warn!("error waiting for stopping checkpoint {:?}", err),
             }
         }
+    }
+
+    /// Runs every table's barrier hook for `checkpoint`, stopping at the first refusal.
+    fn run_barrier_hooks(&self, checkpoint: &CheckpointMessage) -> Result<(), BarrierRefusal> {
+        for (table, implementation) in &self.tables {
+            implementation
+                .on_checkpoint_barrier(checkpoint, &self.acknowledged_fence)
+                .map_err(|error| BarrierRefusal {
+                    table: table.clone(),
+                    epoch: checkpoint.epoch,
+                    error,
+                })?;
+        }
+        Ok(())
     }
 
     pub async fn load_compacted(&mut self, compacted: &CompactionResult) {

@@ -64,6 +64,7 @@ use arroyo_rpc::grpc::rpc::{
     CommitReq, LifecycleOperation, OperatorCommitData, StartExecutionOutcome, StartExecutionReq,
     StartExecutionResp,
 };
+use arroyo_state::ownership::{AcknowledgedFence, AcknowledgedFenceWriter};
 use std::collections::HashMap;
 use std::time::SystemTime;
 use tonic::Status;
@@ -210,7 +211,12 @@ struct FenceState {
     /// Zero is the same reading `StartExecutionResp::observed_lifecycle_fence` gives it: no
     /// controller adopts fence zero, because cold adoption increments the durable fence before
     /// causing any effect, so "none acknowledged" and "fence zero" cannot be confused.
-    acknowledged: u64,
+    ///
+    /// Held as the one writer of the cell this execution's tables read it through
+    /// ([`WorkerLifecycle::acknowledged_fence_handle`], ruling M11.T10R6). The writer is not
+    /// `Clone` and is raised only by [`Self::acknowledge`], so the value a table reads is this
+    /// field and nothing else can move it.
+    acknowledged: AcknowledgedFenceWriter,
     ids: AttemptIds,
 }
 
@@ -265,7 +271,7 @@ impl WorkerLifecycle {
                 identity: LifecycleTarget::addressed(worker_id, generation, incarnation.get()),
                 announced: false,
                 strict: false,
-                acknowledged: 0,
+                acknowledged: AcknowledgedFenceWriter::unacknowledged(),
                 ids: AttemptIds::default(),
             },
         }
@@ -274,6 +280,17 @@ impl WorkerLifecycle {
     /// This generation's execution phase.
     pub(crate) fn execution(&self) -> &WorkerExecutionPhase {
         &self.execution
+    }
+
+    /// A read handle onto this generation's highest acknowledged fence, for the tables of the
+    /// execution it runs: the ownership generation (plan M11.T10b.01, ruling M11.T10R6).
+    ///
+    /// The handle reads the live value, so it follows every later acknowledgement — including
+    /// the `FENCE_ONLY` or `REVOKE` an already-running adoption is acknowledged with while
+    /// the tasks keep running (M11.T27). It cannot write: the writer stays in this value's
+    /// fence state and moves only under this value's lock.
+    pub(crate) fn acknowledged_fence_handle(&self) -> AcknowledgedFence {
+        self.fence.acknowledged.reader()
     }
 
     /// This generation's execution phase, for the handlers that move it after a start.
@@ -732,11 +749,12 @@ impl FenceState {
                 describe_incarnation(identity.incarnation()),
             )));
         }
-        if address.fence() < self.acknowledged {
+        let acknowledged = self.acknowledged.get();
+        if address.fence() < acknowledged {
             return Err(Status::failed_precondition(format!(
                 "lifecycle fence {} is older than fence {} this worker generation has acknowledged",
                 address.fence(),
-                self.acknowledged,
+                acknowledged,
             )));
         }
         Ok(())
@@ -762,10 +780,11 @@ impl FenceState {
     /// a fresh process, which is what a restart produces — and one holding a different fence.
     #[allow(clippy::result_large_err)]
     fn acknowledged_this_fence(&self, address: FenceAddress) -> Result<(), Status> {
-        if address.fence() == self.acknowledged {
+        let acknowledged = self.acknowledged.get();
+        if address.fence() == acknowledged {
             return Ok(());
         }
-        Err(Status::failed_precondition(if self.acknowledged == 0 {
+        Err(Status::failed_precondition(if acknowledged == 0 {
             format!(
                 "this worker generation has acknowledged no lifecycle fence, so no handshake \
                  authorises a request under fence {}",
@@ -776,7 +795,7 @@ impl FenceState {
                 "lifecycle fence {} is not fence {}, the one this worker generation acknowledged, \
                  so no handshake of that authority authorises this request",
                 address.fence(),
-                self.acknowledged,
+                acknowledged,
             )
         }))
     }
@@ -788,7 +807,7 @@ impl FenceState {
     /// acknowledges nothing and changes neither.
     fn acknowledge(&mut self, address: Option<FenceAddress>) {
         if let Some(address) = address {
-            self.acknowledged = self.acknowledged.max(address.fence());
+            self.acknowledged.raise(address.fence());
             self.strict = true;
         }
     }
@@ -800,7 +819,7 @@ impl FenceState {
     /// fence back knows this generation will refuse everything older.
     fn settlement(&self, outcome: StartExecutionOutcome) -> StartExecutionResp {
         StartExecutionResp {
-            observed_lifecycle_fence: self.acknowledged,
+            observed_lifecycle_fence: self.acknowledged.get(),
             outcome: outcome as i32,
         }
     }
@@ -825,7 +844,7 @@ fn refusal(refusal: AttemptIdRefusal) -> Status {
 impl WorkerLifecycle {
     /// The highest fence this generation has acknowledged; zero means none.
     pub(crate) fn acknowledged_fence(&self) -> u64 {
-        self.fence.acknowledged
+        self.fence.acknowledged.get()
     }
 
     /// Whether this generation requires a fence on every start.

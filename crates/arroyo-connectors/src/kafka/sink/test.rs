@@ -12,6 +12,7 @@ use arroyo_operator::context::OperatorContext;
 use arroyo_operator::operator::ArrowOperator;
 use arroyo_rpc::df::ArroyoSchema;
 use arroyo_rpc::formats::{Format, JsonFormat};
+use arroyo_state::ownership::AcknowledgedFence;
 use arroyo_types::CheckpointBarrier;
 use arroyo_types::*;
 use itertools::Itertools;
@@ -99,6 +100,7 @@ impl KafkaTopicTester {
             vec![Arc::new(ArroyoSchema::new_unkeyed(schema(), 0))],
             None,
             HashMap::new(),
+            AcknowledgedFence::unfenced(),
         )
         .await
         .unwrap();

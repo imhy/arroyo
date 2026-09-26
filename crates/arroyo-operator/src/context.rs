@@ -15,6 +15,7 @@ use arroyo_rpc::state_backend::StateBackendError;
 use arroyo_rpc::{
     CompactionResult, ControlMessage, ControlResp, MetadataField, MetadataOrManifest, get_hasher,
 };
+use arroyo_state::ownership::AcknowledgedFence;
 use arroyo_state::tables::table_manager::TableManager;
 use arroyo_types::{
     ArrowMessage, ChainInfo, CheckpointBarrier, SignalMessage, TaskInfo, Watermark,
@@ -701,6 +702,10 @@ impl OperatorContext {
     /// job — or by the restored checkpoint's. The task then fails to start with that
     /// error, which the worker reports to the controller; the job never runs on a backend
     /// it did not select.
+    ///
+    /// `acknowledged_fence` is the worker's acknowledged lifecycle fence, which the table
+    /// manager hands to every table at each checkpoint barrier (ruling M11.T10R6); an
+    /// execution with no lifecycle guard passes [`AcknowledgedFence::unfenced`].
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
         task_info: Arc<TaskInfo>,
@@ -710,20 +715,26 @@ impl OperatorContext {
         in_schemas: Vec<Arc<ArroyoSchema>>,
         out_schema: Option<Arc<ArroyoSchema>>,
         mut tables: HashMap<String, TableConfig>,
+        acknowledged_fence: AcknowledgedFence,
     ) -> Result<Self, StateBackendError> {
         apply_job_state_backend(task_info.state_backend, &mut tables)?;
 
-        let (table_manager, watermark) =
-            match TableManager::load(task_info.clone(), tables, control_tx.clone(), restore_from)
-                .await
-            {
-                Ok(loaded) => loaded,
-                Err(e) => {
-                    return Err(e.downcast::<StateBackendError>().unwrap_or_else(|e| {
-                        panic!("should be able to create TableManager: {e:?}")
-                    }));
-                }
-            };
+        let (table_manager, watermark) = match TableManager::load(
+            task_info.clone(),
+            tables,
+            control_tx.clone(),
+            restore_from,
+            acknowledged_fence,
+        )
+        .await
+        {
+            Ok(loaded) => loaded,
+            Err(e) => {
+                return Err(e
+                    .downcast::<StateBackendError>()
+                    .unwrap_or_else(|e| panic!("should be able to create TableManager: {e:?}")));
+            }
+        };
 
         Ok(Self {
             task_info: task_info.clone(),
@@ -972,6 +983,7 @@ mod tests {
             vec![],
             None,
             tables,
+            AcknowledgedFence::unfenced(),
         )
         .await
         {
@@ -1037,6 +1049,7 @@ mod tests {
             vec![],
             None,
             HashMap::new(),
+            AcknowledgedFence::unfenced(),
         )
         .await
         {

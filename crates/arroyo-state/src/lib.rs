@@ -26,6 +26,7 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::Mutex;
 
 mod metrics;
+pub mod ownership;
 pub mod parquet;
 pub mod provider;
 pub(crate) mod schemas;
@@ -38,15 +39,78 @@ pub const FULL_KEY_RANGE: RangeInclusive<u64> = 0..=u64::MAX;
 #[derive(Debug)]
 pub enum StateMessage {
     Checkpoint(CheckpointMessage),
+    /// A checkpoint one of the subtask's tables refused at its barrier hook
+    /// ([`tables::ErasedTable::on_checkpoint_barrier`]), sent in place of the
+    /// [`Self::Checkpoint`] it would have been. The flusher fails the task with the table's
+    /// error when it reaches it (plan M11.T10b.01).
+    BarrierRefused(BarrierRefusal),
     Compaction(HashMap<String, TableCheckpointMetadata>),
-    TableData { table: String, data: TableData },
+    TableData {
+        table: String,
+        data: TableData,
+    },
 }
+
+/// The checkpoint a barrier asks a subtask's tables for.
+///
+/// [`TableManager::checkpoint`](tables::table_manager::TableManager::checkpoint) builds it
+/// from the barrier, hands it to every table's barrier hook, and then enqueues it for the
+/// flusher, which hands the same message to every table's
+/// [`ErasedCheckpointer::finish`](tables::ErasedCheckpointer::finish) for the epoch. Its
+/// fields are private and nothing outside this crate can build one; tables read it through
+/// the accessors below (plan M11.T10b.01, design M11.D42 as amended by ruling M11.T10R2).
 #[derive(Debug)]
 pub struct CheckpointMessage {
     epoch: u32,
+    /// The barrier's timestamp. It has no accessor: `RunningJobModel::start_checkpoint`, which
+    /// both controllers use, sends it in microseconds and the worker decodes it as
+    /// milliseconds, so its value is not one a table may rely on.
     time: SystemTime,
     watermark: Option<SystemTime>,
     then_stop: bool,
+    min_epoch: u32,
+}
+
+impl CheckpointMessage {
+    /// The epoch being checkpointed: the barrier's.
+    pub fn epoch(&self) -> u32 {
+        self.epoch
+    }
+
+    /// The watermark the subtask held when the barrier reached it, if it held one.
+    pub fn watermark(&self) -> Option<SystemTime> {
+        self.watermark
+    }
+
+    /// Whether the subtask stops after this checkpoint.
+    ///
+    /// When it does, `TableManager::checkpoint` does not return until the flusher has stopped:
+    /// after reporting this checkpoint, or on failing it.
+    pub fn then_stop(&self) -> bool {
+        self.then_stop
+    }
+
+    /// The controller's retention floor carried on this barrier (`CheckpointBarrier::min_epoch`):
+    /// the oldest epoch whose checkpoint the controller still retains.
+    ///
+    /// Not the epoch the subtask restored from, which a table is told once, through
+    /// [`ErasedTable::restored`](tables::ErasedTable::restored), and which `TableManager`
+    /// keeps in a private field that is also called `min_epoch`.
+    pub fn min_epoch(&self) -> u32 {
+        self.min_epoch
+    }
+}
+
+/// A table's refusal of a checkpoint at its barrier hook, travelling the state channel to the
+/// flusher at the position the checkpoint message would have taken.
+///
+/// Only `TableManager::checkpoint` builds one; its fields are private, so a view holding the
+/// state channel's sender cannot forge a refusal.
+#[derive(Debug)]
+pub struct BarrierRefusal {
+    table: String,
+    epoch: u32,
+    error: StateError,
 }
 
 #[derive(Debug)]

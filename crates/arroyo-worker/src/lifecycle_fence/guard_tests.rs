@@ -10,13 +10,16 @@ use super::tests::{
     AMBIGUOUS, GENERATION, INCARNATION, WORKER, acknowledge, acknowledged, addressed_fence_only_to,
     addressed_start, announced, applied, apply_registration_response, call, disposition,
     fence_only, fenced_start, generation, handshaken, has_announced, idle, incarnated_generation,
-    initializing, register, registered, revoke, revoke_owned, settlement, strict, tracked,
+    initializing, read, register, registered, revoke, revoke_owned, settlement, strict, tracked,
     unfenced,
 };
 use crate::lifecycle_fence::attempt_ids::{AttemptDisposition, MAX_TRACKED_ATTEMPT_IDS};
+use crate::lifecycle_fence::guard::WorkerLifecycle;
+use crate::{EngineState, WorkerExecutionPhase};
 use arroyo_rpc::fence_wire::WorkerIncarnation;
 use arroyo_rpc::fencing::{MAX_ATTEMPT_ID_CHARS, MAX_FENCE_TARGETS};
 use arroyo_rpc::grpc::rpc::{StartExecutionOutcome, StartExecutionResp};
+use std::collections::HashMap;
 use tonic::Code;
 
 /// `count` distinct identifiers of exactly the width the controller mints.
@@ -523,4 +526,56 @@ async fn a_worker_generation_zero_is_addressed_by_no_fence() {
         Code::FailedPrecondition
     );
     assert!(idle(&server_b));
+}
+
+/// **M11.T10b.01, ruling M11.T10R6.** The handle an execution's tables read the ownership
+/// generation through is this guard's own acknowledged fence, live.
+///
+/// It rises with every admitted `FENCE_ONLY` and `REVOKE` — here while the execution runs, which
+/// is T27's already-running adoption, acknowledged without a restart — ignores a refused stale
+/// directive, reads the same cell however many handles are taken, and stays zero on the legacy
+/// route, where nothing is ever acknowledged.
+#[tokio::test]
+async fn the_fence_an_executions_tables_read_follows_every_acknowledgement() {
+    let (shutdown, server) = handshaken(4);
+    let fence = read(&server, WorkerLifecycle::acknowledged_fence_handle);
+    assert_eq!(fence.get(), 4);
+
+    *server.state.lifecycle.lock().unwrap().execution_mut() =
+        WorkerExecutionPhase::Running(EngineState {
+            sources: vec![],
+            sinks: vec![],
+            operator_to_node: HashMap::new(),
+            operator_controls: HashMap::new(),
+            shutdown_guard: shutdown.guard("engine-state"),
+        });
+    assert_eq!(
+        call(&server, fence_only(9)).unwrap(),
+        settlement(9, StartExecutionOutcome::FenceAcknowledged)
+    );
+    assert_eq!(fence.get(), 9);
+    assert_eq!(
+        call(&server, revoke(12, &["attempt_9"])).unwrap(),
+        settlement(12, StartExecutionOutcome::Revoked)
+    );
+    assert_eq!(fence.get(), 12);
+
+    assert_eq!(
+        call(&server, fence_only(3)).unwrap_err().code(),
+        Code::FailedPrecondition
+    );
+    assert_eq!(fence.get(), 12);
+    assert_eq!(
+        read(&server, WorkerLifecycle::acknowledged_fence_handle).get(),
+        12
+    );
+    assert_eq!(fence.get(), acknowledged(&server));
+
+    let (_shutdown_legacy, legacy) = registered(false);
+    let legacy_fence = read(&legacy, WorkerLifecycle::acknowledged_fence_handle);
+    assert_eq!(
+        call(&legacy, unfenced("attempt_1")).unwrap(),
+        settlement(0, StartExecutionOutcome::Applied)
+    );
+    assert_eq!(legacy_fence.get(), 0);
 }

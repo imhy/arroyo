@@ -27,6 +27,7 @@ use arroyo_rpc::grpc::rpc::CheckpointManifest;
 use arroyo_rpc::grpc::{api, rpc::TaskAssignment};
 use arroyo_rpc::state_backend::{StateBackendError, StateBackendSelector};
 use arroyo_rpc::{ControlMessage, ControlResp, MetadataOrManifest};
+use arroyo_state::ownership::AcknowledgedFence;
 use arroyo_state::{BackingStore, StateBackend, StorageProviderFor};
 use arroyo_types::{
     CheckpointFilePathLayout, JobId, MachineId, PipelineId, TaskInfo, WorkerId, range_for_server,
@@ -209,11 +210,18 @@ impl Program {
             CheckpointFilePathLayout::Legacy,
             state_backend,
             control_tx,
+            // An in-process program runs under no lifecycle guard, so no fence is ever
+            // acknowledged for it: its tables read zero, as a legacy (unfenced) worker's do.
+            AcknowledgedFence::unfenced(),
         )
         .await
         .expect("could not load")
     }
 
+    /// Builds the physical program for this worker's share of `logical`.
+    ///
+    /// `acknowledged_fence` is this worker generation's acknowledged lifecycle fence, which
+    /// every subtask's tables read at each checkpoint barrier (ruling M11.T10R6).
     #[allow(clippy::too_many_arguments)]
     pub async fn from_logical(
         job_id: &str,
@@ -225,6 +233,7 @@ impl Program {
         file_path_layout: CheckpointFilePathLayout,
         state_backend: StateBackendSelector,
         control_tx: Sender<ControlResp>,
+        acknowledged_fence: AcknowledgedFence,
     ) -> Result<Program, StateError> {
         let mut physical = DiGraph::new();
 
@@ -302,6 +311,7 @@ impl Program {
                         state_backend,
                         control_tx.clone(),
                         registry.clone(),
+                        acknowledged_fence.clone(),
                     )
                     .await?,
                 })));
@@ -820,6 +830,9 @@ impl Engine {
 /// disagrees with `state_backend`, is unknown, or mixes backends. The check happens
 /// before any state is created, so a rejected job never touches a backend it did not
 /// select.
+///
+/// Every operator of the chain gets a clone of `acknowledged_fence`, the worker's acknowledged
+/// lifecycle fence, for its tables (ruling M11.T10R6).
 #[allow(clippy::too_many_arguments)]
 pub async fn construct_node(
     chain: OperatorChain,
@@ -835,6 +848,7 @@ pub async fn construct_node(
     state_backend: StateBackendSelector,
     control_tx: Sender<ControlResp>,
     registry: Arc<Registry>,
+    acknowledged_fence: AcknowledgedFence,
 ) -> Result<OperatorNode, StateBackendError> {
     if chain.is_source() {
         let (head, _) = chain.iter().next().unwrap();
@@ -865,6 +879,7 @@ pub async fn construct_node(
                 vec![],
                 out_schema,
                 operator.tables(),
+                acknowledged_fence,
             )
             .await?,
             operator,
@@ -902,6 +917,7 @@ pub async fn construct_node(
                 },
                 edge.cloned().or(out_schema.clone()),
                 op.tables(),
+                acknowledged_fence.clone(),
             )
             .await?;
 

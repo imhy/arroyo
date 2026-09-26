@@ -1,3 +1,4 @@
+use crate::ownership::AcknowledgedFence;
 use crate::validated::ValidatedTable;
 use crate::{CheckpointMessage, DataOperation, TableData};
 use arroyo_rpc::errors::StateError;
@@ -312,6 +313,66 @@ pub trait ErasedTable: Send + Sync + 'static {
         compacted_checkpoint: TableSubtaskCheckpointMetadata,
         subtask_metadata: TableSubtaskCheckpointMetadata,
     ) -> Result<TableSubtaskCheckpointMetadata, StateError>;
+
+    /// The barrier hook: called once per checkpoint barrier for every table of the subtask,
+    /// synchronously on the operator task, before the checkpoint is enqueued for the flusher
+    /// (plan M11.T10b.01; design M11.D12 and M11.D13a as corrected by ruling M11.T10R2).
+    ///
+    /// [`TableManager::checkpoint`](table_manager::TableManager::checkpoint) makes the call on
+    /// the operator task — for a chained operator after its `handle_checkpoint`, for a source
+    /// from `SourceOperator::start_checkpoint` — so it is ordered after every write the
+    /// operator made before the barrier and before every write it makes after it. The flusher's [`ErasedCheckpointer::finish`] for the same epoch runs later,
+    /// on another task, by which time the operator may have written more; a table that must
+    /// cut its state exactly at the barrier cuts it here.
+    ///
+    /// `checkpoint` is the message the flusher will hand to this epoch's `finish` calls — the
+    /// same epoch, `min_epoch`, `then_stop` and watermark. `acknowledged_fence` is the worker's
+    /// acknowledged lifecycle fence, the ownership generation (ruling M11.T10R6): it reads
+    /// the current value, and a table that keeps a clone can read it again at any later time.
+    ///
+    /// The default does nothing, and every built-in table inherits it, so parquet checkpoints
+    /// exactly as it did before the hook existed.
+    ///
+    /// # Errors
+    ///
+    /// An `Err` refuses the checkpoint. No further table's hook runs for this barrier, the
+    /// checkpoint is not enqueued, and the flusher — on reaching the refusal at the
+    /// checkpoint's position in the state channel — fails the task with this error
+    /// (`ControlResp::TaskFailed`) without calling any table's `finish` for the epoch, so the
+    /// subtask never reports the checkpoint complete. The refusal does not itself stop the
+    /// operator task: it keeps processing until the controller acts on the failure or its
+    /// next use of the state channel finds the flusher gone, so a table that refuses a barrier
+    /// must refuse the writes that follow it as well.
+    #[allow(unused_variables)]
+    fn on_checkpoint_barrier(
+        &self,
+        checkpoint: &CheckpointMessage,
+        acknowledged_fence: &AcknowledgedFence,
+    ) -> Result<(), StateError> {
+        Ok(())
+    }
+
+    /// The restored hook: called once for every table of the subtask when the operator
+    /// restored from a checkpoint, with that checkpoint's epoch (ruling M11.T10R7).
+    ///
+    /// [`TableManager::load`](table_manager::TableManager::load) makes the call after every
+    /// table is constructed and before the flusher starts, so before the first
+    /// [`Self::epoch_checkpointer`] call and before any view of the table exists. A table with
+    /// no state of its own in the restored checkpoint is called too. A subtask that starts
+    /// fresh, with nothing to restore, never calls it. The flusher's first epoch after a
+    /// restore is `epoch + 1`.
+    ///
+    /// The default does nothing, and every built-in table inherits it.
+    ///
+    /// # Errors
+    ///
+    /// An `Err` fails `TableManager::load` with this error, before the flusher is started — for
+    /// example when the state a table was constructed from belongs to a different epoch than
+    /// the checkpoint the operator restored.
+    #[allow(unused_variables)]
+    fn restored(&self, epoch: u32) -> Result<(), StateError> {
+        Ok(())
+    }
 }
 
 impl<T: Table + Sized + 'static> ErasedTable for T {

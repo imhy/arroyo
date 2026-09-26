@@ -1,5 +1,6 @@
 use arrow::datatypes::{DataType, Field, Schema};
 
+use arroyo_state::ownership::AcknowledgedFence;
 use arroyo_state::tables::ErasedTable;
 use arroyo_state::tables::global_keyed_map::GlobalKeyedTable;
 use arroyo_state::validated::{CheckpointMetadataWrite, CompletedCheckpoint, CompletedOperator};
@@ -137,6 +138,7 @@ impl KafkaTopicTester {
             vec![],
             out_schema,
             kafka.tables(),
+            AcknowledgedFence::unfenced(),
         )
         .await
         .unwrap();
@@ -470,6 +472,7 @@ async fn test_kafka_with_metadata_fields() {
             0,
         ))),
         kafka.tables(),
+        AcknowledgedFence::unfenced(),
     )
     .await
     .unwrap();

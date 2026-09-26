@@ -497,6 +497,10 @@ impl WorkerState {
                 CheckpointFilePathLayout::Legacy
             };
 
+            // A live handle, not a copy: the fence can rise while this execution runs, and its
+            // tables must see it rise (ruling M11.T10R6).
+            let acknowledged_fence = self.lifecycle.lock().unwrap().acknowledged_fence_handle();
+
             let program = Program::from_logical(
                 &self.worker_context.job_id,
                 &logical.graph,
@@ -507,6 +511,7 @@ impl WorkerState {
                 file_path_layout,
                 state_backend,
                 control_tx.clone(),
+                acknowledged_fence,
             )
             .await?;
 

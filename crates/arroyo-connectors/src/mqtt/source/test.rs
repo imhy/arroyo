@@ -14,6 +14,7 @@ use arroyo_rpc::df::ArroyoSchema;
 use arroyo_rpc::formats::{Format, JsonFormat};
 use arroyo_rpc::var_str::VarStr;
 use arroyo_rpc::{ControlMessage, ControlResp};
+use arroyo_state::ownership::AcknowledgedFence;
 use arroyo_types::{ArrowMessage, ChainInfo, TaskInfo, to_nanos};
 use rand::random;
 use rumqttc::mqttbytes::QoS;
@@ -160,6 +161,7 @@ impl MqttTopicTester {
                 0,
             ))),
             mqtt.tables(),
+            AcknowledgedFence::unfenced(),
         )
         .await
         .unwrap();

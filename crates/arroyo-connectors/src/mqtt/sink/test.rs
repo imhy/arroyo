@@ -14,6 +14,7 @@ use arroyo_rpc::{
     formats::{Format, JsonFormat},
     var_str::VarStr,
 };
+use arroyo_state::ownership::AcknowledgedFence;
 use arroyo_types::{get_test_task_info, to_nanos};
 use parquet::data_type::AsBytes;
 use rumqttc::{Event, Incoming, Outgoing, mqttbytes::QoS};
@@ -94,6 +95,7 @@ impl MqttTopicTester {
             vec![Arc::new(ArroyoSchema::new_unkeyed(schema(), 0))],
             None,
             HashMap::new(),
+            AcknowledgedFence::unfenced(),
         )
         .await
         .unwrap();

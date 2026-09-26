@@ -170,6 +170,7 @@ async fn write_epoch(
             time: at(0),
             watermark,
             then_stop: false,
+            min_epoch: 0,
         })
         .await
         .expect("finish")
