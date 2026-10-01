@@ -96,6 +96,8 @@ fn commit_under(fence: u64, epoch: u64) -> CommitReq {
     }
 }
 
+// `result_large_err` here and on `answered`: tonic's `Status`, as the handlers under test return it.
+#[allow(clippy::result_large_err)]
 async fn commit(server: &WorkerServer, req: CommitReq) -> Result<(), Status> {
     tokio::time::timeout(DUE, WorkerGrpc::commit(server, Request::new(req)))
         .await
@@ -122,6 +124,7 @@ fn poll_once(call: &mut Pin<&mut impl Future<Output = Answer>>) -> Poll<Answer> 
 }
 
 /// Drives a handler call to its answer, which must be due now.
+#[allow(clippy::result_large_err)]
 async fn answered(call: Pin<&mut impl Future<Output = Answer>>) -> Answer {
     tokio::time::timeout(DUE, call)
         .await

@@ -247,7 +247,7 @@ impl Link {
     pub(super) fn deliver_held_in_reverse(
         &mut self,
     ) -> Vec<(&'static str, Result<StartExecutionResp, Status>)> {
-        let mut reversed: Vec<InFlight> = self.in_flight.drain(..).collect();
+        let mut reversed: Vec<InFlight> = std::mem::take(&mut self.in_flight);
         reversed.reverse();
         reversed
             .into_iter()

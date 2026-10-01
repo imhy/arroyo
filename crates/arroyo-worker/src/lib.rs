@@ -1448,6 +1448,9 @@ impl LeaderServer {
         Ok(())
     }
 
+    // `result_large_err`: `Status` is tonic's error, which every gRPC handler this feeds returns
+    // unboxed; clippy 1.98 flags it here as it does the generated service methods.
+    #[allow(clippy::result_large_err)]
     async fn send_job_message(&self, msg: RunningMessage) -> Result<(), Status> {
         self.state
             .job_controller_tx

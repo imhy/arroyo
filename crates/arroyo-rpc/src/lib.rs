@@ -78,7 +78,13 @@ pub mod identity;
 
 pub mod grpc {
     pub mod rpc {
-        #![allow(clippy::derive_partial_eq_without_eq, deprecated)]
+        // `result_large_err`: tonic's generated service methods return `Result<_, Status>`, and
+        // clippy 1.98 flags every one of them; the generated code is not ours to box.
+        #![allow(
+            clippy::derive_partial_eq_without_eq,
+            clippy::result_large_err,
+            deprecated
+        )]
         tonic::include_proto!("arroyo_rpc");
     }
 
