@@ -17,6 +17,9 @@
 //! checkpointed state: parity against an independent copy of the walk it replaced, the page
 //! bound at 1× and 10× the entries, and the fail-closed refusals.
 //!
+//! [`hook_defaults`] is M11.T10b.01 item 4 — the ownership hook's default, which every parquet
+//! table inherits, changes nothing a checkpoint writes.
+//!
 //! The process cell has no suite here on purpose: it is written at most once per process
 //! and has no reset, so each of its cases needs a process of its own. They are
 //! `tests/provider_install_once.rs` and `tests/provider_install_after_first_use.rs`.
@@ -45,6 +48,7 @@ use crate::{CheckpointMessage, StateMessage, TableData, timestamp_table_config};
 
 mod fake;
 mod global_load;
+mod hook_defaults;
 mod liveness;
 mod merge_parity;
 mod metadata_parity;

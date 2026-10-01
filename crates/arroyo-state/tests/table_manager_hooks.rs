@@ -1,6 +1,7 @@
 //! M11.T10b.01 through a real `TableManager` and its `BackendFlusher`: the barrier hook
-//! (ruling M11.T10R2), the restored hook (ruling M11.T10R7), the checkpoint message's accessors
-//! and forwarded `min_epoch`, and the acknowledged fence a table reads (ruling M11.T10R6).
+//! (ruling M11.T10R2), the restored hook (ruling M11.T10R7), the ownership hook (item 4), the
+//! checkpoint message's accessors and forwarded `min_epoch`, and the acknowledged fence a table
+//! reads (ruling M11.T10R6).
 //!
 //! A test binary of its own because it installs a provider registry, which a process does once
 //! (`provider_install_once.rs`). Every test here runs on that one registry: its stateengine
@@ -47,7 +48,7 @@ const TABLES: [(&str, TableKind); 2] = [
     ("expiring", TableKind::ExpiringKeyedTime),
 ];
 
-/// How long a barrier hook, or the restored hook, dwells before it returns.
+/// How long a barrier hook, the restored hook or the ownership hook dwells before it returns.
 ///
 /// Long enough for a flusher on another worker thread to run in the meantime — to dequeue a
 /// message and call `finish`, or to ask for its first checkpointers — which it could do only if
@@ -72,6 +73,10 @@ fn barrier(epoch: u32, min_epoch: u32, then_stop: bool) -> CheckpointBarrier {
 /// What happened to one table, as that table saw it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Event {
+    Bound {
+        table: String,
+        fence: u64,
+    },
     Restored {
         table: String,
         epoch: u32,
@@ -124,6 +129,7 @@ impl Seen {
 struct Script {
     refuse_barrier_at: Option<u32>,
     refuse_restore: bool,
+    refuse_bind: bool,
 }
 
 /// One job's record of what happened to its tables, in the order it happened.
@@ -132,6 +138,8 @@ struct Journal {
     scripts: HashMap<String, Script>,
     /// The fence handle each table kept from the first barrier it saw.
     kept_fences: Mutex<HashMap<String, AcknowledgedFence>>,
+    /// The fence handle each table kept from its ownership hook.
+    bound_fences: Mutex<HashMap<String, AcknowledgedFence>>,
 }
 
 impl Journal {
@@ -145,6 +153,15 @@ impl Journal {
 
     fn script(&self, table: &str) -> Script {
         self.scripts.get(table).copied().unwrap_or_default()
+    }
+
+    fn bound_fence(&self, table: &str) -> AcknowledgedFence {
+        self.bound_fences
+            .lock()
+            .unwrap()
+            .get(table)
+            .cloned()
+            .expect("the table was bound")
     }
 
     fn kept_fence(&self, table: &str) -> AcknowledgedFence {
@@ -185,6 +202,7 @@ fn open_journal(job: &str, scripts: &[(&str, Script)]) -> Arc<Journal> {
             .map(|(table, script)| (table.to_string(), *script))
             .collect(),
         kept_fences: Mutex::new(HashMap::new()),
+        bound_fences: Mutex::new(HashMap::new()),
     });
     let previous = journals()
         .lock()
@@ -207,6 +225,13 @@ fn barrier_refusal(table: &str, epoch: u32) -> StateError {
     StateError::Other {
         table: table.to_string(),
         error: format!("checkpoint {epoch} arrived while an older one is still pending"),
+    }
+}
+
+fn bind_refusal(table: &str, fence: u64) -> StateError {
+    StateError::Other {
+        table: table.to_string(),
+        error: format!("this table's lineage cannot be opened under fence {fence}"),
     }
 }
 
@@ -334,6 +359,26 @@ impl ErasedTable for RecordingTable {
         });
         if self.journal.script(&self.name).refuse_barrier_at == Some(checkpoint.epoch()) {
             return Err(barrier_refusal(&self.name, checkpoint.epoch()));
+        }
+        Ok(())
+    }
+
+    fn bind_ownership(&self, acknowledged_fence: &AcknowledgedFence) -> Result<(), StateError> {
+        let fence = acknowledged_fence.get();
+        self.journal.record(Event::Bound {
+            table: self.name.clone(),
+            fence,
+        });
+        let previous = self
+            .journal
+            .bound_fences
+            .lock()
+            .unwrap()
+            .insert(self.name.clone(), acknowledged_fence.clone());
+        assert!(previous.is_none(), "{} was bound twice", self.name);
+        std::thread::sleep(HOOK_DWELL);
+        if self.journal.script(&self.name).refuse_bind {
+            return Err(bind_refusal(&self.name, fence));
         }
         Ok(())
     }
@@ -754,7 +799,7 @@ async fn a_refused_barrier_fails_the_task_with_the_tables_error_and_finishes_not
             "global",
             Script {
                 refuse_barrier_at: Some(2),
-                refuse_restore: false,
+                ..Script::default()
             },
         )],
     );
@@ -883,8 +928,8 @@ async fn a_refused_restore_fails_load_with_the_tables_error_before_the_flusher_s
         &[(
             "expiring",
             Script {
-                refuse_barrier_at: None,
                 refuse_restore: true,
+                ..Script::default()
             },
         )],
     );
@@ -910,5 +955,164 @@ async fn a_refused_restore_fails_load_with_the_tables_error_before_the_flusher_s
             .events()
             .iter()
             .any(|event| matches!(event, Event::Checkpointer { .. }))
+    );
+}
+
+fn bound_of(events: &[Event], table: &str) -> Vec<u64> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Bound { table: t, fence } if t == table => Some(*fence),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A fresh subtask binds every table once, with the fence acknowledged when it loads, before the
+/// flusher asks for a checkpointer and before any view exists; the handle a table keeps from the
+/// hook reads a later raise live; and nothing is told a restored epoch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fresh_subtask_binds_every_table_once_before_the_flusher_and_any_view() {
+    let job = "t10-bind-fresh";
+    let journal = open_journal(job, &[]);
+    let mut writer = AcknowledgedFenceWriter::unacknowledged();
+    let Raise::Ready(ready) = writer.prepare(3, None) else {
+        panic!("no fenced request is in flight")
+    };
+    assert_eq!(ready.publish(), 3);
+    let (loaded, mut control) = load(job, None, writer.reader()).await;
+    let (mut manager, _) = loaded.expect("a fresh subtask loads");
+
+    let events = journal
+        .wait_for(|events| {
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::Checkpointer { .. }))
+                .count()
+                == TABLES.len()
+        })
+        .await;
+    for (table, _) in TABLES {
+        assert_eq!(bound_of(&events, table), vec![3], "{events:?}");
+    }
+    let bound = position(&events, |event| matches!(event, Event::Bound { .. }));
+    let checkpointers = position(&events, |event| matches!(event, Event::Checkpointer { .. }));
+    assert_eq!(bound.len(), TABLES.len(), "{events:?}");
+    assert!(
+        bound.iter().max() < checkpointers.iter().min(),
+        "{events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, Event::Restored { .. })),
+        "a fresh start restores nothing: {events:?}"
+    );
+
+    manager
+        .get_expiring_time_key_table("expiring", None)
+        .await
+        .expect("the view opens");
+    let events = journal.events();
+    let opened = position(&events, |event| matches!(event, Event::ViewOpened { .. }));
+    assert_eq!(opened.len(), 1);
+    assert!(bound.iter().max() < opened.iter().min(), "{events:?}");
+
+    // The handle the ownership hook kept is the live one: a raise after load, with no barrier in
+    // between, reads through it, and the first barrier hook is handed the same value.
+    let Raise::Ready(ready) = writer.prepare(8, None) else {
+        panic!("no fenced request is in flight")
+    };
+    assert_eq!(ready.publish(), 8);
+    for (table, _) in TABLES {
+        assert_eq!(journal.bound_fence(table).get(), 8);
+    }
+    manager.checkpoint(barrier(1, 0, false), None).await;
+    assert_completed(next_control(&mut control).await, 1);
+    let events = journal.events();
+    for (table, _) in TABLES {
+        let fences: Vec<u64> = hooks_of(&events, table)
+            .iter()
+            .map(|(_, fence)| *fence)
+            .collect();
+        assert_eq!(fences, vec![8], "{events:?}");
+        assert_eq!(
+            bound_of(&events, table),
+            vec![3],
+            "bound once, at load: {events:?}"
+        );
+    }
+}
+
+/// A restored subtask binds every table before it tells any table the restored epoch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restored_subtask_binds_every_table_before_it_is_told_the_epoch() {
+    let job = "t10-bind-restored";
+    let journal = open_journal(job, &[]);
+    let restore_from = restore_point(job, 5, &["global"]);
+    let (loaded, _control) = load(job, Some(&restore_from), AcknowledgedFence::unfenced()).await;
+    let _manager = loaded.expect("the subtask restores");
+
+    let events = journal
+        .wait_for(|events| {
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::Checkpointer { .. }))
+                .count()
+                == TABLES.len()
+        })
+        .await;
+    let bound = position(&events, |event| matches!(event, Event::Bound { .. }));
+    let restored = position(&events, |event| matches!(event, Event::Restored { .. }));
+    let checkpointers = position(&events, |event| matches!(event, Event::Checkpointer { .. }));
+    assert_eq!(bound.len(), TABLES.len(), "{events:?}");
+    assert_eq!(restored.len(), TABLES.len(), "{events:?}");
+    assert!(bound.iter().max() < restored.iter().min(), "{events:?}");
+    assert!(
+        restored.iter().max() < checkpointers.iter().min(),
+        "{events:?}"
+    );
+    for (table, _) in TABLES {
+        assert_eq!(bound_of(&events, table), vec![0], "{events:?}");
+    }
+}
+
+/// A table's refusal to be bound fails `load` with that table's error: no table is told the
+/// restored epoch, and no flusher is started.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_bind_fails_load_with_the_tables_error_before_restored_and_the_flusher() {
+    let job = "t10-bind-refused";
+    let journal = open_journal(
+        job,
+        &[(
+            "expiring",
+            Script {
+                refuse_bind: true,
+                ..Script::default()
+            },
+        )],
+    );
+    let restore_from = restore_point(job, 5, &["global", "expiring"]);
+    let (loaded, mut control) = load(job, Some(&restore_from), AcknowledgedFence::unfenced()).await;
+    let error = match loaded {
+        Ok(_) => panic!("a refused bind must not load"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error
+            .downcast_ref::<StateError>()
+            .expect("the table's own error")
+            .to_string(),
+        bind_refusal("expiring", 0).to_string()
+    );
+
+    assert!(next_control(&mut control).await.is_none());
+    let events = journal.events();
+    assert_eq!(bound_of(&events, "expiring"), vec![0], "{events:?}");
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, Event::Restored { .. } | Event::Checkpointer { .. })),
+        "{events:?}"
     );
 }

@@ -45,8 +45,8 @@ pub struct TableManager {
     writer: BackendWriter,
     task_info: Arc<TaskInfo>,
     storage: StorageProviderRef,
-    /// The worker's acknowledged lifecycle fence, handed to every table's barrier hook
-    /// (ruling M11.T10R6).
+    /// The worker's acknowledged lifecycle fence, handed to every table's ownership hook at
+    /// [`Self::load`] and to its barrier hook at every barrier (ruling M11.T10R6).
     acknowledged_fence: AcknowledgedFence,
     /// Views whose types this crate must name, recovered by `Any` downcast.
     ///
@@ -319,11 +319,14 @@ impl TableManager {
     /// which now include a table config that states no kind and a selector this process has
     /// no provider for. Callers that need the selector failure typed can downcast it.
     ///
-    /// When the subtask restored, every table's [`ErasedTable::restored`] is then called
-    /// with the restored epoch, after all of them are constructed and before the flusher is
-    /// started (ruling M11.T10R7); a table's refusal fails `load` with that table's
-    /// [`StateError`], and no flusher is started. `acknowledged_fence` is kept for the barrier
-    /// hooks [`Self::checkpoint`] runs (ruling M11.T10R6).
+    /// Every table's [`ErasedTable::bind_ownership`] is then called once with
+    /// `acknowledged_fence`, after all of them are constructed and the restored metadata was
+    /// read, whether or not the subtask restored (plan M11.T10b.01 item 4). When the subtask
+    /// restored, every table's [`ErasedTable::restored`] is called next with the restored epoch
+    /// (ruling M11.T10R7). Both run before the flusher is started and before any view exists;
+    /// a table's refusal of either fails `load` with that table's [`StateError`], and no
+    /// flusher is started. `acknowledged_fence` is kept for the barrier hooks
+    /// [`Self::checkpoint`] runs (ruling M11.T10R6).
     pub async fn load(
         task_info: Arc<TaskInfo>,
         table_configs: HashMap<String, TableConfig>,
@@ -402,6 +405,15 @@ impl TableManager {
                 min_epoch = 1;
                 restored_epoch = None;
             }
+        }
+
+        // The ownership hook (M11.T10b.01 item 4): every table learns the acknowledged fence
+        // before it is told the restored epoch, before the writer below starts the flusher that
+        // asks for its first checkpointer, and before `self` exists to open any view of it. Only
+        // construction and the reads of the restored metadata above precede it, so a load they
+        // refuse binds no table.
+        for table in tables.values() {
+            table.bind_ownership(&acknowledged_fence)?;
         }
 
         if let Some(restored_epoch) = restored_epoch {

@@ -352,15 +352,45 @@ pub trait ErasedTable: Send + Sync + 'static {
         Ok(())
     }
 
+    /// The ownership hook: called exactly once for every table of the subtask, with the worker's
+    /// acknowledged lifecycle fence, before anything else is asked of the table (plan
+    /// M11.T10b.01 item 4; owner-default M11.T10R23 of statebackend issue #137).
+    ///
+    /// [`TableManager::load`](table_manager::TableManager::load) makes the call after every
+    /// table is constructed and after the restored checkpoint's metadata was read, and before
+    /// [`Self::restored`], before the flusher starts — so before the first
+    /// [`Self::epoch_checkpointer`] call — and before any view of the table exists. It is called
+    /// whether the subtask restored or starts fresh. Before this hook a table learns the fence
+    /// only at its first barrier, and its view may write before that barrier; a table whose
+    /// state must be opened under the ownership generation before its first write opens it
+    /// here.
+    ///
+    /// `acknowledged_fence` is the handle the barrier hook later receives (ruling M11.T10R6): it
+    /// reads the current value, and a table that keeps a clone can read it again at any later
+    /// time.
+    ///
+    /// The default does nothing, and every built-in table inherits it, so parquet loads exactly
+    /// as it did before the hook existed. Nothing is installed through it: the hook is called
+    /// on whatever table the selected provider built.
+    ///
+    /// # Errors
+    ///
+    /// An `Err` fails `TableManager::load` with this error: no further table is bound, no table
+    /// is told the restored epoch, and no flusher is started.
+    #[allow(unused_variables)]
+    fn bind_ownership(&self, acknowledged_fence: &AcknowledgedFence) -> Result<(), StateError> {
+        Ok(())
+    }
+
     /// The restored hook: called once for every table of the subtask when the operator
     /// restored from a checkpoint, with that checkpoint's epoch (ruling M11.T10R7).
     ///
     /// [`TableManager::load`](table_manager::TableManager::load) makes the call after every
-    /// table is constructed and before the flusher starts, so before the first
-    /// [`Self::epoch_checkpointer`] call and before any view of the table exists. A table with
-    /// no state of its own in the restored checkpoint is called too. A subtask that starts
-    /// fresh, with nothing to restore, never calls it. The flusher's first epoch after a
-    /// restore is `epoch + 1`.
+    /// table is constructed and bound ([`Self::bind_ownership`]) and before the flusher starts,
+    /// so before the first [`Self::epoch_checkpointer`] call and before any view of the table
+    /// exists. A table with no state of its own in the restored checkpoint is called too. A
+    /// subtask that starts fresh, with nothing to restore, never calls it. The flusher's first
+    /// epoch after a restore is `epoch + 1`.
     ///
     /// The default does nothing, and every built-in table inherits it.
     ///
