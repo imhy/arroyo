@@ -352,18 +352,22 @@ pub trait ErasedTable: Send + Sync + 'static {
         Ok(())
     }
 
-    /// The ownership hook: called exactly once for every table of the subtask, with the worker's
-    /// acknowledged lifecycle fence, before anything else is asked of the table (plan
-    /// M11.T10b.01 item 4; owner-default M11.T10R23 of statebackend issue #137).
+    /// The ownership hook: called at most once for each table of the subtask, with the worker's
+    /// acknowledged lifecycle fence, before anything else is asked of the table except
+    /// [`Self::subtask_metadata_from_table`] — which a restore asks first of every table with
+    /// state in the restored checkpoint (plan M11.T10b.01 item 4; owner-default M11.T10R23 of
+    /// statebackend issue #137).
     ///
     /// [`TableManager::load`](table_manager::TableManager::load) makes the call after every
-    /// table is constructed and after the restored checkpoint's metadata was read, and before
-    /// [`Self::restored`], before the flusher starts — so before the first
+    /// table is constructed and after the restored checkpoint's metadata was read — which asks
+    /// [`Self::subtask_metadata_from_table`] of every table with state in that checkpoint — and
+    /// before [`Self::restored`], before the flusher starts — so before the first
     /// [`Self::epoch_checkpointer`] call — and before any view of the table exists. It is called
-    /// whether the subtask restored or starts fresh. Before this hook a table learns the fence
-    /// only at its first barrier, and its view may write before that barrier; a table whose
-    /// state must be opened under the ownership generation before its first write opens it
-    /// here.
+    /// whether the subtask restored or starts fresh, and on every table unless `load` failed
+    /// first: a construction, a metadata read, or another table's bind. Before this hook a table
+    /// learns the fence only at its first barrier, and its view may write before that barrier; a
+    /// table whose state must be opened under the ownership generation before its first write
+    /// opens it here.
     ///
     /// `acknowledged_fence` is the handle the barrier hook later receives (ruling M11.T10R6): it
     /// reads the current value, and a table that keeps a clone can read it again at any later

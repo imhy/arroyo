@@ -320,12 +320,14 @@ impl TableManager {
     /// no provider for. Callers that need the selector failure typed can downcast it.
     ///
     /// Every table's [`ErasedTable::bind_ownership`] is then called once with
-    /// `acknowledged_fence`, after all of them are constructed and the restored metadata was
-    /// read, whether or not the subtask restored (plan M11.T10b.01 item 4). When the subtask
-    /// restored, every table's [`ErasedTable::restored`] is called next with the restored epoch
-    /// (ruling M11.T10R7). Both run before the flusher is started and before any view exists;
-    /// a table's refusal of either fails `load` with that table's [`StateError`], and no
-    /// flusher is started. `acknowledged_fence` is kept for the barrier hooks
+    /// `acknowledged_fence`, one table after another until one refuses, after all of them are
+    /// constructed and the restored metadata was read —
+    /// [`ErasedTable::subtask_metadata_from_table`] of every table with state in the restored
+    /// checkpoint included — whether or not the subtask restored (plan M11.T10b.01 item 4). When
+    /// the subtask restored, every table's [`ErasedTable::restored`] is called next with the
+    /// restored epoch (ruling M11.T10R7). Both run before the flusher is started and before any
+    /// view exists; a table's refusal of either fails `load` with that table's [`StateError`],
+    /// and no flusher is started. `acknowledged_fence` is kept for the barrier hooks
     /// [`Self::checkpoint`] runs (ruling M11.T10R6).
     pub async fn load(
         task_info: Arc<TaskInfo>,
